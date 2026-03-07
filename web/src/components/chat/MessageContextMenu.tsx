@@ -81,31 +81,31 @@ export function MessageContextMenu({ content, position, onClose, chatJid, messag
       >
         <button
           onClick={handleCopyText}
-          className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-foreground hover:bg-muted/50 active:bg-muted transition-colors"
+          className="group/item w-full flex items-center gap-3 mx-1 px-3 py-2.5 text-sm text-foreground rounded-lg hover:bg-foreground/10 active:bg-foreground/15 transition-colors"
         >
-          <Copy className="w-4 h-4 text-slate-400" />
+          <Copy className="w-4 h-4 text-muted-foreground group-hover/item:text-primary transition-colors" />
           复制文本
         </button>
-        <div className="mx-3 border-t border-border" />
+        <div className="mx-3 my-0.5 border-t border-border" />
         <button
           onClick={handleCopyMarkdown}
-          className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-foreground hover:bg-muted/50 active:bg-muted transition-colors"
+          className="group/item w-full flex items-center gap-3 mx-1 px-3 py-2.5 text-sm text-foreground rounded-lg hover:bg-foreground/10 active:bg-foreground/15 transition-colors"
         >
-          <FileText className="w-4 h-4 text-slate-400" />
+          <FileText className="w-4 h-4 text-muted-foreground group-hover/item:text-primary transition-colors" />
           复制 Markdown
         </button>
         {chatJid && messageId && (
           <>
-            <div className="mx-3 border-t border-border" />
+            <div className="mx-3 my-0.5 border-t border-border" />
             <button
               onClick={handleDelete}
-              className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
+              className={`group/item w-full flex items-center gap-3 mx-1 px-3 py-2.5 text-sm rounded-lg transition-colors ${
                 confirmDelete
-                  ? 'text-red-600 bg-red-50 hover:bg-red-100'
-                  : 'text-red-500 hover:bg-muted/50 active:bg-muted'
+                  ? 'text-red-400 bg-red-500/20 hover:bg-red-500/30'
+                  : 'text-red-400 hover:bg-foreground/10 hover:text-red-500 active:bg-foreground/15'
               }`}
             >
-              <Trash2 className="w-4 h-4" />
+              <Trash2 className={`w-4 h-4 transition-colors ${confirmDelete ? '' : 'group-hover/item:text-red-500'}`} />
               {confirmDelete ? '确认删除' : '删除消息'}
             </button>
           </>
