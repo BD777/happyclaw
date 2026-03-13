@@ -465,6 +465,8 @@ function shouldClose(): boolean {
   return false;
 }
 
+const IPC_INPUT_DRAIN_SENTINEL = path.join(IPC_INPUT_DIR, '_drain');
+
 const IPC_INPUT_INTERRUPT_SENTINEL = path.join(IPC_INPUT_DIR, '_interrupt');
 const INTERRUPT_GRACE_WINDOW_MS = 10_000;
 let lastInterruptRequestedAt = 0;
@@ -495,6 +497,19 @@ function shouldInterrupt(): boolean {
   if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
     try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
     markInterruptRequested();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Check for _drain sentinel (finish current query then exit).
+ * Unlike _close which exits from idle wait, _drain is checked after
+ * a query completes to implement one-question-one-answer semantics.
+ */
+function shouldDrain(): boolean {
+  if (fs.existsSync(IPC_INPUT_DRAIN_SENTINEL)) {
+    try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
     return true;
   }
   return false;
@@ -548,6 +563,11 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   return new Promise((resolve) => {
     const poll = () => {
       if (shouldClose()) {
+        resolve(null);
+        return;
+      }
+      if (shouldDrain()) {
+        log('Drain sentinel received, exiting after completed query');
         resolve(null);
         return;
       }
@@ -705,6 +725,16 @@ async function runQuery(
       interruptedDuringQuery = true;
       lastInterruptRequestedAt = Date.now();
       queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
+      stream.end();
+      ipcPolling = false;
+      return;
+    }
+    // _drain: finish current query then exit. Once a result has been received,
+    // the query is logically done but the MessageStream keeps the SDK alive.
+    // Treat drain as close at this point to release the container.
+    if (resultCount > 0 && shouldDrain()) {
+      log('Drain sentinel detected after query result, ending stream');
+      closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
       return;
@@ -1096,6 +1126,7 @@ async function main(): Promise<void> {
   // Clean up stale sentinels from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
   try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+  try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -1123,8 +1154,9 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   try {
     while (true) {
-      // 清理残留的 _interrupt sentinel，防止空闲期间写入的中断信号影响下一次 query
+      // 清理残留的 sentinel，防止空闲期间写入的信号影响下一次 query
       try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+      try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
       clearInterruptRequested();
 
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);

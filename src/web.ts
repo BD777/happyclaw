@@ -357,6 +357,11 @@ async function handleWebUserMessage(
     } else if (sendResult === 'interrupted_correction') {
       // Correction intent: IPC message written, agent handles it after interrupt
       pipedToActive = true;
+    } else if (sendResult === 'queued') {
+      // Message queued for next container run; don't advance cursor so
+      // processGroupMessages re-reads it from DB, don't enqueue (drain
+      // sentinel will cause the current container to exit, then drainGroup
+      // starts a new one).
     } else {
       deps.queue.enqueueMessageCheck(chatJid);
     }
@@ -1208,6 +1213,7 @@ export function broadcastNewMessage(
   chatJid: string,
   msg: NewMessage & { is_from_me?: boolean },
   agentId?: string,
+  source?: string,
 ): void {
   // For virtual JIDs like "web:xxx#agent:yyy", extract base JID and agentId
   let baseChatJid = chatJid;
@@ -1224,6 +1230,7 @@ export function broadcastNewMessage(
     chatJid: jid,
     message: { ...msg, is_from_me: msg.is_from_me ?? false },
     ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
+    ...(source ? { source } : {}),
   };
   safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
 }
@@ -1287,6 +1294,20 @@ export function broadcastAgentStatus(
     name,
     prompt,
     resultSummary,
+  };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+export function broadcastRunnerState(
+  chatJid: string,
+  state: 'idle' | 'running',
+): void {
+  const jid = normalizeHomeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  const msg: WsMessageOut = {
+    type: 'runner_state',
+    chatJid: jid,
+    state,
   };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
 }
@@ -1366,6 +1387,9 @@ export function startWebServer(webDeps: WebDeps): void {
       }
     }
   });
+
+  // Register runner state change callback for sidebar indicators
+  webDeps.queue.setOnRunnerStateChange(broadcastRunnerState);
 
   // Broadcast status every 5 seconds
   if (statusInterval) clearInterval(statusInterval);

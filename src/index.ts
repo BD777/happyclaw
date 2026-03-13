@@ -1095,6 +1095,8 @@ interface SendMessageOptions {
   sendToIM?: boolean;
   /** Pre-computed local image paths to attach to IM messages. Avoids redundant filesystem scans. */
   localImagePaths?: string[];
+  /** Message source identifier (e.g. 'scheduled_task') for frontend routing. */
+  source?: string;
 }
 
 /**
@@ -2418,9 +2420,15 @@ async function sendMessage(
       content: text,
       timestamp,
       is_from_me: true,
-    });
+    }, undefined, options.source);
     logger.info({ jid, length: text.length, sendToIM }, 'Message sent');
-    broadcastToWebClients(jid, text);
+    // Skip agent_reply broadcast for scheduled tasks to avoid clearing
+    // streaming state of a concurrently running main agent.
+    // Safe because scheduled tasks never trigger typing indicators, so there's
+    // no typing state to clear. The message is still delivered via new_message.
+    if (!options.source) {
+      broadcastToWebClients(jid, text);
+    }
     return msgId;
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
@@ -3777,6 +3785,14 @@ async function startMessageLoop(): Promise<void> {
               id: lastProcessed.id,
             };
             saveState();
+          } else if (sendResult === 'queued') {
+            // Message queued for next container run. Don't advance cursor so
+            // processGroupMessages re-reads it from DB. Drain sentinel will
+            // cause the current container to exit, then drainGroup handles it.
+            logger.debug(
+              { chatJid },
+              'Message queued (drain mode), cursor not advanced',
+            );
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
