@@ -627,6 +627,11 @@ function setupWebSocket(server: any): WebSocketServer {
 
         const msg: WsMessageIn = JSON.parse(data.toString());
 
+        const sendWsError = (error: string, chatJid?: string) => {
+          const msg: WsMessageOut = { type: 'ws_error', error, chatJid };
+          ws.send(JSON.stringify(msg));
+        };
+
         if (msg.type === 'send_message') {
           const wsValidation = MessageCreateSchema.safeParse({
             chatJid: msg.chatJid,
@@ -634,12 +639,7 @@ function setupWebSocket(server: any): WebSocketServer {
             attachments: msg.attachments,
           });
           if (!wsValidation.success) {
-            const errMsg: WsMessageOut = {
-              type: 'ws_error',
-              error: '消息格式无效',
-              chatJid: msg.chatJid,
-            };
-            ws.send(JSON.stringify(errMsg));
+            sendWsError('消息格式无效', msg.chatJid);
             logger.warn(
               { chatJid: msg.chatJid, issues: wsValidation.error.issues.map(i => i.message) },
               'WebSocket send_message validation failed',
@@ -658,12 +658,7 @@ function setupWebSocket(server: any): WebSocketServer {
                 targetGroup,
               )
             ) {
-              const accessDeniedMsg: WsMessageOut = {
-                type: 'ws_error',
-                error: '无权访问该群组',
-                chatJid,
-              };
-              ws.send(JSON.stringify(accessDeniedMsg));
+              sendWsError('无权访问该群组', chatJid);
               logger.warn(
                 { chatJid, userId: session.user_id },
                 'WebSocket send_message blocked: access denied',
@@ -672,12 +667,7 @@ function setupWebSocket(server: any): WebSocketServer {
             }
             if (isHostExecutionGroup(targetGroup)) {
               if (session.role !== 'admin') {
-                const hostModeMsg: WsMessageOut = {
-                  type: 'ws_error',
-                  error: '宿主机模式需要管理员权限',
-                  chatJid,
-                };
-                ws.send(JSON.stringify(hostModeMsg));
+                sendWsError('宿主机模式需要管理员权限', chatJid);
                 logger.warn(
                   { chatJid, userId: session.user_id },
                   'WebSocket send_message blocked: host mode requires admin',
