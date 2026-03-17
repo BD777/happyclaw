@@ -573,8 +573,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 groupJid={groupJid}
                 isWaiting={isWaiting}
                 onInterrupt={() => interruptQuery(groupJid)}
-                agents={agents}
-                onAgentClick={(agentId) => setActiveAgentTab(groupJid, agentId)}
                 onSend={(content) => handleSend(content)}
               />
               <MessageInput

@@ -2,10 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } fr
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Message, useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
-import type { AgentInfo } from '../../types';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
-import { AgentStatusCard } from './AgentStatusCard';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
@@ -23,10 +21,6 @@ interface MessageListProps {
   isWaiting?: boolean;
   /** Callback to interrupt the current agent query */
   onInterrupt?: () => void;
-  /** Sub-agents to display as status cards in the main conversation */
-  agents?: AgentInfo[];
-  /** Callback when a sub-agent status card is clicked */
-  onAgentClick?: (agentId: string) => void;
   /** If set, this MessageList is showing a sub-agent's messages */
   agentId?: string;
   /** Callback to send a message (used for quick prompts in empty state) */
@@ -46,7 +40,7 @@ const quickPrompts = [
   '帮我调试一个问题',
 ];
 
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agents, onAgentClick, agentId, onSend }: MessageListProps) {
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, onSend }: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
   const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
@@ -392,19 +386,6 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         )}
         {groupJid && agentId && (
           <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} agentId={agentId} />
-        )}
-
-        {/* Agent status cards in main conversation (task agents only) */}
-        {!agentId && agents && agents.filter(a => a.kind === 'task').length > 0 && (
-          <div className="py-2">
-            {agents.filter(a => a.kind === 'task').map((agent) => (
-              <AgentStatusCard
-                key={agent.id}
-                agent={agent}
-                onClick={() => onAgentClick?.(agent.id)}
-              />
-            ))}
-          </div>
         )}
 
         {isWaiting && onInterrupt && (

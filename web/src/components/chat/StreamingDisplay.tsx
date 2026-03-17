@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, OctagonX } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import type { AgentInfo } from '../../types';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { TodoProgressPanel } from './TodoProgressPanel';
@@ -49,6 +50,122 @@ function AskUserQuestionCard({ toolInput }: { toolInput: Record<string, unknown>
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+const TASK_STATUS_LABELS: Record<string, string> = {
+  running: '执行中',
+  completed: '已完成',
+  error: '出错',
+};
+
+/** Collapsible block for a single Task Agent — visually consistent with the Thinking block. */
+function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: string }) {
+  const streaming = useChatStore(s => s.agentStreaming[agent.id]);
+  const isRunning = agent.status === 'running';
+  const [expanded, setExpanded] = useState(isRunning);
+  const [localElapsed, setLocalElapsed] = useState<Record<string, number>>({});
+
+  // Auto-expand when agent starts running
+  useEffect(() => {
+    if (isRunning) setExpanded(true);
+  }, [isRunning]);
+
+  // Local elapsed timer for tools
+  useEffect(() => {
+    if (!streaming?.activeTools.length) {
+      setLocalElapsed({});
+      return;
+    }
+    const interval = setInterval(() => {
+      const now = Date.now();
+      const next: Record<string, number> = {};
+      for (const tool of streaming.activeTools) {
+        next[tool.toolUseId] = (now - tool.startTime) / 1000;
+      }
+      setLocalElapsed(next);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [streaming?.activeTools]);
+
+  const borderColor = isRunning ? 'border-blue-200/60' : agent.status === 'error' ? 'border-red-200/60' : 'border-emerald-200/60';
+  const bgColor = isRunning ? 'bg-blue-50/40' : agent.status === 'error' ? 'bg-red-50/40' : 'bg-emerald-50/40';
+  const hoverBg = isRunning ? 'hover:bg-blue-50/60' : agent.status === 'error' ? 'hover:bg-red-50/60' : 'hover:bg-emerald-50/60';
+  const dotColor = isRunning ? 'bg-blue-500 animate-pulse' : agent.status === 'error' ? 'bg-red-500' : 'bg-emerald-500';
+  const textColor = isRunning ? 'text-blue-700' : agent.status === 'error' ? 'text-red-700' : 'text-emerald-700';
+  const chevronColor = isRunning ? 'text-blue-400' : agent.status === 'error' ? 'text-red-400' : 'text-emerald-400';
+  const contentBorderColor = isRunning ? 'border-blue-100' : agent.status === 'error' ? 'border-red-100' : 'border-emerald-100';
+
+  return (
+    <div className={`mb-3 rounded-xl border ${borderColor} ${bgColor} overflow-hidden`}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className={`w-full flex items-center gap-2 px-3 py-2 text-left ${hoverBg} transition-colors`}
+      >
+        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${dotColor}`} />
+        <span className={`text-xs font-medium ${textColor}`}>
+          子 Agent: {agent.name}
+        </span>
+        <span className={`text-[10px] ${textColor} opacity-70`}>
+          {TASK_STATUS_LABELS[agent.status] || agent.status}
+        </span>
+        <span className="flex-1" />
+        {expanded ? (
+          <ChevronUp className={`w-3.5 h-3.5 ${chevronColor}`} />
+        ) : (
+          <ChevronDown className={`w-3.5 h-3.5 ${chevronColor}`} />
+        )}
+      </button>
+      {expanded && (
+        <div className={`px-3 pb-3 border-t ${contentBorderColor} space-y-2`}>
+          {/* Agent prompt */}
+          <p className="text-xs text-foreground/60 mt-2 line-clamp-2">{agent.prompt}</p>
+
+          {/* Live streaming state (running) */}
+          {isRunning && streaming && (
+            <>
+              {streaming.isThinking && (
+                <p className="text-xs text-blue-500 italic flex items-center gap-1">
+                  思考中
+                  <span className="flex gap-0.5 ml-0.5">
+                    <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
+                    <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
+                    <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce" />
+                  </span>
+                </p>
+              )}
+              {streaming.activeTools.length > 0 && (
+                <div className="space-y-1.5">
+                  {streaming.activeTools.filter(t => t.toolName !== 'AskUserQuestion').map((tool) => (
+                    <ToolActivityCard
+                      key={tool.toolUseId}
+                      tool={tool}
+                      localElapsed={localElapsed[tool.toolUseId]}
+                    />
+                  ))}
+                </div>
+              )}
+              {streaming.partialText && (
+                <div className="max-w-none overflow-hidden text-sm [&>div>*:first-child]:!mt-0">
+                  <MarkdownRenderer
+                    content={streaming.partialText.length > 2000
+                      ? '...' + streaming.partialText.slice(-1500)
+                      : streaming.partialText}
+                    groupJid={groupJid}
+                    variant="chat"
+                  />
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Result summary (completed/error) */}
+          {!isRunning && agent.result_summary && (
+            <p className="text-xs text-foreground/70">{agent.result_summary}</p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -214,10 +331,16 @@ interface StreamingDisplayProps {
   agentId?: string;
 }
 
+const EMPTY_AGENTS: AgentInfo[] = [];
+
 export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNameProp = 'AI', agentId }: StreamingDisplayProps) {
   const mainStreaming = useChatStore(s => s.streaming[groupJid]);
   const agentStreamingState = useChatStore(s => agentId ? s.agentStreaming[agentId] : undefined);
   const streaming = agentId ? agentStreamingState : mainStreaming;
+  // Task agents — only shown in main conversation (not inside agent tabs)
+  const allAgents = useChatStore(s => !agentId ? (s.agents[groupJid] ?? EMPTY_AGENTS) : EMPTY_AGENTS);
+  const taskAgents = useMemo(() => allAgents.filter(a => a.kind === 'task'), [allAgents]);
+  const hasTaskAgents = taskAgents.length > 0;
   const currentUser = useAuthStore(s => s.user);
   const appearance = useAuthStore(s => s.appearance);
   const senderName = currentUser?.ai_name || appearance?.aiName || senderNameProp;
@@ -324,7 +447,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
   };
 
   // 计算是否有流式数据（含中断后冻结的 partialText）
-  const hasStreamData = streaming && (
+  const hasStreamData = (streaming && (
     streaming.partialText ||
     streaming.thinkingText ||
     streaming.activeTools.length > 0 ||
@@ -332,7 +455,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     streaming.systemStatus ||
     streaming.recentEvents.length > 0 ||
     (streaming.todos && streaming.todos.length > 0)
-  );
+  )) || hasTaskAgents;
 
   // 仅在既不等待也无冻结数据时才隐藏
   if (!isWaiting && !hasStreamData) return null;
@@ -384,7 +507,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     );
   }
 
-  if (!streaming) return null;
+  if (!streaming && !hasTaskAgents) return null;
 
   // ── Compact mode streaming ──
   if (isCompact) {
@@ -393,7 +516,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
         {/* Sender line */}
         <div className="flex items-center gap-1.5 mb-1">
           <span className="text-xs font-semibold text-primary">{senderName}</span>
-          {streaming.isThinking && (
+          {streaming?.isThinking && (
             <span className="flex gap-0.5 ml-0.5">
               <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
               <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
@@ -406,18 +529,25 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
         <div className="min-w-0 overflow-hidden">
 
           {/* Shared streaming content */}
-          <StreamingContent
-            streaming={streaming}
-            localElapsed={localElapsed}
-            groupJid={groupJid}
-            thinkingExpanded={thinkingExpanded}
-            setThinkingExpanded={(v) => {
-              setThinkingExpanded(v);
-              if (v) userScrolledRef.current = false;
-            }}
-            thinkingRef={thinkingRef}
-            handleThinkingScroll={handleThinkingScroll}
-          />
+          {streaming && (
+            <StreamingContent
+              streaming={streaming}
+              localElapsed={localElapsed}
+              groupJid={groupJid}
+              thinkingExpanded={thinkingExpanded}
+              setThinkingExpanded={(v) => {
+                setThinkingExpanded(v);
+                if (v) userScrolledRef.current = false;
+              }}
+              thinkingRef={thinkingRef}
+              handleThinkingScroll={handleThinkingScroll}
+            />
+          )}
+
+          {/* Task agent blocks */}
+          {taskAgents.map((agent) => (
+            <TaskAgentBlock key={agent.id} agent={agent} groupJid={groupJid} />
+          ))}
         </div>
       </div>
     );
@@ -430,7 +560,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
       <div className="flex items-center gap-2 mb-1.5 lg:hidden">
         <EmojiAvatar imageUrl={aiImageUrl} emoji={aiEmoji} color={aiColor} fallbackChar={senderName[0]} size="sm" />
         <span className="text-xs text-muted-foreground font-medium">{senderName}</span>
-        {streaming.isThinking && (
+        {streaming?.isThinking && (
           <span className="flex gap-0.5 ml-1">
             <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
             <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
@@ -447,7 +577,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
           {/* Desktop: name row */}
           <div className="hidden lg:flex items-center gap-2 mb-1">
             <span className="text-xs text-muted-foreground font-medium">{senderName}</span>
-            {streaming.isThinking && (
+            {streaming?.isThinking && (
               <span className="flex gap-0.5 ml-1">
                 <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
                 <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
@@ -458,18 +588,25 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
 
           {/* Card */}
           <div className="bg-card rounded-xl border border-border border-l-[3px] border-l-[var(--brand-400)] px-5 py-4 overflow-hidden">
-            <StreamingContent
-              streaming={streaming}
-              localElapsed={localElapsed}
-              groupJid={groupJid}
-              thinkingExpanded={thinkingExpanded}
-              setThinkingExpanded={(v) => {
-                setThinkingExpanded(v);
-                if (v) userScrolledRef.current = false;
-              }}
-              thinkingRef={thinkingRef}
-              handleThinkingScroll={handleThinkingScroll}
-            />
+            {streaming && (
+              <StreamingContent
+                streaming={streaming}
+                localElapsed={localElapsed}
+                groupJid={groupJid}
+                thinkingExpanded={thinkingExpanded}
+                setThinkingExpanded={(v) => {
+                  setThinkingExpanded(v);
+                  if (v) userScrolledRef.current = false;
+                }}
+                thinkingRef={thinkingRef}
+                handleThinkingScroll={handleThinkingScroll}
+              />
+            )}
+
+            {/* Task agent blocks */}
+            {taskAgents.map((agent) => (
+              <TaskAgentBlock key={agent.id} agent={agent} groupJid={groupJid} />
+            ))}
           </div>
         </div>
       </div>

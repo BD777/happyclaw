@@ -178,6 +178,11 @@ let stuckRunnerCheckCounter = 0;
 type ReplyRouteUpdater = (newSourceJid: string | null) => void;
 const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 
+// Per-folder IM reply route: tracks the current replySourceImJid for each
+// running processGroupMessages.  IPC watcher reads this to forward send_message
+// outputs to the correct IM channel (the running session holds the truth).
+const activeImReplyRoutes = new Map<string, string | null>();
+
 // Track consecutive IM send failures per JID for auto-unbind
 const imSendFailCounts = new Map<string, number>();
 const IM_SEND_FAIL_THRESHOLD = 3;
@@ -1559,6 +1564,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // chatJid is an IM channel — reply directly
     replySourceImJid = chatJid;
   }
+  // Publish the current IM reply route so the IPC watcher can forward
+  // send_message outputs to the correct IM channel.
+  activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
   const shared = isGroupShared(group.folder);
   const prompt = formatMessages(missedMessages, shared);
@@ -1628,6 +1636,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       'Reply route updated via IPC injection',
     );
     replySourceImJid = newImJid;
+    activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
     // Rebuild streaming session if the target channel changed
     const newStreamingJid = replySourceImJid ?? chatJid;
@@ -2105,6 +2114,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     await setTyping(chatJid, false);
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
+    activeImReplyRoutes.delete(effectiveGroup.folder);
 
     // ── 检测中断：有累积文本但从未发送回复 ──
     const wasInterrupted = streamInterrupted && !sentReply;
@@ -2731,9 +2741,24 @@ function startIpcWatcher(): void {
                         sourceKind: 'sdk_send_message',
                       },
                     });
+                    // Forward to IM channel when chatJid is a routed web JID
+                    // (e.g. 'web:main') but the message originated from an IM source.
+                    // Without this, IPC send_message only reaches Web + DB, not Feishu/TG.
+                    const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
+                    if (
+                      ipcImRoute &&
+                      getChannelType(data.chatJid) === null &&
+                      ipcImRoute !== data.chatJid
+                    ) {
+                      const localImages = extractLocalImImagePaths(
+                        data.text,
+                        sourceGroup,
+                      );
+                      sendImWithFailTracking(ipcImRoute, data.text, localImages);
+                    }
                     ipcMessageSentFolders.add(sourceGroup);
                     logger.info(
-                      { chatJid: data.chatJid, sourceGroup },
+                      { chatJid: data.chatJid, sourceGroup, imRoute: ipcImRoute },
                       'IPC message sent (flagged for dual-reply)',
                     );
                   } else {
@@ -2768,13 +2793,21 @@ function startIpcWatcher(): void {
                       const fileName = data.fileName || undefined;
 
                       // Send to IM channel (caption is included in the image message itself)
-                      await imManager.sendImage(
-                        data.chatJid,
-                        imageBuffer,
-                        mimeType,
-                        caption,
-                        fileName,
-                      );
+                      // Determine which JID to actually send the image to:
+                      // if chatJid is a web JID, route via activeImReplyRoutes.
+                      const imgImRoute =
+                        getChannelType(data.chatJid) !== null
+                          ? data.chatJid
+                          : activeImReplyRoutes.get(sourceGroup) ?? null;
+                      if (imgImRoute) {
+                        await imManager.sendImage(
+                          imgImRoute,
+                          imageBuffer,
+                          mimeType,
+                          caption,
+                          fileName,
+                        );
+                      }
 
                       // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
                       const displayText = caption
@@ -3385,9 +3418,21 @@ async function processTaskIpc(
             break;
           }
 
-          await imManager.sendFile(data.chatJid, resolvedPath, data.fileName);
+          // Route to IM: if chatJid is a web JID, use activeImReplyRoutes
+          const fileImRoute =
+            getChannelType(data.chatJid) !== null
+              ? data.chatJid
+              : activeImReplyRoutes.get(sourceGroup) ?? null;
+          if (fileImRoute) {
+            await imManager.sendFile(fileImRoute, resolvedPath, data.fileName);
+          } else {
+            logger.debug(
+              { chatJid: data.chatJid, sourceGroup },
+              'No IM route for send_file, skipped IM delivery',
+            );
+          }
           logger.info(
-            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName },
+            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName, imRoute: fileImRoute },
             'File sent via IPC',
           );
         } catch (err) {
