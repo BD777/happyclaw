@@ -30,6 +30,7 @@ import {
   closeDatabase,
   createTask,
   deleteExpiredSessions,
+  getExpiredSessionIds,
   deleteTask,
   ensureChatExists,
   ensureUserHomeGroup,
@@ -95,6 +96,7 @@ import {
   type WorkspaceInfo,
 } from './im-command-utils.js';
 import { analyzeIntent } from './intent-analyzer.js';
+import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import {
   getFeishuProviderConfigWithSource,
   getTelegramProviderConfig,
@@ -113,7 +115,7 @@ import type {
   QQConnectConfig,
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
 import {
   checkBillingAccessFresh,
   formatBillingAccessDeniedMessage,
@@ -177,6 +179,11 @@ let stuckRunnerCheckCounter = 0;
 // Key is group folder (one active processGroupMessages per folder).
 type ReplyRouteUpdater = (newSourceJid: string | null) => void;
 const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
+
+// Per-folder IM reply route: tracks the current replySourceImJid for each
+// running processGroupMessages.  IPC watcher reads this to forward send_message
+// outputs to the correct IM channel (the running session holds the truth).
+const activeImReplyRoutes = new Map<string, string | null>();
 
 // Track consecutive IM send failures per JID for auto-unbind
 const imSendFailCounts = new Map<string, number>();
@@ -1559,6 +1566,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // chatJid is an IM channel — reply directly
     replySourceImJid = chatJid;
   }
+  // Publish the current IM reply route so the IPC watcher can forward
+  // send_message outputs to the correct IM channel.
+  activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
   const shared = isGroupShared(group.folder);
   const prompt = formatMessages(missedMessages, shared);
@@ -1628,6 +1638,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       'Reply route updated via IPC injection',
     );
     replySourceImJid = newImJid;
+    activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
     // Rebuild streaming session if the target channel changed
     const newStreamingJid = replySourceImJid ?? chatJid;
@@ -2105,6 +2116,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     await setTyping(chatJid, false);
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
+    activeImReplyRoutes.delete(effectiveGroup.folder);
 
     // ── 检测中断：有累积文本但从未发送回复 ──
     const wasInterrupted = streamInterrupted && !sentReply;
@@ -2658,15 +2670,17 @@ function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
+  const fsp = fs.promises;
+
   const processIpcFiles = async () => {
     if (shuttingDown) return;
     // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
     try {
-      groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
-        const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors';
-      });
+      const entries = await fsp.readdir(ipcBaseDir, { withFileTypes: true });
+      groupFolders = entries
+        .filter((e) => e.isDirectory() && e.name !== 'errors')
+        .map((e) => e.name);
     } catch (err) {
       logger.error({ err }, 'Error reading IPC base directory');
       if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
@@ -2683,22 +2697,34 @@ function startIpcWatcher(): void {
       );
       const isHome = !!sourceGroupEntry?.is_home;
 
-      // Collect all IPC roots: main group dir + agents/*/
+      // Collect all IPC roots: main group dir + agents/*/ + tasks-run/*/
       const groupIpcRoot = path.join(ipcBaseDir, sourceGroup);
       const ipcRoots = [groupIpcRoot];
       try {
         const agentsDir = path.join(groupIpcRoot, 'agents');
-        if (fs.existsSync(agentsDir)) {
-          for (const entry of fs.readdirSync(agentsDir, {
-            withFileTypes: true,
-          })) {
-            if (entry.isDirectory()) {
-              ipcRoots.push(path.join(agentsDir, entry.name));
-            }
+        const agentEntries = await fsp.readdir(agentsDir, {
+          withFileTypes: true,
+        });
+        for (const entry of agentEntries) {
+          if (entry.isDirectory()) {
+            ipcRoots.push(path.join(agentsDir, entry.name));
           }
         }
       } catch {
-        /* ignore */
+        /* agents dir may not exist */
+      }
+      try {
+        const tasksRunDir = path.join(groupIpcRoot, 'tasks-run');
+        const taskRunEntries = await fsp.readdir(tasksRunDir, {
+          withFileTypes: true,
+        });
+        for (const entry of taskRunEntries) {
+          if (entry.isDirectory()) {
+            ipcRoots.push(path.join(tasksRunDir, entry.name));
+          }
+        }
+      } catch {
+        /* tasks-run dir may not exist */
       }
 
       for (const ipcRoot of ipcRoots) {
@@ -2707,248 +2733,371 @@ function startIpcWatcher(): void {
 
         // Process messages from this group's IPC directory
         try {
-          if (fs.existsSync(messagesDir)) {
-            const messageFiles = fs
-              .readdirSync(messagesDir)
-              .filter((f) => f.endsWith('.json'));
-            for (const file of messageFiles) {
-              const filePath = path.join(messagesDir, file);
-              try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                if (data.type === 'message' && data.chatJid && data.text) {
-                  const targetGroup = registeredGroups[data.chatJid];
-                  if (
-                    canSendCrossGroupMessage(
-                      isAdminHome,
-                      isHome,
-                      sourceGroup,
-                      sourceGroupEntry,
-                      targetGroup,
-                    )
-                  ) {
-                    await sendMessage(data.chatJid, data.text, {
-                      messageMeta: {
-                        sourceKind: 'sdk_send_message',
-                      },
-                    });
-                    ipcMessageSentFolders.add(sourceGroup);
-                    logger.info(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'IPC message sent (flagged for dual-reply)',
-                    );
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'Unauthorized IPC message attempt blocked',
-                    );
-                  }
-                } else if (
-                  data.type === 'image' &&
-                  data.chatJid &&
-                  data.imageBase64
+          const messageEntries = await fsp.readdir(messagesDir);
+          const messageFiles = messageEntries.filter((f) =>
+            f.endsWith('.json'),
+          );
+          for (const file of messageFiles) {
+            const filePath = path.join(messagesDir, file);
+            try {
+              const raw = await fsp.readFile(filePath, 'utf-8');
+              const data = JSON.parse(raw);
+              if (data.type === 'message' && data.chatJid && data.text) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  canSendCrossGroupMessage(
+                    isAdminHome,
+                    isHome,
+                    sourceGroup,
+                    sourceGroupEntry,
+                    targetGroup,
+                  )
                 ) {
-                  // Handle image IPC messages from send_image MCP tool
-                  const targetGroup = registeredGroups[data.chatJid];
+                  await sendMessage(data.chatJid, data.text, {
+                    messageMeta: {
+                      sourceKind: 'sdk_send_message',
+                    },
+                  });
+                  // Forward to IM channel when chatJid is a routed web JID
+                  // (e.g. 'web:main') but the message originated from an IM source.
+                  // Without this, IPC send_message only reaches Web + DB, not Feishu/TG.
+                  const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
                   if (
-                    canSendCrossGroupMessage(
-                      isAdminHome,
-                      isHome,
-                      sourceGroup,
-                      sourceGroupEntry,
-                      targetGroup,
-                    )
+                    ipcImRoute &&
+                    getChannelType(data.chatJid) === null &&
+                    ipcImRoute !== data.chatJid
                   ) {
-                    try {
-                      const imageBuffer = Buffer.from(
-                        data.imageBase64,
-                        'base64',
-                      );
-                      const mimeType = data.mimeType || 'image/png';
-                      const caption = data.caption || undefined;
-                      const fileName = data.fileName || undefined;
+                    const localImages = extractLocalImImagePaths(
+                      data.text,
+                      sourceGroup,
+                    );
+                    sendImWithFailTracking(ipcImRoute, data.text, localImages);
+                  }
 
-                      // Send to IM channel (caption is included in the image message itself)
+                  // Scheduled task: broadcast to all connected IM channels of the owner
+                  if (data.isScheduledTask && sourceGroupEntry?.created_by) {
+                    const sentChannelTypes = new Set<string>();
+                    // Mark already-sent channel types
+                    const primaryType = getChannelType(data.chatJid);
+                    if (primaryType) sentChannelTypes.add(primaryType);
+                    if (ipcImRoute) {
+                      const routeType = getChannelType(ipcImRoute);
+                      if (routeType) sentChannelTypes.add(routeType);
+                    }
+
+                    const connectedTypes = imManager.getConnectedChannelTypes(
+                      sourceGroupEntry.created_by,
+                    );
+                    const ownerGroups = getGroupsByOwner(
+                      sourceGroupEntry.created_by,
+                    );
+
+                    for (const channelType of connectedTypes) {
+                      if (sentChannelTypes.has(channelType)) continue;
+                      // Find an IM JID of this channel type (prefer same folder)
+                      const sameFolderGroup = ownerGroups.find(
+                        (g) =>
+                          getChannelType(g.jid) === channelType &&
+                          g.folder === sourceGroup,
+                      );
+                      const anyGroup =
+                        sameFolderGroup ||
+                        ownerGroups.find(
+                          (g) => getChannelType(g.jid) === channelType,
+                        );
+                      if (anyGroup) {
+                        const taskLocalImages = extractLocalImImagePaths(
+                          data.text,
+                          sourceGroup,
+                        );
+                        sendImWithFailTracking(
+                          anyGroup.jid,
+                          data.text,
+                          taskLocalImages,
+                        );
+                        sentChannelTypes.add(channelType);
+                      }
+                    }
+                  }
+
+                  ipcMessageSentFolders.add(sourceGroup);
+                  logger.info(
+                    { chatJid: data.chatJid, sourceGroup, imRoute: ipcImRoute },
+                    'IPC message sent (flagged for dual-reply)',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'image' &&
+                data.chatJid &&
+                data.imageBase64
+              ) {
+                // Handle image IPC messages from send_image MCP tool
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  canSendCrossGroupMessage(
+                    isAdminHome,
+                    isHome,
+                    sourceGroup,
+                    sourceGroupEntry,
+                    targetGroup,
+                  )
+                ) {
+                  try {
+                    const imageBuffer = Buffer.from(
+                      data.imageBase64,
+                      'base64',
+                    );
+                    const mimeType = data.mimeType || 'image/png';
+                    const caption = data.caption || undefined;
+                    const fileName = data.fileName || undefined;
+
+                    // Send to IM channel (caption is included in the image message itself)
+                    // Determine which JID to actually send the image to:
+                    // if chatJid is a web JID, route via activeImReplyRoutes.
+                    const imgImRoute =
+                      getChannelType(data.chatJid) !== null
+                        ? data.chatJid
+                        : activeImReplyRoutes.get(sourceGroup) ?? null;
+                    if (imgImRoute) {
                       await imManager.sendImage(
-                        data.chatJid,
+                        imgImRoute,
                         imageBuffer,
                         mimeType,
                         caption,
                         fileName,
                       );
-
-                      // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
-                      const displayText = caption
-                        ? `[图片: ${fileName || 'image'}]\n${caption}`
-                        : `[图片: ${fileName || 'image'}]`;
-                      const imgMsgId = crypto.randomUUID();
-                      const imgTimestamp = new Date().toISOString();
-                      ensureChatExists(data.chatJid);
-                      const persistedImgMsgId = storeMessageDirect(
-                        imgMsgId,
-                        data.chatJid,
-                        'happyclaw-agent',
-                        ASSISTANT_NAME,
-                        displayText,
-                        imgTimestamp,
-                        true,
-                        { meta: { sourceKind: 'sdk_send_message' } },
-                      );
-                      broadcastNewMessage(data.chatJid, {
-                        id: persistedImgMsgId,
-                        chat_jid: data.chatJid,
-                        sender: 'happyclaw-agent',
-                        sender_name: ASSISTANT_NAME,
-                        content: displayText,
-                        timestamp: imgTimestamp,
-                        is_from_me: true,
-                        turn_id: null,
-                        session_id: null,
-                        sdk_message_uuid: null,
-                        source_kind: 'sdk_send_message',
-                        finalization_reason: null,
-                      });
-                      broadcastToWebClients(data.chatJid, displayText);
-
-                      logger.info(
-                        {
-                          chatJid: data.chatJid,
-                          sourceGroup,
-                          mimeType,
-                          size: imageBuffer.length,
-                        },
-                        'IPC image sent',
-                      );
-                    } catch (err) {
-                      logger.error(
-                        { chatJid: data.chatJid, sourceGroup, err },
-                        'Failed to process IPC image',
-                      );
                     }
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'Unauthorized IPC image attempt blocked',
+
+                    // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
+                    const displayText = caption
+                      ? `[图片: ${fileName || 'image'}]\n${caption}`
+                      : `[图片: ${fileName || 'image'}]`;
+                    const imgMsgId = crypto.randomUUID();
+                    const imgTimestamp = new Date().toISOString();
+                    ensureChatExists(data.chatJid);
+                    const persistedImgMsgId = storeMessageDirect(
+                      imgMsgId,
+                      data.chatJid,
+                      'happyclaw-agent',
+                      ASSISTANT_NAME,
+                      displayText,
+                      imgTimestamp,
+                      true,
+                      { meta: { sourceKind: 'sdk_send_message' } },
+                    );
+                    broadcastNewMessage(data.chatJid, {
+                      id: persistedImgMsgId,
+                      chat_jid: data.chatJid,
+                      sender: 'happyclaw-agent',
+                      sender_name: ASSISTANT_NAME,
+                      content: displayText,
+                      timestamp: imgTimestamp,
+                      is_from_me: true,
+                      turn_id: null,
+                      session_id: null,
+                      sdk_message_uuid: null,
+                      source_kind: 'sdk_send_message',
+                      finalization_reason: null,
+                    });
+                    broadcastToWebClients(data.chatJid, displayText);
+
+                    // Scheduled task: broadcast image to all connected IM channels
+                    if (data.isScheduledTask && sourceGroupEntry?.created_by) {
+                      const sentImgChannelTypes = new Set<string>();
+                      const imgPrimaryType = getChannelType(data.chatJid);
+                      if (imgPrimaryType) sentImgChannelTypes.add(imgPrimaryType);
+                      if (imgImRoute) {
+                        const imgRouteType = getChannelType(imgImRoute);
+                        if (imgRouteType)
+                          sentImgChannelTypes.add(imgRouteType);
+                      }
+
+                      const imgConnectedTypes =
+                        imManager.getConnectedChannelTypes(
+                          sourceGroupEntry.created_by,
+                        );
+                      const imgOwnerGroups = getGroupsByOwner(
+                        sourceGroupEntry.created_by,
+                      );
+
+                      for (const ct of imgConnectedTypes) {
+                        if (sentImgChannelTypes.has(ct)) continue;
+                        const target =
+                          imgOwnerGroups.find(
+                            (g) =>
+                              getChannelType(g.jid) === ct &&
+                              g.folder === sourceGroup,
+                          ) ||
+                          imgOwnerGroups.find(
+                            (g) => getChannelType(g.jid) === ct,
+                          );
+                        if (target) {
+                          imManager
+                            .sendImage(
+                              target.jid,
+                              imageBuffer,
+                              mimeType,
+                              caption,
+                              fileName,
+                            )
+                            .catch((err) =>
+                              logger.warn(
+                                { jid: target.jid, err },
+                                'Failed to broadcast task image to IM',
+                              ),
+                            );
+                          sentImgChannelTypes.add(ct);
+                        }
+                      }
+                    }
+
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        mimeType,
+                        size: imageBuffer.length,
+                      },
+                      'IPC image sent',
+                    );
+                  } catch (err) {
+                    logger.error(
+                      { chatJid: data.chatJid, sourceGroup, err },
+                      'Failed to process IPC image',
                     );
                   }
-                }
-                fs.unlinkSync(filePath);
-              } catch (err) {
-                logger.error(
-                  { file, sourceGroup, err },
-                  'Error processing IPC message',
-                );
-                const errorDir = path.join(ipcBaseDir, 'errors');
-                fs.mkdirSync(errorDir, { recursive: true });
-                try {
-                  fs.renameSync(
-                    filePath,
-                    path.join(errorDir, `${sourceGroup}-${file}`),
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image attempt blocked',
                   );
-                } catch (renameErr) {
-                  logger.error(
-                    { file, sourceGroup, renameErr },
-                    'Failed to move IPC message to error directory, deleting',
-                  );
-                  try {
-                    fs.unlinkSync(filePath);
-                  } catch {
-                    /* ignore */
-                  }
                 }
               }
-            }
-          }
-        } catch (err) {
-          logger.error(
-            { err, sourceGroup },
-            'Error reading IPC messages directory',
-          );
-        }
-
-        // Process tasks from this group's IPC directory
-        try {
-          if (fs.existsSync(tasksDir)) {
-            const allEntries = fs.readdirSync(tasksDir, {
-              withFileTypes: true,
-            });
-
-            // 清理孤儿结果文件（容器崩溃或超时后残留，超过 10 分钟自动删除）
-            for (const entry of allEntries) {
-              if (
-                entry.isFile() &&
-                entry.name.endsWith('.json') &&
-                (entry.name.startsWith('install_skill_result_') ||
-                  entry.name.startsWith('uninstall_skill_result_'))
-              ) {
+              await fsp.unlink(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC message',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              await fsp.mkdir(errorDir, { recursive: true });
+              try {
+                await fsp.rename(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch (renameErr) {
+                logger.error(
+                  { file, sourceGroup, renameErr },
+                  'Failed to move IPC message to error directory, deleting',
+                );
                 try {
-                  const filePath = path.join(tasksDir, entry.name);
-                  const stat = fs.statSync(filePath);
-                  if (Date.now() - stat.mtimeMs > 10 * 60 * 1000) {
-                    fs.unlinkSync(filePath);
-                    logger.debug(
-                      { sourceGroup, file: entry.name },
-                      'Cleaned up stale skill result file',
-                    );
-                  }
+                  await fsp.unlink(filePath);
                 } catch {
                   /* ignore */
                 }
               }
             }
+          }
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') {
+            logger.error(
+              { err, sourceGroup },
+              'Error reading IPC messages directory',
+            );
+          }
+        }
 
-            const taskFiles = allEntries
-              .filter(
-                (entry) =>
-                  entry.isFile() &&
-                  entry.name.endsWith('.json') &&
-                  !entry.name.startsWith('install_skill_result_') &&
-                  !entry.name.startsWith('uninstall_skill_result_'),
-              )
-              .map((entry) => entry.name);
-            for (const file of taskFiles) {
-              const filePath = path.join(tasksDir, file);
+        // Process tasks from this group's IPC directory
+        try {
+          const allEntries = await fsp.readdir(tasksDir, {
+            withFileTypes: true,
+          });
+
+          // 清理孤儿结果文件（容器崩溃或超时后残留，超过 10 分钟自动删除）
+          for (const entry of allEntries) {
+            if (
+              entry.isFile() &&
+              entry.name.endsWith('.json') &&
+              (entry.name.startsWith('install_skill_result_') ||
+                entry.name.startsWith('uninstall_skill_result_'))
+            ) {
               try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                // Pass source group identity to processTaskIpc for authorization
-                await processTaskIpc(
-                  data,
-                  sourceGroup,
-                  isAdminHome,
-                  isHome,
-                  sourceGroupEntry,
+                const filePath = path.join(tasksDir, entry.name);
+                const stat = await fsp.stat(filePath);
+                if (Date.now() - stat.mtimeMs > 10 * 60 * 1000) {
+                  await fsp.unlink(filePath);
+                  logger.debug(
+                    { sourceGroup, file: entry.name },
+                    'Cleaned up stale skill result file',
+                  );
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+
+          const taskFiles = allEntries
+            .filter(
+              (entry) =>
+                entry.isFile() &&
+                entry.name.endsWith('.json') &&
+                !entry.name.startsWith('install_skill_result_') &&
+                !entry.name.startsWith('uninstall_skill_result_'),
+            )
+            .map((entry) => entry.name);
+          for (const file of taskFiles) {
+            const filePath = path.join(tasksDir, file);
+            try {
+              const raw = await fsp.readFile(filePath, 'utf-8');
+              const data = JSON.parse(raw);
+              // Pass source group identity to processTaskIpc for authorization
+              await processTaskIpc(
+                data,
+                sourceGroup,
+                isAdminHome,
+                isHome,
+                sourceGroupEntry,
+              );
+              await fsp.unlink(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC task',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              await fsp.mkdir(errorDir, { recursive: true });
+              try {
+                await fsp.rename(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
                 );
-                fs.unlinkSync(filePath);
-              } catch (err) {
+              } catch (renameErr) {
                 logger.error(
-                  { file, sourceGroup, err },
-                  'Error processing IPC task',
+                  { file, sourceGroup, renameErr },
+                  'Failed to move IPC task to error directory, deleting',
                 );
-                const errorDir = path.join(ipcBaseDir, 'errors');
-                fs.mkdirSync(errorDir, { recursive: true });
                 try {
-                  fs.renameSync(
-                    filePath,
-                    path.join(errorDir, `${sourceGroup}-${file}`),
-                  );
-                } catch (renameErr) {
-                  logger.error(
-                    { file, sourceGroup, renameErr },
-                    'Failed to move IPC task to error directory, deleting',
-                  );
-                  try {
-                    fs.unlinkSync(filePath);
-                  } catch {
-                    /* ignore */
-                  }
+                  await fsp.unlink(filePath);
+                } catch {
+                  /* ignore */
                 }
               }
             }
           }
-        } catch (err) {
-          logger.error(
-            { err, sourceGroup },
-            'Error reading IPC tasks directory',
-          );
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') {
+            logger.error(
+              { err, sourceGroup },
+              'Error reading IPC tasks directory',
+            );
+          }
         }
       } // end for (const ipcRoot of ipcRoots)
     }
@@ -3385,9 +3534,21 @@ async function processTaskIpc(
             break;
           }
 
-          await imManager.sendFile(data.chatJid, resolvedPath, data.fileName);
+          // Route to IM: if chatJid is a web JID, use activeImReplyRoutes
+          const fileImRoute =
+            getChannelType(data.chatJid) !== null
+              ? data.chatJid
+              : activeImReplyRoutes.get(sourceGroup) ?? null;
+          if (fileImRoute) {
+            await imManager.sendFile(fileImRoute, resolvedPath, data.fileName);
+          } else {
+            logger.debug(
+              { chatJid: data.chatJid, sourceGroup },
+              'No IM route for send_file, skipped IM delivery',
+            );
+          }
           logger.info(
-            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName },
+            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName, imRoute: fileImRoute },
             'File sent via IPC',
           );
         } catch (err) {
@@ -4808,6 +4969,13 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'Shutdown signal received, cleaning up...');
 
+    // Force exit after 2s if graceful shutdown hangs
+    const forceExitTimer = setTimeout(() => {
+      logger.warn('Graceful shutdown timed out, force exiting');
+      process.exit(1);
+    }, 2000);
+    forceExitTimer.unref();
+
     if (feishuSyncInterval) {
       clearInterval(feishuSyncInterval);
       feishuSyncInterval = null;
@@ -4818,28 +4986,25 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'Error shutting down terminals');
     }
-    // Abort all active streaming cards before disconnecting IM,
-    // so users see "服务维护中" instead of a stuck "生成中..." card.
-    try {
-      await abortAllStreamingSessions('服务维护中');
-    } catch (err) {
-      logger.warn({ err }, 'Error aborting streaming sessions');
-    }
-    try {
-      await imManager.disconnectAll();
-    } catch (err) {
-      logger.warn({ err }, 'Error disconnecting IM connections');
-    }
-    try {
-      await shutdownWebServer();
-    } catch (err) {
-      logger.warn({ err }, 'Error shutting down web server');
-    }
-    try {
-      await queue.shutdown(10000);
-    } catch (err) {
-      logger.warn({ err }, 'Error shutting down queue');
-    }
+
+    // Run cleanup tasks concurrently with a tight timeout
+    await Promise.allSettled([
+      // Abort all active streaming cards before disconnecting IM,
+      // so users see "服务维护中" instead of a stuck "生成中..." card.
+      abortAllStreamingSessions('服务维护中').catch((err) =>
+        logger.warn({ err }, 'Error aborting streaming sessions'),
+      ),
+      imManager.disconnectAll().catch((err) =>
+        logger.warn({ err }, 'Error disconnecting IM connections'),
+      ),
+      shutdownWebServer().catch((err) =>
+        logger.warn({ err }, 'Error shutting down web server'),
+      ),
+      queue.shutdown(1500).catch((err) =>
+        logger.warn({ err }, 'Error shutting down queue'),
+      ),
+    ]);
+
     try {
       closeDatabase();
     } catch (err) {
@@ -5117,6 +5282,8 @@ async function main(): Promise<void> {
   setInterval(
     () => {
       try {
+        const expiredIds = getExpiredSessionIds();
+        for (const id of expiredIds) invalidateSessionCache(id);
         const deleted = deleteExpiredSessions();
         if (deleted > 0) {
           logger.info({ deleted }, 'Cleaned expired user sessions');
@@ -5201,11 +5368,18 @@ async function main(): Promise<void> {
 
   queue.setProcessMessagesFn(processGroupMessages);
   queue.setHostModeChecker((groupJid: string) => {
-    let group = registeredGroups[groupJid];
+    // Strip virtual JID suffixes to resolve the actual registered group
+    let baseJid = groupJid;
+    const taskSep = baseJid.indexOf('#task:');
+    if (taskSep >= 0) baseJid = baseJid.slice(0, taskSep);
+    const agentSep = baseJid.indexOf('#agent:');
+    if (agentSep >= 0) baseJid = baseJid.slice(0, agentSep);
+
+    let group = registeredGroups[baseJid];
     if (!group) {
-      const dbGroup = getRegisteredGroup(groupJid);
+      const dbGroup = getRegisteredGroup(baseJid);
       if (dbGroup) {
-        registeredGroups[groupJid] = dbGroup;
+        registeredGroups[baseJid] = dbGroup;
         group = dbGroup;
       }
     }
@@ -5224,6 +5398,14 @@ async function main(): Promise<void> {
       const folder = group?.folder || baseJid;
       return `${folder}#${agentId}`;
     }
+    // Task virtual JIDs: {chatJid}#task:{taskId} → separate serialization key
+    const taskSep = groupJid.indexOf('#task:');
+    if (taskSep >= 0) {
+      const baseJid = groupJid.slice(0, taskSep);
+      const taskId = groupJid.slice(taskSep + 6);
+      const group = registeredGroups[baseJid];
+      return `${group?.folder || baseJid}#task:${taskId}`;
+    }
     const group = registeredGroups[groupJid];
     return group?.folder || groupJid;
   });
@@ -5240,7 +5422,13 @@ async function main(): Promise<void> {
   // Billing: user-level concurrent container limit
   queue.setUserConcurrentLimitChecker((groupJid: string) => {
     if (!isBillingEnabled()) return { allowed: true };
-    const group = registeredGroups[groupJid];
+    // Strip virtual JID suffixes
+    let baseJid = groupJid;
+    const taskSep = baseJid.indexOf('#task:');
+    if (taskSep >= 0) baseJid = baseJid.slice(0, taskSep);
+    const agentSep = baseJid.indexOf('#agent:');
+    if (agentSep >= 0) baseJid = baseJid.slice(0, agentSep);
+    const group = registeredGroups[baseJid];
     if (!group?.created_by) return { allowed: true };
     const owner = getUserById(group.created_by);
     if (!owner || owner.role === 'admin') return { allowed: true };
@@ -5255,17 +5443,19 @@ async function main(): Promise<void> {
     }
     return { allowed: userActive < limit };
   });
-  startSchedulerLoop({
+  const schedulerDeps: import('./task-scheduler.js').SchedulerDependencies = {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder, displayName) =>
+    onProcess: (groupJid, proc, containerName, groupFolder, displayName, taskRunId) =>
       queue.registerProcess(
         groupJid,
         proc,
         containerName,
         groupFolder,
         displayName,
+        undefined, // agentId
+        taskRunId,
       ),
     sendMessage,
     assistantName: ASSISTANT_NAME,
@@ -5273,7 +5463,16 @@ async function main(): Promise<void> {
       logger,
       dataDir: DATA_DIR,
     },
-  });
+  };
+  startSchedulerLoop(schedulerDeps);
+
+  // Inject triggerTaskRun into WebDeps (schedulerDeps must exist first)
+  const webDeps = getWebDeps();
+  if (webDeps) {
+    webDeps.triggerTaskRun = (taskId: string) =>
+      triggerTaskNow(taskId, schedulerDeps);
+  }
+
   startIpcWatcher();
   recoverPendingMessages();
   startMessageLoop();

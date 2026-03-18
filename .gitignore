@@ -28,6 +28,14 @@ dist/
 *.db-shm
 *.sqlite
 
+# Bun lockfile（项目以 package-lock.json 为主 lockfile）
+bun.lock
+bun.lockb
+
+# Build cache
+.build-sentinel
+*.tsbuildinfo
+
 # Local tooling metadata
 .claude/
 .mcp.json

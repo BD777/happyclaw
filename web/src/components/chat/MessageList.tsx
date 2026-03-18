@@ -2,10 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } fr
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Message, useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
-import type { AgentInfo } from '../../types';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
-import { AgentStatusCard } from './AgentStatusCard';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
@@ -23,10 +21,6 @@ interface MessageListProps {
   isWaiting?: boolean;
   /** Callback to interrupt the current agent query */
   onInterrupt?: () => void;
-  /** Sub-agents to display as status cards in the main conversation */
-  agents?: AgentInfo[];
-  /** Callback when a sub-agent status card is clicked */
-  onAgentClick?: (agentId: string) => void;
   /** If set, this MessageList is showing a sub-agent's messages */
   agentId?: string;
   /** Callback to send a message (used for quick prompts in empty state) */
@@ -46,7 +40,7 @@ const quickPrompts = [
   '帮我调试一个问题',
 ];
 
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agents, onAgentClick, agentId, onSend }: MessageListProps) {
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, onSend }: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
   const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
@@ -57,6 +51,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
   const aiColor = currentUser?.ai_avatar_color || appearance?.aiAvatarColor;
   const aiImageUrl = currentUser?.ai_avatar_url;
   const parentRef = useRef<HTMLDivElement>(null);
+  const scrollStateRef = useRef({ autoScroll: true, atTop: false });
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
   const prevMessageCount = useRef(messages.length);
@@ -133,7 +128,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         default: return 100;
       }
     },
-    overscan: 8,
+    overscan: window.innerWidth < 1024 ? 12 : 8,
   });
 
   // 检测向上滚动触发 loadMore + 保存滚动位置
@@ -143,9 +138,18 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
 
     const handleScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = parent;
-      const atBottom = scrollHeight - scrollTop - clientHeight < 100;
-      setAutoScroll(atBottom);
-      setAtTop(scrollTop < 50);
+      const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
+      const isAtTop = scrollTop < 50;
+
+      // Only trigger setState when value actually changes
+      if (scrollStateRef.current.autoScroll !== isAtBottom) {
+        scrollStateRef.current.autoScroll = isAtBottom;
+        setAutoScroll(isAtBottom);
+      }
+      if (scrollStateRef.current.atTop !== isAtTop) {
+        scrollStateRef.current.atTop = isAtTop;
+        setAtTop(isAtTop);
+      }
 
       if (scrollTop < 100 && hasMore && !loading) {
         onLoadMore();
@@ -188,33 +192,54 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         parentRef.current.scrollTop = parentRef.current.scrollHeight;
       }
       setAutoScroll(true);
+      // 4-frame rAF chain (~66ms) to wait for measureElement to complete
+      let handle: number;
+      const correct = (depth: number) => {
+        handle = requestAnimationFrame(() => {
+          if (parentRef.current) {
+            parentRef.current.scrollTop = parentRef.current.scrollHeight;
+          }
+          if (depth < 3) correct(depth + 1);
+        });
+      };
+      correct(0);
+      return () => cancelAnimationFrame(handle);
     }
   }, [flatMessages.length, virtualizer, messages.length]);
 
   // Safety net: initialOffset relies on estimated sizes which may be inaccurate.
-  // After mount, verify we're actually at the bottom and correct if not.
+  // After mount (or when messages load asynchronously), verify we're actually at
+  // the bottom and correct if not. Depends on flatMessages.length so that async
+  // message loading triggers a fresh round of corrections.
   useEffect(() => {
     if (flatMessages.length === 0) return;
-    const raf1 = requestAnimationFrame(() => {
-      const el = parentRef.current;
-      if (!el) return;
-      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-      if (gap > 100) {
-        el.scrollTop = el.scrollHeight;
-      }
-    });
-    return () => cancelAnimationFrame(raf1);
-    // Only on mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Auto-scroll when streaming content updates
-  const streaming = useChatStore(s => agentId ? s.agentStreaming[agentId] : s.streaming[groupJid ?? '']);
-  useEffect(() => {
-    if (autoScroll && streaming) {
-      parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
+    const timers: number[] = [];
+    for (const delay of [50, 150, 300, 500]) {
+      timers.push(window.setTimeout(() => {
+        const el = parentRef.current;
+        if (!el) return;
+        const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+        if (gap > 100) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }, delay));
     }
-  }, [streaming, autoScroll]);
+    return () => timers.forEach(clearTimeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flatMessages.length]);
+
+  // Auto-scroll when streaming content is active — poll-based to avoid
+  // re-rendering on every text_delta (the streaming object changes very frequently).
+  const hasStreaming = useChatStore(s =>
+    agentId ? !!s.agentStreaming[agentId] : !!s.streaming[groupJid ?? '']
+  );
+  useEffect(() => {
+    if (!autoScroll || !hasStreaming) return;
+    const id = setInterval(() => {
+      parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
+    }, 100);
+    return () => clearInterval(id);
+  }, [hasStreaming, autoScroll]);
 
   const scrollToTop = useCallback(() => {
     parentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
@@ -392,19 +417,6 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         )}
         {groupJid && agentId && (
           <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} agentId={agentId} />
-        )}
-
-        {/* Agent status cards in main conversation (task agents only) */}
-        {!agentId && agents && agents.filter(a => a.kind === 'task').length > 0 && (
-          <div className="py-2">
-            {agents.filter(a => a.kind === 'task').map((agent) => (
-              <AgentStatusCard
-                key={agent.id}
-                agent={agent}
-                onClick={() => onAgentClick?.(agent.id)}
-              />
-            ))}
-          </div>
         )}
 
         {isWaiting && onInterrupt && (

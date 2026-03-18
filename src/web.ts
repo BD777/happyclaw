@@ -20,6 +20,8 @@ import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
   canAccessGroup,
+  getCachedSessionWithUser,
+  invalidateSessionCache,
 } from './web-context.js';
 
 // Schemas
@@ -61,7 +63,6 @@ import {
   ensureChatExists,
   getRegisteredGroup,
   getJidsByFolder,
-  getSessionWithUser,
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
@@ -548,16 +549,16 @@ function setupWebSocket(server: any): WebSocketServer {
       return;
     }
 
-    const session = getSessionWithUser(token);
+    const session = getCachedSessionWithUser(token);
     if (!session) {
-      lastActiveCache.delete(token);
+      invalidateSessionCache(token);
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
     if (isSessionExpired(session.expires_at)) {
       deleteUserSession(token);
-      lastActiveCache.delete(token);
+      invalidateSessionCache(token);
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
@@ -577,7 +578,7 @@ function setupWebSocket(server: any): WebSocketServer {
   wss.on('connection', (ws, request: any) => {
     const sessionId = request?.__happyclawSessionId as string | undefined;
     logger.info('WebSocket client connected');
-    const connSession = sessionId ? getSessionWithUser(sessionId) : undefined;
+    const connSession = sessionId ? getCachedSessionWithUser(sessionId) : undefined;
     wsClients.set(ws, {
       sessionId: sessionId || '',
       userId: connSession?.user_id || '',
@@ -600,7 +601,7 @@ function setupWebSocket(server: any): WebSocketServer {
           return;
         }
 
-        const session = getSessionWithUser(sessionId);
+        const session = getCachedSessionWithUser(sessionId);
         if (
           !session ||
           isSessionExpired(session.expires_at) ||
@@ -609,7 +610,7 @@ function setupWebSocket(server: any): WebSocketServer {
           if (session && isSessionExpired(session.expires_at)) {
             deleteUserSession(sessionId);
           }
-          lastActiveCache.delete(sessionId);
+          invalidateSessionCache(sessionId);
           ws.close(1008, 'Unauthorized');
           return;
         }
@@ -1052,7 +1053,7 @@ function safeBroadcast(
       continue;
     }
 
-    const session = getSessionWithUser(clientInfo.sessionId);
+    const session = getCachedSessionWithUser(clientInfo.sessionId);
     const expired = !!session && isSessionExpired(session.expires_at);
     const invalid =
       !session ||
@@ -1062,7 +1063,7 @@ function safeBroadcast(
       if (expired) {
         deleteUserSession(clientInfo.sessionId);
       }
-      lastActiveCache.delete(clientInfo.sessionId);
+      invalidateSessionCache(clientInfo.sessionId);
       wsClients.delete(client);
       try {
         client.close(1008, 'Unauthorized');

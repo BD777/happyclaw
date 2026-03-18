@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import Database from './sqlite-compat.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -46,7 +46,112 @@ import {
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
-let db: Database.Database;
+let db: InstanceType<typeof Database>;
+
+// Prepared statement cache — lazy-initialized on first use after initDatabase()
+let _stmts: {
+  storeMessageSelect: any;
+  storeMessageInsert: any;
+  insertUsageInsert: any;
+  insertUsageUpsert: any;
+  getSessionWithUser: any;
+  deleteSession: any;
+  updateSessionLastActive: any;
+  updateTokenUsageById: any;
+  updateTokenUsageLatest: any;
+  getMessagesSince: any;
+  getExpiredSessionIds: any;
+} | null = null;
+
+const _newMsgStmtCache = new Map<number, any>();
+
+function stmts() {
+  if (!_stmts) {
+    _stmts = {
+      storeMessageSelect: db.prepare(
+        `SELECT id FROM messages
+         WHERE chat_jid = ? AND turn_id = ? AND source_kind = 'sdk_final'
+         ORDER BY timestamp DESC LIMIT 1`,
+      ),
+      storeMessageInsert: db.prepare(
+        `INSERT OR REPLACE INTO messages (
+          id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
+          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      insertUsageInsert: db.prepare(
+        `INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
+          input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+          cost_usd, duration_ms, num_turns, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      insertUsageUpsert: db.prepare(
+        `INSERT INTO usage_daily_summary (user_id, model, date,
+          total_input_tokens, total_output_tokens,
+          total_cache_read_tokens, total_cache_creation_tokens,
+          total_cost_usd, request_count, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+        ON CONFLICT(user_id, model, date) DO UPDATE SET
+          total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+          total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+          total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+          total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
+          total_cost_usd = total_cost_usd + excluded.total_cost_usd,
+          request_count = request_count + 1,
+          updated_at = datetime('now')`,
+      ),
+      getSessionWithUser: db.prepare(
+        `SELECT s.*, u.username, u.role, u.status, u.display_name, u.permissions, u.must_change_password
+         FROM user_sessions s
+         JOIN users u ON s.user_id = u.id
+         WHERE s.id = ?`,
+      ),
+      deleteSession: db.prepare('DELETE FROM user_sessions WHERE id = ?'),
+      updateSessionLastActive: db.prepare(
+        'UPDATE user_sessions SET last_active_at = ? WHERE id = ?',
+      ),
+      updateTokenUsageById: db.prepare(
+        `UPDATE messages SET token_usage = ?, cost_usd = ? WHERE id = ? AND chat_jid = ?`,
+      ),
+      updateTokenUsageLatest: db.prepare(
+        `UPDATE messages SET token_usage = ?, cost_usd = ?
+         WHERE rowid = (
+           SELECT rowid FROM messages
+           WHERE chat_jid = ? AND is_from_me = 1 AND token_usage IS NULL
+             AND COALESCE(source_kind, 'legacy') != 'sdk_send_message'
+           ORDER BY timestamp DESC LIMIT 1
+         )`,
+      ),
+      getMessagesSince: db.prepare(
+        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+         FROM messages
+         WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
+         ORDER BY timestamp ASC, id ASC`,
+      ),
+      getExpiredSessionIds: db.prepare(
+        'SELECT id FROM user_sessions WHERE expires_at < ?',
+      ),
+    };
+  }
+  return _stmts;
+}
+
+function getNewMessagesStmt(jidCount: number): any {
+  let s = _newMsgStmtCache.get(jidCount);
+  if (!s) {
+    const placeholders = Array(jidCount).fill('?').join(',');
+    s = db.prepare(
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+       FROM messages
+       WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
+         AND chat_jid IN (${placeholders})
+         AND is_from_me = 0
+       ORDER BY timestamp ASC, id ASC`,
+    );
+    _newMsgStmtCache.set(jidCount, s);
+  }
+  return s;
+}
 
 interface StoredMessageMeta {
   turnId?: string | null;
@@ -114,8 +219,8 @@ export function initDatabase(): void {
   db = new Database(dbPath);
 
   // Enable WAL mode for better concurrency and performance
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 5000');
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -1178,20 +1283,10 @@ export function storeMessageDirect(
   const { attachments, tokenUsage, sourceJid, meta } = opts ?? {};
   const existingFinalRow =
     meta?.sourceKind === 'sdk_final' && meta.turnId
-      ? (db.prepare(
-          `SELECT id FROM messages
-           WHERE chat_jid = ? AND turn_id = ? AND source_kind = 'sdk_final'
-           ORDER BY timestamp DESC
-           LIMIT 1`,
-        ).get(chatJid, meta.turnId) as { id: string } | undefined)
+      ? (stmts().storeMessageSelect.get(chatJid, meta.turnId) as { id: string } | undefined)
       : undefined;
   const effectiveMsgId = existingFinalRow?.id || msgId;
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (
-      id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
-      attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+  stmts().storeMessageInsert.run(
     effectiveMsgId,
     chatJid,
     sourceJid ?? chatJid,
@@ -1224,19 +1319,9 @@ export function updateLatestMessageTokenUsage(
   costUsd?: number,
 ): void {
   if (msgId) {
-    db.prepare(
-      `UPDATE messages SET token_usage = ?, cost_usd = ? WHERE id = ? AND chat_jid = ?`,
-    ).run(tokenUsage, costUsd ?? null, msgId, chatJid);
+    stmts().updateTokenUsageById.run(tokenUsage, costUsd ?? null, msgId, chatJid);
   } else {
-    db.prepare(
-      `UPDATE messages SET token_usage = ?, cost_usd = ?
-       WHERE rowid = (
-         SELECT rowid FROM messages
-         WHERE chat_jid = ? AND is_from_me = 1 AND token_usage IS NULL
-           AND COALESCE(source_kind, 'legacy') != 'sdk_send_message'
-         ORDER BY timestamp DESC LIMIT 1
-       )`,
-    ).run(tokenUsage, costUsd ?? null, chatJid);
+    stmts().updateTokenUsageLatest.run(tokenUsage, costUsd ?? null, chatJid);
   }
 }
 
@@ -1483,15 +1568,7 @@ export function insertUsageRecord(record: {
   const localDate = toLocalDateString();
 
   db.transaction(() => {
-    // Insert into usage_records
-    db.prepare(
-      `
-      INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
-        input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
-        cost_usd, duration_ms, num_turns, source, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-    ).run(
+    stmts().insertUsageInsert.run(
       id,
       record.userId,
       record.groupFolder,
@@ -1508,25 +1585,7 @@ export function insertUsageRecord(record: {
       record.source ?? 'agent',
       now,
     );
-
-    // Upsert daily summary
-    db.prepare(
-      `
-      INSERT INTO usage_daily_summary (user_id, model, date,
-        total_input_tokens, total_output_tokens,
-        total_cache_read_tokens, total_cache_creation_tokens,
-        total_cost_usd, request_count, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
-      ON CONFLICT(user_id, model, date) DO UPDATE SET
-        total_input_tokens = total_input_tokens + excluded.total_input_tokens,
-        total_output_tokens = total_output_tokens + excluded.total_output_tokens,
-        total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
-        total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
-        total_cost_usd = total_cost_usd + excluded.total_cost_usd,
-        request_count = request_count + 1,
-        updated_at = datetime('now')
-    `,
-    ).run(
+    stmts().insertUsageUpsert.run(
       record.userId,
       record.model,
       localDate,
@@ -1698,26 +1757,12 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newCursor: MessageCursor } {
   if (jids.length === 0) return { messages: [], newCursor: cursor };
 
-  const placeholders = jids.map(() => '?').join(',');
-  // Filter out assistant outputs.
-  const sql = `
-    SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
-    FROM messages
-    WHERE
-      (timestamp > ? OR (timestamp = ? AND id > ?))
-      AND chat_jid IN (${placeholders})
-      AND is_from_me = 0
-    ORDER BY timestamp ASC, id ASC
-  `;
-
-  const rows = db
-    .prepare(sql)
-    .all(
-      cursor.timestamp,
-      cursor.timestamp,
-      cursor.id,
-      ...jids,
-    ) as NewMessage[];
+  const rows = getNewMessagesStmt(jids.length).all(
+    cursor.timestamp,
+    cursor.timestamp,
+    cursor.id,
+    ...jids,
+  ) as NewMessage[];
   const last = rows[rows.length - 1];
   return {
     messages: rows,
@@ -1729,24 +1774,12 @@ export function getMessagesSince(
   chatJid: string,
   cursor: MessageCursor,
 ): NewMessage[] {
-  // Filter out assistant outputs.
-  const sql = `
-    SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
-    FROM messages
-    WHERE
-      chat_jid = ?
-      AND (timestamp > ? OR (timestamp = ? AND id > ?))
-      AND is_from_me = 0
-    ORDER BY timestamp ASC, id ASC
-  `;
-  return db
-    .prepare(sql)
-    .all(
-      chatJid,
-      cursor.timestamp,
-      cursor.timestamp,
-      cursor.id,
-    ) as NewMessage[];
+  return stmts().getMessagesSince.all(
+    chatJid,
+    cursor.timestamp,
+    cursor.timestamp,
+    cursor.id,
+  ) as NewMessage[];
 }
 
 export function createTask(
@@ -3103,14 +3136,7 @@ export function createUserSession(session: UserSession): void {
 export function getSessionWithUser(
   sessionId: string,
 ): UserSessionWithUser | undefined {
-  const row = db
-    .prepare(
-      `SELECT s.*, u.username, u.role, u.status, u.display_name, u.permissions, u.must_change_password
-       FROM user_sessions s
-       JOIN users u ON s.user_id = u.id
-       WHERE s.id = ?`,
-    )
-    .get(sessionId) as Record<string, unknown> | undefined;
+  const row = stmts().getSessionWithUser.get(sessionId) as Record<string, unknown> | undefined;
   if (!row) return undefined;
   const role = parseUserRole(row.role);
   return {
@@ -3139,7 +3165,7 @@ export function getUserSessions(userId: string): UserSession[] {
 }
 
 export function deleteUserSession(sessionId: string): void {
-  db.prepare('DELETE FROM user_sessions WHERE id = ?').run(sessionId);
+  stmts().deleteSession.run(sessionId);
 }
 
 export function deleteUserSessionsByUserId(userId: string): void {
@@ -3147,9 +3173,13 @@ export function deleteUserSessionsByUserId(userId: string): void {
 }
 
 export function updateSessionLastActive(sessionId: string): void {
-  db.prepare('UPDATE user_sessions SET last_active_at = ? WHERE id = ?').run(
-    new Date().toISOString(),
-    sessionId,
+  stmts().updateSessionLastActive.run(new Date().toISOString(), sessionId);
+}
+
+export function getExpiredSessionIds(): string[] {
+  const now = new Date().toISOString();
+  return (stmts().getExpiredSessionIds.all(now) as { id: string }[]).map(
+    (r) => r.id,
   );
 }
 
@@ -5127,6 +5157,8 @@ export function tryIncrementRedeemCodeUsage(
  * Should be called during graceful shutdown.
  */
 export function closeDatabase(): void {
+  _stmts = null;
+  _newMsgStmtCache.clear();
   if (db) {
     db.close();
   }

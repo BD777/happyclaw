@@ -10,7 +10,6 @@ interface ShareCardRendererProps {
   aiEmoji?: string | null;
   aiColor?: string | null;
   aiImageUrl?: string | null;
-  assistantName?: string;
 }
 
 /**
@@ -83,7 +82,7 @@ const CONTENT_OVERRIDE_STYLE = `
 
 export const ShareCardRenderer = forwardRef<HTMLDivElement, ShareCardRendererProps>(
   function ShareCardRenderer(
-    { content, senderName, timestamp, groupJid, aiEmoji, aiColor, aiImageUrl, assistantName },
+    { content, senderName, timestamp, groupJid, aiEmoji, aiColor, aiImageUrl },
     ref,
   ) {
     return (
@@ -160,13 +159,19 @@ export const ShareCardRenderer = forwardRef<HTMLDivElement, ShareCardRendererPro
             alignItems: 'center',
             justifyContent: 'center',
             padding: '12px 24px',
+            gap: '6px',
             borderTop: '1px solid #e2e8f0',
             background: '#f8fafc',
             borderRadius: '0 0 16px 16px',
           }}
         >
+          <img
+            src="/icons/icon-192.png"
+            alt="HappyClaw"
+            style={{ width: 16, height: 16, borderRadius: 3 }}
+          />
           <span style={{ fontSize: 12, color: '#94a3b8' }}>
-            {assistantName || 'HappyClaw'} · Powered by Claude
+            HappyClaw · github.com/riba2534/happyclaw
           </span>
         </div>
       </div>

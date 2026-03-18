@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { X, Download, RefreshCw } from 'lucide-react';
+import { X, Download, RefreshCw, Copy, Check } from 'lucide-react';
 import { toPng } from 'html-to-image';
 import { Message } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
@@ -61,7 +61,6 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
   const aiEmoji = currentUser?.ai_avatar_emoji || appearance?.aiAvatarEmoji;
   const aiColor = currentUser?.ai_avatar_color || appearance?.aiAvatarColor;
   const aiImageUrl = currentUser?.ai_avatar_url;
-  const assistantName = currentUser?.ai_name || appearance?.aiName || 'HappyClaw';
 
   const timestamp = new Date(message.timestamp)
     .toLocaleString('zh-CN', {
@@ -128,12 +127,30 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
     generate();
   }, [generate]);
 
+  const [copied, setCopied] = useState(false);
+
   const handleDownload = () => {
     if (!dataUrl) return;
     downloadFromDataUrl(dataUrl, `share-${Date.now()}.png`).catch((err) => {
       console.error('Share image download failed:', err);
       showToast('保存失败', err instanceof Error ? err.message : '图片保存出错，请重试');
     });
+  };
+
+  const handleCopy = async () => {
+    if (!dataUrl) return;
+    try {
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      await navigator.clipboard.write([
+        new ClipboardItem({ [blob.type]: blob }),
+      ]);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Share image copy failed:', err);
+      showToast('复制失败', '浏览器不支持复制图片到剪切板，请使用下载');
+    }
   };
 
   return createPortal(
@@ -189,10 +206,17 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
 
         {/* Footer */}
         {state === 'preview' && (
-          <div className="px-5 py-4 border-t border-border">
+          <div className="flex gap-3 px-5 py-4 border-t border-border">
+            <button
+              onClick={handleCopy}
+              className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium border border-border rounded-lg hover:bg-accent transition-colors cursor-pointer"
+            >
+              {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
+              {copied ? '已复制' : '复制图片'}
+            </button>
             <button
               onClick={handleDownload}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity cursor-pointer"
+              className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity cursor-pointer"
             >
               <Download className="w-4 h-4" />
               保存图片
@@ -212,7 +236,6 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
           aiEmoji={aiEmoji}
           aiColor={aiColor}
           aiImageUrl={aiImageUrl}
-          assistantName={assistantName}
         />
       </div>
     </div>,

@@ -40,6 +40,8 @@ interface GroupState {
   displayName: string | null;
   groupFolder: string | null;
   agentId: string | null;
+  /** Isolated task run ID — used for tasks-run/{taskRunId}/ IPC namespace. */
+  taskRunId: string | null;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restarting: boolean;
@@ -86,6 +88,7 @@ export class GroupQueue {
         displayName: null,
         groupFolder: null,
         agentId: null,
+        taskRunId: null,
         retryCount: 0,
         retryTimer: null,
         restarting: false,
@@ -365,6 +368,7 @@ export class GroupQueue {
     groupFolder?: string,
     displayName?: string,
     agentId?: string,
+    taskRunId?: string,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
@@ -372,6 +376,7 @@ export class GroupQueue {
     state.displayName = displayName || null;
     if (groupFolder) state.groupFolder = groupFolder;
     state.agentId = agentId || null;
+    state.taskRunId = taskRunId || null;
     if (state.pendingMessages && !state.agentId) {
       this.requestDrainForActiveRunner(
         groupJid,
@@ -385,6 +390,16 @@ export class GroupQueue {
    * Sub-agents use a nested path: data/ipc/{folder}/agents/{agentId}/input/
    */
   private resolveIpcInputDir(state: ActiveGroupState): string {
+    if (state.taskRunId) {
+      return path.join(
+        DATA_DIR,
+        'ipc',
+        state.groupFolder,
+        'tasks-run',
+        state.taskRunId,
+        'input',
+      );
+    }
     if (state.agentId) {
       return path.join(
         DATA_DIR,
@@ -503,6 +518,31 @@ export class GroupQueue {
       fs.writeFileSync(path.join(inputDir, '_close'), '');
     } catch {
       // ignore
+    }
+  }
+
+  /**
+   * Remove leftover _drain and _close sentinel files from the IPC input
+   * directory.  Called in finally blocks after a runner exits so that a
+   * subsequent runner for the same folder does not immediately see stale
+   * sentinels and exit prematurely.
+   */
+  private cleanupIpcSentinels(
+    groupFolder: string,
+    agentId?: string | null,
+    taskRunId?: string | null,
+  ): void {
+    const inputDir = taskRunId
+      ? path.join(DATA_DIR, 'ipc', groupFolder, 'tasks-run', taskRunId, 'input')
+      : agentId
+        ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
+        : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+    for (const name of ['_drain', '_close']) {
+      try {
+        fs.unlinkSync(path.join(inputDir, name));
+      } catch {
+        // file may not exist – that's fine
+      }
     }
   }
 
@@ -850,6 +890,14 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
+      // Clean up stale sentinel files before clearing groupFolder/agentId
+      if (state.groupFolder) {
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
+      }
       state.active = false;
       state.drainSentinelWritten = false;
       state.lastActivityAt = null;
@@ -859,6 +907,7 @@ export class GroupQueue {
       state.displayName = null;
       state.groupFolder = null;
       state.agentId = null;
+      state.taskRunId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
@@ -919,6 +968,14 @@ export class GroupQueue {
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
+      // Clean up stale sentinel files before clearing groupFolder/agentId
+      if (state.groupFolder) {
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
+      }
       state.active = false;
       state.activeRunnerIsTask = false;
       state.drainSentinelWritten = false;
@@ -929,6 +986,7 @@ export class GroupQueue {
       state.displayName = null;
       state.groupFolder = null;
       state.agentId = null;
+      state.taskRunId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
@@ -1016,9 +1074,12 @@ export class GroupQueue {
     // Tasks first (they won't be re-discovered from SQLite like messages)
     while (state.pendingTasks.length > 0) {
       const task = state.pendingTasks.shift()!;
-      // Check if scheduled task is still active before occupying a slot
+      // Check if scheduled task is still active before occupying a slot.
+      // Only skip tasks that exist in the DB and are no longer active.
+      // Dynamic tasks (agent conversations, etc.) don't have DB entries
+      // and must always be allowed to run.
       const dbTask = getTaskById(task.id);
-      if (!dbTask || dbTask.status !== 'active') {
+      if (dbTask && dbTask.status !== 'active') {
         logger.info(
           { groupJid, taskId: task.id },
           'Skipping cancelled/deleted task during drain',
@@ -1057,19 +1118,21 @@ export class GroupQueue {
 
       // Prioritize tasks over messages
       if (state.pendingTasks.length > 0) {
-        // Skip cancelled/deleted tasks
+        // Skip cancelled/deleted scheduled tasks (but allow dynamic tasks
+        // like agent conversations that have no DB entry).
         let validTask: QueuedTask | undefined;
         while (state.pendingTasks.length > 0) {
           const candidate = state.pendingTasks.shift()!;
           const dbTask = getTaskById(candidate.id);
-          if (dbTask && dbTask.status === 'active') {
-            validTask = candidate;
-            break;
+          if (dbTask && dbTask.status !== 'active') {
+            logger.info(
+              { groupJid: jid, taskId: candidate.id },
+              'Skipping cancelled/deleted task during drainWaiting',
+            );
+            continue;
           }
-          logger.info(
-            { groupJid: jid, taskId: candidate.id },
-            'Skipping cancelled/deleted task during drainWaiting',
-          );
+          validTask = candidate;
+          break;
         }
         if (validTask) {
           this.runTask(jid, validTask);
