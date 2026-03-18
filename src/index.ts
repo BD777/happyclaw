@@ -147,6 +147,7 @@ import {
   shutdownTerminals,
   shutdownWebServer,
   getActiveStreamingTexts,
+  clearStreamingSnapshot,
 } from './web.js';
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
@@ -1789,6 +1790,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   },
                 });
                 sentReply = true;
+                clearStreamingSnapshot(chatJid);
+                streamingAccumulatedText = '';
                 commitCursor();
               } catch (err) {
                 logger.warn({ err, chatJid }, 'Failed to save interrupted text on status event');
@@ -2102,6 +2105,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
 
             sentReply = true;
+            // Clear streaming snapshot so the next turn starts fresh.
+            // Without this, saveInterruptedStreamingMessages() would merge
+            // text from multiple turns into one message on shutdown.
+            clearStreamingSnapshot(chatJid);
+            streamingAccumulatedText = '';
             // Persist cursor as soon as a visible reply is emitted.
             // Long-lived runners may stay alive for idleTimeout, and waiting
             // until process exit would cause duplicate replay after restart.
