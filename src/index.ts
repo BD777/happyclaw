@@ -3393,13 +3393,11 @@ function startIpcWatcher(): void {
       if (sentChannelTypes.has(channelType)) continue;
       // Filter by notify_channels if specified (null = all channels)
       if (notifyChannels && !notifyChannels.includes(channelType)) continue;
-      const target =
-        ownerGroups.find(
-          (g) =>
-            getChannelType(g.jid) === channelType &&
-            g.folder === sourceFolder,
-        ) ||
-        ownerGroups.find((g) => getChannelType(g.jid) === channelType);
+      const target = ownerGroups.find(
+        (g) =>
+          getChannelType(g.jid) === channelType &&
+          g.folder === sourceFolder,
+      );
       if (target) {
         sendFn(target.jid);
         sentChannelTypes.add(channelType);
