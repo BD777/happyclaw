@@ -20,6 +20,7 @@ const tabClass = (active: boolean) =>
   }`;
 
 export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onCreateConversation, onBindIm, onBindMainIm }: AgentTabBarProps) {
+  // Spawn agents are rendered inline in the main chat, not as separate tabs
   const conversations = agents.filter(a => a.kind === 'conversation');
 
   // Show bar if there are agents OR if creation is available

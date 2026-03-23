@@ -734,6 +734,46 @@ function setupWebSocket(server: any): WebSocketServer {
             }
           }
 
+          // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──
+          const swMatch = content.trim().match(/^\/(sw|spawn)\s+([\s\S]+)$/i);
+          if (swMatch && deps?.handleSpawnCommand) {
+            const spawnMessage = swMatch[2].trim();
+            if (spawnMessage) {
+              try {
+                // For agent tab, include agentId in chatJid so spawn resolves the right workspace
+                const effectiveChatJid = agentId
+                  ? `${chatJid}#agent:${agentId}`
+                  : chatJid;
+                // Store user's /sw message in the current chat so it's visible
+                const userMsgId = crypto.randomUUID();
+                const userMsgTs = new Date().toISOString();
+                ensureChatExists(effectiveChatJid);
+                storeMessageDirect(
+                  userMsgId, effectiveChatJid,
+                  session.user_id,
+                  session.display_name || session.username,
+                  content.trim(),
+                  userMsgTs,
+                  false,
+                  { meta: { sourceKind: 'user_command' } },
+                );
+                broadcastNewMessage(effectiveChatJid, {
+                  id: userMsgId, chat_jid: effectiveChatJid,
+                  sender: session.user_id,
+                  sender_name: session.display_name || session.username,
+                  content: content.trim(),
+                  timestamp: userMsgTs,
+                  is_from_me: false,
+                });
+
+                await deps.handleSpawnCommand(effectiveChatJid, spawnMessage);
+              } catch (err) {
+                logger.error({ chatJid, err }, '/sw command failed');
+              }
+            }
+            return;
+          }
+
           // Route to agent conversation handler if agentId is present
           if (agentId && deps) {
             await handleAgentConversationMessage(

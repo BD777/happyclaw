@@ -139,6 +139,7 @@ import {
   NewMessage,
   RegisteredGroup,
   StreamEvent,
+  SubAgent,
 } from './types.js';
 import { logger } from './logger.js';
 import { stripAgentInternalTags, stripVirtualJidSuffix } from './utils.js';
@@ -894,6 +895,9 @@ async function handleCommand(
       return handleNewCommand(chatJid, rawArgs);
     case 'require_mention':
       return handleRequireMentionCommand(chatJid, rawArgs);
+    case 'sw':
+    case 'spawn':
+      return handleSpawnCommand(chatJid, rawArgs, chatJid);
     default:
       return null;
   }
@@ -1414,6 +1418,158 @@ async function summarizeWithClaude(transcript: string): Promise<string | null> {
   });
 }
 
+// ─── /sw & /spawn: parallel task spawning ────────────────────────
+
+async function handleSpawnCommand(
+  chatJid: string,
+  rawMessage: string,
+  sourceImJid?: string,
+): Promise<string> {
+  const message = rawMessage.trim();
+  if (!message) return '用法: /sw <任务描述>\n在当前工作区创建并行任务';
+
+  const baseJid = stripVirtualJidSuffix(chatJid);
+  const group = registeredGroups[baseJid] ?? getRegisteredGroup(baseJid);
+  if (!group) return '未找到当前工作区';
+  const userId = group.created_by;
+  if (!userId) return '无法确定当前聊天所属用户';
+
+  // 2. Resolve the effective workspace JID and folder
+  let homeChatJid: string;
+  let homeGroup: RegisteredGroup;
+
+  if (group.target_main_jid) {
+    const target = registeredGroups[group.target_main_jid] ?? getRegisteredGroup(group.target_main_jid);
+    if (!target) return '绑定的工作区不存在';
+    homeChatJid = group.target_main_jid;
+    homeGroup = target;
+  } else if (group.target_agent_id) {
+    const agentInfo = getAgent(group.target_agent_id);
+    if (!agentInfo) return '绑定的 Agent 不存在';
+    const parent = registeredGroups[agentInfo.chat_jid] ?? getRegisteredGroup(agentInfo.chat_jid);
+    if (!parent) return '绑定 Agent 所属的工作区不存在';
+    homeChatJid = agentInfo.chat_jid;
+    homeGroup = parent;
+  } else if (baseJid.startsWith('web:')) {
+    homeChatJid = baseJid;
+    homeGroup = group;
+  } else {
+    // IM group not bound — use the user's home workspace
+    const userHome = getUserHomeGroup(userId);
+    if (!userHome) return '未找到用户主工作区';
+    homeChatJid = `web:${userHome.folder}`;
+    // Lookup the RegisteredGroup object — prefer the web: JID, fall back to any JID for this folder
+    const homeJids = getJidsByFolder(userHome.folder);
+    const webJid = homeJids.find(j => j.startsWith('web:')) ?? homeJids[0];
+    const resolvedHome = webJid
+      ? (registeredGroups[webJid] ?? getRegisteredGroup(webJid))
+      : undefined;
+    if (!resolvedHome) return '未找到用户主工作区';
+    homeGroup = resolvedHome;
+  }
+
+  const { effectiveGroup } = resolveEffectiveGroup(homeGroup);
+
+  // 3. Determine the spawned_from_jid (where to inject results back)
+  //    For IM: resolve to the effective web JID so results enter the web message stream
+  //    For Web: use the chatJid directly (may include #agent: for agent-scoped spawn)
+  const spawnedFromJid = sourceImJid ? homeChatJid : chatJid;
+
+  const now = new Date().toISOString();
+  const agentId = crypto.randomUUID();
+  const messageId = crypto.randomUUID();
+  const user = getUserById(userId);
+  const senderName = user?.display_name || user?.username || userId;
+  const truncatedName = message.length > 30
+    ? message.slice(0, 30) + '…'
+    : message;
+  const agentName = `⚡ ${truncatedName}`;
+
+  // Create agent record
+  const newAgent: SubAgent = {
+    id: agentId,
+    group_folder: effectiveGroup.folder,
+    chat_jid: homeChatJid,
+    name: agentName,
+    prompt: '',
+    status: 'idle',
+    kind: 'spawn',
+    created_by: userId,
+    created_at: now,
+    completed_at: null,
+    result_summary: null,
+    last_im_jid: sourceImJid ?? null,
+    spawned_from_jid: spawnedFromJid,
+  };
+  createAgent(newAgent);
+
+  // Create IPC + session directories
+  const agentIpcDir = path.join(DATA_DIR, 'ipc', effectiveGroup.folder, 'agents', agentId);
+  fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
+  fs.mkdirSync(
+    path.join(DATA_DIR, 'sessions', effectiveGroup.folder, 'agents', agentId, '.claude'),
+    { recursive: true },
+  );
+
+  // Create virtual chat + store user's message in it
+  const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
+  ensureChatExists(virtualChatJid);
+  updateChatName(virtualChatJid, agentName);
+  storeMessageDirect(
+    messageId,
+    virtualChatJid,
+    userId,
+    senderName,
+    message,
+    now,
+    false,
+    sourceImJid ? { sourceJid: sourceImJid } : undefined,
+  );
+  broadcastNewMessage(virtualChatJid, {
+    id: messageId,
+    chat_jid: virtualChatJid,
+    sender: userId,
+    sender_name: senderName,
+    content: message,
+    timestamp: now,
+    is_from_me: false,
+  });
+
+  broadcastAgentStatus(homeChatJid, agentId, 'idle', agentName, '', undefined, 'spawn');
+
+  // For IM-originated /sw, mirror the command into homeChatJid so Web chat
+  // shows what was requested. Web path handles this in web.ts instead.
+  if (sourceImJid) {
+    ensureChatExists(homeChatJid);
+    // source_kind='user_command' prevents the polling loop from picking it up.
+    const cmdId = crypto.randomUUID();
+    storeMessageDirect(cmdId, homeChatJid, userId, senderName, `/sw ${message}`, now, false, {
+      meta: { sourceKind: 'user_command' },
+    });
+    broadcastNewMessage(homeChatJid, {
+      id: cmdId, chat_jid: homeChatJid,
+      sender: userId, sender_name: senderName,
+      content: `/sw ${message}`, timestamp: now, is_from_me: false,
+    });
+  }
+
+  // Enqueue task to start the agent
+  const taskId = `spawn:${agentId}:${Date.now()}`;
+  queue.enqueueTask(virtualChatJid, taskId, async () => {
+    await processAgentConversation(homeChatJid, agentId);
+  });
+
+  logger.info(
+    { chatJid, homeChatJid, agentId, userId, sourceImJid, folder: effectiveGroup.folder },
+    '/spawn command: agent created and enqueued',
+  );
+
+  const shortId = agentId.slice(0, 4);
+  return `⚡ 并行任务已启动 [${shortId}]: ${truncatedName}`;
+}
+
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
   // Skip Feishu Reaction when a streaming card is active — the card itself
   // serves as a live typing indicator.
@@ -1544,16 +1700,21 @@ function loadState(): void {
   lastAgentTimestamp = loadCursorMap('last_agent_timestamp');
   lastCommittedCursor = loadCursorMap('last_committed_cursor');
 
-  // Migration: if lastCommittedCursor is empty but lastAgentTimestamp has data,
-  // seed lastCommittedCursor from lastAgentTimestamp to avoid re-processing all
-  // historical messages on the first run after this change.
-  if (
-    Object.keys(lastCommittedCursor).length === 0 &&
-    Object.keys(lastAgentTimestamp).length > 0
-  ) {
-    lastCommittedCursor = { ...lastAgentTimestamp };
-    logger.info('Migrated lastCommittedCursor from lastAgentTimestamp');
-    saveState();
+  // Migration: fill in missing lastCommittedCursor entries from lastAgentTimestamp.
+  // The original migration only triggered when lastCommittedCursor was completely empty,
+  // missing the case where some keys exist but others don't (e.g. new IM groups).
+  {
+    let migrated = false;
+    for (const [jid, cursor] of Object.entries(lastAgentTimestamp)) {
+      if (!lastCommittedCursor[jid]) {
+        lastCommittedCursor[jid] = cursor;
+        migrated = true;
+      }
+    }
+    if (migrated) {
+      logger.info('Migrated missing lastCommittedCursor entries from lastAgentTimestamp');
+      saveState();
+    }
   }
 
   sessions = getAllSessions();
@@ -2010,6 +2171,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   activeRouteUpdaters.set(effectiveGroup.folder, (newSourceJid) => {
     const newImJid =
       newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
+    // New IPC user message arrived — reset sentReply so the next result
+    // can be delivered to IM. This is the correct place to reset, NOT
+    // in the streaming session rebuild (which also fires on SDK Task
+    // completion and would cause multi-result IM spam).
+    sentReply = false;
     if (newImJid === replySourceImJid) return; // no change
     logger.debug(
       { chatJid, oldRoute: replySourceImJid, newRoute: newImJid },
@@ -2122,7 +2288,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             unregisterStreamingSession(streamingSessionJid);
             streamingAccumulatedText = '';
             streamingAccumulatedThinking = '';
-            sentReply = false;
+            // Note: sentReply is NOT reset here. Resetting it would cause
+            // subsequent SDK Task results to be sent to IM as separate messages,
+            // spamming the IM channel. The first substantive reply already
+            // delivered the main content; follow-up results are DB-only.
             streamInterrupted = false;
             streamingSession = imManager.createStreamingSession(
               streamingSessionJid,
@@ -2202,6 +2371,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   completed_at: null,
                   result_summary: null,
                   last_im_jid: null,
+                  spawned_from_jid: null,
                 });
               } else if (se.taskDescription) {
                 updateAgentInfo(
@@ -2290,6 +2460,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   completed_at: new Date().toISOString(),
                   result_summary: summary || null,
                   last_im_jid: null,
+                  spawned_from_jid: null,
                 });
                 broadcastAgentStatus(
                   chatJid,
@@ -2498,11 +2669,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             });
             lastSavedTurnId = effectiveTurnId;
 
-            // For routed IM (web JID with IM source), skip the source channel
-            // if streaming card handled it. send_message content is already
-            // forwarded to IM by the IPC watcher's activeImReplyRoutes logic.
+            // For routed IM (web JID with IM source), only send the FIRST
+            // substantive reply to IM. Subsequent results (e.g., SDK Task
+            // completions) are stored in DB but not spammed to IM.
+            // Streaming card already handles IM delivery for the first reply.
             if (replySourceImJid && replySourceImJid !== chatJid) {
-              if (!streamingCardHandledIM) {
+              if (!streamingCardHandledIM && !sentReply) {
                 sendImWithFailTracking(replySourceImJid, text, localImagePaths);
               }
             }
@@ -4332,10 +4504,10 @@ async function processAgentConversation(
   agentId: string,
 ): Promise<void> {
   const agent = getAgent(agentId);
-  if (!agent || agent.kind !== 'conversation') {
+  if (!agent || (agent.kind !== 'conversation' && agent.kind !== 'spawn')) {
     logger.warn(
       { chatJid, agentId },
-      'processAgentConversation: agent not found or not a conversation',
+      'processAgentConversation: agent not found or not a conversation/spawn',
     );
     return;
   }
@@ -4448,6 +4620,7 @@ async function processAgentConversation(
   let hadError = false;
   let lastError = '';
   let lastAgentReplyMsgId: string | undefined;
+  let lastAgentReplyText: string | undefined;
   const lastProcessed = missedMessages[missedMessages.length - 1];
   const commitCursor = (): void => {
     if (cursorCommitted) return;
@@ -4574,11 +4747,18 @@ async function processAgentConversation(
           : JSON.stringify(output.result);
       let text = stripAgentInternalTags(raw);
       if (output.sourceKind === 'overflow_partial' || output.sourceKind === 'compact_partial') {
-        text = buildOverflowPartialReply(text);
+        // Spawn agents are fire-and-forget: context compression is an internal
+        // detail. Don't append the "上下文压缩中" suffix — it confuses users
+        // seeing the Feishu card suddenly change to a warning.
+        if (agent.kind !== 'spawn') {
+          text = buildOverflowPartialReply(text);
+        }
       }
       if (text) {
+        const isFirstReply = !lastAgentReplyMsgId;
         const msgId = crypto.randomUUID();
         lastAgentReplyMsgId = msgId;
+        lastAgentReplyText = text;
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
         const persistedMsgId = storeMessageDirect(
@@ -4661,10 +4841,9 @@ async function processAgentConversation(
           }
         }
 
-        if (replySourceImJid && !streamingCardHandledIM) {
-          // Await retry so agent conversation blocks until IM delivery is
-          // confirmed (or exhausted).  Uses shared sendImWithRetry for
-          // consistent retry + fail-tracking with the main session path.
+        if (replySourceImJid && !streamingCardHandledIM && isFirstReply) {
+          // Only send the FIRST substantive reply to IM. Subsequent results
+          // (SDK Task completions) are stored in DB but not spammed to IM.
           const imSent = await sendImWithRetry(replySourceImJid, text, localImagePaths);
           if (imSent) {
             logger.info(
@@ -4695,6 +4874,19 @@ async function processAgentConversation(
 
         commitCursor();
         resetIdleTimer();
+
+        // Spawn agents are fire-and-forget: close after first reply to free process slot.
+        // Skip for overflow_partial/compact_partial — those are intermediate context
+        // compression outputs, not the final result; closing now would kill the agent
+        // before it finishes the actual task.
+        if (
+          agent.kind === 'spawn' && text &&
+          output.sourceKind !== 'overflow_partial' &&
+          output.sourceKind !== 'compact_partial'
+        ) {
+          logger.info({ agentId, chatJid }, 'Spawn agent replied, sending close signal');
+          queue.closeStdin(virtualChatJid);
+        }
       }
     }
 
@@ -4925,10 +5117,49 @@ async function processAgentConversation(
       }
     }
 
+    // ── Spawn result injection: write final output back to the source chat ──
+    if (agent.kind === 'spawn' && agent.spawned_from_jid && lastAgentReplyText) {
+      try {
+        const resultText = lastAgentReplyText;
+        const injectId = crypto.randomUUID();
+        const injectTs = new Date().toISOString();
+        ensureChatExists(agent.spawned_from_jid);
+        storeMessageDirect(
+          injectId,
+          agent.spawned_from_jid,
+          'happyclaw-agent',
+          ASSISTANT_NAME,
+          resultText,
+          injectTs,
+          true,
+        );
+        broadcastNewMessage(agent.spawned_from_jid, {
+          id: injectId,
+          chat_jid: agent.spawned_from_jid,
+          sender: 'happyclaw-agent',
+          sender_name: ASSISTANT_NAME,
+          content: resultText,
+          timestamp: injectTs,
+          is_from_me: true,
+        });
+        logger.info(
+          { agentId, spawned_from_jid: agent.spawned_from_jid, textLen: lastAgentReplyText.length },
+          'Spawn result injected back to source chat',
+        );
+      } catch (err) {
+        logger.error({ agentId, err }, 'Failed to inject spawn result back to source chat');
+      }
+    }
+
     // Process ended → set status back to idle (conversation agents persist).
+    // Spawn agents are fire-and-forget: mark as completed (or error) so they
+    // don't accumulate in the active agent list.
     // MUST be inside finally so status is reset even on unhandled exceptions (#227).
-    updateAgentStatus(agentId, 'idle');
-    broadcastAgentStatus(chatJid, agentId, 'idle', agent.name, agent.prompt);
+    const endStatus = agent.kind === 'spawn'
+      ? (hadError ? 'error' : 'completed')
+      : 'idle';
+    updateAgentStatus(agentId, endStatus, hadError ? lastError : undefined);
+    broadcastAgentStatus(chatJid, agentId, endStatus, agent.name, agent.prompt, hadError ? lastError : undefined);
 
     ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
   }
@@ -5127,7 +5358,13 @@ function recoverStuckPendingGroups(): void {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceCursor = lastCommittedCursor[chatJid] || EMPTY_CURSOR;
+    // No committed cursor → this group was never successfully processed.
+    // Skip recovery — the normal 2s message loop will pick up any pending messages.
+    // Using EMPTY_CURSOR here would match ALL historical messages and falsely
+    // trigger session clearing (the bug that caused context reset on restart).
+    const sinceCursor = lastCommittedCursor[chatJid];
+    if (!sinceCursor) continue;
+
     const pending = getMessagesSince(chatJid, sinceCursor);
     if (pending.length > 0) {
       // Clear stale session to avoid "session ghost" — the agent will start
@@ -5715,6 +5952,7 @@ async function connectUserIMChannels(
       wechatConfig,
       onNewChat,
       {
+        ignoreMessagesBefore,
         onCommand: handleCommand,
         resolveGroupFolder,
         resolveEffectiveChatJid,
@@ -6229,6 +6467,7 @@ async function main(): Promise<void> {
           },
           onNewChat,
           {
+            ignoreMessagesBefore: Date.now(),
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
@@ -6284,6 +6523,7 @@ async function main(): Promise<void> {
     updateReplyRoute: (folder: string, sourceJid: string | null) => {
       activeRouteUpdaters.get(folder)?.(sourceJid);
     },
+    handleSpawnCommand,
   });
 
   // Clean expired sessions every hour
@@ -6673,6 +6913,7 @@ async function main(): Promise<void> {
         effectiveTelegram,
         effectiveQQ,
         effectiveWeChat,
+        Date.now(),
       );
       if (result.feishu) anyFeishuConnected = true;
       logger.info(

@@ -555,9 +555,9 @@ export function createWeChatConnection(
       if (isDuplicate(key)) return;
       markSeen(key);
 
-      // Skip stale messages
-      if (opts.ignoreMessagesBefore && msg.create_time_ms) {
-        if (msg.create_time_ms < opts.ignoreMessagesBefore) return;
+      // Skip stale messages — if no timestamp available, skip as well (can't verify freshness)
+      if (opts.ignoreMessagesBefore) {
+        if (!msg.create_time_ms || msg.create_time_ms < opts.ignoreMessagesBefore) return;
       }
 
       // Cache context_token for replies
@@ -767,6 +767,13 @@ export function createWeChatConnection(
         }
       } catch (err) {
         if (stopping) break;
+
+        // Long-poll timeout is expected when no new messages arrive — just retry immediately.
+        const isTimeout = err instanceof Error && err.message.includes('timed out');
+        if (isTimeout) {
+          logger.debug({ err }, 'WeChat poll timeout (normal, retrying)');
+          continue;
+        }
 
         logger.error({ err }, 'WeChat poll loop error');
         await sleep(reconnectDelay);

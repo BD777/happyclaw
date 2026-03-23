@@ -109,6 +109,7 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
     completed_at: null,
     result_summary: null,
     last_im_jid: null,
+    spawned_from_jid: null,
   };
 
   createAgent(agent);

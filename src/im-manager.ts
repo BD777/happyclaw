@@ -452,6 +452,7 @@ class IMConnectionManager {
     config: WeChatConnectConfig,
     onNewChat: (chatJid: string, chatName: string) => void,
     options?: {
+      ignoreMessagesBefore?: number;
       onCommand?: (chatJid: string, command: string) => Promise<string | null>;
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (
@@ -478,6 +479,7 @@ class IMConnectionManager {
         logger.info({ userId }, 'User WeChat bot connected');
       },
       onNewChat,
+      ignoreMessagesBefore: options?.ignoreMessagesBefore,
       onCommand: options?.onCommand,
       resolveGroupFolder: options?.resolveGroupFolder,
       resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
