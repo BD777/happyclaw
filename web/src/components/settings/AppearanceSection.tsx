@@ -166,7 +166,8 @@ const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
 ];
 
 const SCHEME_OPTIONS: { value: ColorScheme; label: string; preview: { bg: string; accent: string; text: string } }[] = [
-  { value: 'default', label: '暖橙', preview: { bg: '#FAF9F5', accent: '#f97316', text: '#141413' } },
+  { value: 'default', label: '经典绿', preview: { bg: '#ffffff', accent: '#0d9488', text: '#0f172a' } },
+  { value: 'orange', label: '暖橙', preview: { bg: '#FAF9F5', accent: '#f97316', text: '#141413' } },
   { value: 'neutral', label: '素白', preview: { bg: '#ffffff', accent: '#52525b', text: '#18181b' } },
 ];
 
@@ -184,7 +185,7 @@ function ThemeSelector() {
       <div>
         <h3 className="text-base font-semibold text-foreground mb-1">主题色</h3>
         <p className="text-xs text-muted-foreground mb-3">选择界面的配色方案</p>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-3 gap-3">
           {SCHEME_OPTIONS.map((opt) => {
             const active = colorScheme === opt.value;
             return (

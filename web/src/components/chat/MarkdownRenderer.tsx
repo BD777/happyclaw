@@ -128,8 +128,8 @@ function CodeBlock({
   const [copied, setCopied] = useState(false);
   const match = /language-(\w+)/.exec(className || '');
   const lang = match?.[1];
-  const isBlock = Boolean(match);
   const codeString = extractText(children).replace(/\n$/, '');
+  const isBlock = Boolean(match) || codeString.includes('\n');
 
   if (lang === 'mermaid') {
     return <MermaidDiagram code={codeString} />;
