@@ -103,6 +103,24 @@ export interface ClaudeOAuthCredentials {
   subscriptionType?: string; // e.g. 'max', 'pro' — written to .credentials.json if present
 }
 
+export interface OAuthUsageBucket {
+  utilization: number; // 0-100
+  resets_at: string; // ISO 8601
+}
+
+export interface OAuthUsageResponse {
+  five_hour: OAuthUsageBucket | null;
+  seven_day: OAuthUsageBucket | null;
+  seven_day_opus: OAuthUsageBucket | null;
+  seven_day_sonnet: OAuthUsageBucket | null;
+}
+
+export interface CachedOAuthUsage {
+  data: OAuthUsageResponse;
+  fetchedAt: number; // Unix timestamp ms
+  error?: string;
+}
+
 export interface ClaudeProviderConfig {
   anthropicBaseUrl: string;
   anthropicAuthToken: string;

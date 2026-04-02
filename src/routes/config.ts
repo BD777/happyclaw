@@ -73,7 +73,7 @@ import {
   saveUserDingTalkConfig,
   updateAllSessionCredentials,
 } from '../runtime-config.js';
-import type { ClaudeOAuthCredentials } from '../runtime-config.js';
+import type { ClaudeOAuthCredentials, CachedOAuthUsage, OAuthUsageResponse } from '../runtime-config.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
@@ -194,6 +194,54 @@ setInterval(() => {
     if (flow.expiresAt < now) oauthFlows.delete(key);
   }
 }, 60_000);
+
+// --- OAuth Usage Cache ---
+
+const OAUTH_USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+const usageCache = new Map<string, CachedOAuthUsage>();
+
+async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
+  const cached = usageCache.get(providerId);
+  if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
+    return cached;
+  }
+
+  const providers = getProviders();
+  const provider = providers.find((p) => p.id === providerId);
+  if (!provider?.claudeOAuthCredentials) {
+    throw new Error('Provider has no OAuth credentials');
+  }
+
+  const resp = await fetch(OAUTH_USAGE_API, {
+    headers: {
+      Authorization: `Bearer ${provider.claudeOAuthCredentials.accessToken}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+    },
+  });
+
+  if (!resp.ok) {
+    // Return stale cache if available, otherwise throw
+    if (cached) {
+      const stale: CachedOAuthUsage = { ...cached, error: `HTTP ${resp.status}` };
+      usageCache.set(providerId, stale);
+      return stale;
+    }
+    throw new Error(`Usage API returned ${resp.status}`);
+  }
+
+  const raw = (await resp.json()) as Record<string, unknown>;
+  const data: OAuthUsageResponse = {
+    five_hour: raw.five_hour as OAuthUsageResponse['five_hour'],
+    seven_day: raw.seven_day as OAuthUsageResponse['seven_day'],
+    seven_day_opus: raw.seven_day_opus as OAuthUsageResponse['seven_day_opus'],
+    seven_day_sonnet: raw.seven_day_sonnet as OAuthUsageResponse['seven_day_sonnet'],
+  };
+
+  const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
+  usageCache.set(providerId, result);
+  return result;
+}
 
 // --- Routes ---
 
@@ -472,6 +520,24 @@ configRoutes.get(
     const balancing = getBalancingConfig();
     providerPool.refreshFromConfig(enabledProviders, balancing);
     return c.json({ statuses: providerPool.getHealthStatuses() });
+  },
+);
+
+// ─── GET /claude/providers/:id/usage — OAuth 用量数据 ─────
+configRoutes.get(
+  '/claude/providers/:id/usage',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    try {
+      const usage = await fetchOAuthUsage(id);
+      return c.json(usage);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      logger.warn({ err, providerId: id }, 'Failed to fetch OAuth usage');
+      return c.json({ error: msg }, 400);
+    }
   },
 );
 
