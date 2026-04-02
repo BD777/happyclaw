@@ -1621,6 +1621,8 @@ async function main(): Promise<void> {
       '[定时任务 - 以下内容由系统自动发送，并非来自用户或群组的直接消息。]',
       '',
       '重要：你正在定时任务模式下运行。你的最终输出不会自动发送给用户。你必须使用 mcp__happyclaw__send_message 工具来发送消息，否则用户将收不到任何内容。',
+      '',
+      '注意：只在完成任务后调用一次 send_message 发送最终结果，不要发送中间状态或重复消息。',
     ];
     const scheduledTaskPrefix = scheduledTaskPrefixLines.join('\n');
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
