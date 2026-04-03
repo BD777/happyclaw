@@ -169,6 +169,7 @@ export interface SchedulerDependencies {
     groupFolder: string,
     displayName?: string,
     taskRunId?: string,
+    selectedProviderId?: string | null,
   ) => void;
   sendMessage: (
     jid: string,
@@ -402,7 +403,7 @@ async function runTask(
         isScheduledTask: true,
         taskRunId: options?.taskRunId,
       },
-      (proc, identifier) =>
+      (proc, identifier, selectedProviderId) =>
         deps.onProcess(
           effectiveJid,
           proc,
@@ -410,6 +411,7 @@ async function runTask(
           workspace.folder,
           identifier,
           options?.taskRunId,
+          selectedProviderId,
         ),
       async (streamedOutput: ContainerOutput) => {
         // Broadcast stream events to WebSocket clients viewing the task workspace
