@@ -274,7 +274,10 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
   const providerNameMap = new Map(providers.map((p) => [p.id, p.name]));
   const userNameCache = new Map<string, string>();
   const enrichedGroups = filteredGroups.map((g) => {
-    const reg = getRegisteredGroup(g.jid);
+    // Sub-agent virtual JIDs (web:main#agent:xxx) aren't in registered_groups,
+    // fall back to the base JID (web:main)
+    const baseJid = g.jid.includes('#agent:') ? g.jid.split('#agent:')[0] : g.jid;
+    const reg = getRegisteredGroup(baseJid);
     let ownerUsername: string | null = null;
     if (reg?.created_by) {
       if (userNameCache.has(reg.created_by)) {
