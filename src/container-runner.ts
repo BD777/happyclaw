@@ -612,6 +612,10 @@ function buildContainerArgs(
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Pass host UID/GID so entrypoint can align container user, eliminating
+  // cross-uid permission issues on bind-mounted volumes.
+  args.push('-e', `HOST_UID=${process.getuid!()}`, '-e', `HOST_GID=${process.getgid!()}`);
+
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
     if (mount.readonly) {

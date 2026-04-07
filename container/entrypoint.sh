@@ -1,21 +1,29 @@
 #!/bin/bash
 set -e
 
-# Set permissive umask so files created by the container (node user, uid 1000)
-# are writable by the host backend (agent user, uid 1002).
-# Without this, the host cannot delete/modify files created by the container.
+# ─── UID alignment ───
+# Align container node user's UID/GID with the host process, so all files
+# created inside the container are owned by the same uid as the host.
+# This eliminates cross-uid permission issues on bind-mounted volumes.
+HOST_UID="${HOST_UID:-1000}"
+HOST_GID="${HOST_GID:-1000}"
+if [ "$(id -u node)" != "$HOST_UID" ]; then
+  usermod -u "$HOST_UID" -o node 2>/dev/null || true
+fi
+if [ "$(id -g node)" != "$HOST_GID" ]; then
+  groupmod -g "$HOST_GID" -o node 2>/dev/null || true
+fi
+# Fix ownership of node's home dir after UID change
+chown -R node:node /home/node 2>/dev/null || true
+
+# Set permissive umask as safety net — in case any tool forces restrictive modes
 umask 0000
 
-# Fix ownership on mounted volumes.
-# Host uid may differ from container node user (uid 1000), especially in
-# rootless podman where uid remapping causes EACCES on bind mounts.
-# Running as root here so chown works regardless of host uid.
+# Fix ownership on mounted volumes (host files may have stale uid from before alignment)
 chown -R node:node /home/node/.claude 2>/dev/null || true
 chown -R node:node /workspace/group /workspace/global /workspace/memory /workspace/ipc 2>/dev/null || true
 
 # Mark mounted directories as safe for git (CVE-2022-24765 ownership check).
-# Host uid may differ from container node user, causing git to refuse operations.
-# 使用通配符 '*' 因为挂载路径动态（extra mounts、customCwd），无法枚举具体目录。
 git config --global --add safe.directory '*' 2>/dev/null || true
 
 # Source environment variables from mounted env file
@@ -56,14 +64,5 @@ chmod -R a-w /tmp/dist
 cat > /tmp/input.json
 chmod 644 /tmp/input.json
 
-# Fix permissions on exit: Claude Code creates some files with mode 0600
-# (e.g. settings.json), which the host backend (agent user) cannot read.
-# The trap runs as root after the node process exits.
-cleanup() {
-  chmod -R a+rwX /home/node/.claude 2>/dev/null || true
-  chmod -R a+rwX /workspace/group 2>/dev/null || true
-}
-trap cleanup EXIT
-
-# Drop privileges and execute agent-runner as node user
+# Drop privileges and execute agent-runner as node user (now with host-aligned UID)
 runuser -u node -- node /tmp/dist/index.js < /tmp/input.json
