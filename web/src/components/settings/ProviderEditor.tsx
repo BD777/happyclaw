@@ -62,7 +62,6 @@ interface ProviderEditorProps {
   onSave: () => void;
   onCancel: () => void;
   setNotice: (msg: string | null) => void;
-  setError: (msg: string | null) => void;
 }
 
 export function ProviderEditor({
@@ -71,7 +70,6 @@ export function ProviderEditor({
   onSave,
   onCancel,
   setNotice,
-  setError,
 }: ProviderEditorProps) {
   const isCreate = provider === null;
 
@@ -98,16 +96,21 @@ export function ProviderEditor({
   const [authToken, setAuthToken] = useState('');
   const [authTokenDirty, setAuthTokenDirty] = useState(false);
   const [clearTokenOnSave, setClearTokenOnSave] = useState(false);
+  const [thirdPartyApiKey, setThirdPartyApiKey] = useState('');
+  const [thirdPartyApiKeyDirty, setThirdPartyApiKeyDirty] = useState(false);
+  const [clearApiKeyOnSave, setClearApiKeyOnSave] = useState(false);
 
   // 环境变量
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
 
   // 状态
   const [saving, setSaving] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
 
   // 初始化表单
   useEffect(() => {
     if (!open) return;
+    setLocalError(null);
 
     if (isCreate) {
       setProviderType('third_party');
@@ -124,6 +127,9 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
+      setThirdPartyApiKey('');
+      setThirdPartyApiKeyDirty(false);
+      setClearApiKeyOnSave(false);
       setCustomEnvRows([]);
     } else {
       setProviderType(provider.type);
@@ -140,6 +146,9 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
+      setThirdPartyApiKey('');
+      setThirdPartyApiKeyDirty(false);
+      setClearApiKeyOnSave(false);
       const envRows = Object.entries(provider.customEnv || {}).map(([key, value]) => ({ key, value }));
       setCustomEnvRows(envRows);
     }
@@ -156,7 +165,7 @@ export function ProviderEditor({
   // ─── OAuth 流程 ─────────────────────────────────────────────
   const handleOAuthStart = useCallback(async () => {
     setOauthLoading(true);
-    setError(null);
+    setLocalError(null);
     try {
       const body: Record<string, unknown> = {};
       // 编辑模式下传入目标提供商 ID
@@ -171,19 +180,19 @@ export function ProviderEditor({
       setOauthCode('');
       window.open(data.authorizeUrl, '_blank', 'noopener,noreferrer');
     } catch (err) {
-      setError(getErrorMessage(err, 'OAuth 授权启动失败'));
+      setLocalError(getErrorMessage(err, 'OAuth 授权启动失败'));
     } finally {
       setOauthLoading(false);
     }
-  }, [isCreate, provider, setError]);
+  }, [isCreate, provider]);
 
   const handleOAuthCallback = useCallback(async () => {
     if (!oauthState || !oauthCode.trim()) {
-      setError('请粘贴授权码');
+      setLocalError('请粘贴授权码');
       return;
     }
     setOauthExchanging(true);
-    setError(null);
+    setLocalError(null);
     try {
       await api.post('/api/config/claude/oauth/callback', {
         state: oauthState,
@@ -194,28 +203,28 @@ export function ProviderEditor({
       setNotice('OAuth 登录成功，凭据已保存。');
       onSave();
     } catch (err) {
-      setError(getErrorMessage(err, 'OAuth 授权码换取失败'));
+      setLocalError(getErrorMessage(err, 'OAuth 授权码换取失败'));
     } finally {
       setOauthExchanging(false);
     }
-  }, [oauthState, oauthCode, setError, setNotice, onSave]);
+  }, [oauthState, oauthCode, setNotice, onSave]);
 
   // ─── 保存 ──────────────────────────────────────────────────
   const handleSave = async () => {
     const trimmedName = name.trim();
     if (!trimmedName) {
-      setError('请填写提供商名称');
+      setLocalError('请填写提供商名称');
       return;
     }
 
     const envResult = buildCustomEnv(customEnvRows);
     if (envResult.error) {
-      setError(envResult.error);
+      setLocalError(envResult.error);
       return;
     }
 
     setSaving(true);
-    setError(null);
+    setLocalError(null);
 
     try {
       if (isCreate) {
@@ -230,24 +239,26 @@ export function ProviderEditor({
         if (providerType === 'third_party') {
           const trimmedBaseUrl = baseUrl.trim();
           const trimmedToken = authToken.trim();
+          const trimmedApiKey = thirdPartyApiKey.trim();
           if (!trimmedBaseUrl) {
-            setError('请填写 ANTHROPIC_BASE_URL');
+            setLocalError('请填写 ANTHROPIC_BASE_URL');
             setSaving(false);
             return;
           }
-          if (!trimmedToken) {
-            setError('新建第三方提供商时必须填写 ANTHROPIC_AUTH_TOKEN');
+          if (!trimmedToken && !trimmedApiKey) {
+            setLocalError('新建第三方提供商时需填写 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY');
             setSaving(false);
             return;
           }
           createBody.anthropicBaseUrl = trimmedBaseUrl;
-          createBody.anthropicAuthToken = trimmedToken;
+          if (trimmedToken) createBody.anthropicAuthToken = trimmedToken;
+          if (trimmedApiKey) createBody.anthropicApiKey = trimmedApiKey;
         } else {
           // 官方模式 — 根据认证方式设置凭据
           if (authTab === 'setup_token') {
             const trimmed = setupToken.trim();
             if (!trimmed) {
-              setError('请填写 setup-token 或粘贴 .credentials.json 内容');
+              setLocalError('请填写 setup-token 或粘贴 .credentials.json 内容');
               setSaving(false);
               return;
             }
@@ -277,7 +288,7 @@ export function ProviderEditor({
           } else if (authTab === 'api_key') {
             const trimmed = apiKey.trim();
             if (!trimmed) {
-              setError('请填写 Anthropic API Key');
+              setLocalError('请填写 Anthropic API Key');
               setSaving(false);
               return;
             }
@@ -320,6 +331,26 @@ export function ProviderEditor({
           } else if (authTokenDirty && authToken.trim()) {
             secretsBody.anthropicAuthToken = authToken.trim();
             hasSecretsChange = true;
+          }
+          if (clearApiKeyOnSave) {
+            secretsBody.clearAnthropicApiKey = true;
+            hasSecretsChange = true;
+          } else if (thirdPartyApiKeyDirty && thirdPartyApiKey.trim()) {
+            secretsBody.anthropicApiKey = thirdPartyApiKey.trim();
+            hasSecretsChange = true;
+          }
+
+          // 校验：保存后是否会导致两个凭据都为空
+          const tokenAfterSave = clearTokenOnSave ? false
+            : (authTokenDirty && authToken.trim()) ? true
+            : !!provider?.hasAnthropicAuthToken;
+          const apiKeyAfterSave = clearApiKeyOnSave ? false
+            : (thirdPartyApiKeyDirty && thirdPartyApiKey.trim()) ? true
+            : !!provider?.hasAnthropicApiKey;
+          if (!tokenAfterSave && !apiKeyAfterSave) {
+            setLocalError('ANTHROPIC_AUTH_TOKEN 和 ANTHROPIC_API_KEY 至少需要保留一个');
+            setSaving(false);
+            return;
           }
         } else {
           // 官方模式编辑时更新凭据
@@ -371,7 +402,7 @@ export function ProviderEditor({
 
       onSave();
     } catch (err) {
-      setError(getErrorMessage(err, isCreate ? '创建提供商失败' : '保存提供商失败'));
+      setLocalError(getErrorMessage(err, isCreate ? '创建提供商失败' : '保存提供商失败'));
     } finally {
       setSaving(false);
     }
@@ -392,6 +423,12 @@ export function ProviderEditor({
         </DialogHeader>
 
         <div className="space-y-4">
+          {localError && (
+            <div className="bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-lg px-3 py-2 text-sm text-red-700 dark:text-red-300">
+              {localError}
+            </div>
+          )}
+
           {/* 类型选择（仅创建模式） */}
           {isCreate && (
             <div>
@@ -624,12 +661,15 @@ export function ProviderEditor({
                   disabled={saving || clearTokenOnSave}
                   placeholder={
                     isCreate
-                      ? '输入 Token（必填）'
+                      ? '输入 Token（与 API_KEY 二选一）'
                       : provider?.hasAnthropicAuthToken
                         ? '留空不变；输入新值覆盖'
                         : '输入 Token（可选）'
                   }
                 />
+                <p className="text-xs text-muted-foreground mt-1">
+                  发送为 Authorization: Bearer 头。
+                </p>
                 {!isCreate && provider?.hasAnthropicAuthToken && (
                   <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
                     <input
@@ -645,6 +685,56 @@ export function ProviderEditor({
                       disabled={saving}
                     />
                     保存时清空当前 Token
+                  </label>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">
+                  <span className="flex items-center gap-1.5">
+                    <Key className="w-3.5 h-3.5" />
+                    ANTHROPIC_API_KEY{' '}
+                    {!isCreate && provider?.hasAnthropicApiKey
+                      ? `(${provider.anthropicApiKeyMasked})`
+                      : ''}
+                  </span>
+                </label>
+                <Input
+                  type="password"
+                  value={thirdPartyApiKey}
+                  onChange={(e) => {
+                    setThirdPartyApiKey(e.target.value);
+                    setThirdPartyApiKeyDirty(true);
+                    setClearApiKeyOnSave(false);
+                  }}
+                  disabled={saving || clearApiKeyOnSave}
+                  placeholder={
+                    isCreate
+                      ? '输入 API Key（与 AUTH_TOKEN 二选一）'
+                      : provider?.hasAnthropicApiKey
+                        ? '留空不变；输入新值覆盖'
+                        : '输入 API Key（可选）'
+                  }
+                  className="font-mono"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  发送为 x-api-key 头。与 AUTH_TOKEN 二选一或同时使用。
+                </p>
+                {!isCreate && provider?.hasAnthropicApiKey && (
+                  <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={clearApiKeyOnSave}
+                      onChange={(e) => {
+                        setClearApiKeyOnSave(e.target.checked);
+                        if (e.target.checked) {
+                          setThirdPartyApiKey('');
+                          setThirdPartyApiKeyDirty(false);
+                        }
+                      }}
+                      disabled={saving}
+                    />
+                    保存时清空当前 API Key
                   </label>
                 )}
               </div>

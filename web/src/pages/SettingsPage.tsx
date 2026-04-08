@@ -32,6 +32,8 @@ export function SettingsPage() {
   const { user: currentUser } = useAuthStore();
   const [searchParams, setSearchParams] = useSearchParams();
   const [navOpen, setNavOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const hasSystemConfigPermission =
     currentUser?.role === 'admin' || !!currentUser?.permissions.includes('manage_system_config');
@@ -59,6 +61,8 @@ export function SettingsPage() {
 
   const handleTabChange = useCallback((tab: SettingsTab) => {
     setNavOpen(false);
+    setNotice(null);
+    setError(null);
     setSearchParams({ tab }, { replace: true });
   }, [setSearchParams]);
 
@@ -203,9 +207,20 @@ export function SettingsPage() {
                 </div>
               )}
 
+              {notice && (
+                <div className="bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 rounded-xl px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300">
+                  {notice}
+                </div>
+              )}
+              {error && (
+                <div className="bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-xl px-4 py-3 text-sm text-red-700 dark:text-red-300">
+                  {error}
+                </div>
+              )}
+
               <Card>
                 <CardContent>
-                  {activeTab === 'claude' && <ClaudeProviderSection setNotice={() => {}} setError={() => {}} />}
+                  {activeTab === 'claude' && <ClaudeProviderSection setNotice={setNotice} setError={setError} />}
                   {activeTab === 'registration' && <RegistrationSection />}
                   {activeTab === 'appearance' && <AppearanceSection />}
                   {activeTab === 'system' && <SystemSettingsSection />}

@@ -325,7 +325,6 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
         onSave={handleEditorSave}
         onCancel={handleEditorCancel}
         setNotice={setNotice}
-        setError={setError}
       />
 
       {/* 确认删除对话框 */}

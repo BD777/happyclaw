@@ -1188,6 +1188,23 @@ export async function runHostAgent(
     ...(process.env as Record<string, string>),
   };
 
+  // 确保本地回环地址不走 HTTP 代理（宿主机可能继承代理配置）
+  if (hostEnv['http_proxy'] || hostEnv['HTTP_PROXY'] || hostEnv['https_proxy'] || hostEnv['HTTPS_PROXY']) {
+    const LOCAL_HOSTS = ['localhost', '127.0.0.1', '::1'];
+    for (const key of ['no_proxy', 'NO_PROXY']) {
+      const existing = hostEnv[key];
+      if (existing) {
+        const entries = existing.split(',').map((s) => s.trim());
+        const missing = LOCAL_HOSTS.filter((h) => !entries.includes(h));
+        if (missing.length > 0) {
+          hostEnv[key] = `${existing},${missing.join(',')}`;
+        }
+      } else {
+        hostEnv[key] = LOCAL_HOSTS.join(',');
+      }
+    }
+  }
+
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);
   const hostPoolResult = trySelectPoolProvider(group.folder);
