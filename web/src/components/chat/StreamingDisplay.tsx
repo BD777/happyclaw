@@ -3,7 +3,7 @@ import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
-import type { AgentInfo } from '../../types';
+import type { AgentInfo, InteractionMode } from '../../types';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { TodoProgressPanel } from './TodoProgressPanel';
@@ -11,6 +11,7 @@ import { ToolActivityCard } from './ToolActivityCard';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
 import { WorkflowRunCard } from './WorkflowRunCard';
+import { shouldShowStreamingPartialText } from '../../lib/interaction-mode';
 
 /** Render AskUserQuestion options as a visual card (read-only). */
 function AskUserQuestionCard({
@@ -532,6 +533,7 @@ function StreamingContent({
   setThinkingExpanded,
   thinkingRef,
   handleThinkingScroll,
+  showPartialText,
 }: {
   streaming: import('../../stores/chat').StreamingState;
   localElapsed: Record<string, number>;
@@ -540,6 +542,7 @@ function StreamingContent({
   setThinkingExpanded: (v: boolean) => void;
   thinkingRef: React.RefObject<HTMLDivElement | null>;
   handleThinkingScroll: () => void;
+  showPartialText: boolean;
 }) {
   // Classify active tools
   const cardTools = streaming.activeTools.filter(
@@ -742,7 +745,7 @@ function StreamingContent({
       )}
 
       {/* Partial text */}
-      {streaming.partialText && (
+      {showPartialText && streaming.partialText && (
         <div className="max-w-none overflow-hidden [&>div>*:first-child]:!mt-0">
           <MarkdownRenderer
             content={
@@ -768,6 +771,7 @@ interface StreamingDisplayProps {
   agentAvatarUrl?: string | null;
   agentAvatarEmoji?: string | null;
   agentAvatarColor?: string | null;
+  interactionMode?: InteractionMode;
 }
 
 const EMPTY_AGENTS: AgentInfo[] = [];
@@ -780,6 +784,7 @@ export function StreamingDisplay({
   agentAvatarUrl,
   agentAvatarEmoji,
   agentAvatarColor,
+  interactionMode = 'assistant',
 }: StreamingDisplayProps) {
   const mainStreaming = useChatStore((s) => s.streaming[groupJid]);
   const agentStreamingState = useChatStore((s) =>
@@ -795,6 +800,7 @@ export function StreamingDisplay({
     [allAgents],
   );
   const hasTaskAgents = taskAgents.length > 0;
+  const showPartialText = shouldShowStreamingPartialText(interactionMode);
   const appearance = useAuthStore((state) => state.appearance);
   const agentIdentity = resolveAgentDisplayIdentity({
     agentName: senderNameProp,
@@ -950,7 +956,7 @@ export function StreamingDisplay({
   // 计算是否有流式数据（含中断后冻结的 partialText）
   const hasStreamData =
     (streaming &&
-      (streaming.partialText ||
+      ((showPartialText && streaming.partialText) ||
         streaming.thinkingText ||
         streaming.activeTools.length > 0 ||
         streaming.activeHook ||
@@ -984,7 +990,7 @@ export function StreamingDisplay({
             <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
             <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce" />
             <span className="text-sm text-muted-foreground ml-1">
-              正在准备...
+              {interactionMode === 'persona' ? '正在处理…' : '正在准备...'}
             </span>
           </div>
         </div>
@@ -1028,7 +1034,7 @@ export function StreamingDisplay({
                 <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
                 <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce" />
                 <span className="text-sm text-muted-foreground ml-1">
-                  正在准备...
+                  {interactionMode === 'persona' ? '正在处理…' : '正在准备...'}
                 </span>
               </div>
             </div>
@@ -1074,6 +1080,7 @@ export function StreamingDisplay({
               }}
               thinkingRef={thinkingRef}
               handleThinkingScroll={handleThinkingScroll}
+              showPartialText={showPartialText}
             />
           )}
 
@@ -1157,6 +1164,7 @@ export function StreamingDisplay({
                 }}
                 thinkingRef={thinkingRef}
                 handleThinkingScroll={handleThinkingScroll}
+                showPartialText={showPartialText}
               />
             )}
 

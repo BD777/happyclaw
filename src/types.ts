@@ -34,6 +34,8 @@ export interface ContainerConfig {
 }
 
 export type ExecutionMode = 'container' | 'host';
+/** User-visible interaction contract owned by one Workspace↔Agent binding. */
+export type InteractionMode = 'assistant' | 'persona';
 export type ConversationSource = 'manual' | 'native_thread' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';
@@ -300,6 +302,15 @@ export interface AgentProfilePromptVersion extends AgentProfilePrompts {
   change_source: 'create' | 'update' | 'restore' | 'migration';
   restored_from_version: number | null;
   created_at: string;
+}
+
+/** Durable Workspace↔AgentProfile binding and its interaction contract. */
+export interface WorkspaceAgentProfileBinding {
+  group_folder: string;
+  agent_profile_id: string;
+  interaction_mode: InteractionMode;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface AgentProfileRuntimePolicy {

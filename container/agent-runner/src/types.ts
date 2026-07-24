@@ -197,6 +197,8 @@ export interface ContainerInput {
   turnId?: string;
   groupFolder: string;
   chatJid: string;
+  /** Workspace-scoped interaction contract for this public Agent turn. */
+  interactionMode?: 'assistant' | 'persona';
   /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */

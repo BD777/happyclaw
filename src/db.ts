@@ -33,6 +33,7 @@ import {
   ExecutionMode,
   InviteCode,
   InviteCodeWithCreator,
+  InteractionMode,
   MessageFinalizationReason,
   FollowUpMode,
   FollowUpStatus,
@@ -62,6 +63,7 @@ import {
   UserSubscription,
   UserSession,
   UserSessionWithUser,
+  WorkspaceAgentProfileBinding,
   Permission,
   PermissionTemplateKey,
 } from './types.js';
@@ -80,7 +82,7 @@ import {
 } from './channel-reliability-store.js';
 
 let db: InstanceType<typeof Database>;
-const CURRENT_SCHEMA_VERSION = 60;
+const CURRENT_SCHEMA_VERSION = 61;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -901,6 +903,8 @@ export function initDatabase(): void {
     CREATE TABLE IF NOT EXISTS workspace_agent_profiles (
       group_folder TEXT PRIMARY KEY,
       agent_profile_id TEXT NOT NULL,
+      interaction_mode TEXT NOT NULL DEFAULT 'assistant'
+        CHECK (interaction_mode IN ('assistant', 'persona')),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -2204,6 +2208,21 @@ export function initDatabase(): void {
   // schema and fenced APIs; db.ts only binds it to this process connection.
   createChannelReliabilitySchema(db);
   bindChannelReliabilityDatabase(db);
+
+  // v60 -> v61: interaction behavior belongs to the Workspace↔Agent binding,
+  // not the reusable AgentProfile. Existing workspaces retain assistant
+  // semantics; profile switches preserve this independent binding field.
+  ensureColumn(
+    'workspace_agent_profiles',
+    'interaction_mode',
+    "TEXT NOT NULL DEFAULT 'assistant'",
+  );
+  db.prepare(
+    `UPDATE workspace_agent_profiles
+     SET interaction_mode = 'assistant'
+     WHERE interaction_mode IS NULL
+        OR interaction_mode NOT IN ('assistant', 'persona')`,
+  ).run();
 
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
@@ -7585,30 +7604,105 @@ export function archiveAgentProfile(
 export function assignWorkspaceAgentProfile(
   groupFolder: string,
   profileId: string,
+  interactionMode?: InteractionMode,
 ): void {
   const now = new Date().toISOString();
   db.transaction(() => {
     db.prepare(
       `INSERT INTO workspace_agent_profiles (
-        group_folder, agent_profile_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?)
+        group_folder, agent_profile_id, interaction_mode, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(group_folder) DO UPDATE SET
         agent_profile_id = excluded.agent_profile_id,
+        interaction_mode = CASE
+          WHEN ? IS NULL THEN workspace_agent_profiles.interaction_mode
+          ELSE excluded.interaction_mode
+        END,
         updated_at = excluded.updated_at`,
-    ).run(groupFolder, profileId, now, now);
+    ).run(
+      groupFolder,
+      profileId,
+      interactionMode ?? 'assistant',
+      now,
+      now,
+      interactionMode ?? null,
+    );
     syncAgentChannelMountsForWorkspaceFolder(groupFolder);
   })();
+}
+
+function parseInteractionMode(
+  value: unknown,
+  groupFolder: string,
+): InteractionMode {
+  if (value === 'persona') return 'persona';
+  if (value !== 'assistant' && value != null && value !== '') {
+    logger.warn(
+      { groupFolder, interactionMode: value },
+      'Invalid workspace interaction mode; falling back to assistant',
+    );
+  }
+  return 'assistant';
+}
+
+export function getWorkspaceAgentProfileBinding(
+  groupFolder: string,
+): WorkspaceAgentProfileBinding | undefined {
+  const row = db
+    .prepare(
+      `SELECT group_folder, agent_profile_id, interaction_mode, created_at, updated_at
+       FROM workspace_agent_profiles
+       WHERE group_folder = ?`,
+    )
+    .get(groupFolder) as
+    | {
+        group_folder: string;
+        agent_profile_id: string;
+        interaction_mode: unknown;
+        created_at: string;
+        updated_at: string;
+      }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    group_folder: row.group_folder,
+    agent_profile_id: row.agent_profile_id,
+    interaction_mode: parseInteractionMode(
+      row.interaction_mode,
+      row.group_folder,
+    ),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
 }
 
 export function getWorkspaceAgentProfileId(
   groupFolder: string,
 ): string | undefined {
-  const row = db
+  return getWorkspaceAgentProfileBinding(groupFolder)?.agent_profile_id;
+}
+
+export function getWorkspaceInteractionMode(
+  groupFolder: string,
+): InteractionMode {
+  return (
+    getWorkspaceAgentProfileBinding(groupFolder)?.interaction_mode ??
+    'assistant'
+  );
+}
+
+export function setWorkspaceInteractionMode(
+  groupFolder: string,
+  interactionMode: InteractionMode,
+): boolean {
+  const result = db
     .prepare(
-      'SELECT agent_profile_id FROM workspace_agent_profiles WHERE group_folder = ?',
+      `UPDATE workspace_agent_profiles
+       SET interaction_mode = ?, updated_at = ?
+       WHERE group_folder = ?`,
     )
-    .get(groupFolder) as { agent_profile_id: string } | undefined;
-  return row?.agent_profile_id;
+    .run(interactionMode, new Date().toISOString(), groupFolder);
+  return result.changes > 0;
 }
 
 export function deleteWorkspaceAgentProfile(groupFolder: string): void {

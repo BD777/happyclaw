@@ -30,6 +30,8 @@ export interface McpContext {
   isAdminHome: boolean;
   /** Whether this runtime is an interactive session of the main HappyClaw. */
   agentBuilderEnabled: boolean;
+  /** Public reply contract selected by the workspace. */
+  interactionMode?: 'assistant' | 'persona';
   isScheduledTask?: boolean;
   /** Mutable: set when the current IPC turn was triggered by a task prompt.
    * Cleared between turns by the agent-runner main loop so that regular
@@ -199,6 +201,10 @@ export function buildSendMessageData(
     groupFolder: ctx.groupFolder,
     timestamp: new Date().toISOString(),
     ...extras,
+    // Freeze the public delivery contract at IPC write time. The host must not
+    // reinterpret an already-written side effect after a workspace mode change.
+    interactionMode:
+      ctx.interactionMode === 'persona' ? 'persona' : 'assistant',
   };
   if (ctx.isScheduledTask) {
     data.isScheduledTask = true;
@@ -468,24 +474,33 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_message ---
     tool(
       'send_message',
-      "Publish text through HappyClaw's turn-owned delivery coordinator. In an interactive user turn, delivery_role=progress updates the existing reply status and delivery_role=final stages the primary answer on the existing card; neither creates a second text reply. Use delivery_role=separate only when the user explicitly requested another message. Scheduled/background tasks always deliver separately because their normal SDK final is not published.",
+      ctx.interactionMode === 'persona' && !ctx.isScheduledTask
+        ? 'Send one user-visible message now. You are operating as a person-like Agent: every call creates an independent native chat message, and your normal SDK final text is not published. Call this tool whenever you decide it is useful to speak; you may call it multiple times before the turn ends.'
+        : "Publish text through HappyClaw's turn-owned delivery coordinator. In an interactive user turn, delivery_role=progress updates the existing reply status and delivery_role=final stages the primary answer on the existing card; neither creates a second text reply. Use delivery_role=separate only when the user explicitly requested another message. Scheduled/background tasks always deliver separately because their normal SDK final is not published.",
       {
         text: z.string().describe('The message text to publish'),
         delivery_role: z
           .enum(['progress', 'final', 'separate'])
           .optional()
           .describe(
-            'progress updates the active reply, final stages its answer, separate creates an additional message. Defaults to final for interactive turns and separate for scheduled tasks.',
+            ctx.interactionMode === 'persona' && !ctx.isScheduledTask
+              ? 'Ignored in person-like mode: every call is delivered as an independent native message.'
+              : 'progress updates the active reply, final stages its answer, separate creates an additional message. Defaults to final for interactive turns and separate for scheduled tasks.',
           ),
       },
       async (args) => {
         const deliveryRole = ctx.isScheduledTask
           ? 'separate'
-          : (args.delivery_role ?? 'final');
+          : ctx.interactionMode === 'persona'
+            ? 'separate'
+            : (args.delivery_role ?? 'final');
         const data = buildSendMessageData(ctx, {
           type: 'message',
           text: args.text,
           deliveryRole,
+          ...(ctx.interactionMode === 'persona' && !ctx.isScheduledTask
+            ? { presentation: 'native' }
+            : {}),
           requestId: newRequestId(),
         });
         const result = await pollIpcResult(

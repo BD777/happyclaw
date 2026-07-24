@@ -177,6 +177,7 @@ export interface IMChannel {
     chatId: string,
     text: string,
     localImagePaths?: string[],
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void>;
   /** Send file to chat (if supported) */
   sendFile?(chatId: string, filePath: string, fileName: string): Promise<void>;
@@ -215,6 +216,11 @@ export interface IMChannel {
     context: ChannelTurnContext,
     request: FeishuCapabilityRequest,
   ): Promise<FeishuCapabilityResult>;
+}
+
+export interface ChannelMessageDeliveryOptions {
+  /** `native` avoids bot/card presentation for person-like workspace Agents. */
+  presentation?: 'default' | 'native';
 }
 
 // ─── Channel Registry ───────────────────────────────────────────
@@ -294,6 +300,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       chatId: string,
       text: string,
       localImagePaths?: string[],
+      options?: ChannelMessageDeliveryOptions,
     ): Promise<void> {
       if (!inner) {
         logger.warn(
@@ -302,7 +309,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         );
         return;
       }
-      await inner.sendMessage(chatId, text, localImagePaths);
+      await inner.sendMessage(chatId, text, localImagePaths, options);
     },
 
     async sendImage(

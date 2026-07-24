@@ -12,6 +12,7 @@ import type {
   ConversationSource,
   RegisteredGroup,
   ExecutionMode,
+  InteractionMode,
 } from '../types.js';
 import { checkGroupLimit } from '../billing.js';
 import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
@@ -63,6 +64,8 @@ import {
   getAgentProfileForWorkspace,
   getOrCreateDefaultAgentProfile,
   getWorkspaceAgentProfileId,
+  getWorkspaceInteractionMode,
+  setWorkspaceInteractionMode,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
@@ -266,6 +269,7 @@ interface GroupPayloadItem {
   lastMessage?: string;
   lastMessageTime?: string;
   execution_mode: 'container' | 'host';
+  interaction_mode?: InteractionMode;
   custom_cwd?: string;
   is_home?: boolean;
   is_my_home?: boolean;
@@ -371,6 +375,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
         chats.get(jid)?.last_message_time ||
         group.added_at,
       execution_mode: group.executionMode || 'container',
+      interaction_mode: isWeb
+        ? getWorkspaceInteractionMode(group.folder)
+        : undefined,
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
       is_my_home: (isHome && group.created_by === user.id) || undefined,
@@ -475,6 +482,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   const executionMode =
     validation.data.execution_mode ||
     ((await isDockerAvailable()) ? 'container' : 'host');
+  const interactionMode = validation.data.interaction_mode ?? 'assistant';
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
@@ -806,7 +814,11 @@ groupRoutes.post('/', authMiddleware, async (c) => {
           // Mapping first and registered-group publication immediately after
           // it occur in one synchronous critical section. Agent PATCH cannot
           // snapshot between them: it holds this same profile lock.
-          assignWorkspaceAgentProfile(folder, lockedProfile.id);
+          assignWorkspaceAgentProfile(
+            folder,
+            lockedProfile.id,
+            interactionMode,
+          );
           setRegisteredGroup(jid, group);
           updateChatName(jid, name);
           deps.getRegisteredGroups()[jid] = group;
@@ -859,6 +871,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     lastMessage: undefined,
     lastMessageTime: now,
     execution_mode: group.executionMode || 'container',
+    interaction_mode: interactionMode,
     custom_cwd: isAdmin ? group.customCwd : undefined,
     is_my_home: undefined,
     can_modify: canModifyGroup(authUser, groupWithJid),
@@ -902,6 +915,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     is_pinned,
     activation_mode,
     execution_mode,
+    interaction_mode,
   } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
@@ -910,7 +924,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     !name &&
     is_pinned === undefined &&
     activation_mode === undefined &&
-    execution_mode === undefined
+    execution_mode === undefined &&
+    interaction_mode === undefined
   ) {
     return c.json({ error: 'No fields to update' }, 400);
   }
@@ -936,7 +951,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     is_pinned !== undefined &&
     !name &&
     activation_mode === undefined &&
-    execution_mode === undefined;
+    execution_mode === undefined &&
+    interaction_mode === undefined;
   if (isPinOnly) {
     if (
       !canAccessGroup(
@@ -968,6 +984,12 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         403,
       );
     }
+    if (interaction_mode !== undefined && !jid.startsWith('web:')) {
+      return c.json(
+        { error: 'Only web workspaces can change interaction mode' },
+        403,
+      );
+    }
   }
 
   // Handle pin/unpin (per-user, separate table)
@@ -978,8 +1000,15 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     unpinGroup(authUser.id, jid);
   }
 
-  // Update registered group if name, activation_mode, or execution_mode changed
-  if (name || activation_mode !== undefined || execution_mode !== undefined) {
+  // Interaction mode is stored on the Workspace↔AgentProfile binding rather
+  // than registered_groups. It still shares the execution-mode quiesce
+  // boundary so a warm runner can observe only the old or the new contract.
+  if (
+    name ||
+    activation_mode !== undefined ||
+    execution_mode !== undefined ||
+    interaction_mode !== undefined
+  ) {
     // Spread `...existing` instead of rebuilding from an explicit field list.
     // setRegisteredGroup is INSERT OR REPLACE (full-row overwrite), so every
     // field omitted from the object gets silently nulled. The old explicit list
@@ -1002,15 +1031,27 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     };
 
     const commitUpdate = () => {
-      setRegisteredGroup(jid, updated);
-      if (name) updateChatName(jid, name);
-      deps.getRegisteredGroups()[jid] = updated;
       if (
-        execution_mode !== undefined &&
-        execution_mode !== (existing.executionMode || 'container')
+        name ||
+        activation_mode !== undefined ||
+        execution_mode !== undefined
       ) {
+        setRegisteredGroup(jid, updated);
+        if (name) updateChatName(jid, name);
+        deps.getRegisteredGroups()[jid] = updated;
+      }
+      if (
+        interaction_mode !== undefined &&
+        !setWorkspaceInteractionMode(existing.folder, interaction_mode)
+      ) {
+        throw new Error(
+          `Workspace ${jid} has no AgentProfile binding for interaction mode update`,
+        );
+      }
+      if (executionModeChanged || interactionModeChanged) {
         // SDK resume state is environment-bound. Never carry a host session
-        // into a container (or vice versa) after the old runner is stopped.
+        // into a container, or an assistant/persona transcript across output
+        // authorities, after the old runner is stopped.
         deleteWorkspaceSessions(existing.folder);
         delete deps.sessions[existing.folder];
       }
@@ -1019,12 +1060,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     const executionModeChanged =
       execution_mode !== undefined &&
       execution_mode !== (existing.executionMode || 'container');
+    const interactionModeChanged =
+      interaction_mode !== undefined &&
+      interaction_mode !== getWorkspaceInteractionMode(existing.folder);
+    const runtimeContractFieldProvided =
+      execution_mode !== undefined || interaction_mode !== undefined;
     const runtimeWasSafetyBlocked =
-      execution_mode !== undefined &&
+      runtimeContractFieldProvided &&
       (deps.queue?.isGroupRuntimeSafetyBlocked?.(jid) ?? false);
     if (
       executionModeChanged ||
-      (execution_mode !== undefined && runtimeWasSafetyBlocked)
+      interactionModeChanged ||
+      (runtimeContractFieldProvided && runtimeWasSafetyBlocked)
     ) {
       const runtimeJids = getWorkspaceRuntimeJids(deps, existing.folder, jid);
       try {
@@ -1032,11 +1079,11 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
           deps,
           [{ folder: existing.folder, primaryJid: jid }],
           {
-            reason: `Workspace ${jid} execution mode changed`,
+            reason: `Workspace ${jid} runtime interaction contract changed`,
             onPostCommitFailure: (failedRuntimeJids) =>
               deps.queue?.blockGroupsForRuntimeSafety?.(
                 failedRuntimeJids,
-                `Workspace ${jid} runtime cleanup failed after execution mode commit`,
+                `Workspace ${jid} runtime cleanup failed after interaction contract commit`,
               ),
           },
           commitUpdate,
@@ -1047,14 +1094,14 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         if (err.persisted) {
           deps.queue?.blockGroupsForRuntimeSafety?.(
             runtimeJids,
-            `Workspace ${jid} runtime cleanup failed after execution mode commit`,
+            `Workspace ${jid} runtime cleanup failed after interaction contract commit`,
           );
         }
         return c.json(
           {
             error: err.persisted
-              ? 'Execution mode changed, but runtime cleanup failed; retry the request'
-              : 'Failed to stop the active workspace; execution mode was not changed',
+              ? 'Workspace interaction contract changed, but runtime cleanup failed; retry the request'
+              : 'Failed to stop the active workspace; interaction contract was not changed',
             persisted: err.persisted,
             retryable: true,
           },
@@ -1066,7 +1113,11 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     }
   }
 
-  return c.json({ success: true, pinned_at });
+  return c.json({
+    success: true,
+    pinned_at,
+    interaction_mode: getWorkspaceInteractionMode(existing.folder),
+  });
 });
 
 // PATCH /api/groups/:jid/agent-profile - 切换 workspace 归属的顶层 AgentProfile
@@ -1233,6 +1284,7 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
     agent_profile_id: committedProfile.id,
     agent_profile_name: committedProfile.name,
     agent_profile_version: committedProfile.version,
+    interaction_mode: getWorkspaceInteractionMode(existing.folder),
     invalidated_runtime_jids: invalidatedRuntimeJids,
   });
 });

@@ -231,6 +231,7 @@ export const GroupCreateSchema = z.object({
     .optional()
     .transform((val) => (val && val.trim() ? val.trim() : undefined)),
   execution_mode: z.enum(['container', 'host']).optional(),
+  interaction_mode: z.enum(['assistant', 'persona']).optional(),
   custom_cwd: z
     .string()
     .optional()
@@ -466,6 +467,7 @@ export const GroupPatchSchema = z.object({
     .enum(['auto', 'always', 'when_mentioned', 'owner_mentioned', 'disabled'])
     .optional(),
   execution_mode: z.enum(['container', 'host']).optional(),
+  interaction_mode: z.enum(['assistant', 'persona']).optional(),
 });
 
 export const LoginSchema = z.object({

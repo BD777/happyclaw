@@ -13,6 +13,7 @@ export interface HostIpcOutputRouteInput {
   deliveryRole?: unknown;
   authorized: boolean;
   scheduledTask: boolean;
+  interactionMode?: 'assistant' | 'persona';
 }
 
 export type HostIpcOutputRoute =
@@ -67,6 +68,7 @@ export function routeHostIpcOutput(
   }
   if (
     input.scheduledTask ||
+    input.interactionMode === 'persona' ||
     deliveryRole === null ||
     deliveryRole === 'separate'
   ) {

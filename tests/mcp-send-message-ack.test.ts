@@ -78,6 +78,7 @@ describe('send_message host acknowledgement', () => {
 
     expect(request.inputTurnId).toBe('delivery-turn-1');
     expect(request.deliveryRole).toBe('final');
+    expect(request.interactionMode).toBe('assistant');
     expect(typeof request.requestId).toBe('string');
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(settled).toBe(false);
@@ -120,9 +121,31 @@ describe('send_message host acknowledgement', () => {
     expect(request).toMatchObject({
       deliveryRole: 'separate',
       isScheduledTask: true,
+      interactionMode: 'assistant',
     });
     writeResult(root, request.requestId as string, { success: true });
     await expect(pending).resolves.toBeDefined();
+  });
+
+  test('persona turns force independent native messages regardless of requested role', async () => {
+    const { root, sendTool } = setupSendTool('send_message', {
+      interactionMode: 'persona',
+    });
+    const pending = sendTool.handler(
+      { text: '我先看一下', delivery_role: 'progress' },
+      {} as never,
+    );
+    const request = await readRequest(root);
+    expect(request).toMatchObject({
+      deliveryRole: 'separate',
+      interactionMode: 'persona',
+      presentation: 'native',
+      inputTurnId: 'delivery-turn-1',
+    });
+    writeResult(root, request.requestId as string, { success: true });
+    await expect(pending).resolves.toMatchObject({
+      content: [{ type: 'text', text: 'Message sent separately.' }],
+    });
   });
 
   test('surfaces a host delivery failure instead of returning a false success', async () => {

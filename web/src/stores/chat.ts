@@ -18,9 +18,15 @@ import type {
   GroupInfo,
   AgentInfo,
   AvailableImGroup,
+  InteractionMode,
   WorkspaceDeleteImpact,
 } from '../types';
 import { applyFollowUpTransition } from '../lib/message-timeline';
+import {
+  normalizeGroupInteractionMode,
+  normalizeInteractionMode,
+} from '../lib/interaction-mode';
+import { useGroupsStore } from './groups';
 
 export type { GroupInfo, AgentInfo };
 
@@ -370,9 +376,14 @@ interface ChatState {
       init_source_path?: string;
       init_git_url?: string;
       agent_profile_id?: string;
+      interaction_mode?: InteractionMode;
     },
   ) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
+  updateInteractionMode: (
+    jid: string,
+    interactionMode: InteractionMode,
+  ) => Promise<boolean>;
   togglePin: (jid: string) => Promise<void>;
   inspectDeleteFlow: (jid: string) => Promise<WorkspaceDeleteImpact>;
   deleteFlow: (
@@ -1607,24 +1618,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const data = await api.get<{ groups: Record<string, GroupInfo> }>(
         '/api/groups',
       );
+      const groups = Object.fromEntries(
+        Object.entries(data.groups).map(([jid, group]) => [
+          jid,
+          normalizeGroupInteractionMode(group),
+        ]),
+      );
       set((state) => {
         const currentStillExists =
-          state.currentGroup && !!data.groups[state.currentGroup];
+          state.currentGroup && !!groups[state.currentGroup];
 
         let nextCurrent = currentStillExists ? state.currentGroup : null;
         if (!nextCurrent) {
-          const homeEntry = Object.entries(data.groups).find(
+          const homeEntry = Object.entries(groups).find(
             ([_, group]) => group.is_my_home,
           );
           if (homeEntry) {
             nextCurrent = homeEntry[0];
           } else {
-            nextCurrent = Object.keys(data.groups)[0] || null;
+            nextCurrent = Object.keys(groups)[0] || null;
           }
         }
 
         return {
-          groups: data.groups,
+          groups,
           currentGroup: nextCurrent,
           loading: false,
           error: null,
@@ -2219,6 +2236,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       init_source_path?: string;
       init_git_url?: string;
       agent_profile_id?: string;
+      interaction_mode?: InteractionMode;
     },
   ) => {
     try {
@@ -2230,6 +2248,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (options?.init_git_url) body.init_git_url = options.init_git_url;
       if (options?.agent_profile_id)
         body.agent_profile_id = options.agent_profile_id;
+      body.interaction_mode = normalizeInteractionMode(
+        options?.interaction_mode,
+      );
 
       const needsLongTimeout = !!(
         options?.init_source_path || options?.init_git_url
@@ -2241,12 +2262,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }>('/api/groups', body, needsLongTimeout ? 120_000 : undefined);
       if (!data.success) return null;
 
+      const group = normalizeGroupInteractionMode(data.group);
       set((s) => ({
-        groups: { ...s.groups, [data.jid]: data.group },
+        groups: { ...s.groups, [data.jid]: group },
         error: null,
       }));
 
-      return { jid: data.jid, folder: data.group.folder };
+      return { jid: data.jid, folder: group.folder };
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
       return null;
@@ -2275,6 +2297,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  updateInteractionMode: async (jid, interactionMode) => {
+    try {
+      await api.patch<{ success: boolean }>(
+        `/api/groups/${encodeURIComponent(jid)}`,
+        { interaction_mode: interactionMode },
+      );
+      const patchGroups = (groups: Record<string, GroupInfo>) => {
+        const group = groups[jid];
+        if (!group) return groups;
+        return {
+          ...groups,
+          [jid]: { ...group, interaction_mode: interactionMode },
+        };
+      };
+      set((state) => ({
+        groups: patchGroups(state.groups),
+        error: null,
+      }));
+      useGroupsStore.setState((state) => ({
+        groups: patchGroups(state.groups),
+      }));
+      return true;
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+      return false;
     }
   },
 

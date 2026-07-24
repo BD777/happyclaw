@@ -113,6 +113,42 @@ describe('host IPC primary output routing', () => {
     ).toBe('separate_provider');
   });
 
+  test('persona mode forces progress and final requests onto independent message delivery', () => {
+    const activeTurnOutputs = new ActiveTurnOutputRegistry();
+    const projected = vi.fn(() => true);
+    activeTurnOutputs.bind(
+      channelTurnScope('workspace', 'conversation-agent'),
+      'turn-1',
+      {
+        onProgress: projected,
+        onFinalCandidate: projected,
+      },
+    );
+
+    for (const deliveryRole of ['progress', 'final'] as const) {
+      expect(
+        routeHostIpcOutput(
+          {
+            sourceGroup: 'workspace',
+            agentId: 'conversation-agent',
+            inputTurnId: 'turn-1',
+            text: `${deliveryRole} utterance`,
+            deliveryRole,
+            authorized: true,
+            scheduledTask: false,
+            interactionMode: 'persona',
+          },
+          activeTurnOutputs,
+        ),
+      ).toMatchObject({
+        path: 'separate_provider',
+        staged: false,
+        deliveryRole,
+      });
+    }
+    expect(projected).not.toHaveBeenCalled();
+  });
+
   test('wires both host execution paths to the live visible answer for interruption persistence', () => {
     const main = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),

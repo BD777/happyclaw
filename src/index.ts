@@ -130,6 +130,7 @@ import {
   getSession,
   getSessionAgentIdentity,
   getAgentProfileForWorkspace,
+  getWorkspaceInteractionMode,
   listAgentsByJid,
   getGroupsByOwner,
   getMessagesPage,
@@ -201,7 +202,19 @@ import {
   getChannelType,
   extractChatId,
   type StreamingSession,
+  type ChannelMessageDeliveryOptions,
 } from './im-channel.js';
+import {
+  PERSONA_TAIL_INTERRUPTION_NOTICE,
+  buildInteractionTextOutboxPayload,
+  isInteractionTurnSettled,
+  publishesFrameworkAnswer,
+  resolveFrozenIpcInteractionMode,
+  resolveRuntimeInteractionMode,
+  shouldBroadcastSdkStreamEvent,
+  shouldSendPersonaTailInterruptionNotice,
+  usesNativeMessagePresentation,
+} from './workspace-interaction-runtime.js';
 import {
   channelConversationJid,
   parseChannelAddress,
@@ -2395,6 +2408,7 @@ async function sendImWithRetry(
   text: string,
   localImagePaths: string[],
   outbox?: ChannelOutboxDeliveryRef,
+  deliveryOptions?: ChannelMessageDeliveryOptions,
 ): Promise<boolean> {
   let ok: boolean;
   const durableScoped = outbox !== undefined;
@@ -2410,8 +2424,11 @@ async function sendImWithRetry(
         },
         {
           kind: 'text',
-          payload: { text },
-          send: () => imManager.sendMessage(imJid, text, []),
+          payload: buildInteractionTextOutboxPayload(
+            text,
+            deliveryOptions?.presentation,
+          ),
+          send: () => imManager.sendMessage(imJid, text, [], deliveryOptions),
         },
       );
       ok = delivered === true;
@@ -2453,7 +2470,7 @@ async function sendImWithRetry(
     }
   } else {
     ok = await retryImOperation('send_message', imJid, () =>
-      imManager.sendMessage(imJid, text, localImagePaths),
+      imManager.sendMessage(imJid, text, localImagePaths, deliveryOptions),
     );
   }
   if (ok) {
@@ -2525,7 +2542,9 @@ async function deliverIndependentChannelSystemNotice(input: {
   noticeKey: string;
   text: string;
   sender?: string;
+  senderName?: string;
   agentId?: string | null;
+  presentation?: 'default' | 'native';
   route: {
     provider: string;
     accountId: string;
@@ -2558,12 +2577,20 @@ async function deliverIndependentChannelSystemNotice(input: {
       getUncertainChannelOutboxForTurn(noticeRuntime.runId),
     );
     if (!acknowledged) {
-      acknowledged = await sendImWithRetry(input.targetJid, input.text, [], {
-        scopeKey: input.scopeKey,
-        scopeToken: scope.token,
-        operationKey: `system-notice:${input.noticeKey}`,
-        ordinalSlot: `system-notice:${input.noticeKey}`,
-      });
+      acknowledged = await sendImWithRetry(
+        input.targetJid,
+        input.text,
+        [],
+        {
+          scopeKey: input.scopeKey,
+          scopeToken: scope.token,
+          operationKey: `system-notice:${input.noticeKey}`,
+          ordinalSlot: `system-notice:${input.noticeKey}`,
+        },
+        input.presentation === 'native'
+          ? { presentation: 'native' }
+          : undefined,
+      );
     }
     const becameUncertain = Boolean(
       getUncertainChannelOutboxForTurn(noticeRuntime.runId),
@@ -2597,7 +2624,7 @@ async function deliverIndependentChannelSystemNotice(input: {
       msgId,
       input.logicalChatJid,
       input.sender ?? '__reconciliation__',
-      ASSISTANT_NAME,
+      input.senderName ?? ASSISTANT_NAME,
       input.text,
       timestamp,
       true,
@@ -2607,7 +2634,7 @@ async function deliverIndependentChannelSystemNotice(input: {
       id: msgId,
       chat_jid: input.logicalChatJid,
       sender: input.sender ?? '__reconciliation__',
-      sender_name: ASSISTANT_NAME,
+      sender_name: input.senderName ?? ASSISTANT_NAME,
       content: input.text,
       timestamp,
       is_from_me: true,
@@ -2618,6 +2645,55 @@ async function deliverIndependentChannelSystemNotice(input: {
     activeChannelOutboxScopes.unbind(input.scopeKey, scope);
     noticeRuntime.dispose();
   }
+}
+
+async function deliverPersonaTailInterruptionNotice(input: {
+  logicalChatJid: string;
+  scopeKey: string;
+  inputTurnId: string;
+  agentId?: string | null;
+  targetJid?: string | null;
+  scope?: ActiveChannelOutboxScope;
+}): Promise<boolean> {
+  const scopeRoute = input.scope?.chatId
+    ? {
+        provider: input.scope.provider,
+        accountId: input.scope.accountId,
+        sourceJid: input.scope.sourceJid,
+        chatId: input.scope.chatId,
+        rootId: input.scope.rootId,
+        threadId: input.scope.threadId,
+      }
+    : null;
+  const route =
+    scopeRoute ??
+    (input.targetJid ? resolveDurableChannelRoute(input.targetJid) : null);
+  if (input.targetJid && route) {
+    const delivered = await deliverIndependentChannelSystemNotice({
+      logicalChatJid: input.logicalChatJid,
+      scopeKey: input.scopeKey,
+      targetJid: input.targetJid,
+      originalInputTurnId: input.inputTurnId,
+      originalRunId: input.scope?.turnRunId ?? `persona:${input.inputTurnId}`,
+      noticeKey: 'persona-tail-interruption',
+      text: PERSONA_TAIL_INTERRUPTION_NOTICE,
+      sender: '__system__',
+      senderName: 'system',
+      agentId: input.agentId,
+      presentation: 'native',
+      route,
+    });
+    if (delivered) return true;
+  }
+
+  // Web-only sessions, and native notices that could not be acknowledged,
+  // still receive a durable system record explaining why no replay occurred.
+  sendSystemMessage(
+    input.logicalChatJid,
+    'persona_interrupted',
+    PERSONA_TAIL_INTERRUPTION_NOTICE,
+  );
+  return true;
 }
 
 function resolveDurableChannelRoute(targetJid: string): {
@@ -4831,6 +4907,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       effectiveGroup.created_by,
     ),
   );
+  const interactionMode = resolveRuntimeInteractionMode(
+    getWorkspaceInteractionMode(effectiveGroup.folder),
+    { agentKind: 'main' },
+  );
   const resetForAgentProfile = resetMainSessionForAgentProfileMismatch(
     effectiveGroup,
     agentProfile,
@@ -5018,7 +5098,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     for (const inputId of inputIds) {
       const runtime = channelTurnRuntimes.get(inputId);
       if (!runtime) continue;
-      if (channelPhysicalDeliveryAckByInput.get(inputId) !== true) {
+      const utteranceDelivered =
+        channelPhysicalDeliveryAckByInput.get(inputId) === true;
+      if (publishesFrameworkAnswer(interactionMode) && !utteranceDelivered) {
         allCompleted = false;
         logger.error(
           { chatJid, inputTurnId: inputId, runId: runtime.runId },
@@ -5030,7 +5112,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         runtime.markFinalizing() &&
         runtime.complete({
           cursorCommitted: true,
-          sentReply: true,
+          sentReply: utteranceDelivered,
+          silent: !utteranceDelivered,
           inputTurnId: inputId,
         });
       if (completed) {
@@ -5129,10 +5212,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // second provider card. The final static fallback remains outbox-governed.
   const retryAttempt = queue.getRetryCount(chatJid);
   let activeDurableCardLifecycle =
-    retryAttempt === 0 && streamingAddress?.provider === 'feishu'
+    publishesFrameworkAnswer(interactionMode) &&
+    retryAttempt === 0 &&
+    streamingAddress?.provider === 'feishu'
       ? channelTurnRuntime?.reserveStreamingCard()
       : undefined;
   if (
+    publishesFrameworkAnswer(interactionMode) &&
     channelTurnRuntime &&
     streamingAddress?.provider === 'feishu' &&
     retryAttempt === 0 &&
@@ -5151,13 +5237,38 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     ActiveChannelOutboxScope
   >();
   const rejectedChannelInputTurns = new Set<string>();
+  let personaTailNoticeDelivered = false;
+  const notifyPersonaTailInterruption = async (
+    inputTurnId: string,
+  ): Promise<boolean> => {
+    if (
+      personaTailNoticeDelivered ||
+      !shouldSendPersonaTailInterruptionNotice({
+        mode: interactionMode,
+        utteranceDelivered:
+          channelPhysicalDeliveryAckByInput.get(inputTurnId) === true,
+        runnerFailed: true,
+      })
+    ) {
+      return false;
+    }
+    personaTailNoticeDelivered = true;
+    const scope = channelOutboxScopesByInput.get(inputTurnId);
+    return deliverPersonaTailInterruptionNotice({
+      logicalChatJid: chatJid,
+      scopeKey: channelTurnScope(effectiveGroup.folder),
+      inputTurnId,
+      targetJid: scope?.sourceJid ?? replySourceImJid,
+      scope,
+    });
+  };
   const makeOnCardCreated = (jid: string) => (messageId: string) =>
     registerMessageIdMapping(messageId, jid);
   // 重试轮（指数退避后的重跑）静默执行，不新建流式卡片：否则一条持续失败的
   // 消息每轮都会在飞书发一张「生成中→处理出错」卡，最多刷 6 张（消息洪流）。
   // 重试成功时最终回复仍经静态 sendMessage 送达。
   let streamingSession =
-    retryAttempt > 0
+    retryAttempt > 0 || !publishesFrameworkAnswer(interactionMode)
       ? undefined
       : await imManager.createStreamingSession(
           streamingSessionJid,
@@ -5308,6 +5419,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         }
         return true;
       },
+      onUtteranceDelivered: () => {
+        if (interactionMode !== 'persona') return;
+        channelPhysicalDeliveryAckByInput.set(inputTurnId, true);
+        sentReplyByInput.set(inputTurnId, true);
+        acknowledgeIpcReplyTurn(ipcReplyTurnTracker, inputTurnId);
+      },
     });
     turnOutputCoordinators.set(inputTurnId, coordinator);
     return coordinator;
@@ -5355,10 +5472,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           return false;
         }
         nextLifecycle =
+          publishesFrameworkAnswer(interactionMode) &&
           nextAddress.provider === 'feishu'
             ? nextRuntime.reserveStreamingCard()
             : undefined;
-        if (nextAddress.provider === 'feishu' && !nextLifecycle) {
+        if (
+          publishesFrameworkAnswer(interactionMode) &&
+          nextAddress.provider === 'feishu' &&
+          !nextLifecycle
+        ) {
           nextRuntime.retry('Unable to reserve warm streaming card');
           nextRuntime.dispose();
           return false;
@@ -5507,6 +5629,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // 见下方 stream 事件处理的 sessionErrored 分支），在新用户消息开启新一轮时
         // 重建一张干净卡片，恢复流式展示能力。
         if (
+          publishesFrameworkAnswer(interactionMode) &&
           streamingSession &&
           (streamingSession as { currentState?: string }).currentState ===
             'error'
@@ -5538,7 +5661,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
           }
         }
-        if (!streamingSession && newImJid) {
+        if (
+          publishesFrameworkAnswer(interactionMode) &&
+          !streamingSession &&
+          newImJid
+        ) {
           streamingSession = await imManager
             .createStreamingSession(
               streamingSessionJid,
@@ -5577,7 +5704,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const newStreamingJid =
         replySourceImJid ??
         (directImReply ? `web:${effectiveGroup.folder}` : chatJid);
-      if (newStreamingJid !== streamingSessionJid) {
+      if (
+        publishesFrameworkAnswer(interactionMode) &&
+        newStreamingJid !== streamingSessionJid
+      ) {
         if (streamingSession) {
           if (streamingSession.isActive()) streamingSession.dispose();
           unregisterStreamingSession(streamingSessionJid);
@@ -5939,11 +6069,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             const answerProjection = streamTurnCoordinator.reduceStreamEvent(
               result.streamEvent,
             );
-            if (answerProjection.visibleAnswerChanged) {
+            if (
+              publishesFrameworkAnswer(interactionMode) &&
+              answerProjection.visibleAnswerChanged
+            ) {
               streamingAccumulatedText = answerProjection.visibleAnswerText;
             }
 
-            broadcastStreamEvent(chatJid, result.streamEvent);
+            if (
+              shouldBroadcastSdkStreamEvent(interactionMode, result.streamEvent)
+            ) {
+              broadcastStreamEvent(chatJid, result.streamEvent);
+            }
 
             // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
             // 仅累积主 Agent 文本（无 parentToolUseId）。子 Agent（SDK Task）的
@@ -6077,7 +6214,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               const inlineAlreadySaved =
                 shutdownSavedJids.has(chatJid) ||
                 shutdownSavedJids.has(inlineWebJid);
-              if (!sentReply && !inlineAlreadySaved) {
+              if (
+                publishesFrameworkAnswer(interactionMode) &&
+                !sentReply &&
+                !inlineAlreadySaved
+              ) {
                 const interruptedText = steered
                   ? buildSteeredReply(streamingAccumulatedText)
                   : buildStoppedReply(
@@ -6161,15 +6302,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     se.taskDescription,
                   );
                 }
-                broadcastAgentStatus(
-                  chatJid,
-                  taskId,
-                  'running',
-                  taskName,
-                  desc,
-                  undefined,
-                  'task',
-                );
+                if (publishesFrameworkAnswer(interactionMode)) {
+                  broadcastAgentStatus(
+                    chatJid,
+                    taskId,
+                    'running',
+                    taskName,
+                    desc,
+                    undefined,
+                    'task',
+                  );
+                }
               } catch (err) {
                 logger.warn(
                   { err, toolUseId: se.toolUseId },
@@ -6187,15 +6330,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 ) {
                   updateAgentStatus(se.toolUseId, 'completed');
                   queryTaskIds.delete(existing.id);
-                  broadcastAgentStatus(
-                    chatJid,
-                    existing.id,
-                    'completed',
-                    existing.name,
-                    existing.prompt,
-                    existing.result_summary || '任务已完成',
-                    'task',
-                  );
+                  if (publishesFrameworkAnswer(interactionMode)) {
+                    broadcastAgentStatus(
+                      chatJid,
+                      existing.id,
+                      'completed',
+                      existing.name,
+                      existing.prompt,
+                      existing.result_summary || '任务已完成',
+                      'task',
+                    );
+                  }
                 }
               } catch (err) {
                 logger.warn(
@@ -6245,27 +6390,31 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     last_im_jid: null,
                     spawned_from_jid: null,
                   });
-                  broadcastAgentStatus(
-                    chatJid,
-                    targetTaskId,
-                    status,
-                    'Task',
-                    '',
-                    summary,
-                    'task',
-                  );
+                  if (publishesFrameworkAnswer(interactionMode)) {
+                    broadcastAgentStatus(
+                      chatJid,
+                      targetTaskId,
+                      status,
+                      'Task',
+                      '',
+                      summary,
+                      'task',
+                    );
+                  }
                 } else if (existing.kind === 'task') {
                   updateAgentStatus(existing.id, status, summary);
                   queryTaskIds.delete(existing.id);
-                  broadcastAgentStatus(
-                    chatJid,
-                    existing.id,
-                    status,
-                    existing.name,
-                    existing.prompt,
-                    summary,
-                    'task',
-                  );
+                  if (publishesFrameworkAnswer(interactionMode)) {
+                    broadcastAgentStatus(
+                      chatJid,
+                      existing.id,
+                      status,
+                      existing.name,
+                      existing.prompt,
+                      summary,
+                      'task',
+                    );
+                  }
                 }
               } catch (err) {
                 logger.warn(
@@ -6361,6 +6510,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             );
             resetIdleTimer();
             return;
+          }
+
+          if (!publishesFrameworkAnswer(interactionMode)) {
+            // In person-like mode the SDK Result is an internal control-plane
+            // terminal, never a user-visible answer. A healthy turn may have
+            // emitted several native messages or intentionally stayed silent.
+            result.result = null;
+            if (result.status === 'success' && result.inputTurnCompleted) {
+              if (completeChannelRuntimesForOutput(result)) commitCursor();
+              broadcastStreamEvent(chatJid, {
+                eventType: 'status',
+                statusText: 'idle',
+                turnId: result.inputTurnId ?? lastProcessed.id,
+                sessionId: activeSessionId,
+              });
+              resetIdleTimer();
+              return;
+            }
           }
 
           // Merge SDK Result and any send_message(final) candidate into the
@@ -6968,7 +7135,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     // ── 检测中断：有累积文本但从未发送回复 ──
-    const wasInterrupted = streamInterrupted && !sentReply;
+    const wasInterrupted =
+      publishesFrameworkAnswer(interactionMode) &&
+      streamInterrupted &&
+      !sentReply;
     const wasSteered = wasInterrupted && streamSteered;
 
     // ── Streaming card cleanup ──
@@ -7048,9 +7218,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const explicitDiscard =
         queue.getRecentStopDisposition(effectiveGroup.folder) === 'discard';
       for (const [inputTurnId, runtime] of channelTurnRuntimes) {
-        const inputSettled =
-          healthyInputTurnCompleted &&
+        const utteranceDelivered =
           channelPhysicalDeliveryAckByInput.get(inputTurnId) === true;
+        const inputSettled = isInteractionTurnSettled({
+          mode: interactionMode,
+          healthyInputTurnCompleted,
+          utteranceDelivered,
+        });
         let settled = false;
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
@@ -7077,12 +7251,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         } else if (explicitDiscard) {
           settled = runtime.cancel('Input discarded by explicit stop');
         } else if (
-          inputTurnId === ipcReplyTurnTracker.inputTurnId &&
+          (interactionMode === 'persona' ||
+            inputTurnId === ipcReplyTurnTracker.inputTurnId) &&
           inputSettled
         ) {
           settled =
             runtime.markFinalizing() &&
-            runtime.complete({ cursorCommitted, sentReply });
+            runtime.complete({
+              cursorCommitted,
+              sentReply:
+                interactionMode === 'persona' ? utteranceDelivered : sentReply,
+              silent: interactionMode === 'persona' && !utteranceDelivered,
+            });
         } else {
           settled = runtime.retry(
             lastError ||
@@ -7193,6 +7373,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // narrow delivery signals complete the turn; DB-only interrupt partials
     // deliberately do not set either signal and therefore remain retryable.
     if (genuineReplyDelivered || ipcReplyTurnTracker.delivered) {
+      await notifyPersonaTailInterruption(ipcReplyTurnTracker.inputTurnId);
       commitCursor();
       return true;
     }
@@ -7287,6 +7468,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       { group: group.name, chatJid, turnOutcome },
       'Container close resolved without replay',
     );
+    await notifyPersonaTailInterruption(ipcReplyTurnTracker.inputTurnId);
     return true;
   }
 
@@ -7303,16 +7485,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           { chatJid, marked },
           'Marked remaining running task agents as error',
         );
-        for (const agent of runningAgents) {
-          broadcastAgentStatus(
-            chatJid,
-            agent.id,
-            'error',
-            agent.name,
-            agent.prompt,
-            '容器超时或异常退出',
-            agent.kind,
-          );
+        if (publishesFrameworkAnswer(interactionMode)) {
+          for (const agent of runningAgents) {
+            broadcastAgentStatus(
+              chatJid,
+              agent.id,
+              'error',
+              agent.name,
+              agent.prompt,
+              '容器超时或异常退出',
+              agent.kind,
+            );
+          }
         }
       }
     } catch (err) {
@@ -7337,15 +7521,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           'completed',
           agent.result_summary || '任务已完成',
         );
-        broadcastAgentStatus(
-          chatJid,
-          taskId,
-          'completed',
-          agent.name,
-          agent.prompt,
-          agent.result_summary || '任务已完成',
-          agent.kind,
-        );
+        if (publishesFrameworkAnswer(interactionMode)) {
+          broadcastAgentStatus(
+            chatJid,
+            taskId,
+            'completed',
+            agent.name,
+            agent.prompt,
+            agent.result_summary || '任务已完成',
+            agent.kind,
+          );
+        }
         completed += 1;
       }
       if (completed > 0) {
@@ -7360,6 +7546,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'Failed to force-complete stale running task agents',
       );
     }
+  }
+
+  if (
+    shouldSendPersonaTailInterruptionNotice({
+      mode: interactionMode,
+      utteranceDelivered: ipcReplyTurnTracker.delivered,
+      runnerFailed: isErrorExit,
+    })
+  ) {
+    await notifyPersonaTailInterruption(ipcReplyTurnTracker.inputTurnId);
+    commitCursor();
+    return true;
   }
 
   if (isErrorExit && !healthyInputTurnCompleted) {
@@ -7702,6 +7900,10 @@ async function runAgent(
   const resolvedAgentProfile = resolveEffectiveAgentProfile(
     agentProfile ?? getAgentProfileForWorkspace(group.folder, group.created_by),
   );
+  const interactionMode = resolveRuntimeInteractionMode(
+    getWorkspaceInteractionMode(group.folder),
+    { agentKind: 'main' },
+  );
   if (resetMainSessionForAgentProfileMismatch(group, resolvedAgentProfile)) {
     logger.info(
       { groupFolder: group.folder, chatJid },
@@ -7819,6 +8021,7 @@ async function runAgent(
           turnId,
           groupFolder: group.folder,
           chatJid,
+          interactionMode,
           currentSourceJid,
           channelContext,
           isMain: isAdminHome,
@@ -7843,6 +8046,7 @@ async function runAgent(
           turnId,
           groupFolder: group.folder,
           chatJid,
+          interactionMode,
           currentSourceJid,
           channelContext,
           isMain: isAdminHome,
@@ -8433,6 +8637,28 @@ function startIpcWatcher(): void {
                 data.taskId ||
                 ipcTaskId
               );
+              const frozenIpcMode = resolveFrozenIpcInteractionMode(
+                data.interactionMode,
+                {
+                  scheduledTask: isTaskIpcMessage,
+                  spawnAgent:
+                    !!ipcAgentId &&
+                    getAgent(ipcAgentId)?.kind !== 'conversation',
+                },
+              );
+              if (!frozenIpcMode.valid) {
+                messageResultWritten = writeIpcMessageResult(
+                  messageResultsDir,
+                  messageRequestId,
+                  {
+                    success: false,
+                    error: 'Invalid frozen interaction mode.',
+                  },
+                );
+                await fsp.unlink(filePath);
+                continue;
+              }
+              const ipcInteractionMode = frozenIpcMode.mode;
               const authorized = canSendCrossGroupMessage(
                 isAdminHome,
                 isHome,
@@ -8449,6 +8675,7 @@ function startIpcWatcher(): void {
                   deliveryRole: data.deliveryRole,
                   authorized,
                   scheduledTask: isTaskIpcMessage,
+                  interactionMode: ipcInteractionMode,
                 },
                 activeTurnOutputs,
               );
@@ -8577,6 +8804,9 @@ function startIpcWatcher(): void {
                           data.inputTurnId,
                           `ipc-message:${messageRequestId ?? file}`,
                         ),
+                        usesNativeMessagePresentation(ipcInteractionMode)
+                          ? { presentation: 'native' }
+                          : undefined,
                       );
                     }
                   }
@@ -8698,6 +8928,18 @@ function startIpcWatcher(): void {
                 ipcTaskId ||
                 ipcAgentId
               );
+              if (
+                messageDelivered &&
+                !messageStaged &&
+                !isTaskIpcMessage &&
+                typeof data.inputTurnId === 'string' &&
+                data.inputTurnId
+              ) {
+                activeTurnOutputs.recordDeliveredUtterance({
+                  scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
+                  inputTurnId: data.inputTurnId,
+                });
+              }
               if (
                 messageDelivered &&
                 !messageStaged &&
@@ -11390,6 +11632,10 @@ async function processAgentConversation(
       effectiveGroup.created_by,
     ),
   );
+  const interactionMode = resolveRuntimeInteractionMode(
+    getWorkspaceInteractionMode(effectiveGroup.folder),
+    { agentKind: agent.kind },
+  );
   const resetForAgentProfile = resetConversationSessionForAgentProfileMismatch(
     effectiveGroup,
     agentId,
@@ -11525,7 +11771,9 @@ async function processAgentConversation(
     for (const inputId of inputIds) {
       const runtime = agentChannelTurnRuntimes.get(inputId);
       if (!runtime) continue;
-      if (agentPhysicalDeliveryAckByInput.get(inputId) !== true) {
+      const utteranceDelivered =
+        agentPhysicalDeliveryAckByInput.get(inputId) === true;
+      if (publishesFrameworkAnswer(interactionMode) && !utteranceDelivered) {
         allCompleted = false;
         logger.error(
           { chatJid, agentId, inputTurnId: inputId, runId: runtime.runId },
@@ -11537,7 +11785,8 @@ async function processAgentConversation(
         runtime.markFinalizing() &&
         runtime.complete({
           cursorCommitted: true,
-          replyDelivered: true,
+          replyDelivered: utteranceDelivered,
+          silent: !utteranceDelivered,
           inputTurnId: inputId,
         });
       if (completed) {
@@ -11637,10 +11886,13 @@ async function processAgentConversation(
   }
   const agentRetryAttempt = queue.getRetryCount(virtualChatJid);
   let activeAgentDurableCardLifecycle =
-    agentRetryAttempt === 0 && agentStreamingAddress?.provider === 'feishu'
+    publishesFrameworkAnswer(interactionMode) &&
+    agentRetryAttempt === 0 &&
+    agentStreamingAddress?.provider === 'feishu'
       ? agentChannelTurnRuntime?.reserveStreamingCard()
       : undefined;
   if (
+    publishesFrameworkAnswer(interactionMode) &&
     agentChannelTurnRuntime &&
     agentStreamingAddress?.provider === 'feishu' &&
     agentRetryAttempt === 0 &&
@@ -11658,14 +11910,15 @@ async function processAgentConversation(
     ActiveChannelOutboxScope
   >();
   const rejectedAgentInputTurns = new Set<string>();
-  let agentStreamingSession = replySourceImJid
-    ? await imManager.createStreamingSession(
-        replySourceImJid,
-        (messageId) =>
-          registerMessageIdMapping(messageId, streamingSessionJid!),
-        activeAgentDurableCardLifecycle,
-      )
-    : undefined;
+  let agentStreamingSession =
+    publishesFrameworkAnswer(interactionMode) && replySourceImJid
+      ? await imManager.createStreamingSession(
+          replySourceImJid,
+          (messageId) =>
+            registerMessageIdMapping(messageId, streamingSessionJid!),
+          activeAgentDurableCardLifecycle,
+        )
+      : undefined;
   const agentStreamingSessionsByInput = new Map<
     string,
     { session: NonNullable<typeof agentStreamingSession>; jid: string }
@@ -11818,6 +12071,11 @@ async function processAgentConversation(
         }
         return true;
       },
+      onUtteranceDelivered: () => {
+        if (interactionMode !== 'persona') return;
+        agentPhysicalDeliveryAckByInput.set(inputTurnId, true);
+        agentReplySentByInput.set(inputTurnId, true);
+      },
     });
     agentTurnOutputCoordinators.set(inputTurnId, coordinator);
     return coordinator;
@@ -11856,10 +12114,15 @@ async function processAgentConversation(
         return false;
       }
       nextLifecycle =
+        publishesFrameworkAnswer(interactionMode) &&
         nextAddress.provider === 'feishu'
           ? nextRuntime.reserveStreamingCard()
           : undefined;
-      if (nextAddress.provider === 'feishu' && !nextLifecycle) {
+      if (
+        publishesFrameworkAnswer(interactionMode) &&
+        nextAddress.provider === 'feishu' &&
+        !nextLifecycle
+      ) {
         nextRuntime.retry('Unable to reserve warm agent card');
         nextRuntime.dispose();
         return false;
@@ -12064,6 +12327,32 @@ async function processAgentConversation(
   const agentPhysicalDeliveryAckByInput = new Map<string, boolean>([
     [lastProcessed.id, false],
   ]);
+  let personaAgentTailNoticeDelivered = false;
+  const notifyPersonaAgentTailInterruption = async (
+    inputTurnId: string,
+  ): Promise<boolean> => {
+    if (
+      personaAgentTailNoticeDelivered ||
+      !shouldSendPersonaTailInterruptionNotice({
+        mode: interactionMode,
+        utteranceDelivered:
+          agentPhysicalDeliveryAckByInput.get(inputTurnId) === true,
+        runnerFailed: true,
+      })
+    ) {
+      return false;
+    }
+    personaAgentTailNoticeDelivered = true;
+    const scope = agentChannelOutboxScopesByInput.get(inputTurnId);
+    return deliverPersonaTailInterruptionNotice({
+      logicalChatJid: virtualChatJid,
+      scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+      inputTurnId,
+      agentId,
+      targetJid: scope?.sourceJid ?? replySourceImJid,
+      scope,
+    });
+  };
   const currentAgentSourceJid = lastProcessed.source_jid || chatJid;
   const currentAgentChannelContext = resolveBatchChannelContext(
     missedMessages,
@@ -12269,10 +12558,15 @@ async function processAgentConversation(
       const agentAnswerProjection = agentTurnCoordinator.reduceStreamEvent(
         output.streamEvent,
       );
-      if (agentAnswerProjection.visibleAnswerChanged) {
+      if (
+        publishesFrameworkAnswer(interactionMode) &&
+        agentAnswerProjection.visibleAnswerChanged
+      ) {
         agentStreamingAccText = agentAnswerProjection.visibleAnswerText;
       }
-      broadcastStreamEvent(chatJid, output.streamEvent, agentId);
+      if (shouldBroadcastSdkStreamEvent(interactionMode, output.streamEvent)) {
+        broadcastStreamEvent(chatJid, output.streamEvent, agentId);
+      }
 
       // ── Feed stream events into Feishu streaming card ──
       if (agentStreamingSession) {
@@ -12342,7 +12636,7 @@ async function processAgentConversation(
             }
           }
         }
-        if (!cursorCommitted) {
+        if (publishesFrameworkAnswer(interactionMode) && !cursorCommitted) {
           const interruptedText = steered
             ? buildSteeredReply(agentStreamingAccText)
             : buildStoppedReply(agentStreamingAccText);
@@ -12457,6 +12751,25 @@ async function processAgentConversation(
       // don't get killed while the agent is actively working.
       resetIdleTimer();
       return;
+    }
+
+    if (!publishesFrameworkAnswer(interactionMode)) {
+      output.result = null;
+      if (output.status === 'success' && output.inputTurnCompleted) {
+        if (completeAgentChannelRuntimesForOutput(output)) commitCursor();
+        broadcastStreamEvent(
+          chatJid,
+          {
+            eventType: 'status',
+            statusText: 'idle',
+            turnId: output.inputTurnId ?? lastProcessed.id,
+            sessionId: currentAgentSessionId,
+          },
+          agentId,
+        );
+        resetIdleTimer();
+        return;
+      }
     }
 
     // Provider quota/limit notice surfaced as a "successful" result — silent
@@ -13022,6 +13335,7 @@ async function processAgentConversation(
       turnId: lastProcessed.id,
       groupFolder: effectiveGroup.folder,
       chatJid,
+      interactionMode,
       currentSourceJid: currentAgentSourceJid,
       channelContext: currentAgentChannelContext,
       isMain: isAdminHome,
@@ -13186,6 +13500,19 @@ async function processAgentConversation(
           : 'Conversation agent close resolved without replay',
       );
     }
+    if (
+      interactionMode === 'persona' &&
+      (output.status === 'error' || hadError)
+    ) {
+      const utteranceDelivered =
+        agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true;
+      if (utteranceDelivered) {
+        commitCursor();
+        retryUnfinishedTurn = false;
+      } else {
+        retryUnfinishedTurn = true;
+      }
+    }
   } catch (err) {
     hadError = true;
     logger.error({ agentId, chatJid, err }, 'Agent conversation error');
@@ -13194,12 +13521,20 @@ async function processAgentConversation(
     // on that throw path; mutation-preserve stops deliberately keep the cursor.
     if (queue.getRecentStopDisposition(effectiveGroup.folder) === 'discard') {
       commitCursor();
+    } else if (interactionMode === 'persona') {
+      const utteranceDelivered =
+        agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true;
+      if (utteranceDelivered) commitCursor();
+      retryUnfinishedTurn = !utteranceDelivered;
     }
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
 
     const wasInterrupted =
-      agentStreamInterrupted && !agentInterruptFinalized && !cursorCommitted;
+      publishesFrameworkAnswer(interactionMode) &&
+      agentStreamInterrupted &&
+      !agentInterruptFinalized &&
+      !cursorCommitted;
     const wasSteered = wasInterrupted && agentStreamSteered;
 
     // ── Streaming card cleanup ──
@@ -13278,9 +13613,13 @@ async function processAgentConversation(
     if (agentChannelTurnRuntimes.size > 0) {
       let allAgentManualNoticesAcknowledged = true;
       for (const [inputTurnId, runtime] of agentChannelTurnRuntimes) {
-        const inputSettled =
-          healthyAgentInputTurnCompleted &&
+        const utteranceDelivered =
           agentPhysicalDeliveryAckByInput.get(inputTurnId) === true;
+        const inputSettled = isInteractionTurnSettled({
+          mode: interactionMode,
+          healthyInputTurnCompleted: healthyAgentInputTurnCompleted,
+          utteranceDelivered,
+        });
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
         );
@@ -13305,12 +13644,17 @@ async function processAgentConversation(
               })
             : false;
           if (!notified) allAgentManualNoticesAcknowledged = false;
-        } else if (runtime === agentChannelTurnRuntime && inputSettled) {
+        } else if (
+          (interactionMode === 'persona' ||
+            runtime === agentChannelTurnRuntime) &&
+          inputSettled
+        ) {
           settled =
             runtime.markFinalizing() &&
             runtime.complete({
               cursorCommitted,
-              replyDelivered: true,
+              replyDelivered: utteranceDelivered,
+              silent: interactionMode === 'persona' && !utteranceDelivered,
               inputTurnId,
             });
         } else {
@@ -13347,6 +13691,16 @@ async function processAgentConversation(
           retryUnfinishedTurn = true;
         }
       }
+    }
+
+    if (
+      interactionMode === 'persona' &&
+      agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true
+    ) {
+      // A native utterance is an irreversible user-visible side effect. If the
+      // runner faults afterwards, replaying the input would duplicate it.
+      commitCursor();
+      retryUnfinishedTurn = false;
     }
 
     // ── 保存中断内容 ──
@@ -13405,7 +13759,11 @@ async function processAgentConversation(
     }
 
     // ── 兜底：进程异常退出导致累积文本未持久化 ──
-    if (!cursorCommitted && agentStreamingAccText.trim()) {
+    if (
+      publishesFrameworkAnswer(interactionMode) &&
+      !cursorCommitted &&
+      agentStreamingAccText.trim()
+    ) {
       try {
         const partialReply = buildInterruptedReply(agentStreamingAccText);
         const msgId = crypto.randomUUID();
@@ -13561,6 +13919,16 @@ async function processAgentConversation(
         channelTurnScope(effectiveGroup.folder, agentId),
         scope,
       );
+    }
+    if (
+      shouldSendPersonaTailInterruptionNotice({
+        mode: interactionMode,
+        utteranceDelivered:
+          agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true,
+        runnerFailed: hadError || agentClosed,
+      })
+    ) {
+      await notifyPersonaAgentTailInterruption(activeAgentInputTurnId);
     }
     activeAgentBuilderTurns.delete(agentBuilderScope);
     activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder, agentId));

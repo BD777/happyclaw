@@ -173,6 +173,7 @@ export interface FeishuConnection {
     chatId: string,
     text: string,
     localImagePaths?: string[],
+    options?: { presentation?: 'default' | 'native' },
   ): Promise<void>;
   sendImage(
     chatId: string,
@@ -3246,6 +3247,7 @@ export function createFeishuConnection(
       chatId: string,
       text: string,
       localImagePaths?: string[],
+      options?: { presentation?: 'default' | 'native' },
     ): Promise<void> {
       if (!client) {
         throw new Error('Feishu client is not initialized');
@@ -3254,43 +3256,51 @@ export function createFeishuConnection(
       requireFeishuRouteTarget(chatId);
 
       try {
-        // Detect pre-built Feishu interactive card JSON — send directly without wrapping
-        if (text.startsWith('{"type":"interactive"')) {
-          try {
-            const parsed = JSON.parse(text);
-            if (parsed.type === 'interactive' && parsed.card) {
-              await sendToFeishu(chatId, 'interactive', text);
-              clearAckForTarget(chatId);
-              return;
-            }
-          } catch {
-            // Not valid card JSON, fall through to normal handling
-          }
-        }
-
-        // Count markdown tables to decide format upfront — Feishu cards have a table limit
-        // Each table has exactly one separator row (e.g. |---|---|), so counting those = table count
-        const tableCount = (text.match(/^\|[\s:-]+\|/gm) || []).length;
-        const usePostMd = tableCount > CARD_TABLE_LIMIT;
-
-        if (usePostMd) {
-          // Too many tables for card format, go directly to post+md
-          const postContent = buildPostMdFallback(text);
-          await sendToFeishu(chatId, 'post', postContent);
+        // Person-like workspace Agents speak as ordinary native rich-text
+        // messages. They never enter the interactive-card presentation lane.
+        if (options?.presentation === 'native') {
+          await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
         } else {
-          const card = buildInteractiveCard(text);
-          const content = JSON.stringify(card);
-          try {
-            await sendToFeishu(chatId, 'interactive', content);
-          } catch (err) {
-            logger.warn(
-              { err, chatId },
-              'Feishu interactive send failed, fallback to post+md',
-            );
+          if (text.startsWith('{"type":"interactive"')) {
+            // Detect pre-built Feishu interactive card JSON — send directly
+            // without wrapping.
+            try {
+              const parsed = JSON.parse(text);
+              if (parsed.type === 'interactive' && parsed.card) {
+                await sendToFeishu(chatId, 'interactive', text);
+                clearAckForTarget(chatId);
+                return;
+              }
+            } catch {
+              // Not valid card JSON, fall through to normal handling
+            }
+          }
+
+          // Count markdown tables to decide format upfront — Feishu cards have
+          // a table limit. Each table has exactly one separator row.
+          const tableCount = (text.match(/^\|[\s:-]+\|/gm) || []).length;
+          const usePostMd = tableCount > CARD_TABLE_LIMIT;
+
+          if (usePostMd) {
             await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
+          } else {
+            const card = buildInteractiveCard(text);
+            const content = JSON.stringify(card);
+            try {
+              await sendToFeishu(chatId, 'interactive', content);
+            } catch (err) {
+              logger.warn(
+                { err, chatId },
+                'Feishu interactive send failed, fallback to post+md',
+              );
+              await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
+            }
           }
         }
-        logger.debug({ chatId }, 'Sent Feishu card message');
+        logger.debug(
+          { chatId, presentation: options?.presentation ?? 'default' },
+          'Sent Feishu message',
+        );
 
         for (const localImagePath of localImagePaths || []) {
           try {
@@ -3323,7 +3333,7 @@ export function createFeishuConnection(
         }
         clearAckForTarget(chatId);
       } catch (err) {
-        logger.error({ err, chatId }, 'Failed to send Feishu card message');
+        logger.error({ err, chatId }, 'Failed to send Feishu message');
         clearAckForTarget(chatId);
         throw err;
       }

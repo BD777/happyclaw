@@ -76,7 +76,11 @@ import {
 } from './claude-context-resolver.js';
 import { pluginSkillLayers } from './effective-skill-resolver.js';
 import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
-import type { AgentProfileRuntimePolicy, ChannelTurnContext } from './types.js';
+import type {
+  AgentProfileRuntimePolicy,
+  ChannelTurnContext,
+  InteractionMode,
+} from './types.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import {
@@ -316,6 +320,8 @@ export interface ContainerInput {
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
+  /** Workspace-scoped interaction contract for this public Agent turn. */
+  interactionMode?: InteractionMode;
   /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */

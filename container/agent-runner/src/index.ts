@@ -268,6 +268,7 @@ const OUTPUT_GUIDELINES = loadPrompt('output.md');
 const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
 const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
 const DELIVERY_CONTRACT = loadPrompt('delivery-contract.md');
+const PERSONA_DELIVERY_CONTRACT = loadPrompt('delivery-contract.persona.md');
 const AGENT_BUILDER_GUIDELINES = loadPrompt('agent-builder.md');
 const MEMORY_SYSTEM_HOME = loadPrompt('memory-system.home.md');
 const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
@@ -2132,7 +2133,12 @@ async function runQueryAttempt(
           },
         }
       : {}),
-    ...(containerInput.agentId ? { deliveryContract: DELIVERY_CONTRACT } : {}),
+    ...(containerInput.interactionMode === 'persona' &&
+    !containerInput.isScheduledTask
+      ? { deliveryContract: PERSONA_DELIVERY_CONTRACT }
+      : containerInput.agentId
+        ? { deliveryContract: DELIVERY_CONTRACT }
+        : {}),
   });
   for (const warning of promptPlan.warnings) log(`[WARN] ${warning}`);
   if (promptPlan.errors.length > 0) {
@@ -3376,6 +3382,7 @@ async function main(): Promise<void> {
     isHome,
     isAdminHome,
     agentBuilderEnabled,
+    interactionMode: containerInput.interactionMode ?? 'assistant',
     isScheduledTask: containerInput.isScheduledTask || false,
     currentTaskId: containerInput.messageTaskId ?? null,
     currentInputTurnId: containerInput.turnId,

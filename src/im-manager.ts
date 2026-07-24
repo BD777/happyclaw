@@ -8,6 +8,7 @@
 import {
   type IMChannel,
   type IMChannelConnectOpts,
+  type ChannelMessageDeliveryOptions,
   getChannelType,
   createFeishuChannel,
   createTelegramChannel,
@@ -766,6 +767,7 @@ export class IMConnectionManager {
     jid: string,
     text: string,
     localImagePaths?: string[],
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
@@ -778,7 +780,12 @@ export class IMConnectionManager {
     if (!channel) {
       throw new Error(`No IM channel available for ${jid} (${channelType})`);
     }
-    await channel.sendMessage(chatId, text, localImagePaths);
+    if (options) {
+      await channel.sendMessage(chatId, text, localImagePaths, options);
+    } else {
+      // Preserve the historical three-argument connector call shape.
+      await channel.sendMessage(chatId, text, localImagePaths);
+    }
   }
 
   /**

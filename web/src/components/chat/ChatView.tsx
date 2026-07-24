@@ -30,6 +30,7 @@ import {
   PanelRightClose,
   PanelRightOpen,
   Server,
+  Settings2,
   SlidersHorizontal,
   Sun,
   Terminal,
@@ -50,6 +51,8 @@ import {
 } from '../../utils/workspaceLastAgent';
 import { CHANNEL_LABEL } from '../settings/channel-meta';
 import { getAgentProfileDisplayName } from '../../utils/agent-product';
+import { normalizeInteractionMode } from '../../lib/interaction-mode';
+import { WorkspaceInteractionModeDialog } from './WorkspaceInteractionModeDialog';
 
 /** Sentinel value for binding the main conversation (vs. a specific agent) */
 const MAIN_BINDING = '__main__' as const;
@@ -79,6 +82,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     'files',
   );
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [showInteractionModeDialog, setShowInteractionModeDialog] =
+    useState(false);
   const [resetLoading, setResetLoading] = useState(false);
   const [resetAgentId, setResetAgentId] = useState<string | null>(null);
   // Desktop: visible controls panel height, mounted controls terminal lifecycle.
@@ -123,6 +128,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const handleStreamEvent = useChatStore((s) => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore((s) => s.handleWsNewMessage);
   const handleStreamSnapshot = useChatStore((s) => s.handleStreamSnapshot);
+  const updateInteractionMode = useChatStore((s) => s.updateInteractionMode);
 
   const agents = useChatStore((s) => s.agents[groupJid] ?? EMPTY_AGENTS);
   const activeAgentTab = useChatStore(
@@ -186,6 +192,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   // ACL result is propagated via the `can_modify` field; trust it as the
   // single source of truth to avoid frontend/backend divergence.
   const canModifyWorkspaceConfig = !!group?.can_modify;
+  const interactionMode = normalizeInteractionMode(group?.interaction_mode);
 
   useEffect(() => {
     if (!canModifyWorkspaceConfig && contextPanelView === 'env') {
@@ -855,6 +862,22 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   </span>
                 </>
               )}
+              <span className="text-muted-foreground/40">·</span>
+              <span
+                className={cn(
+                  'inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[10px] font-medium',
+                  interactionMode === 'persona'
+                    ? 'border-primary/30 bg-primary/5 text-primary'
+                    : 'border-border bg-muted/50 text-muted-foreground',
+                )}
+                title={
+                  interactionMode === 'persona'
+                    ? '由 Agent 决定何时发送消息'
+                    : '任务完成后交付一条主回复'
+                }
+              >
+                {interactionMode === 'persona' ? '人物' : '助手'}
+              </span>
               {isOwnHome &&
                 imStatus &&
                 Object.entries(imStatus).some(([, v]) => v) && (
@@ -880,6 +903,18 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
               运行中
             </span>
+          )}
+          {canModifyWorkspaceConfig && (
+            <button
+              type="button"
+              onClick={() => setShowInteractionModeDialog(true)}
+              className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+              title="工作区设置"
+              aria-label="工作区设置"
+            >
+              <Settings2 className="h-4 w-4" />
+              <span className="hidden xl:inline">工作区设置</span>
+            </button>
           )}
           {canModifyWorkspaceConfig && (
             <button
@@ -986,6 +1021,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   agentAvatarUrl={group?.agent_profile_avatar_url}
                   agentAvatarEmoji={group?.agent_profile_avatar_emoji}
                   agentAvatarColor={group?.agent_profile_avatar_color}
+                  interactionMode={interactionMode}
                   onSend={(content) => {
                     handleActiveAgentSend(content);
                   }}
@@ -1036,6 +1072,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   agentAvatarUrl={group?.agent_profile_avatar_url}
                   agentAvatarEmoji={group?.agent_profile_avatar_emoji}
                   agentAvatarColor={group?.agent_profile_avatar_color}
+                  interactionMode={interactionMode}
                   onSend={(content) => handleSend(content)}
                 />
                 <MessageInput
@@ -1134,6 +1171,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           {renderContextPanel()}
         </SheetContent>
       </Sheet>
+
+      <WorkspaceInteractionModeDialog
+        open={showInteractionModeDialog}
+        workspaceName={workspaceDisplayName}
+        currentMode={interactionMode}
+        onClose={() => setShowInteractionModeDialog(false)}
+        onSave={(mode) => updateInteractionMode(groupJid, mode)}
+      />
 
       {/* Mobile: Terminal sheet */}
       <Sheet

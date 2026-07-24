@@ -114,7 +114,7 @@ describe('schema v54 durable scheduled task migration', () => {
     const db = await import('../src/db.js');
     db.initDatabase();
 
-    expect(db.getRouterState('schema_version')).toBe('60');
+    expect(db.getRouterState('schema_version')).toBe('61');
     expect(db.getTaskById('legacy-task')).toMatchObject({
       id: 'legacy-task',
       prompt: 'legacy prompt',
