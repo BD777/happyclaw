@@ -40,6 +40,7 @@ import {
   writeCredentialsFile,
 } from './runtime-config.js';
 import { providerPool } from './provider-pool.js';
+import { resolveProviderFailureDisposition } from './provider-failure.js';
 import {
   deleteSession,
   getUserById,
@@ -374,8 +375,15 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   providerFailure?: boolean;
+  /**
+   * Host-derived terminal boundary. False means the durable input must be
+   * replayed on another healthy provider; true means the pool is exhausted.
+   */
+  providerFailureTerminal?: boolean;
   /** Internal agent-runner marker: the failed turn is being retried in-process. */
   providerFailureRetrying?: boolean;
+  /** Provider failed during a post-turn internal maintenance query. */
+  providerFailureMaintenance?: boolean;
   streamEvent?: StreamEvent;
   /** Durable input-turn correlation emitted by agent-runner. */
   readonly inputTurnId?: string;
@@ -397,6 +405,31 @@ export interface ContainerOutput {
     coveredCursors?: Array<{ timestamp: string; id: string }>;
     cursor: { timestamp: string; id: string };
   }>;
+}
+
+function applyProviderFailureDisposition(
+  output: ContainerOutput,
+  selectedProfileId: string | null,
+): boolean {
+  providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
+  providerPool.refreshRecoveryState();
+  const disposition = resolveProviderFailureDisposition(
+    selectedProfileId,
+    providerPool.getHealthStatuses(),
+  );
+  applyKnownProviderFailureDisposition(output, disposition.terminal);
+  return disposition.terminal;
+}
+
+function applyKnownProviderFailureDisposition(
+  output: ContainerOutput,
+  terminal: boolean,
+): void {
+  // Provider failures are control-plane signals. Chat/task callers synthesize
+  // their own terminal projection only after the pool is exhausted.
+  output.result = null;
+  output.providerFailureTerminal = terminal;
+  output.inputTurnCompleted = terminal;
 }
 
 interface VolumeMount {
@@ -1367,6 +1400,9 @@ export async function runContainerAgent(
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
   let providerFailureReported = false;
+  let providerFailureTerminal: boolean | undefined;
+  let providerFailureMaintenance = false;
+  let healthyInputTurnCompleted = false;
   if (poolResult?.resetSession && input.sessionId) {
     logger.info(
       {
@@ -1593,6 +1629,12 @@ export async function runContainerAgent(
       };
       const handleOutput = onOutput
         ? async (output: ContainerOutput): Promise<void> => {
+            if (
+              !output.providerFailure &&
+              output.inputTurnCompleted !== undefined
+            ) {
+              healthyInputTurnCompleted = output.inputTurnCompleted;
+            }
             if (output.providerFailureRetrying) {
               if (output.providerFailure && selectedProfileId) {
                 if (!providerFailureReported) {
@@ -1611,7 +1653,6 @@ export async function runContainerAgent(
               // This is host-control metadata, never a user-visible output.
               return;
             }
-            await onOutput(output);
             if (output.providerFailure && selectedProfileId) {
               if (!providerFailureReported) {
                 providerFailureReported = true;
@@ -1626,6 +1667,64 @@ export async function runContainerAgent(
                   'Provider failure detected from streamed output, stopping container',
                 );
               }
+            }
+            if (
+              output.providerFailureMaintenance &&
+              healthyInputTurnCompleted
+            ) {
+              providerFailureMaintenance = true;
+              logger.warn(
+                {
+                  group: group.name,
+                  containerName,
+                  providerId: selectedProfileId,
+                },
+                'Provider failed during internal maintenance; quarantining without user projection or replay',
+              );
+              exec(`docker stop ${containerName}`, (err) => {
+                if (err) {
+                  logger.warn(
+                    { group: group.name, containerName, err },
+                    'Failed to stop container after maintenance provider failure',
+                  );
+                  container.kill('SIGTERM');
+                }
+              });
+              return;
+            }
+            if (output.providerFailureMaintenance) {
+              logger.warn(
+                {
+                  group: group.name,
+                  containerName,
+                  providerId: selectedProfileId,
+                },
+                'Maintenance query failed before durable input completion; treating as replayable provider failure',
+              );
+            }
+            if (output.providerFailure) {
+              const terminal = applyProviderFailureDisposition(
+                output,
+                selectedProfileId,
+              );
+              providerFailureTerminal = terminal;
+              logger.warn(
+                {
+                  group: group.name,
+                  containerName,
+                  providerId: selectedProfileId,
+                  terminal,
+                },
+                terminal
+                  ? 'Provider pool exhausted; surfacing terminal failure'
+                  : 'Provider quarantined; preserving input for failover replay',
+              );
+            }
+            // Quarantine and classify before awaiting any IM/card projection so
+            // concurrent sessions cannot keep selecting a provider that just
+            // returned an account-level failure.
+            await onOutput(output);
+            if (output.providerFailure) {
               exec(`docker stop ${containerName}`, (err) => {
                 if (err) {
                   logger.warn(
@@ -1714,6 +1813,7 @@ export async function runContainerAgent(
       if (result.providerFailure) {
         if (!providerFailureReported) {
           providerPool.reportFailure(selectedProfileId, true);
+          providerFailureReported = true;
         }
       } else if (
         !providerFailureReported &&
@@ -1722,6 +1822,27 @@ export async function runContainerAgent(
         providerPool.reportSuccess(selectedProfileId);
       } else if (result.status === 'error' && isApiError(result.error || '')) {
         providerPool.reportFailure(selectedProfileId);
+      }
+    }
+    if (providerFailureMaintenance) {
+      return {
+        ...result,
+        status: 'success',
+        result: null,
+        providerFailure: false,
+        providerFailureTerminal: undefined,
+        providerFailureMaintenance: true,
+        inputTurnCompleted: true,
+      };
+    }
+    if (result.providerFailure) {
+      if (providerFailureTerminal === undefined) {
+        providerFailureTerminal = applyProviderFailureDisposition(
+          result,
+          selectedProfileId,
+        );
+      } else {
+        applyKnownProviderFailureDisposition(result, providerFailureTerminal);
       }
     }
 
@@ -2070,6 +2191,9 @@ export async function runHostAgent(
   const globalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
+  let hostProviderFailureTerminal: boolean | undefined;
+  let hostProviderFailureMaintenance = false;
+  let hostHealthyInputTurnCompleted = false;
   if (hostPoolResult?.resetSession && input.sessionId) {
     logger.info(
       {
@@ -2428,6 +2552,12 @@ export async function runHostAgent(
       };
       const handleOutput = onOutput
         ? async (output: ContainerOutput): Promise<void> => {
+            if (
+              !output.providerFailure &&
+              output.inputTurnCompleted !== undefined
+            ) {
+              hostHealthyInputTurnCompleted = output.inputTurnCompleted;
+            }
             if (output.providerFailureRetrying) {
               if (output.providerFailure && hostSelectedProfileId) {
                 if (!hostProviderFailureReported) {
@@ -2446,7 +2576,6 @@ export async function runHostAgent(
               // This is host-control metadata, never a user-visible output.
               return;
             }
-            await onOutput(output);
             if (output.providerFailure && hostSelectedProfileId) {
               if (!hostProviderFailureReported) {
                 hostProviderFailureReported = true;
@@ -2461,6 +2590,55 @@ export async function runHostAgent(
                   'Provider failure detected from streamed output, stopping host agent',
                 );
               }
+            }
+            if (
+              output.providerFailureMaintenance &&
+              hostHealthyInputTurnCompleted
+            ) {
+              hostProviderFailureMaintenance = true;
+              logger.warn(
+                {
+                  group: group.name,
+                  processId,
+                  providerId: hostSelectedProfileId,
+                },
+                'Provider failed during internal maintenance; quarantining without user projection or replay',
+              );
+              killProcessTree(proc, 'SIGTERM');
+              return;
+            }
+            if (output.providerFailureMaintenance) {
+              logger.warn(
+                {
+                  group: group.name,
+                  processId,
+                  providerId: hostSelectedProfileId,
+                },
+                'Maintenance query failed before durable input completion; treating as replayable provider failure',
+              );
+            }
+            if (output.providerFailure) {
+              const terminal = applyProviderFailureDisposition(
+                output,
+                hostSelectedProfileId,
+              );
+              hostProviderFailureTerminal = terminal;
+              logger.warn(
+                {
+                  group: group.name,
+                  processId,
+                  providerId: hostSelectedProfileId,
+                  terminal,
+                },
+                terminal
+                  ? 'Provider pool exhausted; surfacing terminal failure'
+                  : 'Provider quarantined; preserving input for failover replay',
+              );
+            }
+            // Keep provider selection safe while the user-facing projection is
+            // awaiting a network ACK.
+            await onOutput(output);
+            if (output.providerFailure) {
               killProcessTree(proc, 'SIGTERM');
             }
           }
@@ -2537,6 +2715,7 @@ export async function runHostAgent(
       if (hostResult.providerFailure) {
         if (!hostProviderFailureReported) {
           providerPool.reportFailure(hostSelectedProfileId, true);
+          hostProviderFailureReported = true;
         }
       } else if (
         !hostProviderFailureReported &&
@@ -2548,6 +2727,30 @@ export async function runHostAgent(
         isApiError(hostResult.error || '')
       ) {
         providerPool.reportFailure(hostSelectedProfileId);
+      }
+    }
+    if (hostProviderFailureMaintenance) {
+      return {
+        ...hostResult,
+        status: 'success',
+        result: null,
+        providerFailure: false,
+        providerFailureTerminal: undefined,
+        providerFailureMaintenance: true,
+        inputTurnCompleted: true,
+      };
+    }
+    if (hostResult.providerFailure) {
+      if (hostProviderFailureTerminal === undefined) {
+        hostProviderFailureTerminal = applyProviderFailureDisposition(
+          hostResult,
+          hostSelectedProfileId,
+        );
+      } else {
+        applyKnownProviderFailureDisposition(
+          hostResult,
+          hostProviderFailureTerminal,
+        );
       }
     }
 
@@ -2563,7 +2766,13 @@ export async function runHostAgent(
 /** A concrete agent runner (Docker or host) — both share this signature. */
 export type AgentRunner = typeof runContainerAgent | typeof runHostAgent;
 
-/** Compatibility entry point; same-turn fallback now lives inside agent-runner. */
+/**
+ * Model-tier fallback lives inside agent-runner. Scheduled tasks have no warm
+ * user-turn stream, so they can also retry the same immutable prompt across
+ * healthy provider profiles here. Interactive conversations keep failover in
+ * GroupQueue/IPC recovery so a late warm-turn failure never replays the
+ * process's original cold-start prompt.
+ */
 export async function runAgentWithModelFallback(
   runFn: AgentRunner,
   group: RegisteredGroup,
@@ -2576,5 +2785,81 @@ export async function runAgentWithModelFallback(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
-  return runFn(group, input, onProcess, onOutput, ownerHomeFolder);
+  const maxAttempts = input.isScheduledTask
+    ? Math.max(1, getEnabledProviders().length)
+    : 1;
+  let lastOutput: ContainerOutput | undefined;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    let completedInputBeforeProviderFailure = false;
+    const gatedOnOutput = onOutput
+      ? async (output: ContainerOutput): Promise<void> => {
+          if (!output.providerFailure && output.inputTurnCompleted) {
+            completedInputBeforeProviderFailure = true;
+          }
+          if (
+            input.isScheduledTask &&
+            output.providerFailure &&
+            (completedInputBeforeProviderFailure ||
+              output.providerFailureTerminal !== true)
+          ) {
+            return;
+          }
+          await onOutput(output);
+        }
+      : undefined;
+
+    lastOutput = await runFn(
+      group,
+      input,
+      onProcess,
+      gatedOnOutput,
+      ownerHomeFolder,
+    );
+    if (
+      input.isScheduledTask &&
+      lastOutput.providerFailure &&
+      completedInputBeforeProviderFailure
+    ) {
+      logger.warn(
+        {
+          group: group.name,
+          attempt: attempt + 1,
+        },
+        'Provider failed after scheduled input completed; suppressing replay to avoid duplicate side effects',
+      );
+      return {
+        ...lastOutput,
+        status: 'success',
+        result: null,
+        providerFailure: false,
+        providerFailureTerminal: undefined,
+        inputTurnCompleted: true,
+      };
+    }
+    if (
+      !input.isScheduledTask ||
+      !lastOutput.providerFailure ||
+      lastOutput.providerFailureTerminal === true
+    ) {
+      return lastOutput;
+    }
+
+    logger.warn(
+      {
+        group: group.name,
+        attempt: attempt + 1,
+        maxAttempts,
+      },
+      'Scheduled task provider failed; retrying the same prompt on another provider',
+    );
+  }
+
+  return (
+    lastOutput ?? {
+      status: 'error',
+      result: null,
+      error: 'No provider attempt was executed',
+    }
+  );
 }

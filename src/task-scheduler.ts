@@ -18,6 +18,7 @@ import {
   runAgentWithModelFallback,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   advanceSkippedTask,
   cancelTaskRun,
@@ -101,6 +102,21 @@ import {
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
 import { getScriptTaskHostExecutionError } from './script-task-policy.js';
+
+export function shouldFinalizeScheduledRunOutput(
+  output: Pick<
+    ContainerOutput,
+    'status' | 'inputTurnCompleted' | 'providerFailureTerminal'
+  >,
+  inputPreviouslyCompleted = false,
+): boolean {
+  return (
+    output.status === 'error' ||
+    output.providerFailureTerminal === true ||
+    (output.status === 'success' && output.inputTurnCompleted === true) ||
+    (output.status === 'closed' && inputPreviouslyCompleted)
+  );
+}
 
 /**
  * Resolve the actual group JID to send a task to.
@@ -1003,6 +1019,7 @@ async function runTaskInner(
 
   let result: string | null = null;
   let error: string | null = null;
+  let scheduledInputCompleted = false;
   // Track the time of last meaningful output from the agent.
   // duration_ms should measure actual work time, not include idle wait.
   let lastOutputTime = startTime;
@@ -1125,10 +1142,21 @@ async function runTaskInner(
         if (streamedOutput.status === 'stream' && streamedOutput.streamEvent) {
           deps.broadcastStreamEvent?.(effectiveJid, streamedOutput.streamEvent);
         }
-        if (streamedOutput.result) {
+        if (streamedOutput.providerFailure) {
+          if (streamedOutput.providerFailureTerminal === true) {
+            error = PROVIDER_FAILURE_USER_NOTICE;
+            lastOutputTime = Date.now();
+          }
+        } else if (streamedOutput.result) {
           result = streamedOutput.result;
           lastOutputTime = Date.now();
           resetIdleTimer();
+        }
+        if (
+          !streamedOutput.providerFailure &&
+          streamedOutput.inputTurnCompleted === true
+        ) {
+          scheduledInputCompleted = true;
         }
         if (streamedOutput.status === 'error') {
           error = streamedOutput.error || 'Unknown error';
@@ -1150,9 +1178,22 @@ async function runTaskInner(
             },
           );
         }
-        // Finalize run log on first non-stream output (success/error/closed).
-        // Don't wait for the process to exit — idle timeout can be very long.
-        if (streamedOutput.status !== 'stream') {
+        const closedBeforeCompletion =
+          streamedOutput.status === 'closed' && !scheduledInputCompleted;
+        if (closedBeforeCompletion) {
+          error = 'Agent closed before completing the scheduled task input';
+          lastOutputTime = Date.now();
+        }
+        // A non-stream frame can still be an incomplete partial (context
+        // compaction/truncation). Only finalize after the durable scheduled
+        // input reaches a real terminal boundary.
+        if (
+          closedBeforeCompletion ||
+          shouldFinalizeScheduledRunOutput(
+            streamedOutput,
+            scheduledInputCompleted,
+          )
+        ) {
           finalizeRunLog();
         }
       },
@@ -1161,8 +1202,24 @@ async function runTaskInner(
 
     if (idleTimer) clearTimeout(idleTimer);
 
-    if (output.status === 'error') {
+    if (!output.providerFailure && output.inputTurnCompleted === true) {
+      scheduledInputCompleted = true;
+    }
+    if (output.providerFailure) {
+      error = PROVIDER_FAILURE_USER_NOTICE;
+      lastOutputTime = Date.now();
+    } else if (output.status === 'closed' && !scheduledInputCompleted) {
+      error = 'Agent closed before completing the scheduled task input';
+      lastOutputTime = Date.now();
+    } else if (output.status === 'error') {
       error = output.error || 'Unknown error';
+      lastOutputTime = Date.now();
+    } else if (
+      output.status === 'success' &&
+      !scheduledInputCompleted &&
+      output.inputTurnCompleted !== true
+    ) {
+      error = 'Agent exited before completing the scheduled task input';
       lastOutputTime = Date.now();
     } else if (output.result) {
       // Messages are sent via MCP tool (IPC), result text is just logged

@@ -255,8 +255,18 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   providerFailure?: boolean;
+  /**
+   * Set by the host after it quarantines the failed provider and checks the
+   * remaining pool. The agent runner itself only emits providerFailure.
+   */
+  providerFailureTerminal?: boolean;
   /** Internal host-control marker: this turn is being retried in-process. */
   providerFailureRetrying?: boolean;
+  /**
+   * Provider failed during an internal side-query after the durable user turn
+   * completed. The host quarantines it without replaying or notifying again.
+   */
+  providerFailureMaintenance?: boolean;
   streamEvent?: StreamEvent;
   /**
    * Immutable identity of the user input turn that produced this output.

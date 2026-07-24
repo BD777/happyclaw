@@ -61,6 +61,7 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   closeDatabase,
   createTask,
@@ -5037,6 +5038,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let lastError = '';
   let cursorCommitted = false;
   let healthyInputTurnCompleted = false;
+  let providerFailoverPending = false;
   let channelDeliveryNeedsManualReconciliation = false;
   let channelManualNoticesAcknowledged = true;
   let lastReplyMsgId: string | undefined;
@@ -5372,6 +5374,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     });
     logger.debug({ chatJid }, 'Streaming card session created for Feishu');
   }
+  const rollbackIdleMainCardReservation = (inputTurnId: string): boolean => {
+    const projection =
+      channelStreamingSessionsByInput.get(inputTurnId) ??
+      (inputTurnId === lastProcessed.id && streamingSession
+        ? { session: streamingSession, jid: streamingSessionJid }
+        : undefined);
+    const runtime = channelTurnRuntimes.get(inputTurnId);
+    if (projection?.session.isActive()) return false;
+    if (!runtime?.rollbackUnpublishedStreamingCardReservation()) {
+      // The reservation may already have reached Feishu. Activate the
+      // controller so the normal complete/abort path can terminalize it.
+      projection?.session.setThinking();
+      return false;
+    }
+    projection?.session.dispose();
+    if (projection) unregisterStreamingSession(projection.jid);
+    channelStreamingSessionsByInput.delete(inputTurnId);
+    if (projection?.session === streamingSession) {
+      streamingSession = undefined;
+      activeDurableCardLifecycle = undefined;
+    }
+    logger.info(
+      { chatJid, inputTurnId },
+      'Rolled back unpublished streaming card after provider failure',
+    );
+    return true;
+  };
 
   interface AdmittedWarmMainInput {
     sourceJid: string | null;
@@ -6492,27 +6521,39 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             return;
           }
 
-          // Provider quota/limit notice surfaced as a "successful" result.
-          // The switch is silent to the user (decided in #549): never deliver
-          // the English limit text to IM/web — only log for admin/monitoring.
-          // The runner already stops the container and re-routes to another
-          // provider on the next turn.
+          // Surface a stable localized notice only after the host has exhausted the
+          // provider pool. Otherwise preserve the input for failover replay.
           if (result.providerFailure) {
+            const providerFailureInputId = resolveContainerOutputInputTurnId(
+              result,
+              lastProcessed.id,
+            );
+            rollbackIdleMainCardReservation(providerFailureInputId);
+            if (result.providerFailureTerminal !== true) {
+              providerFailoverPending = true;
+              logger.warn(
+                {
+                  group: group.name,
+                  inputTurnId: providerFailureInputId,
+                },
+                'Provider failure kept retryable for failover',
+              );
+              resetIdleTimer();
+              return;
+            }
+            result.result = PROVIDER_FAILURE_USER_NOTICE;
             logger.warn(
               {
                 group: group.name,
-                result:
-                  typeof result.result === 'string'
-                    ? result.result.slice(0, 200)
-                    : result.result,
               },
-              'Provider failure result suppressed from user (silent switch)',
+              'Provider failure surfaced to user',
             );
-            resetIdleTimer();
-            return;
           }
 
-          if (!publishesFrameworkAnswer(interactionMode)) {
+          if (
+            !publishesFrameworkAnswer(interactionMode) &&
+            !result.providerFailure
+          ) {
             // In person-like mode the SDK Result is an internal control-plane
             // terminal, never a user-visible answer. A healthy turn may have
             // emitted several native messages or intentionally stayed silent.
@@ -7159,6 +7200,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           heldCardParts = [];
           heldCardUsage = null;
           await streamingSession.abort(heldNote).catch(() => {});
+        } else if (providerFailoverPending) {
+          await streamingSession
+            .abort('模型服务切换中，正在重试')
+            .catch(() => {});
         } else if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
@@ -7942,7 +7987,10 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         queue.markRunnerActivity(chatJid);
-        if (output.ipcReceipts?.length) {
+        if (
+          output.ipcReceipts?.length &&
+          (!output.providerFailure || output.providerFailureTerminal === true)
+        ) {
           queue.acknowledgeIpcDeliveries(
             chatJid,
             output.ipcReceipts,
@@ -12021,6 +12069,33 @@ async function processAgentConversation(
       'Streaming card session created for conversation agent',
     );
   }
+  const rollbackIdleAgentCardReservation = (inputTurnId: string): boolean => {
+    const projection =
+      agentStreamingSessionsByInput.get(inputTurnId) ??
+      (inputTurnId === lastProcessed.id &&
+      agentStreamingSession &&
+      streamingSessionJid
+        ? { session: agentStreamingSession, jid: streamingSessionJid }
+        : undefined);
+    const runtime = agentChannelTurnRuntimes.get(inputTurnId);
+    if (projection?.session.isActive()) return false;
+    if (!runtime?.rollbackUnpublishedStreamingCardReservation()) {
+      projection?.session.setThinking();
+      return false;
+    }
+    projection?.session.dispose();
+    if (projection) unregisterStreamingSession(projection.jid);
+    agentStreamingSessionsByInput.delete(inputTurnId);
+    if (projection?.session === agentStreamingSession) {
+      agentStreamingSession = undefined;
+      activeAgentDurableCardLifecycle = undefined;
+    }
+    logger.info(
+      { chatJid, agentId, inputTurnId },
+      'Rolled back unpublished agent streaming card after provider failure',
+    );
+    return true;
+  };
   interface AdmittedWarmAgentInput {
     sourceJid: string | null;
     imJid: string | null;
@@ -12316,6 +12391,7 @@ async function processAgentConversation(
   let cursorCommitted = false;
   let healthyAgentInputTurnCompleted = false;
   let retryUnfinishedTurn = false;
+  let agentProviderFailoverPending = false;
   let agentDeliveryNeedsManualReconciliation = false;
   let hadError = false;
   let lastError = '';
@@ -12406,7 +12482,10 @@ async function processAgentConversation(
       return;
     }
     await activateAgentProjectionForInput(output.inputTurnId);
-    if (output.ipcReceipts?.length) {
+    if (
+      output.ipcReceipts?.length &&
+      (!output.providerFailure || output.providerFailureTerminal === true)
+    ) {
       queue.acknowledgeIpcDeliveries(
         virtualJid,
         output.ipcReceipts,
@@ -12753,7 +12832,7 @@ async function processAgentConversation(
       return;
     }
 
-    if (!publishesFrameworkAnswer(interactionMode)) {
+    if (!publishesFrameworkAnswer(interactionMode) && !output.providerFailure) {
       output.result = null;
       if (output.status === 'success' && output.inputTurnCompleted) {
         if (completeAgentChannelRuntimesForOutput(output)) commitCursor();
@@ -12772,23 +12851,32 @@ async function processAgentConversation(
       }
     }
 
-    // Provider quota/limit notice surfaced as a "successful" result — silent
-    // switch (#549): suppress the English limit text from the user, log only.
-    // Session was already cleared at the top of this callback.
+    // Provider failures remain invisible while another healthy provider can
+    // replay the durable input. Only pool exhaustion becomes a terminal reply.
     if (output.providerFailure) {
+      const providerFailureInputId = resolveContainerOutputInputTurnId(
+        output,
+        lastProcessed.id,
+      );
+      rollbackIdleAgentCardReservation(providerFailureInputId);
+      if (output.providerFailureTerminal !== true) {
+        agentProviderFailoverPending = true;
+        retryUnfinishedTurn = !healthyAgentInputTurnCompleted;
+        logger.warn(
+          { chatJid, agentId, inputTurnId: providerFailureInputId },
+          'Agent provider failure kept retryable for failover',
+        );
+        resetIdleTimer();
+        return;
+      }
+      output.result = PROVIDER_FAILURE_USER_NOTICE;
       logger.warn(
         {
           chatJid,
           agentId,
-          result:
-            typeof output.result === 'string'
-              ? output.result.slice(0, 200)
-              : output.result,
         },
-        'Provider failure result suppressed from user (silent switch)',
+        'Provider failure surfaced to user',
       );
-      resetIdleTimer();
-      return;
     }
 
     if (
@@ -13558,6 +13646,10 @@ async function processAgentConversation(
           heldAgentParts = [];
           heldAgentUsage = null;
           await agentStreamingSession.abort(heldNote).catch(() => {});
+        } else if (agentProviderFailoverPending) {
+          await agentStreamingSession
+            .abort('模型服务切换中，正在重试')
+            .catch(() => {});
         } else if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
