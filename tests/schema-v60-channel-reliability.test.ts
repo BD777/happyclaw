@@ -36,7 +36,7 @@ describe('schema v60 channel reliability migration', () => {
   test('upgrades v59 in place, preserves state, and is restart-idempotent', async () => {
     const db = await import('../src/db.js');
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('61');
+    expect(db.getRouterState('schema_version')).toBe('62');
     expect(db.getRouterState('preserved-key')).toBe('preserved-value');
     db.closeDatabase();
 
@@ -59,10 +59,10 @@ describe('schema v60 channel reliability migration', () => {
     probe.close();
 
     const backups = fs.readdirSync(path.join(storeDir, 'migration-backups'));
-    expect(backups.some((name) => name.includes('v59-to-v61'))).toBe(true);
+    expect(backups.some((name) => name.includes('v59-to-v62'))).toBe(true);
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('61');
+    expect(db.getRouterState('schema_version')).toBe('62');
     expect(db.getRouterState('preserved-key')).toBe('preserved-value');
     db.closeDatabase();
   });

@@ -14,7 +14,7 @@ export function resolveRuntimeInteractionMode(
   },
 ): InteractionMode {
   if (input.scheduledTask || input.agentKind === 'spawn') return 'assistant';
-  return workspaceMode === 'persona' ? 'persona' : 'assistant';
+  return workspaceMode === 'proactive' ? 'proactive' : 'assistant';
 }
 
 export function publishesFrameworkAnswer(mode: InteractionMode): boolean {
@@ -23,7 +23,7 @@ export function publishesFrameworkAnswer(mode: InteractionMode): boolean {
 
 /**
  * Assistant turns require a healthy SDK terminal plus a physical reply ACK.
- * Persona turns may intentionally stay silent; once an utterance was delivered,
+ * Proactive turns may intentionally stay silent; once an utterance was delivered,
  * a later runner error must not replay the user's input and duplicate it.
  */
 export function isInteractionTurnSettled(input: {
@@ -31,13 +31,13 @@ export function isInteractionTurnSettled(input: {
   healthyInputTurnCompleted: boolean;
   utteranceDelivered: boolean;
 }): boolean {
-  return input.mode === 'persona'
+  return input.mode === 'proactive'
     ? input.healthyInputTurnCompleted || input.utteranceDelivered
     : input.healthyInputTurnCompleted && input.utteranceDelivered;
 }
 
 export function usesNativeMessagePresentation(mode: InteractionMode): boolean {
-  return mode === 'persona';
+  return mode === 'proactive';
 }
 
 export function buildInteractionTextOutboxPayload(
@@ -69,9 +69,13 @@ export function resolveFrozenIpcInteractionMode(
   },
 ): FrozenIpcInteractionMode {
   const legacyDefaulted = value === undefined;
-  const valid = legacyDefaulted || value === 'assistant' || value === 'persona';
+  const valid =
+    legacyDefaulted ||
+    value === 'assistant' ||
+    value === 'proactive' ||
+    value === 'persona';
   const payloadMode: InteractionMode =
-    value === 'persona' ? 'persona' : 'assistant';
+    value === 'proactive' || value === 'persona' ? 'proactive' : 'assistant';
   return {
     mode: input.scheduledTask || input.spawnAgent ? 'assistant' : payloadMode,
     valid,
@@ -80,7 +84,7 @@ export function resolveFrozenIpcInteractionMode(
 }
 
 /**
- * Persona mode exposes only lifecycle boundaries required to start/stop the
+ * Proactive mode exposes only lifecycle boundaries required to start/stop the
  * public spinner. Model thoughts, tools, usage, workflows and free-form status
  * narration remain private.
  */
@@ -97,15 +101,15 @@ export function shouldBroadcastSdkStreamEvent(
   );
 }
 
-export const PERSONA_TAIL_INTERRUPTION_NOTICE =
+export const PROACTIVE_TAIL_INTERRUPTION_NOTICE =
   '⚠️ 本轮处理在已发送部分消息后异常中断。为避免重复发言，系统没有自动重放；上面的内容可能不完整，请重新询问以继续。';
 
-export function shouldSendPersonaTailInterruptionNotice(input: {
+export function shouldSendProactiveTailInterruptionNotice(input: {
   mode: InteractionMode;
   utteranceDelivered: boolean;
   runnerFailed: boolean;
 }): boolean {
   return (
-    input.mode === 'persona' && input.utteranceDelivered && input.runnerFailed
+    input.mode === 'proactive' && input.utteranceDelivered && input.runnerFailed
   );
 }

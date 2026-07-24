@@ -270,19 +270,36 @@ function resolveBundledClaudeCli(): string | undefined {
 
 const SECURITY_RULES = loadPrompt('security-rules.md');
 const INTERACTION_GUIDELINES = loadPrompt('interaction.md');
-const OUTPUT_GUIDELINES = loadPrompt('output.md');
+const ASSISTANT_OUTPUT_GUIDELINES = loadPrompt('output.assistant.md');
+const PROACTIVE_OUTPUT_GUIDELINES = loadPrompt('output.proactive.md');
+const TASK_OUTPUT_GUIDELINES = loadPrompt('output.task.md');
 const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
 const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
-const DELIVERY_CONTRACT = loadPrompt('delivery-contract.md');
-const PERSONA_DELIVERY_CONTRACT = loadPrompt('delivery-contract.persona.md');
+const ASSISTANT_DELIVERY_CONTRACT = loadPrompt(
+  'delivery-contract.assistant.md',
+);
+const PROACTIVE_DELIVERY_CONTRACT = loadPrompt(
+  'delivery-contract.proactive.md',
+);
 const AGENT_BUILDER_GUIDELINES = loadPrompt('agent-builder.md');
 const MEMORY_SYSTEM_HOME = loadPrompt('memory-system.home.md');
 const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
 
 // 各渠道共用的格式说明：Web 端始终可看完整渲染，不因来源降级输出。
-// Mermaid 渲染说明已在 output.md（<guidelines>）讲过，此处不重复，channels/*.md 只写各自差异。
+// Mermaid 渲染说明已在模式专属 output prompt 中讲过，此处不重复，
+// channels/*.md 只写各自差异。
 const CHANNEL_FORMAT_COMMON =
   '用户同时可以在 Web 端查看你的回复，Web 端支持完整 Markdown 渲染，因此不要因为消息来源限制输出格式。';
+
+function usesProactiveInteractiveContract(
+  containerInput: ContainerInput,
+): boolean {
+  return (
+    containerInput.interactionMode === 'proactive' &&
+    !containerInput.isScheduledTask &&
+    !containerInput.messageTaskId
+  );
+}
 
 function escapeXmlAttribute(value: string): string {
   return value
@@ -295,13 +312,12 @@ function escapeXmlAttribute(value: string): string {
 
 function buildAgentIdentityPrompt(
   containerInput: ContainerInput,
+  includeClaudePreset: boolean,
 ): string | undefined {
   const agentProfile = containerInput.agentProfile;
   const profilePrompt = agentProfile?.identityPrompt;
   if (!agentProfile || !profilePrompt?.trim()) return undefined;
-  const presetBoundary = agentProfile.includeClaudePreset
-    ? '、Claude Code 原生提示词'
-    : '';
+  const presetBoundary = includeClaudePreset ? '、Claude Code 原生提示词' : '';
 
   return [
     `<agent-identity profile_id="${escapeXmlAttribute(agentProfile.id)}" name="${escapeXmlAttribute(agentProfile.name)}" version="${agentProfile.version}" hash="${escapeXmlAttribute(agentProfile.identityHash)}">`,
@@ -2150,10 +2166,21 @@ async function runQueryAttempt(
   );
   const hasBackgroundTaskTools =
     allowedTools.includes('Task') && allowedTools.includes('TaskOutput');
+  const proactiveInteractiveContract =
+    usesProactiveInteractiveContract(containerInput);
+  // The reference person-like runtime supplies its own complete system prompt
+  // instead of inheriting Claude Code's Assistant-oriented preset. Proactive
+  // mode follows that boundary while preserving the same SDK tools.
+  const includeClaudePreset =
+    !proactiveInteractiveContract &&
+    (containerInput.agentProfile?.includeClaudePreset ?? true);
   const promptPlan = buildHappyClawPromptPlan({
     // Agent identity leads platform workspace/context material per the
     // documented Agent-first composition order.
-    agentIdentity: buildAgentIdentityPrompt(containerInput),
+    agentIdentity: buildAgentIdentityPrompt(
+      containerInput,
+      includeClaudePreset,
+    ),
     interaction: INTERACTION_GUIDELINES,
     security: buildSecurityRulesPrompt(),
     ...(memoryRecall && hasMemoryTools
@@ -2169,7 +2196,12 @@ async function runQueryAttempt(
     !containerInput.messageTaskId
       ? { agentBuilder: AGENT_BUILDER_GUIDELINES }
       : {}),
-    output: OUTPUT_GUIDELINES,
+    output:
+      containerInput.isScheduledTask || containerInput.messageTaskId
+        ? TASK_OUTPUT_GUIDELINES
+        : proactiveInteractiveContract
+          ? PROACTIVE_OUTPUT_GUIDELINES
+          : ASSISTANT_OUTPUT_GUIDELINES,
     ...(hasWebTools ? { web: WEB_FETCH_GUIDELINES } : {}),
     ...(hasBackgroundTaskTools
       ? { backgroundTasks: BACKGROUND_TASK_GUIDELINES }
@@ -2182,20 +2214,19 @@ async function runQueryAttempt(
           },
         }
       : {}),
-    ...(containerInput.interactionMode === 'persona' &&
-    !containerInput.isScheduledTask
-      ? { deliveryContract: PERSONA_DELIVERY_CONTRACT }
-      : containerInput.agentId
-        ? { deliveryContract: DELIVERY_CONTRACT }
-        : {}),
+    ...(!containerInput.isScheduledTask && !containerInput.messageTaskId
+      ? {
+          deliveryContract: proactiveInteractiveContract
+            ? PROACTIVE_DELIVERY_CONTRACT
+            : ASSISTANT_DELIVERY_CONTRACT,
+        }
+      : {}),
   });
   for (const warning of promptPlan.warnings) log(`[WARN] ${warning}`);
   if (promptPlan.errors.length > 0) {
     throw new Error(`prompt_plan_invalid: ${promptPlan.errors.join('; ')}`);
   }
   const systemPromptAppend = promptPlan.text;
-  const includeClaudePreset =
-    containerInput.agentProfile?.includeClaudePreset ?? true;
   const systemPrompt = includeClaudePreset
     ? {
         type: 'preset' as const,
@@ -3119,7 +3150,10 @@ async function runQueryAttempt(
           canonicalAssistantUuid || lastAssistantUuid;
         emit({
           status: 'success',
-          result: finalText,
+          // In Proactive mode the SDK Result is control-plane data only. Null
+          // it at the runner boundary as well as the host boundary so a stale
+          // host or an alternate consumer can never publish Assistant text.
+          result: proactiveInteractiveContract ? null : finalText,
           newSessionId,
           sdkMessageUuid: canonicalAssistantUuid || lastAssistantUuid,
           sourceKind: sourceKindOverride ?? 'sdk_final',

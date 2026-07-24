@@ -990,7 +990,7 @@ export function StreamingDisplay({
             <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
             <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce" />
             <span className="text-sm text-muted-foreground ml-1">
-              {interactionMode === 'persona' ? '正在处理…' : '正在准备...'}
+              {interactionMode === 'proactive' ? '正在处理…' : '正在准备...'}
             </span>
           </div>
         </div>
@@ -1034,7 +1034,9 @@ export function StreamingDisplay({
                 <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
                 <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce" />
                 <span className="text-sm text-muted-foreground ml-1">
-                  {interactionMode === 'persona' ? '正在处理…' : '正在准备...'}
+                  {interactionMode === 'proactive'
+                    ? '正在处理…'
+                    : '正在准备...'}
                 </span>
               </div>
             </div>

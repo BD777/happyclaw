@@ -3,43 +3,43 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
-  PERSONA_TAIL_INTERRUPTION_NOTICE,
+  PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   buildInteractionTextOutboxPayload,
   isInteractionTurnSettled,
   publishesFrameworkAnswer,
   resolveFrozenIpcInteractionMode,
   resolveRuntimeInteractionMode,
   shouldBroadcastSdkStreamEvent,
-  shouldSendPersonaTailInterruptionNotice,
+  shouldSendProactiveTailInterruptionNotice,
   usesNativeMessagePresentation,
 } from '../src/workspace-interaction-runtime.js';
 
 describe('workspace interaction runtime policy', () => {
-  test('persona applies to public main and conversation loops only', () => {
+  test('proactive applies to public main and conversation loops only', () => {
     expect(
-      resolveRuntimeInteractionMode('persona', { agentKind: 'main' }),
-    ).toBe('persona');
+      resolveRuntimeInteractionMode('proactive', { agentKind: 'main' }),
+    ).toBe('proactive');
     expect(
-      resolveRuntimeInteractionMode('persona', {
+      resolveRuntimeInteractionMode('proactive', {
         agentKind: 'conversation',
       }),
-    ).toBe('persona');
+    ).toBe('proactive');
     expect(
-      resolveRuntimeInteractionMode('persona', { agentKind: 'spawn' }),
+      resolveRuntimeInteractionMode('proactive', { agentKind: 'spawn' }),
     ).toBe('assistant');
     expect(
-      resolveRuntimeInteractionMode('persona', {
+      resolveRuntimeInteractionMode('proactive', {
         agentKind: 'main',
         scheduledTask: true,
       }),
     ).toBe('assistant');
   });
 
-  test('assistant publishes framework answers while persona uses native messages', () => {
+  test('assistant publishes framework answers while proactive uses native messages', () => {
     expect(publishesFrameworkAnswer('assistant')).toBe(true);
     expect(usesNativeMessagePresentation('assistant')).toBe(false);
-    expect(publishesFrameworkAnswer('persona')).toBe(false);
-    expect(usesNativeMessagePresentation('persona')).toBe(true);
+    expect(publishesFrameworkAnswer('proactive')).toBe(false);
+    expect(usesNativeMessagePresentation('proactive')).toBe(true);
   });
 
   test('keeps the legacy assistant Outbox payload hash and extends only native sends', () => {
@@ -57,12 +57,22 @@ describe('workspace interaction runtime policy', () => {
 
   test('uses the IPC-file mode frozen before a workspace mode switch', () => {
     expect(
+      resolveFrozenIpcInteractionMode('proactive', {
+        scheduledTask: false,
+        spawnAgent: false,
+      }),
+    ).toEqual({
+      mode: 'proactive',
+      valid: true,
+      legacyDefaulted: false,
+    });
+    expect(
       resolveFrozenIpcInteractionMode('persona', {
         scheduledTask: false,
         spawnAgent: false,
       }),
     ).toEqual({
-      mode: 'persona',
+      mode: 'proactive',
       valid: true,
       legacyDefaulted: false,
     });
@@ -99,11 +109,17 @@ describe('workspace interaction runtime policy', () => {
     expect(watcher).not.toContain('getWorkspaceInteractionMode');
   });
 
-  test('scheduled and spawn IPC can never opt into persona delivery', () => {
+  test('scheduled and spawn IPC can never opt into proactive delivery', () => {
     expect(
-      resolveFrozenIpcInteractionMode('persona', {
+      resolveFrozenIpcInteractionMode('proactive', {
         scheduledTask: true,
         spawnAgent: false,
+      }).mode,
+    ).toBe('assistant');
+    expect(
+      resolveFrozenIpcInteractionMode('proactive', {
+        scheduledTask: false,
+        spawnAgent: true,
       }).mode,
     ).toBe('assistant');
     expect(
@@ -114,10 +130,10 @@ describe('workspace interaction runtime policy', () => {
     ).toBe('assistant');
   });
 
-  test('persona exposes lifecycle boundaries but no SDK internals to Web', () => {
+  test('proactive exposes lifecycle boundaries but no SDK internals to Web', () => {
     for (const statusText of ['requesting', 'idle', 'interrupted']) {
       expect(
-        shouldBroadcastSdkStreamEvent('persona', {
+        shouldBroadcastSdkStreamEvent('proactive', {
           eventType: 'status',
           statusText,
         }),
@@ -133,12 +149,12 @@ describe('workspace interaction runtime policy', () => {
       'task_start',
       'task_notification',
     ]) {
-      expect(shouldBroadcastSdkStreamEvent('persona', { eventType })).toBe(
+      expect(shouldBroadcastSdkStreamEvent('proactive', { eventType })).toBe(
         false,
       );
     }
     expect(
-      shouldBroadcastSdkStreamEvent('persona', {
+      shouldBroadcastSdkStreamEvent('proactive', {
         eventType: 'status',
         statusText: '正在深入分析…',
       }),
@@ -150,24 +166,24 @@ describe('workspace interaction runtime policy', () => {
     ).toBe(true);
   });
 
-  test('persona permits healthy silence and treats a delivered utterance as irreversible', () => {
+  test('proactive permits healthy silence and treats a delivered utterance as irreversible', () => {
     expect(
       isInteractionTurnSettled({
-        mode: 'persona',
+        mode: 'proactive',
         healthyInputTurnCompleted: true,
         utteranceDelivered: false,
       }),
     ).toBe(true);
     expect(
       isInteractionTurnSettled({
-        mode: 'persona',
+        mode: 'proactive',
         healthyInputTurnCompleted: false,
         utteranceDelivered: true,
       }),
     ).toBe(true);
     expect(
       isInteractionTurnSettled({
-        mode: 'persona',
+        mode: 'proactive',
         healthyInputTurnCompleted: false,
         utteranceDelivered: false,
       }),
@@ -198,24 +214,24 @@ describe('workspace interaction runtime policy', () => {
     ).toBe(false);
   });
 
-  test('persona tail errors stop replay and require an incomplete-result notice', () => {
+  test('proactive tail errors stop replay and require an incomplete-result notice', () => {
     expect(
-      shouldSendPersonaTailInterruptionNotice({
-        mode: 'persona',
+      shouldSendProactiveTailInterruptionNotice({
+        mode: 'proactive',
         utteranceDelivered: true,
         runnerFailed: true,
       }),
     ).toBe(true);
-    expect(PERSONA_TAIL_INTERRUPTION_NOTICE).toContain('可能不完整');
+    expect(PROACTIVE_TAIL_INTERRUPTION_NOTICE).toContain('可能不完整');
     expect(
-      shouldSendPersonaTailInterruptionNotice({
-        mode: 'persona',
+      shouldSendProactiveTailInterruptionNotice({
+        mode: 'proactive',
         utteranceDelivered: false,
         runnerFailed: true,
       }),
     ).toBe(false);
     expect(
-      shouldSendPersonaTailInterruptionNotice({
+      shouldSendProactiveTailInterruptionNotice({
         mode: 'assistant',
         utteranceDelivered: true,
         runnerFailed: true,
@@ -223,13 +239,13 @@ describe('workspace interaction runtime policy', () => {
     ).toBe(false);
   });
 
-  test('wires persona tail notices to durable native delivery with a Web fallback', () => {
+  test('wires proactive tail notices to durable native delivery with a Web fallback', () => {
     const source = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),
       'utf8',
     );
     const helper = source.slice(
-      source.indexOf('async function deliverPersonaTailInterruptionNotice'),
+      source.indexOf('async function deliverProactiveTailInterruptionNotice'),
       source.indexOf('function resolveDurableChannelRoute'),
     );
     expect(helper).toContain('deliverIndependentChannelSystemNotice({');
@@ -237,10 +253,10 @@ describe('workspace interaction runtime policy', () => {
     expect(helper).toContain("sender: '__system__'");
     expect(helper).toContain('sendSystemMessage(');
     expect(source).toContain(
-      'await notifyPersonaTailInterruption(ipcReplyTurnTracker.inputTurnId)',
+      'await notifyProactiveTailInterruption(ipcReplyTurnTracker.inputTurnId)',
     );
     expect(source).toContain(
-      'await notifyPersonaAgentTailInterruption(activeAgentInputTurnId)',
+      'await notifyProactiveAgentTailInterruption(activeAgentInputTurnId)',
     );
   });
 });

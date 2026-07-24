@@ -45,11 +45,11 @@ export function WorkspaceInteractionModeDialog({
     try {
       const saved = await onSave(draftMode);
       if (!saved) {
-        toast.error('交互方式保存失败，请重试');
+        toast.error('回复模式保存失败，请重试');
         return;
       }
       toast.success(
-        `已切换为${draftMode === 'persona' ? '人物模式' : '助手模式'}`,
+        `已切换为${draftMode === 'proactive' ? '主动模式' : 'Assistant 模式'}`,
       );
       onClose();
     } finally {
@@ -66,9 +66,9 @@ export function WorkspaceInteractionModeDialog({
     >
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>工作区设置</DialogTitle>
+          <DialogTitle>工作区回复模式</DialogTitle>
           <DialogDescription>
-            设置“{workspaceName}”组织和发送 Agent 回复的方式。
+            设置“{workspaceName}”由谁控制对用户发消息的时机和数量。
           </DialogDescription>
         </DialogHeader>
 
@@ -77,12 +77,12 @@ export function WorkspaceInteractionModeDialog({
           onChange={setDraftMode}
           name="workspace-interaction-mode"
           disabled={saving}
-          description="此设置会应用到该工作区的 Web、飞书和所有已绑定渠道。"
+          description="同一模式会应用到该工作区的 Web、飞书和所有已绑定渠道；渠道只负责选择流式卡片、普通消息或消息气泡等具体呈现。"
         />
 
         <p className="rounded-md bg-muted/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          切换会安全重启该工作区的 Agent
-          运行时。尚未处理的消息和下一条新消息将按新模式继续。
+          模式会作为系统级回复契约注入
+          Agent。切换后工作区运行时会安全重启，尚未处理的消息和下一条新消息将按新模式继续。
         </p>
 
         <DialogFooter>

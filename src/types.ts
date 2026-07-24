@@ -35,7 +35,7 @@ export interface ContainerConfig {
 
 export type ExecutionMode = 'container' | 'host';
 /** User-visible interaction contract owned by one Workspace↔Agent binding. */
-export type InteractionMode = 'assistant' | 'persona';
+export type InteractionMode = 'assistant' | 'proactive';
 export type ConversationSource = 'manual' | 'native_thread' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';

@@ -82,7 +82,7 @@ import {
 } from './channel-reliability-store.js';
 
 let db: InstanceType<typeof Database>;
-const CURRENT_SCHEMA_VERSION = 61;
+const CURRENT_SCHEMA_VERSION = 62;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -904,7 +904,7 @@ export function initDatabase(): void {
       group_folder TEXT PRIMARY KEY,
       agent_profile_id TEXT NOT NULL,
       interaction_mode TEXT NOT NULL DEFAULT 'assistant'
-        CHECK (interaction_mode IN ('assistant', 'persona')),
+        CHECK (interaction_mode IN ('assistant', 'proactive')),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -2138,11 +2138,50 @@ export function initDatabase(): void {
     'interaction_mode',
     "TEXT NOT NULL DEFAULT 'assistant'",
   );
+
+  // v61 -> v62: "persona" conflated identity with reply delivery. The mode is
+  // now named "proactive": the Agent explicitly decides when to call
+  // send_message, while its identity remains owned by AgentProfile.
+  const replyModeSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (replyModeSchemaVersion < 62) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE workspace_agent_profiles_v62 (
+          group_folder TEXT PRIMARY KEY,
+          agent_profile_id TEXT NOT NULL,
+          interaction_mode TEXT NOT NULL DEFAULT 'assistant'
+            CHECK (interaction_mode IN ('assistant', 'proactive')),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO workspace_agent_profiles_v62 (
+          group_folder, agent_profile_id, interaction_mode, created_at, updated_at
+        )
+        SELECT
+          group_folder,
+          agent_profile_id,
+          CASE
+            WHEN interaction_mode IN ('persona', 'proactive') THEN 'proactive'
+            ELSE 'assistant'
+          END,
+          created_at,
+          updated_at
+        FROM workspace_agent_profiles;
+        DROP TABLE workspace_agent_profiles;
+        ALTER TABLE workspace_agent_profiles_v62
+          RENAME TO workspace_agent_profiles;
+        CREATE INDEX idx_workspace_agent_profiles_profile
+          ON workspace_agent_profiles(agent_profile_id);
+      `);
+    })();
+  }
   db.prepare(
     `UPDATE workspace_agent_profiles
      SET interaction_mode = 'assistant'
      WHERE interaction_mode IS NULL
-        OR interaction_mode NOT IN ('assistant', 'persona')`,
+        OR interaction_mode NOT IN ('assistant', 'proactive')`,
   ).run();
 
   db.exec('DROP TABLE IF EXISTS group_members');
@@ -7637,7 +7676,7 @@ function parseInteractionMode(
   value: unknown,
   groupFolder: string,
 ): InteractionMode {
-  if (value === 'persona') return 'persona';
+  if (value === 'proactive' || value === 'persona') return 'proactive';
   if (value !== 'assistant' && value != null && value !== '') {
     logger.warn(
       { groupFolder, interactionMode: value },

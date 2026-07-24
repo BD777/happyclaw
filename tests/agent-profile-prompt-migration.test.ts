@@ -82,7 +82,7 @@ describe('AgentProfile v48 prompt migration', () => {
       // Prompt migration remains v48, while the database may continue through
       // later additive migrations in the same startup (v49 channel accounts,
       // then the v60 durable channel reliability ledgers and v61 interaction mode).
-    ).toEqual({ value: '61' });
+    ).toEqual({ value: '62' });
     raw.close();
   });
 });

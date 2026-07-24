@@ -13,13 +13,14 @@ const read = (relativePath: string) =>
   fs.readFileSync(path.join(root, relativePath), 'utf8');
 
 describe('frontend workspace interaction mode contract', () => {
-  test('defaults missing and legacy values to assistant mode', () => {
+  test('normalizes current, missing, and legacy values', () => {
     expect(DEFAULT_INTERACTION_MODE).toBe('assistant');
     expect(normalizeInteractionMode(undefined)).toBe('assistant');
     expect(normalizeInteractionMode(null)).toBe('assistant');
     expect(normalizeInteractionMode('legacy')).toBe('assistant');
     expect(normalizeInteractionMode('assistant')).toBe('assistant');
-    expect(normalizeInteractionMode('persona')).toBe('persona');
+    expect(normalizeInteractionMode('proactive')).toBe('proactive');
+    expect(normalizeInteractionMode('persona')).toBe('proactive');
   });
 
   test('sends the selected mode on create and PATCHes workspace changes', () => {
@@ -35,8 +36,8 @@ describe('frontend workspace interaction mode contract', () => {
     expect(createDialog).toContain(
       'options.interaction_mode = interactionMode',
     );
-    expect(createDialog).toContain('助手模式');
-    expect(createDialog).toContain('人物模式');
+    expect(createDialog).toContain('Assistant 模式');
+    expect(createDialog).toContain('主动模式');
   });
 
   test('exposes mode and safe runtime restart semantics in workspace settings', () => {
@@ -50,22 +51,22 @@ describe('frontend workspace interaction mode contract', () => {
 
     expect(chatView).toContain('<WorkspaceInteractionModeDialog');
     expect(chatView).toContain('工作区设置');
-    expect(chatView).toContain(
-      "interactionMode === 'persona' ? '人物' : '助手'",
-    );
+    expect(chatView).toContain("'主动' : 'Assistant'");
     expect(settingsDialog).toContain(
-      '此设置会应用到该工作区的 Web、飞书和所有已绑定渠道。',
+      '同一模式会应用到该工作区的 Web、飞书和所有已绑定渠道',
     );
-    expect(settingsDialog).toContain(
-      '运行时。尚未处理的消息和下一条新消息将按新模式继续。',
-    );
-    expect(selector).toContain('助手模式（推荐）');
-    expect(selector).toContain('人物模式');
+    expect(settingsDialog).toContain('模式会作为系统级回复契约注入');
+    expect(settingsDialog).toContain('Agent。切换后工作区运行时会安全重启');
+    expect(settingsDialog).toContain('下一条新消息将按新模式继续');
+    expect(selector).toContain('Assistant 模式（推荐）');
+    expect(selector).toContain('主动模式');
+    expect(selector).toContain('一轮可以发送多条');
+    expect(selector).toContain('CircleCheck');
   });
 
-  test('never presents uncommitted partial text in persona mode', () => {
+  test('never presents uncommitted partial text in proactive mode', () => {
     expect(shouldShowStreamingPartialText('assistant')).toBe(true);
-    expect(shouldShowStreamingPartialText('persona')).toBe(false);
+    expect(shouldShowStreamingPartialText('proactive')).toBe(false);
 
     const streamingDisplay = read(
       'web/src/components/chat/StreamingDisplay.tsx',
@@ -76,7 +77,7 @@ describe('frontend workspace interaction mode contract', () => {
       'showPartialText && streaming.partialText',
     );
     expect(streamingDisplay).toContain(
-      "interactionMode === 'persona' ? '正在处理…' : '正在准备...'",
+      "interactionMode === 'proactive' ? '正在处理…' : '正在准备...'",
     );
     expect(messageList).toContain('interactionMode={interactionMode}');
   });

@@ -115,33 +115,33 @@ afterAll(() => {
 });
 
 describe('workspace interaction_mode API', () => {
-  test('creation persists persona and groups/workspaces serialize it', async () => {
+  test('creation persists proactive and groups/workspaces serialize it', async () => {
     asUser(OWNER_ID);
     const profile = db.getOrCreateDefaultAgentProfile(OWNER_ID);
     const createResponse = await groupRoutes.request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        name: 'Persona Workspace',
+        name: 'Proactive Workspace',
         agent_profile_id: profile.id,
         execution_mode: 'container',
-        interaction_mode: 'persona',
+        interaction_mode: 'proactive',
       }),
     });
     expect(createResponse.status).toBe(200);
     const created = await createResponse.json();
-    expect(created.group.interaction_mode).toBe('persona');
+    expect(created.group.interaction_mode).toBe('proactive');
     expect(
       db.getWorkspaceAgentProfileBinding(created.group.folder),
     ).toMatchObject({
       agent_profile_id: profile.id,
-      interaction_mode: 'persona',
+      interaction_mode: 'proactive',
     });
 
     const groupList = await groupRoutes.request('/', { method: 'GET' });
     const groupListBody = await groupList.json();
     expect(groupListBody.groups[created.jid]).toMatchObject({
-      interaction_mode: 'persona',
+      interaction_mode: 'proactive',
       agent_profile_id: profile.id,
     });
 
@@ -153,8 +153,27 @@ describe('workspace interaction_mode API', () => {
     await expect(workspaceDetail.json()).resolves.toMatchObject({
       workspace: {
         jid: created.jid,
-        interaction_mode: 'persona',
+        interaction_mode: 'proactive',
       },
+    });
+  });
+
+  test('normalizes the legacy persona API value to proactive', async () => {
+    asUser(OWNER_ID);
+    const profile = db.getOrCreateDefaultAgentProfile(OWNER_ID);
+    const response = await groupRoutes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Legacy Reply Mode Input',
+        agent_profile_id: profile.id,
+        interaction_mode: 'persona',
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      group: { interaction_mode: 'proactive' },
     });
   });
 
@@ -171,30 +190,30 @@ describe('workspace interaction_mode API', () => {
     });
     registeredGroups[jid] = db.getRegisteredGroup(jid);
     db.assignWorkspaceAgentProfile(folder, profile.id, 'assistant');
-    db.setSession(folder, 'sdk-session-before-persona');
-    sessions[folder] = 'sdk-session-before-persona';
+    db.setSession(folder, 'sdk-session-before-proactive');
+    sessions[folder] = 'sdk-session-before-proactive';
 
     stopGroup.mockImplementationOnce(async () => {
       expect(db.getWorkspaceInteractionMode(folder)).toBe('assistant');
     });
     stopGroup.mockImplementationOnce(async () => {
-      expect(db.getWorkspaceInteractionMode(folder)).toBe('persona');
+      expect(db.getWorkspaceInteractionMode(folder)).toBe('proactive');
     });
 
     asUser(OWNER_ID);
     const response = await groupRoutes.request(`/${encodeURIComponent(jid)}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ interaction_mode: 'persona' }),
+      body: JSON.stringify({ interaction_mode: 'proactive' }),
     });
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       success: true,
-      interaction_mode: 'persona',
+      interaction_mode: 'proactive',
     });
     expect(stopGroup).toHaveBeenCalledTimes(2);
-    expect(db.getWorkspaceInteractionMode(folder)).toBe('persona');
+    expect(db.getWorkspaceInteractionMode(folder)).toBe('proactive');
     expect(db.getSession(folder)).toBeUndefined();
     expect(sessions[folder]).toBeUndefined();
   });
@@ -216,7 +235,7 @@ describe('workspace interaction_mode API', () => {
       executionMode: 'container',
     });
     registeredGroups[jid] = db.getRegisteredGroup(jid);
-    db.assignWorkspaceAgentProfile(folder, first.id, 'persona');
+    db.assignWorkspaceAgentProfile(folder, first.id, 'proactive');
 
     asUser(STRANGER_ID);
     const denied = await groupRoutes.request(`/${encodeURIComponent(jid)}`, {
@@ -225,7 +244,7 @@ describe('workspace interaction_mode API', () => {
       body: JSON.stringify({ interaction_mode: 'assistant' }),
     });
     expect(denied.status).toBe(404);
-    expect(db.getWorkspaceInteractionMode(folder)).toBe('persona');
+    expect(db.getWorkspaceInteractionMode(folder)).toBe('proactive');
 
     asUser(OWNER_ID);
     const switched = await groupRoutes.request(
@@ -239,11 +258,11 @@ describe('workspace interaction_mode API', () => {
     expect(switched.status).toBe(200);
     await expect(switched.json()).resolves.toMatchObject({
       agent_profile_id: second.id,
-      interaction_mode: 'persona',
+      interaction_mode: 'proactive',
     });
     expect(db.getWorkspaceAgentProfileBinding(folder)).toMatchObject({
       agent_profile_id: second.id,
-      interaction_mode: 'persona',
+      interaction_mode: 'proactive',
     });
   });
 });

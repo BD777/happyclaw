@@ -250,7 +250,12 @@ describe('resolveTurnOutcome', () => {
     expect(mainCleanup).toContain('getUncertainChannelOutboxForTurn');
     expect(mainCleanup).toContain('runtime.interrupt');
     expect(mainCleanup).toContain('commitCursor();');
-    expect(mainCleanup).toContain("'delivery-uncertain'");
+    expect(mainCleanup).toContain(
+      'await deliverChannelManualReconciliationNotice',
+    );
+    expect(mainCleanup).toContain(
+      "interactionMode === 'proactive' ? 'native' : 'default'",
+    );
 
     const postCleanup = main.slice(
       main.indexOf('// runAgent threw — output is undefined'),
@@ -278,18 +283,29 @@ describe('resolveTurnOutcome', () => {
       path.join(process.cwd(), 'src/index.ts'),
       'utf8',
     );
+    const branchStart = main.indexOf(
+      '// Feishu card JSON: store extracted markdown for web',
+    );
     const branch = main.slice(
-      main.indexOf('// Feishu card JSON: store extracted markdown for web'),
-      main.indexOf('// Scheduled-task output routing.'),
+      branchStart,
+      main.indexOf(
+        'recordSuccessfulIpcSend(sourceGroup, data.chatJid, data.text)',
+        branchStart,
+      ),
     );
 
     expect(branch).toContain('sendToIM: false');
+    expect(branch).toContain('effectiveChatJid');
+    expect(branch).toContain('projectionMessageId');
     expect(branch).toContain('resolveImRoute({');
     expect(branch).toContain('ipcAgentId,');
     expect(branch).toContain('data.inputTurnId');
-    expect(branch).toContain('channelTurnScope(sourceGroup, ipcAgentId)');
+    expect(branch).toContain('const messageScopeKey = channelTurnScope(');
     expect(branch).toContain(
       'sendImWithRetry(\n                        ipcImRoute,\n                        data.text,',
+    );
+    expect(branch.indexOf('sendImWithRetry(')).toBeLessThan(
+      branch.indexOf('const sendOutcome = await sendMessageWithOutcome'),
     );
     expect(branch).not.toContain('imTextOverride: webText');
   });

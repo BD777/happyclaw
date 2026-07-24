@@ -127,9 +127,9 @@ describe('send_message host acknowledgement', () => {
     await expect(pending).resolves.toBeDefined();
   });
 
-  test('persona turns force independent native messages regardless of requested role', async () => {
+  test('proactive turns force independent native messages regardless of requested role', async () => {
     const { root, sendTool } = setupSendTool('send_message', {
-      interactionMode: 'persona',
+      interactionMode: 'proactive',
     });
     const pending = sendTool.handler(
       { text: '我先看一下', delivery_role: 'progress' },
@@ -138,13 +138,20 @@ describe('send_message host acknowledgement', () => {
     const request = await readRequest(root);
     expect(request).toMatchObject({
       deliveryRole: 'separate',
-      interactionMode: 'persona',
+      interactionMode: 'proactive',
       presentation: 'native',
       inputTurnId: 'delivery-turn-1',
     });
     writeResult(root, request.requestId as string, { success: true });
     await expect(pending).resolves.toMatchObject({
-      content: [{ type: 'text', text: 'Message sent separately.' }],
+      content: [
+        {
+          type: 'text',
+          text: expect.stringContaining(
+            'Send again only for new, non-redundant content',
+          ),
+        },
+      ],
     });
   });
 

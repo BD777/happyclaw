@@ -203,7 +203,7 @@ describe('message-level ChannelTurnContext', () => {
     legacy.close();
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('61');
+    expect(db.getRouterState('schema_version')).toBe('62');
     expect(db.getMessagesPage('web:legacy-context')[0].channel_context).toBe(
       undefined,
     );

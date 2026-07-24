@@ -866,17 +866,17 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               <span
                 className={cn(
                   'inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[10px] font-medium',
-                  interactionMode === 'persona'
+                  interactionMode === 'proactive'
                     ? 'border-primary/30 bg-primary/5 text-primary'
                     : 'border-border bg-muted/50 text-muted-foreground',
                 )}
                 title={
-                  interactionMode === 'persona'
-                    ? '由 Agent 决定何时发送消息'
-                    : '任务完成后交付一条主回复'
+                  interactionMode === 'proactive'
+                    ? '主动模式：由 Agent 决定何时发送 0～多条独立消息'
+                    : 'Assistant 模式：框架在任务完成后交付一条主回复'
                 }
               >
-                {interactionMode === 'persona' ? '人物' : '助手'}
+                {interactionMode === 'proactive' ? '主动' : 'Assistant'}
               </span>
               {isOwnHome &&
                 imStatus &&

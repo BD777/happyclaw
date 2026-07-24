@@ -39,7 +39,7 @@ afterAll(() => {
 
 describe('channel reliability schema v60', () => {
   test('creates all four ledgers and nonterminal indexes idempotently', () => {
-    expect(db.getRouterState('schema_version')).toBe('61');
+    expect(db.getRouterState('schema_version')).toBe('62');
     db.closeDatabase();
 
     const probe = new Database(path.join(storeDir, 'messages.db'), {
@@ -77,7 +77,7 @@ describe('channel reliability schema v60', () => {
     probe.close();
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('61');
+    expect(db.getRouterState('schema_version')).toBe('62');
   });
 
   test('advances provider cursors monotonically and scopes them by chat', () => {
@@ -673,6 +673,47 @@ describe('per-artifact durable channel outbox', () => {
       now: '2026-07-23T02:00:00.000Z',
     }).run;
   }
+
+  test('a turn cannot complete while a nonterminal child Outbox remains', () => {
+    const run = createOutboxRun('parent-completion-fence');
+    const turnClaim = reliability.claimChannelTurnRunById(
+      run.id,
+      'parent-completion-worker',
+      60_000,
+    )!;
+    const outbox = reliability.enqueueChannelOutbox({
+      ...route,
+      turnRunId: run.id,
+      ordinal: 0,
+      kind: 'text',
+      payload: { text: 'must settle before parent completion' },
+    }).item;
+
+    expect(
+      reliability.completeChannelTurnRun(turnClaim, {
+        result: { replyDelivered: true },
+      }),
+    ).toBe(false);
+    expect(reliability.getChannelTurnRun(run.id)?.status).toBe('running');
+
+    const outboxClaim = reliability.claimChannelOutboxById(
+      outbox.id,
+      'child-outbox-worker',
+      60_000,
+    )!;
+    expect(reliability.markChannelOutboxSending(outboxClaim)).toBe(true);
+    expect(
+      reliability.completeChannelOutbox(outboxClaim, {
+        providerMessageId: 'om_child_settled',
+      }),
+    ).toBe(true);
+    expect(
+      reliability.completeChannelTurnRun(turnClaim, {
+        result: { replyDelivered: true },
+      }),
+    ).toBe(true);
+    expect(reliability.getChannelTurnRun(run.id)?.status).toBe('completed');
+  });
 
   test('claims an explicitly selected item without stealing another route', () => {
     const run = createOutboxRun('targeted');

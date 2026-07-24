@@ -219,7 +219,7 @@ export interface IMChannel {
 }
 
 export interface ChannelMessageDeliveryOptions {
-  /** `native` avoids bot/card presentation for person-like workspace Agents. */
+  /** `native` avoids bot/card presentation for Proactive-mode workspace Agents. */
   presentation?: 'default' | 'native';
 }
 

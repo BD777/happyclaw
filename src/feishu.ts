@@ -3256,7 +3256,7 @@ export function createFeishuConnection(
       requireFeishuRouteTarget(chatId);
 
       try {
-        // Person-like workspace Agents speak as ordinary native rich-text
+        // Proactive-mode workspace Agents speak as ordinary native rich-text
         // messages. They never enter the interactive-card presentation lane.
         if (options?.presentation === 'native') {
           await sendToFeishu(chatId, 'post', buildPostMdFallback(text));

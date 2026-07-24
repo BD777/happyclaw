@@ -30,7 +30,10 @@ import {
   ActiveTurnOutputRegistry,
   TurnOutputCoordinator,
 } from './turn-output-coordinator.js';
-import { routeHostIpcOutput } from './host-ipc-output-router.js';
+import {
+  resolveHostIpcLogicalChatJid,
+  routeHostIpcOutput,
+} from './host-ipc-output-router.js';
 import {
   buildInterruptedReply,
   buildSteeredReply,
@@ -206,14 +209,14 @@ import {
   type ChannelMessageDeliveryOptions,
 } from './im-channel.js';
 import {
-  PERSONA_TAIL_INTERRUPTION_NOTICE,
+  PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   buildInteractionTextOutboxPayload,
   isInteractionTurnSettled,
   publishesFrameworkAnswer,
   resolveFrozenIpcInteractionMode,
   resolveRuntimeInteractionMode,
   shouldBroadcastSdkStreamEvent,
-  shouldSendPersonaTailInterruptionNotice,
+  shouldSendProactiveTailInterruptionNotice,
   usesNativeMessagePresentation,
 } from './workspace-interaction-runtime.js';
 import {
@@ -2512,6 +2515,7 @@ async function deliverChannelManualReconciliationNotice(input: {
   targetJid: string;
   runtime: ChannelTurnRuntime;
   agentId?: string | null;
+  presentation?: 'default' | 'native';
   route: {
     provider: string;
     accountId: string;
@@ -2521,7 +2525,7 @@ async function deliverChannelManualReconciliationNotice(input: {
     threadId?: string | null;
   };
 }): Promise<boolean> {
-  return deliverIndependentChannelSystemNotice({
+  const delivered = await deliverIndependentChannelSystemNotice({
     logicalChatJid: input.logicalChatJid,
     scopeKey: input.scopeKey,
     targetJid: input.targetJid,
@@ -2531,7 +2535,18 @@ async function deliverChannelManualReconciliationNotice(input: {
     originalRunId: input.runtime.runId,
     noticeKey: 'manual-reconciliation',
     text: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+    presentation: input.presentation,
   });
+  if (delivered) return true;
+
+  // The native warning can itself fail. Preserve an auditable Web-visible
+  // terminal error instead of leaving the session looking permanently stuck.
+  sendSystemMessage(
+    input.logicalChatJid,
+    'delivery_uncertain',
+    CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+  );
+  return true;
 }
 
 async function deliverIndependentChannelSystemNotice(input: {
@@ -2648,7 +2663,7 @@ async function deliverIndependentChannelSystemNotice(input: {
   }
 }
 
-async function deliverPersonaTailInterruptionNotice(input: {
+async function deliverProactiveTailInterruptionNotice(input: {
   logicalChatJid: string;
   scopeKey: string;
   inputTurnId: string;
@@ -2675,9 +2690,9 @@ async function deliverPersonaTailInterruptionNotice(input: {
       scopeKey: input.scopeKey,
       targetJid: input.targetJid,
       originalInputTurnId: input.inputTurnId,
-      originalRunId: input.scope?.turnRunId ?? `persona:${input.inputTurnId}`,
-      noticeKey: 'persona-tail-interruption',
-      text: PERSONA_TAIL_INTERRUPTION_NOTICE,
+      originalRunId: input.scope?.turnRunId ?? `proactive:${input.inputTurnId}`,
+      noticeKey: 'proactive-tail-interruption',
+      text: PROACTIVE_TAIL_INTERRUPTION_NOTICE,
       sender: '__system__',
       senderName: 'system',
       agentId: input.agentId,
@@ -2691,8 +2706,8 @@ async function deliverPersonaTailInterruptionNotice(input: {
   // still receive a durable system record explaining why no replay occurred.
   sendSystemMessage(
     input.logicalChatJid,
-    'persona_interrupted',
-    PERSONA_TAIL_INTERRUPTION_NOTICE,
+    'proactive_interrupted',
+    PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   );
   return true;
 }
@@ -4200,6 +4215,8 @@ async function setTyping(jid: string, isTyping: boolean): Promise<void> {
 }
 
 interface SendMessageOptions {
+  /** Stable logical message id for replay-safe Web projection. */
+  messageId?: string;
   /** Whether to forward the reply to the IM channel (Feishu/Telegram). Defaults to true for IM JIDs. */
   sendToIM?: boolean;
   /** IM 渠道实际发送的文本（默认与 text 相同）。挂起序列合并时 text 为
@@ -5089,9 +5106,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (channelTurnRuntime) {
     channelTurnRuntimes.set(lastProcessed.id, channelTurnRuntime);
   }
-  const completeChannelRuntimesForOutput = (
+  const completeChannelRuntimesForOutput = async (
     result: ContainerOutput,
-  ): boolean => {
+  ): Promise<boolean> => {
     if (!result.inputTurnCompleted) return false;
     let allCompleted = true;
     const inputIds = result.ipcReceipts?.length
@@ -5100,6 +5117,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     for (const inputId of inputIds) {
       const runtime = channelTurnRuntimes.get(inputId);
       if (!runtime) continue;
+      const uncertainDelivery = getUncertainChannelOutboxForTurn(runtime.runId);
+      if (uncertainDelivery) {
+        channelDeliveryNeedsManualReconciliation = true;
+        const interrupted = runtime.interrupt(
+          `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
+        );
+        const exactScope = channelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelManualReconciliationNotice({
+              logicalChatJid: chatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : false;
+        if (interrupted && notified) {
+          runtime.dispose();
+          channelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
+        continue;
+      }
       const utteranceDelivered =
         channelPhysicalDeliveryAckByInput.get(inputId) === true;
       if (publishesFrameworkAnswer(interactionMode) && !utteranceDelivered) {
@@ -5173,6 +5216,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         scopeKey: channelTurnScope(effectiveGroup.folder),
         targetJid: streamingSessionJid,
         runtime: channelTurnRuntime,
+        presentation: interactionMode === 'proactive' ? 'native' : 'default',
         route: {
           provider: streamingAddress.provider,
           accountId: streamingAccountId,
@@ -5239,13 +5283,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     ActiveChannelOutboxScope
   >();
   const rejectedChannelInputTurns = new Set<string>();
-  let personaTailNoticeDelivered = false;
-  const notifyPersonaTailInterruption = async (
+  let proactiveTailNoticeDelivered = false;
+  const notifyProactiveTailInterruption = async (
     inputTurnId: string,
   ): Promise<boolean> => {
     if (
-      personaTailNoticeDelivered ||
-      !shouldSendPersonaTailInterruptionNotice({
+      proactiveTailNoticeDelivered ||
+      !shouldSendProactiveTailInterruptionNotice({
         mode: interactionMode,
         utteranceDelivered:
           channelPhysicalDeliveryAckByInput.get(inputTurnId) === true,
@@ -5254,9 +5298,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     ) {
       return false;
     }
-    personaTailNoticeDelivered = true;
+    proactiveTailNoticeDelivered = true;
     const scope = channelOutboxScopesByInput.get(inputTurnId);
-    return deliverPersonaTailInterruptionNotice({
+    return deliverProactiveTailInterruptionNotice({
       logicalChatJid: chatJid,
       scopeKey: channelTurnScope(effectiveGroup.folder),
       inputTurnId,
@@ -5449,7 +5493,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         return true;
       },
       onUtteranceDelivered: () => {
-        if (interactionMode !== 'persona') return;
+        if (interactionMode !== 'proactive') return;
         channelPhysicalDeliveryAckByInput.set(inputTurnId, true);
         sentReplyByInput.set(inputTurnId, true);
         acknowledgeIpcReplyTurn(ipcReplyTurnTracker, inputTurnId);
@@ -6554,12 +6598,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             !publishesFrameworkAnswer(interactionMode) &&
             !result.providerFailure
           ) {
-            // In person-like mode the SDK Result is an internal control-plane
+            // In Proactive mode the SDK Result is an internal control-plane
             // terminal, never a user-visible answer. A healthy turn may have
             // emitted several native messages or intentionally stayed silent.
             result.result = null;
             if (result.status === 'success' && result.inputTurnCompleted) {
-              if (completeChannelRuntimesForOutput(result)) commitCursor();
+              if (await completeChannelRuntimesForOutput(result)) {
+                commitCursor();
+              }
               broadcastStreamEvent(chatJid, {
                 eventType: 'status',
                 statusText: 'idle',
@@ -7120,7 +7166,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               if (
                 result.inputTurnCompleted &&
                 replyDeliveryAcknowledged &&
-                completeChannelRuntimesForOutput(result)
+                (await completeChannelRuntimesForOutput(result))
               ) {
                 commitCursor();
               }
@@ -7281,14 +7327,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           );
           const exactScope = channelOutboxScopesByInput.get(inputTurnId);
           const notified = exactScope?.chatId
-            ? await deliverIndependentChannelSystemNotice({
+            ? await deliverChannelManualReconciliationNotice({
                 logicalChatJid: chatJid,
                 scopeKey: channelTurnScope(effectiveGroup.folder),
                 targetJid: exactScope.sourceJid,
-                originalInputTurnId: inputTurnId,
-                originalRunId: runtime.runId,
-                noticeKey: 'delivery-uncertain',
-                text: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+                runtime,
+                presentation:
+                  interactionMode === 'proactive' ? 'native' : 'default',
                 route: { ...exactScope, chatId: exactScope.chatId },
               })
             : false;
@@ -7296,7 +7341,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         } else if (explicitDiscard) {
           settled = runtime.cancel('Input discarded by explicit stop');
         } else if (
-          (interactionMode === 'persona' ||
+          (interactionMode === 'proactive' ||
             inputTurnId === ipcReplyTurnTracker.inputTurnId) &&
           inputSettled
         ) {
@@ -7305,8 +7350,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             runtime.complete({
               cursorCommitted,
               sentReply:
-                interactionMode === 'persona' ? utteranceDelivered : sentReply,
-              silent: interactionMode === 'persona' && !utteranceDelivered,
+                interactionMode === 'proactive'
+                  ? utteranceDelivered
+                  : sentReply,
+              silent: interactionMode === 'proactive' && !utteranceDelivered,
             });
         } else {
           settled = runtime.retry(
@@ -7418,7 +7465,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // narrow delivery signals complete the turn; DB-only interrupt partials
     // deliberately do not set either signal and therefore remain retryable.
     if (genuineReplyDelivered || ipcReplyTurnTracker.delivered) {
-      await notifyPersonaTailInterruption(ipcReplyTurnTracker.inputTurnId);
+      await notifyProactiveTailInterruption(ipcReplyTurnTracker.inputTurnId);
       commitCursor();
       return true;
     }
@@ -7513,7 +7560,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       { group: group.name, chatJid, turnOutcome },
       'Container close resolved without replay',
     );
-    await notifyPersonaTailInterruption(ipcReplyTurnTracker.inputTurnId);
+    await notifyProactiveTailInterruption(ipcReplyTurnTracker.inputTurnId);
     return true;
   }
 
@@ -7594,13 +7641,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   if (
-    shouldSendPersonaTailInterruptionNotice({
+    shouldSendProactiveTailInterruptionNotice({
       mode: interactionMode,
       utteranceDelivered: ipcReplyTurnTracker.delivered,
       runnerFailed: isErrorExit,
     })
   ) {
-    await notifyPersonaTailInterruption(ipcReplyTurnTracker.inputTurnId);
+    await notifyProactiveTailInterruption(ipcReplyTurnTracker.inputTurnId);
     commitCursor();
     return true;
   }
@@ -8192,7 +8239,7 @@ async function sendMessageWithOutcome(
     }
 
     // Persist assistant reply so Web polling can render it and clear waiting state.
-    const msgId = crypto.randomUUID();
+    const msgId = options.messageId ?? crypto.randomUUID();
     const timestamp = new Date().toISOString();
     ensureChatExists(jid);
     const persistedMsgId = storeMessageDirect(
@@ -8676,6 +8723,7 @@ function startIpcWatcher(): void {
               const targetGroup = getIpcDeliveryTargetGroup(data.chatJid);
               let messageDelivered = false;
               let messageStaged = false;
+              let messageDeliveryError: string | undefined;
               let stagedDisposition:
                 | 'staged_progress'
                 | 'staged_final'
@@ -8793,28 +8841,18 @@ function startIpcWatcher(): void {
                 // Conversation agents and isolated scheduled tasks route to
                 // virtual JIDs so output appears in their own tab/session,
                 // not the workspace main conversation.
-                const effectiveChatJid = ipcAgentId
-                  ? `${data.chatJid}#agent:${ipcAgentId}`
-                  : ipcTaskId && data.isScheduledTask
-                    ? `${data.chatJid}#task:${ipcTaskId}`
-                    : data.chatJid;
+                const effectiveChatJid = resolveHostIpcLogicalChatJid({
+                  sourceChatJid: data.chatJid,
+                  agentId: ipcAgentId,
+                  agentChatJid: ipcAgentId
+                    ? getAgent(ipcAgentId)?.chat_jid
+                    : undefined,
+                  taskRunId: ipcTaskId,
+                  scheduledTask: data.isScheduledTask === true,
+                });
                 // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
                 const cardText = extractFeishuCardText(data.text);
                 const webText = cardText || data.text;
-                const sendOutcome = await sendMessageWithOutcome(
-                  effectiveChatJid,
-                  webText,
-                  {
-                    // Persist/project only. Native delivery below must use
-                    // the exact inputTurnId-bound Outbox even when this JID
-                    // itself is a Feishu/IM address.
-                    sendToIM: false,
-                    messageMeta: {
-                      sourceKind: 'sdk_send_message',
-                    },
-                  },
-                );
-                messageDelivered = sendOutcome.targetDelivered;
 
                 // Every non-task native send, including conversation agents,
                 // resolves the sticky exact route and uses the Turn Outbox.
@@ -8842,12 +8880,22 @@ function startIpcWatcher(): void {
                         'Suppressed IPC send_message without an immutable inputTurnId',
                       );
                     } else {
+                      const messageScopeKey = channelTurnScope(
+                        sourceGroup,
+                        ipcAgentId,
+                      );
+                      const messageScope =
+                        activeChannelOutboxScopes.resolveInput(
+                          messageScopeKey,
+                          data.inputTurnId,
+                          ipcImRoute,
+                        );
                       messageDelivered = await sendImWithRetry(
                         ipcImRoute,
                         data.text,
                         extractLocalImImagePaths(data.text, sourceGroup),
                         channelOutboxRefForInput(
-                          channelTurnScope(sourceGroup, ipcAgentId),
+                          messageScopeKey,
                           ipcImRoute,
                           data.inputTurnId,
                           `ipc-message:${messageRequestId ?? file}`,
@@ -8856,7 +8904,20 @@ function startIpcWatcher(): void {
                           ? { presentation: 'native' }
                           : undefined,
                       );
+                      if (
+                        !messageDelivered &&
+                        messageScope &&
+                        getUncertainChannelOutboxForTurn(messageScope.turnRunId)
+                      ) {
+                        messageDeliveryError =
+                          'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
+                      }
                     }
+                  } else {
+                    // A Web-only logical session is delivered by durable
+                    // persistence/broadcast below; it has no native provider
+                    // side effect to acknowledge first.
+                    messageDelivered = true;
                   }
                 }
 
@@ -8954,6 +9015,40 @@ function startIpcWatcher(): void {
                   }
                 }
                 if (messageDelivered) {
+                  const projectionMessageId = `ipc_${crypto
+                    .createHash('sha256')
+                    .update(
+                      [
+                        effectiveChatJid,
+                        typeof data.inputTurnId === 'string'
+                          ? data.inputTurnId
+                          : '',
+                        data.text,
+                      ].join('\0'),
+                    )
+                    .digest('hex')
+                    .slice(0, 32)}`;
+                  const sendOutcome = await sendMessageWithOutcome(
+                    effectiveChatJid,
+                    webText,
+                    {
+                      // Native delivery above owns the physical ACK. Only
+                      // confirmed sends are projected into the canonical Web
+                      // session, using a replay-stable id.
+                      sendToIM: false,
+                      messageId: projectionMessageId,
+                      messageMeta: {
+                        turnId:
+                          typeof data.inputTurnId === 'string'
+                            ? data.inputTurnId
+                            : undefined,
+                        sourceKind: 'sdk_send_message',
+                      },
+                    },
+                  );
+                  messageDelivered = sendOutcome.targetDelivered;
+                }
+                if (messageDelivered) {
                   recordSuccessfulIpcSend(sourceGroup, data.chatJid, data.text);
                 }
                 logger.info(
@@ -8961,8 +9056,11 @@ function startIpcWatcher(): void {
                     chatJid: effectiveChatJid,
                     sourceGroup,
                     agentId: ipcAgentId,
+                    delivered: messageDelivered,
                   },
-                  'IPC message sent',
+                  messageDelivered
+                    ? 'IPC message delivered and projected'
+                    : 'IPC message was not delivered',
                 );
               } else {
                 logger.warn(
@@ -9011,7 +9109,9 @@ function startIpcWatcher(): void {
                     }
                   : {
                       success: false,
-                      error: 'Message could not be delivered to its target.',
+                      error:
+                        messageDeliveryError ??
+                        'Message could not be delivered to its target.',
                     },
               );
             } else if (
@@ -11808,9 +11908,9 @@ async function processAgentConversation(
   if (agentChannelTurnRuntime) {
     agentChannelTurnRuntimes.set(lastProcessed.id, agentChannelTurnRuntime);
   }
-  const completeAgentChannelRuntimesForOutput = (
+  const completeAgentChannelRuntimesForOutput = async (
     result: ContainerOutput,
-  ): boolean => {
+  ): Promise<boolean> => {
     if (!result.inputTurnCompleted) return false;
     let allCompleted = true;
     const inputIds = result.ipcReceipts?.length
@@ -11819,6 +11919,33 @@ async function processAgentConversation(
     for (const inputId of inputIds) {
       const runtime = agentChannelTurnRuntimes.get(inputId);
       if (!runtime) continue;
+      const uncertainDelivery = getUncertainChannelOutboxForTurn(runtime.runId);
+      if (uncertainDelivery) {
+        agentDeliveryNeedsManualReconciliation = true;
+        const interrupted = runtime.interrupt(
+          `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
+        );
+        const exactScope = agentChannelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelManualReconciliationNotice({
+              logicalChatJid: virtualChatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              agentId,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : false;
+        if (interrupted && notified) {
+          runtime.dispose();
+          agentChannelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
+        continue;
+      }
       const utteranceDelivered =
         agentPhysicalDeliveryAckByInput.get(inputId) === true;
       if (publishesFrameworkAnswer(interactionMode) && !utteranceDelivered) {
@@ -11892,6 +12019,7 @@ async function processAgentConversation(
         targetJid: replySourceImJid,
         runtime: agentChannelTurnRuntime,
         agentId,
+        presentation: interactionMode === 'proactive' ? 'native' : 'default',
         route: {
           provider: agentStreamingAddress.provider,
           accountId: agentStreamingAccountId,
@@ -12147,7 +12275,7 @@ async function processAgentConversation(
         return true;
       },
       onUtteranceDelivered: () => {
-        if (interactionMode !== 'persona') return;
+        if (interactionMode !== 'proactive') return;
         agentPhysicalDeliveryAckByInput.set(inputTurnId, true);
         agentReplySentByInput.set(inputTurnId, true);
       },
@@ -12403,13 +12531,13 @@ async function processAgentConversation(
   const agentPhysicalDeliveryAckByInput = new Map<string, boolean>([
     [lastProcessed.id, false],
   ]);
-  let personaAgentTailNoticeDelivered = false;
-  const notifyPersonaAgentTailInterruption = async (
+  let proactiveAgentTailNoticeDelivered = false;
+  const notifyProactiveAgentTailInterruption = async (
     inputTurnId: string,
   ): Promise<boolean> => {
     if (
-      personaAgentTailNoticeDelivered ||
-      !shouldSendPersonaTailInterruptionNotice({
+      proactiveAgentTailNoticeDelivered ||
+      !shouldSendProactiveTailInterruptionNotice({
         mode: interactionMode,
         utteranceDelivered:
           agentPhysicalDeliveryAckByInput.get(inputTurnId) === true,
@@ -12418,9 +12546,9 @@ async function processAgentConversation(
     ) {
       return false;
     }
-    personaAgentTailNoticeDelivered = true;
+    proactiveAgentTailNoticeDelivered = true;
     const scope = agentChannelOutboxScopesByInput.get(inputTurnId);
-    return deliverPersonaTailInterruptionNotice({
+    return deliverProactiveTailInterruptionNotice({
       logicalChatJid: virtualChatJid,
       scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
       inputTurnId,
@@ -12835,7 +12963,7 @@ async function processAgentConversation(
     if (!publishesFrameworkAnswer(interactionMode) && !output.providerFailure) {
       output.result = null;
       if (output.status === 'success' && output.inputTurnCompleted) {
-        if (completeAgentChannelRuntimesForOutput(output)) commitCursor();
+        if (await completeAgentChannelRuntimesForOutput(output)) commitCursor();
         broadcastStreamEvent(
           chatJid,
           {
@@ -13323,7 +13451,7 @@ async function processAgentConversation(
 
         if (
           output.inputTurnCompleted &&
-          completeAgentChannelRuntimesForOutput(output)
+          (await completeAgentChannelRuntimesForOutput(output))
         ) {
           commitCursor();
         }
@@ -13589,7 +13717,7 @@ async function processAgentConversation(
       );
     }
     if (
-      interactionMode === 'persona' &&
+      interactionMode === 'proactive' &&
       (output.status === 'error' || hadError)
     ) {
       const utteranceDelivered =
@@ -13609,7 +13737,7 @@ async function processAgentConversation(
     // on that throw path; mutation-preserve stops deliberately keep the cursor.
     if (queue.getRecentStopDisposition(effectiveGroup.folder) === 'discard') {
       commitCursor();
-    } else if (interactionMode === 'persona') {
+    } else if (interactionMode === 'proactive') {
       const utteranceDelivered =
         agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true;
       if (utteranceDelivered) commitCursor();
@@ -13723,21 +13851,20 @@ async function processAgentConversation(
           );
           const exactScope = agentChannelOutboxScopesByInput.get(inputTurnId);
           const notified = exactScope?.chatId
-            ? await deliverIndependentChannelSystemNotice({
+            ? await deliverChannelManualReconciliationNotice({
                 logicalChatJid: virtualChatJid,
                 scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
                 targetJid: exactScope.sourceJid,
-                originalInputTurnId: inputTurnId,
-                originalRunId: runtime.runId,
-                noticeKey: 'delivery-uncertain',
-                text: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+                runtime,
                 agentId,
+                presentation:
+                  interactionMode === 'proactive' ? 'native' : 'default',
                 route: { ...exactScope, chatId: exactScope.chatId },
               })
             : false;
           if (!notified) allAgentManualNoticesAcknowledged = false;
         } else if (
-          (interactionMode === 'persona' ||
+          (interactionMode === 'proactive' ||
             runtime === agentChannelTurnRuntime) &&
           inputSettled
         ) {
@@ -13746,7 +13873,7 @@ async function processAgentConversation(
             runtime.complete({
               cursorCommitted,
               replyDelivered: utteranceDelivered,
-              silent: interactionMode === 'persona' && !utteranceDelivered,
+              silent: interactionMode === 'proactive' && !utteranceDelivered,
               inputTurnId,
             });
         } else {
@@ -13786,7 +13913,8 @@ async function processAgentConversation(
     }
 
     if (
-      interactionMode === 'persona' &&
+      interactionMode === 'proactive' &&
+      !agentDeliveryNeedsManualReconciliation &&
       agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true
     ) {
       // A native utterance is an irreversible user-visible side effect. If the
@@ -14013,14 +14141,14 @@ async function processAgentConversation(
       );
     }
     if (
-      shouldSendPersonaTailInterruptionNotice({
+      shouldSendProactiveTailInterruptionNotice({
         mode: interactionMode,
         utteranceDelivered:
           agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true,
         runnerFailed: hadError || agentClosed,
       })
     ) {
-      await notifyPersonaAgentTailInterruption(activeAgentInputTurnId);
+      await notifyProactiveAgentTailInterruption(activeAgentInputTurnId);
     }
     activeAgentBuilderTurns.delete(agentBuilderScope);
     activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder, agentId));

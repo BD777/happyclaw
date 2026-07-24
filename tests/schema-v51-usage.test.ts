@@ -62,7 +62,7 @@ describe('schema v51 usage event migration', () => {
     raw.close();
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('61');
+    expect(db.getRouterState('schema_version')).toBe('62');
     expect(db.getUsageUsers()).toEqual([
       { id: 'real-owner', username: 'real-owner' },
     ]);

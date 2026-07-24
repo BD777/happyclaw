@@ -14,10 +14,13 @@ const PROMPTS_DIR = path.join(
 const REQUIRED_FILES = [
   'security-rules.md',
   'interaction.md',
-  'output.md',
+  'output.assistant.md',
+  'output.proactive.md',
+  'output.task.md',
   'web-fetch.md',
   'background-tasks.md',
-  'delivery-contract.md',
+  'delivery-contract.assistant.md',
+  'delivery-contract.proactive.md',
   'memory-system.home.md',
   'memory-system.guest.md',
 ];
@@ -111,13 +114,45 @@ describe('prompts/ files', () => {
     );
   });
 
-  test('delivery contract does not impersonate a sub-session or force a language', () => {
-    const delivery = fs.readFileSync(
-      path.join(PROMPTS_DIR, 'delivery-contract.md'),
+  test('reply-mode contracts are explicit delivery rules, not identity prompts', () => {
+    const assistant = fs.readFileSync(
+      path.join(PROMPTS_DIR, 'delivery-contract.assistant.md'),
       'utf-8',
     );
-    expect(delivery).not.toContain('最高优先级');
-    expect(delivery).not.toContain('子会话');
-    expect(delivery).not.toContain('简体中文');
+    const proactive = fs.readFileSync(
+      path.join(PROMPTS_DIR, 'delivery-contract.proactive.md'),
+      'utf-8',
+    );
+    const assistantOutput = fs.readFileSync(
+      path.join(PROMPTS_DIR, 'output.assistant.md'),
+      'utf-8',
+    );
+    const proactiveOutput = fs.readFileSync(
+      path.join(PROMPTS_DIR, 'output.proactive.md'),
+      'utf-8',
+    );
+    const taskOutput = fs.readFileSync(
+      path.join(PROMPTS_DIR, 'output.task.md'),
+      'utf-8',
+    );
+    expect(assistant).toContain('Assistant reply mode');
+    expect(assistant).toContain('automatically publishes');
+    expect(proactive).toContain('Proactive reply mode');
+    expect(proactive).toContain('only way for you to say something');
+    expect(proactive).toContain('zero, one, or many messages');
+    expect(assistantOutput).toContain('最终回复必须自包含');
+    expect(proactiveOutput).toContain('真实对话参与者');
+    expect(proactiveOutput).toContain(
+      '[Your previous response had no visible output.',
+    );
+    expect(proactiveOutput).not.toContain('最终回复必须自包含');
+    expect(taskOutput).toContain('最终 SDK Assistant 文本不会自动发送');
+    for (const delivery of [assistant, proactive]) {
+      expect(delivery).toContain('not an identity or personality instruction');
+      expect(delivery).not.toContain('person-like');
+      expect(delivery).not.toContain('最高优先级');
+      expect(delivery).not.toContain('子会话');
+      expect(delivery).not.toContain('简体中文');
+    }
   });
 });

@@ -3,7 +3,9 @@ import type { GroupInfo, InteractionMode } from '../types';
 export const DEFAULT_INTERACTION_MODE: InteractionMode = 'assistant';
 
 export function normalizeInteractionMode(value: unknown): InteractionMode {
-  return value === 'persona' ? 'persona' : DEFAULT_INTERACTION_MODE;
+  return value === 'proactive' || value === 'persona'
+    ? 'proactive'
+    : DEFAULT_INTERACTION_MODE;
 }
 
 export function normalizeGroupInteractionMode(group: GroupInfo): GroupInfo {

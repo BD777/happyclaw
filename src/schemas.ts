@@ -224,6 +224,10 @@ export const MessageCreateSchema = z
     }
   });
 
+const InteractionModeSchema = z
+  .enum(['assistant', 'proactive', 'persona'])
+  .transform((mode) => (mode === 'persona' ? 'proactive' : mode));
+
 export const GroupCreateSchema = z.object({
   name: z.string().min(1).max(MAX_GROUP_NAME_LEN),
   agent_profile_id: z
@@ -231,7 +235,7 @@ export const GroupCreateSchema = z.object({
     .optional()
     .transform((val) => (val && val.trim() ? val.trim() : undefined)),
   execution_mode: z.enum(['container', 'host']).optional(),
-  interaction_mode: z.enum(['assistant', 'persona']).optional(),
+  interaction_mode: InteractionModeSchema.optional(),
   custom_cwd: z
     .string()
     .optional()
@@ -467,7 +471,7 @@ export const GroupPatchSchema = z.object({
     .enum(['auto', 'always', 'when_mentioned', 'owner_mentioned', 'disabled'])
     .optional(),
   execution_mode: z.enum(['container', 'host']).optional(),
-  interaction_mode: z.enum(['assistant', 'persona']).optional(),
+  interaction_mode: InteractionModeSchema.optional(),
 });
 
 export const LoginSchema = z.object({

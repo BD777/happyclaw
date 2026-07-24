@@ -3,10 +3,31 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { channelTurnScope } from '../src/channel-turn-registry.js';
-import { routeHostIpcOutput } from '../src/host-ipc-output-router.js';
+import {
+  resolveHostIpcLogicalChatJid,
+  routeHostIpcOutput,
+} from '../src/host-ipc-output-router.js';
 import { ActiveTurnOutputRegistry } from '../src/turn-output-coordinator.js';
 
 describe('host IPC primary output routing', () => {
+  test('projects conversation-agent output into its canonical Web session', () => {
+    expect(
+      resolveHostIpcLogicalChatJid({
+        sourceChatJid: 'feishu:oc_chat#thread:omt_topic#root:om_root',
+        agentId: 'conversation-agent',
+        agentChatJid: 'web:main',
+        scheduledTask: false,
+      }),
+    ).toBe('web:main#agent:conversation-agent');
+    expect(
+      resolveHostIpcLogicalChatJid({
+        sourceChatJid: 'web:workspace',
+        taskRunId: 'task-run-1',
+        scheduledTask: true,
+      }),
+    ).toBe('web:workspace#task:task-run-1');
+  });
+
   test('stages a custom-agent final in its exact scope without a separate provider send', async () => {
     const activeTurnOutputs = new ActiveTurnOutputRegistry();
     const projectedFinal = vi.fn(() => true);
@@ -113,7 +134,7 @@ describe('host IPC primary output routing', () => {
     ).toBe('separate_provider');
   });
 
-  test('persona mode forces progress and final requests onto independent message delivery', () => {
+  test('proactive mode forces progress and final requests onto independent message delivery', () => {
     const activeTurnOutputs = new ActiveTurnOutputRegistry();
     const projected = vi.fn(() => true);
     activeTurnOutputs.bind(
@@ -136,7 +157,7 @@ describe('host IPC primary output routing', () => {
             deliveryRole,
             authorized: true,
             scheduledTask: false,
-            interactionMode: 'persona',
+            interactionMode: 'proactive',
           },
           activeTurnOutputs,
         ),

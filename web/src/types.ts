@@ -1,4 +1,4 @@
-export type InteractionMode = 'assistant' | 'persona';
+export type InteractionMode = 'assistant' | 'proactive';
 
 export interface GroupInfo {
   name: string;

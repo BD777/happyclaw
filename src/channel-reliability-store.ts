@@ -1443,6 +1443,7 @@ export function completeChannelTurnRun(
   } = {},
 ): boolean {
   const now = isoNow(input.now);
+  const status = input.status ?? 'completed';
   const changed = requireDatabase()
     .prepare(
       `UPDATE turn_runs
@@ -1450,10 +1451,21 @@ export function completeChannelTurnRun(
            lease_owner = NULL, lease_expires_at = NULL,
            revision = revision + 1, updated_at = ?
        WHERE id = ? AND status IN ('running','finalizing')
-         AND lease_owner = ? AND lease_token = ? AND lease_expires_at > ?`,
+         AND lease_owner = ? AND lease_token = ? AND lease_expires_at > ?
+         AND (
+           ? <> 'completed'
+           OR NOT EXISTS (
+             SELECT 1 FROM channel_outbox
+             WHERE turn_run_id = turn_runs.id
+               AND status IN (
+                 'pending','claimed','retry_wait','uploading',
+                 'uploaded','sending','uncertain'
+               )
+           )
+         )`,
     )
     .run(
-      input.status ?? 'completed',
+      status,
       stringifyPayload(input.result),
       input.error ?? null,
       now,
@@ -1462,6 +1474,7 @@ export function completeChannelTurnRun(
       claim.leaseOwner,
       claim.leaseToken,
       now,
+      status,
     );
   return changed.changes === 1;
 }

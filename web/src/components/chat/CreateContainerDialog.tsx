@@ -164,7 +164,7 @@ export function CreateContainerDialog({
         <DialogHeader>
           <DialogTitle>为 Agent 新建工作区</DialogTitle>
           <DialogDescription>
-            选择 Agent，并确认工作区的交互方式、运行位置和上下文。
+            选择 Agent，并确认工作区的回复模式、运行位置和上下文。
           </DialogDescription>
         </DialogHeader>
 
@@ -277,10 +277,12 @@ export function CreateContainerDialog({
                 </div>
                 <div className="min-w-0">
                   <div className="text-[11px] font-medium text-muted-foreground">
-                    交互方式
+                    回复模式
                   </div>
                   <div className="mt-1 text-sm font-medium text-foreground">
-                    {interactionMode === 'persona' ? '人物模式' : '助手模式'}
+                    {interactionMode === 'proactive'
+                      ? '主动模式'
+                      : 'Assistant 模式'}
                   </div>
                 </div>
               </div>

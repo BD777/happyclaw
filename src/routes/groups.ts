@@ -1050,7 +1050,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       }
       if (executionModeChanged || interactionModeChanged) {
         // SDK resume state is environment-bound. Never carry a host session
-        // into a container, or an assistant/persona transcript across output
+        // into a container, or an assistant/proactive transcript across output
         // authorities, after the old runner is stopped.
         deleteWorkspaceSessions(existing.folder);
         delete deps.sessions[existing.folder];
