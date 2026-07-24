@@ -2128,6 +2128,23 @@ export function initDatabase(): void {
   // pass backfills sources and removes any projection-only ghosts.
   // v45 → v46: workspace sharing was removed. Drop the legacy membership
   // table so stale grants cannot survive an upgrade.
+  // v60 -> v61: interaction behavior belongs to the Workspace↔Agent binding,
+  // not the reusable AgentProfile. This column must exist before the generic
+  // AgentProfile workspace backfill below: that backfill reads existing
+  // bindings through getWorkspaceAgentProfileId(), whose row projection now
+  // includes interaction_mode.
+  ensureColumn(
+    'workspace_agent_profiles',
+    'interaction_mode',
+    "TEXT NOT NULL DEFAULT 'assistant'",
+  );
+  db.prepare(
+    `UPDATE workspace_agent_profiles
+     SET interaction_mode = 'assistant'
+     WHERE interaction_mode IS NULL
+        OR interaction_mode NOT IN ('assistant', 'persona')`,
+  ).run();
+
   db.exec('DROP TABLE IF EXISTS group_members');
   backfillAgentProfileDefaultsAndWorkspaceMappings();
   removeLegacyAgentToolPolicies();
@@ -2208,21 +2225,6 @@ export function initDatabase(): void {
   // schema and fenced APIs; db.ts only binds it to this process connection.
   createChannelReliabilitySchema(db);
   bindChannelReliabilityDatabase(db);
-
-  // v60 -> v61: interaction behavior belongs to the Workspace↔Agent binding,
-  // not the reusable AgentProfile. Existing workspaces retain assistant
-  // semantics; profile switches preserve this independent binding field.
-  ensureColumn(
-    'workspace_agent_profiles',
-    'interaction_mode',
-    "TEXT NOT NULL DEFAULT 'assistant'",
-  );
-  db.prepare(
-    `UPDATE workspace_agent_profiles
-     SET interaction_mode = 'assistant'
-     WHERE interaction_mode IS NULL
-        OR interaction_mode NOT IN ('assistant', 'persona')`,
-  ).run();
 
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',

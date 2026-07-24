@@ -40,7 +40,7 @@ beforeAll(() => {
       (jid, name, folder, added_at, created_by, is_home)
     VALUES
       ('web:legacy-workspace', 'Legacy Workspace', 'legacy-workspace',
-       '2026-07-24T00:00:00.000Z', NULL, 0);
+       '2026-07-24T00:00:00.000Z', 'legacy-owner', 0);
     CREATE TABLE workspace_agent_profiles (
       group_folder TEXT PRIMARY KEY,
       agent_profile_id TEXT NOT NULL,
