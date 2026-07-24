@@ -36,7 +36,10 @@ import {
   type MentionGateMention,
 } from './feishu-mention-gate.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
-import { parseChannelAddress } from './channel-address.js';
+import {
+  extractProviderTarget,
+  parseChannelAddress,
+} from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
   executeFeishuCapability,
@@ -58,6 +61,10 @@ import {
   updateClaimedChannelInbox,
   type ClaimedChannelInboxItem,
 } from './channel-reliability-store.js';
+import {
+  ExactAsyncIndicatorRegistry,
+  processingIndicatorKey,
+} from './processing-indicator.js';
 import type {
   ChannelTurnContext,
   FeishuMessageMeta,
@@ -184,8 +191,8 @@ export interface FeishuConnection {
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendReaction(chatId: string, isTyping: boolean): Promise<void>;
-  /** Clear the "OnIt" ack reaction for a chat (e.g. when streaming card handled the reply). */
-  clearAckReaction(chatId: string): void;
+  /** Clear the "OnIt" ack reaction owned by one exact inbound input. */
+  clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
   syncGroups(): Promise<void>;
   getChatInfo(chatId: string): Promise<FeishuChatInfo | null>;
@@ -989,7 +996,10 @@ export function createFeishuConnection(
   const inboxOwner = `feishu:${reliabilityAccountId}:${randomUUID()}`;
   const senderNameCache = new Map<string, string>();
   const lastMessageIdByChat = new Map<string, string>();
-  const ackReactionByChat = new Map<string, string>();
+  const ackReactions = new ExactAsyncIndicatorRegistry<{
+    messageId: string;
+    reactionId: string;
+  }>();
   const typingReactionByChat = new Map<string, string>();
   const inboxHeartbeatByClaim = new Map<string, NodeJS.Timeout>();
   const knownChatIds = new Set<string>();
@@ -1488,26 +1498,34 @@ export function createFeishuConnection(
     }
   }
 
-  async function removeReaction(
+  async function removeReactionStrict(
+    messageId: string,
+    reactionId: string,
+  ): Promise<void> {
+    await client!.im.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    });
+  }
+
+  async function removeReactionBestEffort(
     messageId: string,
     reactionId: string,
   ): Promise<void> {
     try {
-      await client!.im.messageReaction.delete({
-        path: { message_id: messageId, reaction_id: reactionId },
-      });
+      await removeReactionStrict(messageId, reactionId);
     } catch (err) {
       logger.debug({ err, messageId, reactionId }, 'Failed to remove reaction');
     }
   }
 
-  function clearAckForTarget(rawTarget: string): void {
+  function clearAckForInput(
+    rawTarget: string,
+    inputMessageId: string,
+  ): Promise<void> {
     const target = parseFeishuRouteTarget(rawTarget);
-    const ackStored = ackReactionByChat.get(target.raw);
-    if (!ackStored) return;
-    const [ackMsgId, ackReactionId] = ackStored.split(':');
-    removeReaction(ackMsgId, ackReactionId).catch(() => {});
-    ackReactionByChat.delete(target.raw);
+    return ackReactions.clear(
+      processingIndicatorKey(target.raw, inputMessageId),
+    );
   }
 
   function p2pLastMessageId(target: FeishuRouteTarget): string | undefined {
@@ -2473,20 +2491,22 @@ export function createFeishuConnection(
 
       // ── Ack Reaction：确认已收到消息（在 mention 过滤之后，避免对未处理的消息加表情） ──
       if (source === 'ws') {
+        // The registry is owned by one channel-account instance. Keep its key
+        // provider-native on both attach and clear; account scoping belongs to
+        // ImManager's instance lookup, not to the provider target.
         const ackTarget = parseFeishuRouteTarget(
-          routeSourceJid.startsWith('feishu:')
-            ? routeSourceJid.slice('feishu:'.length)
-            : routeSourceJid,
+          extractProviderTarget(routeSourceJid),
         );
-        addReaction(messageId, 'OnIt')
-          .then((reactionId) => {
-            if (reactionId) {
-              ackReactionByChat.set(
-                ackTarget.raw,
-                `${messageId}:${reactionId}`,
-              );
-            }
-          })
+        ackReactions
+          .attach(
+            processingIndicatorKey(ackTarget.raw, messageId),
+            async () => {
+              const reactionId = await addReaction(messageId, 'OnIt');
+              return reactionId ? { messageId, reactionId } : null;
+            },
+            ({ messageId: ackMessageId, reactionId }) =>
+              removeReactionStrict(ackMessageId, reactionId),
+          )
           .catch(() => {});
       }
 
@@ -3229,6 +3249,7 @@ export function createFeishuConnection(
       eventDispatcher = null;
       reconnecting = false;
       disconnectedChecks = 0;
+      await ackReactions.clearAll();
       if (wsClient) {
         logger.info('Stopping Feishu client');
         try {
@@ -3268,7 +3289,6 @@ export function createFeishuConnection(
               const parsed = JSON.parse(text);
               if (parsed.type === 'interactive' && parsed.card) {
                 await sendToFeishu(chatId, 'interactive', text);
-                clearAckForTarget(chatId);
                 return;
               }
             } catch {
@@ -3331,10 +3351,8 @@ export function createFeishuConnection(
             throw imageErr;
           }
         }
-        clearAckForTarget(chatId);
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Feishu message');
-        clearAckForTarget(chatId);
         throw err;
       }
     },
@@ -3381,8 +3399,6 @@ export function createFeishuConnection(
         if (caption) {
           await sendToFeishu(chatId, 'text', JSON.stringify({ text: caption }));
         }
-        clearAckForTarget(chatId);
-
         logger.info(
           { chatId, imageKey, mimeType, size: imageBuffer.length },
           'Feishu image sent',
@@ -3447,8 +3463,6 @@ export function createFeishuConnection(
           msgType,
           JSON.stringify({ file_key: fileKey }),
         );
-        clearAckForTarget(chatId);
-
         logger.info(
           { chatId, fileName, fileSize: buffer.length },
           'File sent to Feishu',
@@ -3484,14 +3498,14 @@ export function createFeishuConnection(
         const stored = typingReactionByChat.get(reactionKey);
         if (stored) {
           const [msgId, reactionId] = stored.split(':');
-          await removeReaction(msgId, reactionId);
+          await removeReactionBestEffort(msgId, reactionId);
           typingReactionByChat.delete(reactionKey);
         }
       }
     },
 
-    clearAckReaction(chatId: string): void {
-      clearAckForTarget(chatId);
+    clearAckReaction(chatId: string, inputMessageId: string): Promise<void> {
+      return clearAckForInput(chatId, inputMessageId);
     },
 
     isConnected(): boolean {

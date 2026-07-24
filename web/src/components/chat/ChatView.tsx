@@ -448,7 +448,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   useEffect(() => {
     const unsub1 = wsManager.on('stream_event', (data: any) => {
       if (data.chatJid === groupJid) {
-        handleStreamEvent(groupJid, data.event, data.agentId);
+        handleStreamEvent(groupJid, data.event, data.agentId, data.runId);
       }
     });
     // 通过 new_message 立即添加消息到本地状态（消除轮询延迟导致的消息"丢失"）
@@ -468,14 +468,19 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     const unsub4 = wsManager.on('stream_snapshot', (data: any) => {
       if (!data.snapshot) return;
       if (data.chatJid === groupJid) {
-        handleStreamSnapshot(groupJid, data.snapshot);
+        handleStreamSnapshot(groupJid, data.snapshot, undefined, data.runId);
       } else if (
         typeof data.chatJid === 'string' &&
         data.chatJid.startsWith(agentSnapshotPrefix)
       ) {
         // Agent-specific snapshot: extract agentId and restore agentStreaming
         const snapshotAgentId = data.chatJid.slice(agentSnapshotPrefix.length);
-        handleStreamSnapshot(groupJid, data.snapshot, snapshotAgentId);
+        handleStreamSnapshot(
+          groupJid,
+          data.snapshot,
+          snapshotAgentId,
+          data.runId,
+        );
       }
     });
     const unsub5 = wsManager.on('follow_up_update', (data: any) => {

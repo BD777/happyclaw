@@ -319,6 +319,8 @@ function ensureSettingsJson(
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  /** Exact GroupQueue query attempt for Web stream fencing. */
+  queryRunId?: string;
   groupFolder: string;
   chatJid: string;
   /** Workspace-scoped interaction contract for this public Agent turn. */
@@ -402,8 +404,12 @@ export interface ContainerOutput {
   ipcReceipts?: Array<{
     deliveryId: string;
     chatJid: string;
-    coveredCursors?: Array<{ timestamp: string; id: string }>;
-    cursor: { timestamp: string; id: string };
+    coveredCursors?: Array<{
+      timestamp: string;
+      id: string;
+      sourceJid?: string;
+    }>;
+    cursor: { timestamp: string; id: string; sourceJid?: string };
   }>;
 }
 

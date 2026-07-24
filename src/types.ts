@@ -788,10 +788,16 @@ export interface ImContextBinding {
 
 export interface ActiveRunSnapshot {
   chatJid: string;
-  runId: string | null;
+  runId: string;
   startedAt: string;
   phase: 'queued' | 'preparing' | 'running';
 }
+
+export type RunFinishReason =
+  | 'completed'
+  | 'released'
+  | 'runner_exit'
+  | 'stopped';
 
 // WebSocket message types
 export type WsMessageOut =
@@ -822,6 +828,8 @@ export type WsMessageOut =
       chatJid: string;
       event: StreamEvent;
       agentId?: string;
+      /** Exact GroupQueue attempt that owns this stream event. */
+      runId?: string;
     }
   | {
       type: 'agent_status';
@@ -845,6 +853,13 @@ export type WsMessageOut =
       runId: string;
       startedAt: string;
       phase: 'preparing';
+    }
+  | {
+      type: 'run_finished';
+      chatJid: string;
+      runId: string;
+      finishedAt: string;
+      reason: RunFinishReason;
     }
   | {
       type: 'active_run_snapshot';
@@ -905,6 +920,8 @@ export type WsMessageOut =
   | {
       type: 'stream_snapshot';
       chatJid: string;
+      /** Exact GroupQueue attempt that owns this reconnect snapshot. */
+      runId?: string;
       snapshot: {
         partialText: string;
         thinkingText?: string;

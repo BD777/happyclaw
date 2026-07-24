@@ -911,14 +911,18 @@ export class IMConnectionManager {
   /**
    * Set typing indicator on an IM chat, auto-routing via JID prefix.
    */
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+  async setTyping(
+    jid: string,
+    isTyping: boolean,
+    leaseId?: string,
+  ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) return;
 
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel) {
-      await channel.setTyping(chatId, isTyping);
+      await channel.setTyping(chatId, isTyping, leaseId);
     }
     // No fallback for typing — silently ignore if owner's connection is unavailable
   }
@@ -926,14 +930,14 @@ export class IMConnectionManager {
   /**
    * Clear the ack reaction for a chat (e.g. when streaming card handled the reply).
    */
-  clearAckReaction(jid: string): void {
+  async clearAckReaction(jid: string, inputMessageId: string): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) return;
 
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.clearAckReaction) {
-      channel.clearAckReaction(chatId);
+      await channel.clearAckReaction(chatId, inputMessageId);
     }
   }
 

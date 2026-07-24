@@ -94,6 +94,7 @@ function resetChatStore(): void {
       currentGroup: null,
       messages: {},
       waiting: {},
+      activeRuns: {},
       hasMore: {},
       loading: false,
       error: null,
@@ -250,6 +251,14 @@ describe('conversation Agent usage events', () => {
       agentHasMore: { [agentId]: false },
       agentStreaming: {},
       agentWaiting: { [agentId]: false },
+      activeRuns: {
+        [`${jid}#agent:${agentId}`]: {
+          chatJid: `${jid}#agent:${agentId}`,
+          runId: 'run-workflow-1',
+          startedAt: '2026-07-21T15:22:00.000Z',
+          phase: 'running',
+        },
+      },
     });
 
     useChatStore.getState().handleStreamEvent(
@@ -269,6 +278,7 @@ describe('conversation Agent usage events', () => {
         },
       },
       agentId,
+      'run-workflow-1',
     );
 
     const updated = useChatStore.getState().agentMessages[agentId][0];
@@ -285,6 +295,120 @@ describe('conversation Agent usage events', () => {
       [expect.objectContaining({ id: finalReply.id })],
       false,
     );
+  });
+});
+
+describe('exact Web run state sequences', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetChatStore();
+  });
+
+  it('replaces A streaming with B snapshot after reconnect', () => {
+    const jid = 'web:reconnect';
+    useChatStore.setState({
+      activeRuns: {
+        [jid]: {
+          chatJid: jid,
+          runId: 'run-a',
+          startedAt: '2026-07-25T00:00:00.000Z',
+          phase: 'running',
+        },
+      },
+      waiting: { [jid]: true },
+      streaming: {
+        [jid]: {
+          partialText: 'A stale partial',
+          thinkingText: '',
+          isThinking: false,
+          activeTools: [],
+          activeHook: null,
+          systemStatus: null,
+          recentEvents: [],
+          traceEvents: [],
+          taskStates: {},
+        },
+      },
+    });
+
+    useChatStore.getState().handleActiveRunSnapshot([
+      {
+        chatJid: jid,
+        runId: 'run-b',
+        startedAt: '2026-07-25T00:01:00.000Z',
+        phase: 'running',
+      },
+    ]);
+    expect(useChatStore.getState().streaming[jid]).toBeUndefined();
+    expect(useChatStore.getState().activeRuns[jid]?.runId).toBe('run-b');
+
+    useChatStore.getState().handleStreamSnapshot(
+      jid,
+      {
+        partialText: 'B canonical partial',
+        activeTools: [],
+        recentEvents: [],
+        systemStatus: null,
+      },
+      undefined,
+      'run-b',
+    );
+
+    expect(useChatStore.getState().streaming[jid]?.partialText).toBe(
+      'B canonical partial',
+    );
+  });
+
+  it('does not restore waiting for proactive sdk_send_message on a warm idle runner', async () => {
+    const jid = 'web:proactive-idle';
+    const proactiveUtterance: Message = {
+      id: 'utterance-1',
+      chat_jid: jid,
+      sender: 'happyclaw-agent',
+      sender_name: 'HappyClaw',
+      content: '我先告诉你当前进度。',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      is_from_me: true,
+      source_kind: 'sdk_send_message',
+    };
+    useChatStore.setState({
+      messages: { [jid]: [proactiveUtterance] },
+      waiting: { [jid]: true },
+      streaming: {
+        [jid]: {
+          partialText: 'stale',
+          thinkingText: '',
+          isThinking: false,
+          activeTools: [],
+          activeHook: null,
+          systemStatus: null,
+          recentEvents: [],
+          traceEvents: [],
+          taskStates: {},
+        },
+      },
+    });
+    apiGetMock.mockImplementation(async (path: string) => {
+      if (path === '/api/status') {
+        return {
+          groups: [
+            {
+              jid,
+              active: true,
+              pendingMessages: false,
+              queryInFlight: false,
+              queryId: null,
+            },
+          ],
+        };
+      }
+      return { messages: [] };
+    });
+
+    await useChatStore.getState().restoreActiveState();
+
+    expect(useChatStore.getState().waiting[jid]).toBeUndefined();
+    expect(useChatStore.getState().streaming[jid]).toBeUndefined();
   });
 });
 

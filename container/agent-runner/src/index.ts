@@ -124,6 +124,11 @@ import {
   shouldAnchorInitialAgentTurn,
 } from './agent-turn-contract.js';
 import { prepareMessageStreamText } from './message-stream-text.js';
+import {
+  DurableInputTurnCompletion,
+  QuiescentResultGate,
+  shouldFailIncompleteQueryExit,
+} from './background-task-drain.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -1414,6 +1419,8 @@ function drainIpcInput(): IpcDrainResult {
           result.messages.push({
             text: data.text,
             images: data.images,
+            queryRunId:
+              typeof data.queryRunId === 'string' ? data.queryRunId : undefined,
             taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
             sourceJid:
               typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
@@ -1745,6 +1752,9 @@ async function runQueryAttempt(
       }
     }
     if (currentMessage) {
+      if (currentMessage.queryRunId) {
+        containerInput.queryRunId = currentMessage.queryRunId;
+      }
       setCurrentChannelTurn(
         containerInput,
         currentMessage.sourceJid,
@@ -1764,7 +1774,7 @@ async function runQueryAttempt(
   let providerFailureTurn: ProviderFallbackRetryTurn | undefined;
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
-  let durableInputTurnCompleted = false;
+  const durableInputCompletion = new DurableInputTurnCompletion();
   const assistantTextTracker = new AssistantTextTracker();
   let canonicalAssistantUuid: string | undefined;
   const agentTurnAnchor = resolveAgentTurnAnchor(
@@ -1785,6 +1795,7 @@ async function runQueryAttempt(
   const initialRejected = stream.push(prompt, images, decorateInitialUserTurn);
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
+    queryRunId: containerInput.queryRunId,
     turnId: containerInput.turnId,
     sessionId: newSessionId || sessionId,
   });
@@ -1869,6 +1880,7 @@ async function runQueryAttempt(
   // After a result is received, allow a short window for the host to write _drain
   // before force-closing the stream.
   let resultReceivedAt: number | null = null;
+  let cancelBackgroundResultCompletion: () => void = () => {};
   const POST_RESULT_TIMEOUT_MS = 5_000;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
   let queryRef: Pick<Query, 'interrupt'> | null = null;
@@ -1996,6 +2008,7 @@ async function runQueryAttempt(
 
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
+      cancelBackgroundResultCompletion();
       closedDuringQuery = true;
       emitResultUsage({}, containerInput.turnId || generateTurnId());
       interruptQueryForShutdown('Close sentinel detected during query');
@@ -2006,6 +2019,7 @@ async function runQueryAttempt(
     }
     if (shouldInterrupt()) {
       log('Interrupt sentinel detected, interrupting current query');
+      cancelBackgroundResultCompletion();
       interruptedDuringQuery = true;
       const cancelledInputs = ipcDeliveryTracker.cancelCurrentTurn();
       cancelledIpcReceipts = cancelledInputs
@@ -2039,6 +2053,7 @@ async function runQueryAttempt(
     // Treat drain as close at this point to release the container.
     if (resultCount > 0 && shouldDrain()) {
       log('Drain sentinel detected after query result, ending stream');
+      cancelBackgroundResultCompletion();
       closedDuringQuery = true;
       interruptQueryForShutdown('Drain sentinel detected after query result');
       stream.end();
@@ -2100,6 +2115,7 @@ async function runQueryAttempt(
       const becomesCurrentTurn = !ipcDeliveryTracker.hasPendingTurns;
       ipcDeliveryTracker.acceptTurn([msg]);
       if (becomesCurrentTurn) {
+        durableInputCompletion.activateInput();
         providerFallbackTurns.acceptCurrentTurn([msg]);
         activateCurrentInputTurn(
           msg.receipt?.deliveryId || containerInput.turnId || generateTurnId(),
@@ -2168,6 +2184,98 @@ async function runQueryAttempt(
     allowedTools.includes('Task') && allowedTools.includes('TaskOutput');
   const proactiveInteractiveContract =
     usesProactiveInteractiveContract(containerInput);
+  const backgroundResultGate = new QuiescentResultGate(100);
+  type BackgroundResultCandidate = {
+    finalText: string | null;
+    suspectTruncated: boolean;
+    pendingBgTasks: number;
+    sdkMessageUuid?: string;
+    completedAssistantUuid?: string;
+  };
+  let pendingBackgroundResult: BackgroundResultCandidate | undefined;
+  cancelBackgroundResultCompletion = () => {
+    backgroundResultGate.activityObserved();
+    pendingBackgroundResult = undefined;
+    processor.invalidateObservedBackgroundResult();
+  };
+
+  const publishResultCandidate = (
+    candidate: BackgroundResultCandidate,
+    inputTurnCompleted: boolean,
+  ): void => {
+    const ipcReceipts = inputTurnCompleted
+      ? ipcDeliveryTracker.completeNextTurn()
+      : undefined;
+    const queryIdle = inputTurnCompleted && !ipcDeliveryTracker.hasPendingTurns;
+    durableInputCompletion.publishResult(
+      inputTurnCompleted,
+      ipcDeliveryTracker.hasPendingTurns,
+    );
+    emit({
+      status: 'success',
+      // Proactive SDK text is control-plane only; user-visible speech must
+      // already have crossed the send_message delivery boundary.
+      result: proactiveInteractiveContract ? null : candidate.finalText,
+      newSessionId,
+      sdkMessageUuid: candidate.sdkMessageUuid,
+      sourceKind: sourceKindOverride ?? 'sdk_final',
+      finalizationReason: candidate.suspectTruncated
+        ? 'truncated'
+        : 'completed',
+      pendingBgTasks: candidate.pendingBgTasks,
+      inputTurnCompleted,
+      queryIdle,
+      ...(ipcReceipts && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
+    });
+
+    containerInput.turnId = generateTurnId();
+    if (inputTurnCompleted) {
+      providerFallbackTurns.completeHealthyTurn({
+        sessionId: newSessionId || sessionId,
+        resumeAt: candidate.completedAssistantUuid,
+        nextTurnMessages: ipcDeliveryTracker.currentTurnMessages,
+      });
+    }
+
+    if (!inputTurnCompleted) {
+      resultReceivedAt = null;
+      return;
+    }
+    if (!ipcDeliveryTracker.hasPendingTurns) {
+      sawPendingBackgroundTasks = false;
+      backgroundSummaryForceAttempts = 0;
+      resultReceivedAt = Date.now();
+      return;
+    }
+
+    // The completed output still belongs to A. Activate B only after A's
+    // immutable receipt has been emitted.
+    resultReceivedAt = null;
+    durableInputCompletion.activateInput();
+    activateCurrentInputTurn(containerInput.turnId);
+    log(
+      `Result completed after background drain; keeping stream open for ${ipcDeliveryTracker.pendingTurnCount} accepted follow-up turn(s)`,
+    );
+  };
+
+  const scheduleBackgroundResultCompletion = (): void => {
+    const candidate = pendingBackgroundResult;
+    if (!candidate || !processor.canCompleteObservedBackgroundResult()) {
+      return;
+    }
+    backgroundResultGate.schedule(() => {
+      if (
+        pendingBackgroundResult !== candidate ||
+        !processor.canCompleteObservedBackgroundResult()
+      ) {
+        return;
+      }
+      pendingBackgroundResult = undefined;
+      processor.commitObservedBackgroundResult();
+      publishResultCandidate({ ...candidate, pendingBgTasks: 0 }, true);
+      log('Background completion debt drained after quiescence');
+    });
+  };
   // The reference person-like runtime supplies its own complete system prompt
   // instead of inheriting Claude Code's Assistant-oriented preset. Proactive
   // mode follows that boundary while preserving the same SDK tools.
@@ -2487,6 +2595,20 @@ async function runQueryAttempt(
     }
     for await (const message of q) {
       firstResponseWatchdog.observe(message.type);
+      const preservesObservedBackgroundResult =
+        (message.type === 'system' &&
+          (message.subtype === 'background_tasks_changed' ||
+            message.subtype === 'task_notification' ||
+            (message.subtype === 'session_state_changed' &&
+              message.state === 'idle'))) ||
+        (message.type === 'user' &&
+          message.origin?.kind === 'task-notification' &&
+          message.shouldQuery === false);
+      backgroundResultGate.activityObserved();
+      if (!preservesObservedBackgroundResult && pendingBackgroundResult) {
+        pendingBackgroundResult = undefined;
+        processor.invalidateObservedBackgroundResult();
+      }
       if (providerFailurePublished) {
         continue;
       }
@@ -2612,6 +2734,17 @@ async function runQueryAttempt(
         if (suppressOutputAfterInterrupt) {
           continue;
         }
+        if (
+          (message.parent_tool_use_id ?? null) === null &&
+          message.event.type === 'message_start' &&
+          processor.getBlockingBackgroundCompletionDebtCount() > 0 &&
+          ipcDeliveryTracker.pendingTurnCount <= 1
+        ) {
+          // Compatibility fallback for CLI builds which omit
+          // user.origin=task-notification. Never apply it while B is already
+          // accepted, or B's assistant activity could repay A's debt.
+          processor.observeBackgroundNotificationActivity();
+        }
         processor.processStreamEvent(message as any);
         continue;
       }
@@ -2641,7 +2774,14 @@ async function runQueryAttempt(
       // System messages
       if (message.type === 'system') {
         const sys = message as any;
-        if (processor.processSystemMessage(sys)) {
+        const handled = processor.processSystemMessage(sys);
+        if (
+          sys.subtype === 'background_tasks_changed' ||
+          (sys.subtype === 'session_state_changed' && sys.state === 'idle')
+        ) {
+          scheduleBackgroundResultCompletion();
+        }
+        if (handled) {
           continue;
         }
       }
@@ -2722,6 +2862,14 @@ async function runQueryAttempt(
         ) {
           sawLiveTurnActivity = true;
         }
+        if (um.origin?.kind === 'task-notification') {
+          if ((message as { shouldQuery?: boolean }).shouldQuery === false) {
+            processor.observeBackgroundNotificationWithoutQuery();
+            scheduleBackgroundResultCompletion();
+          } else {
+            processor.observeBackgroundNotificationActivity();
+          }
+        }
       }
 
       if (message.type !== 'system') {
@@ -2790,6 +2938,12 @@ async function runQueryAttempt(
         lastAssistantUuid = (message as { uuid: string }).uuid;
         const assistantMsg = message as Record<string, unknown>;
         if ((assistantMsg.parent_tool_use_id ?? null) === null) {
+          if (
+            processor.getBlockingBackgroundCompletionDebtCount() > 0 &&
+            ipcDeliveryTracker.pendingTurnCount <= 1
+          ) {
+            processor.observeBackgroundNotificationActivity();
+          }
           const msgContent = (
             assistantMsg.message as Record<string, unknown> | undefined
           )?.content;
@@ -3080,9 +3234,6 @@ async function runQueryAttempt(
           !!finalText &&
           isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
         const pendingBgTasks = emitOutput
-          ? processor.getPendingSdkTaskCount()
-          : 0;
-        const blockingPendingBgTasks = emitOutput
           ? processor.getBlockingPendingSdkTaskCount()
           : 0;
         if (pendingBgTasks > 0) {
@@ -3135,71 +3286,86 @@ async function runQueryAttempt(
         } else {
           suspectTruncatedTail = undefined;
         }
+        const resultOriginKind = (
+          resultMsg.origin as { kind?: string } | undefined
+        )?.kind;
+        const backgroundResultReady = emitOutput
+          ? processor.observeBackgroundResult(resultOriginKind)
+          : true;
+        const blockingBackgroundProtocol = emitOutput
+          ? processor.getBlockingBackgroundProtocolCount()
+          : 0;
         const inputTurnCompleted = isHealthyInputTurnCompletion(
-          blockingPendingBgTasks,
+          blockingBackgroundProtocol,
           suspectTruncated,
         );
-        durableInputTurnCompleted = inputTurnCompleted;
-        const ipcReceipts = inputTurnCompleted
-          ? ipcDeliveryTracker.completeNextTurn()
-          : undefined;
-        const queryIdle =
-          inputTurnCompleted && !ipcDeliveryTracker.hasPendingTurns;
-        const completedTurnId = containerInput.turnId || generateTurnId();
-        const completedAssistantUuid =
-          canonicalAssistantUuid || lastAssistantUuid;
-        emit({
-          status: 'success',
-          // In Proactive mode the SDK Result is control-plane data only. Null
-          // it at the runner boundary as well as the host boundary so a stale
-          // host or an alternate consumer can never publish Assistant text.
-          result: proactiveInteractiveContract ? null : finalText,
-          newSessionId,
-          sdkMessageUuid: canonicalAssistantUuid || lastAssistantUuid,
-          sourceKind: sourceKindOverride ?? 'sdk_final',
-          finalizationReason: suspectTruncated ? 'truncated' : 'completed',
+        const candidate: BackgroundResultCandidate = {
+          finalText,
+          suspectTruncated,
           pendingBgTasks,
-          inputTurnCompleted,
-          queryIdle,
-          ...(ipcReceipts && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
-        });
-        // Keep the usage event on the same turn ID as the result it charges.
-        // The previous implementation rotated turnId first, so Web received a
-        // usage event labelled as the following turn.
-        emitResultUsage(resultMsg, completedTurnId);
+          sdkMessageUuid: canonicalAssistantUuid || lastAssistantUuid,
+          completedAssistantUuid: canonicalAssistantUuid || lastAssistantUuid,
+        };
+
+        // Usage belongs to every real SDK result, including an old boundary
+        // withheld while notification completion debt is still outstanding.
+        // Keeping it here avoids losing provider billing facts when a newer
+        // notification-driven result supersedes this candidate.
+        emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
         assistantBatchFlushedSinceLastResult = false;
-        // After emitting an sdk_final result, rotate turnId so that if
-        // another result is emitted within the same query (e.g. user sent
-        // a follow-up via IPC mid-query), it won't overwrite this one (#214).
-        containerInput.turnId = generateTurnId();
-        const nextTurnMessages = ipcDeliveryTracker.currentTurnMessages;
-        providerFallbackTurns.completeHealthyTurn({
-          sessionId: newSessionId || sessionId,
-          resumeAt: completedAssistantUuid,
-          nextTurnMessages,
-        });
-        // 同步重置已累积的 assistant 文本分段：单次 query 内若产生第二条 result
-        // （mid-query follow-up），tracker 不应携带上一 turn 的文本，
-        // 否则第二条回复会重复前一 turn 的内容前缀（与 turnId 轮转对称）。
         assistantTextTracker.reset();
         canonicalAssistantUuid = undefined;
 
-        // ── 标记结果已收到 ──
-        // pollIpcDuringQuery 会在 POST_RESULT_TIMEOUT_MS 后关闭 stream，
-        // 期间仍可检测 _drain/_close/_interrupt sentinel。
-        // 后台任务感知：主 turn 结束时若仍有未 settle 的后台任务（异步 Agent /
-        // backgrounded Bash），不启动关流倒计时——关流会连坐杀掉还在跑的任务
-        //（表现为子 Agent 全部 stoppedByUser，模型承诺的"完成后汇总"永远不来）。
-        // 文本已在上方正常 emit（用户即时收到本 turn 回复），只推迟关流：
-        // 任务 settle 后 CLI 注入通知唤起模型开新 turn，汇总以第二条 result/消息
-        // 送达（CLI 对 completed/failed/stopped 全部状态无差别入队唤醒）。
-        // 同时清掉前一条 result 可能遗留的倒计时，避免 mid-query follow-up 场景
-        // 下旧倒计时在等待期误触发关流。
-        // side-query（emitOutput=false，如 memory flush）不参与：其 result 本就
-        // 不面向用户，挂起等待只会阻塞主循环。
-        // 常驻型后台任务（dev server 等）永不 settle，流保持打开直到
-        // IDLE_TIMEOUT / CONTAINER_TIMEOUT 兜底回收——用户已收到回复，无消息损失。
-        //（pendingBgTasks 已在上方 emit 前置计算处取值，与 result 携带的字段一致）
+        if (
+          inputTurnCompleted &&
+          backgroundResultReady &&
+          emitOutput &&
+          processor.requiresBackgroundResultQuiescence()
+        ) {
+          // A task-completion result is only a candidate. A late init,
+          // assistant or notification frame cancels this timer and requires a
+          // newer result; an authoritative late empty level may reschedule it.
+          pendingBackgroundResult = candidate;
+          resultReceivedAt = null;
+          scheduleBackgroundResultCompletion();
+          log(
+            `Result #${resultCount} background drain ready; waiting for quiescence`,
+          );
+        } else if (inputTurnCompleted && backgroundResultReady) {
+          pendingBackgroundResult = undefined;
+          publishResultCandidate(candidate, true);
+        } else if (pendingBgTasks > 0 || suspectTruncated) {
+          // Preserve the existing visible interim-result behavior while live
+          // work remains. Completion debt without a live task is withheld so
+          // an old result cannot be mistaken for the final summary.
+          pendingBackgroundResult = undefined;
+          publishResultCandidate(candidate, false);
+        } else {
+          // Retain the boundary while protocol debt is unresolved. A normal
+          // notification-driven query will invalidate it before producing its
+          // newer Result; `shouldQuery:false` deliberately has no newer Result
+          // and may accept this candidate after settling the notification.
+          pendingBackgroundResult =
+            processor.requiresBackgroundResultQuiescence()
+              ? candidate
+              : undefined;
+          resultReceivedAt = null;
+          log(
+            `Result #${resultCount} withheld: ${blockingBackgroundProtocol} background protocol obligation(s) remain`,
+          );
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'status',
+              agentScope: 'system',
+              statusText: '后台任务已结束，正在等待 Agent 完成最终汇总',
+              summary: '后台任务通知正在由主 Agent 收尾',
+              displayLevel: 'primary',
+            },
+          });
+        }
+
         if (pendingBgTasks > 0) {
           resultReceivedAt = null;
           log(
@@ -3216,29 +3382,22 @@ async function runQueryAttempt(
               displayLevel: 'primary',
             },
           });
-        } else if (!ipcDeliveryTracker.hasPendingTurns) {
-          sawPendingBackgroundTasks = false;
-          backgroundSummaryForceAttempts = 0;
-          resultReceivedAt = Date.now();
-        } else {
-          // A steer was accepted before this result. The SDK will start that
-          // turn in the same query, so arming the post-result timeout here can
-          // kill it a few seconds later (the exact race that dropped queued
-          // follow-ups in conversation agents).
-          resultReceivedAt = null;
-          log(
-            `Result #${resultCount} emitted; keeping stream open for ${ipcDeliveryTracker.pendingTurnCount} accepted follow-up turn(s)`,
-          );
-        }
-        // The completed result, its usage, and any immediately-derived status
-        // above all belong to the old turn. Only now may an already accepted
-        // steer become the active output/MCP turn. This prevents a slow A
-        // result from being attributed to B merely because B arrived first.
-        if (inputTurnCompleted && ipcDeliveryTracker.hasPendingTurns) {
-          durableInputTurnCompleted = false;
-          activateCurrentInputTurn(containerInput.turnId);
         }
       }
+    }
+
+    if (
+      shouldFailIncompleteQueryExit({
+        emitOutput,
+        closedDuringQuery,
+        interruptedDuringQuery,
+        hasPendingTurns: ipcDeliveryTracker.hasPendingTurns,
+        durableInputTurnCompleted: durableInputCompletion.isCompleted,
+      })
+    ) {
+      throw new Error(
+        'background_drain_incomplete: SDK query ended before the active input reached a durable result',
+      );
     }
 
     // Cleanup residual state（IPC watcher 统一由下方 finally 关闭）
@@ -3255,7 +3414,7 @@ async function runQueryAttempt(
       cancelledIpcReceipts,
       pipedMessagesDuringQuery,
       suspectTruncatedTail,
-      durableInputTurnCompleted,
+      durableInputTurnCompleted: durableInputCompletion.isCompleted,
       providerFailureTurn,
       providerAccountFailure: false,
     };
@@ -3364,11 +3523,11 @@ async function runQueryAttempt(
       };
     }
 
-    // SDK 在 yield result 后可能再抛异常（如检测到 result text 含错误内容），
-    // 但此时 success 结果已通过 emit() 发送给调用方。再 re-throw 会导致
-    // 外层 catch 额外发射一条 error output 并 exit(1)，引发无意义的重试。
-    // 如果已成功发射过结果，将后续 SDK 异常降级为警告。
-    if (resultCount > 0) {
+    // SDK 在 durable result 后可能再抛异常（如检测到 result text 含错误内容）。
+    // 只有当前 input 已真实越过 publishResultCandidate(..., true) 才能降级；
+    // resultCount 也包含被 background debt/quiescence 暂扣的边界，不能作为
+    // “已成功发射”的替代，否则会吞掉未确认输入的恢复信号。
+    if (durableInputCompletion.isCompleted) {
       log(
         `runQuery post-result SDK error (non-fatal, ${resultCount} result(s) already emitted): ${errorMessage}`,
       );
@@ -3382,6 +3541,7 @@ async function runQueryAttempt(
         interruptedDuringQuery,
         cancelledIpcReceipts,
         pipedMessagesDuringQuery,
+        durableInputTurnCompleted: true,
       };
     }
 
@@ -3396,6 +3556,8 @@ async function runQueryAttempt(
     throw err;
   } finally {
     firstResponseWatchdog?.clear();
+    backgroundResultGate.dispose();
+    pendingBackgroundResult = undefined;
     // IPC watcher 清理：覆盖 try 块内的正常出口、catch 抛出，以及 try 内所有 early-return
     // （resume 失败 / 上下文溢出 / 不可恢复 transcript 错误）。query 启动前的中断 early-return
     // 在 try 之外，已就地 close()。finally 必然执行，避免长生命周期容器累积 FSWatcher + 后备
@@ -3635,6 +3797,15 @@ async function main(): Promise<void> {
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
   }
   const pendingDrain = drainIpcInput();
+  // Files replayed after a runner failure may still carry the previous
+  // attempt's ID. Startup belongs to the host's newly allocated exact query,
+  // so normalize the entire initial batch to ContainerInput.queryRunId.
+  if (containerInput.queryRunId) {
+    pendingDrain.messages = pendingDrain.messages.map((message) => ({
+      ...message,
+      queryRunId: containerInput.queryRunId,
+    }));
+  }
   let currentIpcMessages: IpcInputMessage[] = pendingDrain.messages;
   if (pendingDrain.messages.length > 0) {
     log(
@@ -3855,6 +4026,7 @@ async function main(): Promise<void> {
           streamEvent: {
             eventType: 'status',
             statusText: 'interrupted',
+            queryRunId: containerInput.queryRunId,
             turnId: containerInput.turnId,
             sessionId,
           },
@@ -4249,6 +4421,8 @@ async function main(): Promise<void> {
             eventType: 'status',
             agentScope: 'system',
             statusText: 'truncation_continue_exhausted',
+            queryRunId: containerInput.queryRunId,
+            turnId: containerInput.turnId,
           },
         });
       }
@@ -4268,6 +4442,9 @@ async function main(): Promise<void> {
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
       currentIpcMessages = nextMessage.messages;
+      containerInput.queryRunId =
+        latestIpcInputMessage(nextMessage.messages)?.queryRunId ??
+        containerInput.queryRunId;
       containerInput.turnId = generateTurnId();
       mcpToolsConfig.currentInputTurnId =
         latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;

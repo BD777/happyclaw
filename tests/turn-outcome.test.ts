@@ -124,7 +124,7 @@ describe('resolveTurnOutcome', () => {
     );
 
     expect(closedBranch).toContain(
-      'genuineReplyDelivered || ipcReplyTurnTracker.delivered',
+      'activeGenuineReplyDelivered || ipcReplyTurnTracker.delivered',
     );
     expect(closedBranch).not.toContain('replyDelivered: sentReply');
   });
@@ -140,7 +140,7 @@ describe('resolveTurnOutcome', () => {
     );
 
     expect(missingOutputBranch).toContain(
-      'genuineReplyDelivered || ipcReplyTurnTracker.delivered',
+      'activeGenuineReplyDelivered || ipcReplyTurnTracker.delivered',
     );
     expect(missingOutputBranch).toContain('commitCursor();');
     expect(missingOutputBranch).not.toContain('sentReply');
@@ -265,7 +265,7 @@ describe('resolveTurnOutcome', () => {
       'if (channelDeliveryNeedsManualReconciliation)',
     );
     expect(postCleanup).toContain(
-      'return channelManualNoticesAcknowledged && cursorCommitted;',
+      'return channelManualNoticesAcknowledged && activeCursorCommitted;',
     );
 
     const agentCleanup = main.slice(

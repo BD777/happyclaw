@@ -49,6 +49,20 @@ export interface RetrySkipDecisionInput {
   ipcReplyDeliveredForInputTurn: boolean;
 }
 
+/**
+ * Read a genuine SDK-final acknowledgement by immutable input id.
+ *
+ * Warm runners can activate input B before a delayed callback for input A
+ * arrives. Callers must therefore never collapse this ledger into a
+ * runner-wide boolean: A's late final is not evidence that B was delivered.
+ */
+export function wasGenuineReplyDeliveredForInput(
+  deliveredByInput: ReadonlyMap<string, boolean>,
+  inputTurnId: string,
+): boolean {
+  return deliveredByInput.get(inputTurnId) === true;
+}
+
 export interface IpcReplyTurnTracker {
   inputTurnId: string;
   delivered: boolean;

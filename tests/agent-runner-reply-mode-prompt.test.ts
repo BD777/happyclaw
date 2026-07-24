@@ -48,7 +48,7 @@ describe('Agent Runner reply-mode prompt contract', () => {
     expect(tools).toContain("presentation: 'native'");
     expect(runner).toContain('!proactiveInteractiveContract &&');
     expect(runner).toContain(
-      'result: proactiveInteractiveContract ? null : finalText',
+      'result: proactiveInteractiveContract ? null : candidate.finalText',
     );
     expect(proactiveOutput).not.toContain('最终回复必须自包含');
     expect(proactiveOutput).toContain(

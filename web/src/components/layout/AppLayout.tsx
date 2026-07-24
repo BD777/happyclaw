@@ -76,6 +76,10 @@ export function AppLayout() {
       }
       useChatStore.getState().handleRunStarted(data.chatJid, data.runId);
     });
+    const unsubFinished = wsManager.on('run_finished', (data: any) => {
+      if (!data.chatJid || !data.runId) return;
+      useChatStore.getState().handleRunFinished(data.chatJid, data.runId);
+    });
     const unsubSnapshot = wsManager.on('active_run_snapshot', (data: any) => {
       const runs = Array.isArray(data.runs) ? data.runs : [];
       useChatStore.getState().handleActiveRunSnapshot(runs);
@@ -89,6 +93,7 @@ export function AppLayout() {
     return () => {
       unsubRunner();
       unsubStarted();
+      unsubFinished();
       unsubSnapshot();
     };
   }, []);

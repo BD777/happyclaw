@@ -5,6 +5,7 @@ import {
   isGenuineReplyResult,
   setIpcReplyInputTurn,
   shouldSkipRetryAfterLateError,
+  wasGenuineReplyDeliveredForInput,
 } from '../src/reply-delivery.js';
 
 describe('isGenuineReplyResult', () => {
@@ -116,6 +117,32 @@ describe('shouldSkipRetryAfterLateError', () => {
 });
 
 describe('IPC reply turn correlation', () => {
+  test("regression: A's late SDK final cannot make active B skip retry", () => {
+    const genuineReplyDeliveredByInput = new Map<string, boolean>([
+      ['delivery-a', false],
+    ]);
+    genuineReplyDeliveredByInput.set('delivery-b', false);
+
+    // B is already active when the delayed SDK callback for A is delivered.
+    genuineReplyDeliveredByInput.set('delivery-a', true);
+
+    expect(
+      wasGenuineReplyDeliveredForInput(
+        genuineReplyDeliveredByInput,
+        'delivery-a',
+      ),
+    ).toBe(true);
+    expect(
+      shouldSkipRetryAfterLateError({
+        genuineReplyDelivered: wasGenuineReplyDeliveredForInput(
+          genuineReplyDeliveredByInput,
+          'delivery-b',
+        ),
+        ipcReplyDeliveredForInputTurn: false,
+      }),
+    ).toBe(false);
+  });
+
   test("regression: an older turn's delivery on the same warm runner cannot suppress the current turn's retry", () => {
     const tracker = { inputTurnId: 'delivery-old', delivered: false };
     expect(acknowledgeIpcReplyTurn(tracker, 'delivery-old')).toBe(true);
