@@ -3850,6 +3850,10 @@ export interface SystemSettings {
   // 该数字刻意不写进 Prompt，避免模型把它当成可以用满的配额。
   // 0 = 关闭。默认 20。
   maxRepliesPerTurn: number;
+  // 每个用户可持有的定时任务数上限（不含已软删）。频率下限和「每 task 至多一条
+  // 非终态 run」只约束单个任务，挡不住「N 个任务 × 每分钟」持续占满执行容量。
+  // 0 = 关闭。默认 200。
+  maxTasksPerUser: number;
 }
 
 // Upper bound for the login lockout window. auth.ts reclaims login-attempt
@@ -3882,6 +3886,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
   maxRepliesPerTurn: 20,
+  maxTasksPerUser: 200,
 };
 
 type SystemSettingsSource = 'file' | 'env' | 'api';
@@ -3948,6 +3953,13 @@ function normalizeSystemSettings(
     DEFAULT_SYSTEM_SETTINGS.maxRepliesPerTurn,
     0,
     500,
+  );
+
+  const maxTasksPerUser = numberField(
+    'maxTasksPerUser',
+    DEFAULT_SYSTEM_SETTINGS.maxTasksPerUser,
+    0,
+    10_000,
   );
 
   // Accept the former system-wide key as the main Agent default during upgrade.
@@ -4124,6 +4136,7 @@ function normalizeSystemSettings(
     ),
     taskBackfillGraceMs,
     maxRepliesPerTurn,
+    maxTasksPerUser,
   };
 
   if (invalidFields.size > 0) {

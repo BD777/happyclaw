@@ -4163,6 +4163,23 @@ export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
     .map(mapTaskRow);
 }
 
+/**
+ * Live (non-deleted) schedule count for one owner, used as a capacity fuse.
+ *
+ * Per-task frequency floors and the one-nonterminal-run index bound a single
+ * task, but nothing bounded the number of tasks: N schedules firing every
+ * minute can keep the queue saturated and crowd out interactive sessions.
+ */
+export function countTasksByOwner(ownerId: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM scheduled_tasks
+       WHERE deleted_at IS NULL AND created_by = ?`,
+    )
+    .get(ownerId) as { count: number } | undefined;
+  return row?.count ?? 0;
+}
+
 export function getAllTasks(): ScheduledTask[] {
   return db
     .prepare(

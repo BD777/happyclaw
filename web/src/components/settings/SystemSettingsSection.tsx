@@ -22,7 +22,8 @@ type NumericSettingKey =
   | 'maxConcurrentScripts'
   | 'scriptTimeout'
   | 'taskBackfillGraceMs'
-  | 'maxRepliesPerTurn';
+  | 'maxRepliesPerTurn'
+  | 'maxTasksPerUser';
 
 interface FieldConfig {
   key: NumericSettingKey;
@@ -169,6 +170,18 @@ const fieldGroups: FieldGroup[] = [
         min: 0,
         max: 1440,
         step: 1,
+      },
+      {
+        key: 'maxTasksPerUser',
+        label: '每用户定时任务上限',
+        description:
+          '单个用户可持有的定时任务总数，防止大量任务持续占满执行容量。0 表示不限制。',
+        unit: '个',
+        toDisplay: (value) => value,
+        toStored: (value) => value,
+        min: 0,
+        max: 10000,
+        step: 10,
       },
       {
         key: 'maxRepliesPerTurn',

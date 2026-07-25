@@ -228,6 +228,21 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
   const hasCrossGroupAccess = ctx.isAdminHome;
   const toRelativePath = createToRelativePath(ctx);
 
+  /**
+   * Must stay in step with `usesProactiveInteractiveContract()` in
+   * container/agent-runner/src/index.ts, which selects the system prompt.
+   *
+   * A message-triggered task run gets the task delivery contract, not the
+   * interactive Proactive one. The tool descriptions here checked only
+   * `isScheduledTask`, so such a run was told two different things at once: the
+   * prompt said "send one complete result when the task is done" while the tool
+   * said "call me zero, one, or many times".
+   */
+  const usesProactiveInteractiveContract =
+    ctx.interactionMode === 'proactive' &&
+    !ctx.isScheduledTask &&
+    !ctx.currentTaskId;
+
   const currentChannelContext = (): ChannelTurnContext | undefined =>
     normalizeChannelTurnContext(ctx.channelContext, ctx.chatJid);
 
@@ -474,16 +489,19 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_message ---
     tool(
       'send_message',
-      ctx.interactionMode === 'proactive' && !ctx.isScheduledTask
+      usesProactiveInteractiveContract
         ? 'Send one user-visible message now. The Workspace uses Proactive reply mode: every call creates an independent native chat message immediately, and your normal SDK final text is not published. You may call this tool zero, one, or many times and continue working after each successful send. A delivery error is authoritative: do not sleep and retry, switch to a card, or call a raw channel API as a fallback.'
         : "Publish text through HappyClaw's turn-owned delivery coordinator. In an interactive user turn, delivery_role=progress updates the existing reply status and delivery_role=final stages the primary answer on the existing card; neither creates a second text reply. Use delivery_role=separate only when the user explicitly requested another message. Scheduled/background tasks always deliver separately because their normal SDK final is not published.",
       {
-        text: z.string().describe('The message text to publish'),
+        // Trim/min-length at the schema layer: the host guard is `!data.text`,
+        // which a whitespace-only string passes, so it reached the chat as an
+        // empty message.
+        text: z.string().trim().min(1).describe('The message text to publish'),
         delivery_role: z
           .enum(['progress', 'final', 'separate'])
           .optional()
           .describe(
-            ctx.interactionMode === 'proactive' && !ctx.isScheduledTask
+            usesProactiveInteractiveContract
               ? 'Ignored in Proactive reply mode: every call is delivered as an independent native message.'
               : 'progress updates the active reply, final stages its answer, separate creates an additional message. Defaults to final for interactive turns and separate for scheduled tasks.',
           ),
@@ -498,7 +516,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
           type: 'message',
           text: args.text,
           deliveryRole,
-          ...(ctx.interactionMode === 'proactive' && !ctx.isScheduledTask
+          ...(usesProactiveInteractiveContract
             ? { presentation: 'native' }
             : {}),
           requestId: newRequestId(),
@@ -526,7 +544,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
             ? 'Progress updated on the active reply.'
             : disposition === 'staged_final'
               ? 'Final answer staged on the active reply; return the same answer normally so the SDK Result can finalize it.'
-              : ctx.interactionMode === 'proactive' && !ctx.isScheduledTask
+              : usesProactiveInteractiveContract
                 ? 'Message delivered. If this completes the thought, end the turn now. Send again only for new, non-redundant content; never repeat this message in SDK final text.'
                 : 'Message sent separately.';
         return {

@@ -70,6 +70,7 @@ import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   closeDatabase,
   createTask,
+  countTasksByOwner,
   deleteExpiredSessions,
   getExpiredSessionIds,
   deleteTask,
@@ -10740,6 +10741,21 @@ async function processTaskIpc(
             nextRun: dupExisting.next_run,
             duplicate: true,
           });
+          break;
+        }
+
+        // Same capacity fuse as the REST surface: an Agent can create schedules
+        // in a loop, and `findDuplicateActiveAgentTask` only blocks byte-identical
+        // definitions, so one changed word is a new task.
+        const ipcTaskCap = getSystemSettings().maxTasksPerUser;
+        if (
+          ipcTaskCap > 0 &&
+          taskCreatedBy &&
+          countTasksByOwner(taskCreatedBy) >= ipcTaskCap
+        ) {
+          failSchedule(
+            `Scheduled-task limit reached (${ipcTaskCap}). Delete an existing task first.`,
+          );
           break;
         }
 

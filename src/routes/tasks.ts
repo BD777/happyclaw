@@ -3,6 +3,7 @@
 import { Hono, type Context } from 'hono';
 import * as crypto from 'node:crypto';
 import { sdkQuery } from '../sdk-query.js';
+import { getSystemSettings } from '../runtime-config.js';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { TaskCreateSchema, TaskPatchSchema } from '../schemas.js';
@@ -12,6 +13,7 @@ import {
   getDeletedTasks,
   getTaskById,
   createTask,
+  countTasksByOwner,
   getTaskRunLogs,
   updateTaskWithRevision,
   softDeleteTaskWithRevision,
@@ -260,6 +262,20 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
 
   const taskId = crypto.randomUUID();
   const now = new Date().toISOString();
+
+  // Capacity fuse: per-task frequency floors bound one schedule, nothing bounded
+  // how many a user may hold, and N schedules firing every minute can saturate
+  // the execution queue.
+  const taskCap = getSystemSettings().maxTasksPerUser;
+  if (taskCap > 0 && countTasksByOwner(authUser.id) >= taskCap) {
+    return c.json(
+      {
+        error: `定时任务数量已达上限（${taskCap}）。请先删除不再需要的任务。`,
+        code: 'TASK_LIMIT_REACHED',
+      },
+      409,
+    );
+  }
 
   let nextRun: string;
   try {

@@ -53,7 +53,8 @@ export const ChannelAccountPatchSchema = z.object({
 
 export const TaskPatchSchema = z.object({
   chat_jid: z.string().min(1).optional(),
-  prompt: z.string().optional(),
+  // Same bound as TaskCreateSchema; an update must not be a way around it.
+  prompt: z.string().max(16384).optional(),
   schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
   schedule_value: z.string().optional(),
   context_mode: z.enum(['group', 'isolated']).optional(),
@@ -103,7 +104,10 @@ export const TaskCreateSchema = z
   .object({
     group_folder: z.string().min(1).optional(),
     chat_jid: z.string().min(1).optional(),
-    prompt: z.string().optional().default(''),
+    // A schedule's prompt is replayed on a timer, so it is stored content with
+    // no natural bound. `script_command` was already capped; this closes the
+    // same hole on the Agent path.
+    prompt: z.string().max(16384).optional().default(''),
     schedule_type: z.enum(['cron', 'interval', 'once']),
     schedule_value: z.string().min(1),
     context_mode: z.enum(['group', 'isolated']).optional(),
@@ -518,6 +522,7 @@ export const SystemSettingsSchema = z
       )
       .optional(),
     maxRepliesPerTurn: z.number().int().min(0).max(500).optional(),
+    maxTasksPerUser: z.number().int().min(0).max(10000).optional(),
     fallbackModel: z.string().max(64).optional(),
   })
   .strict();

@@ -42,9 +42,15 @@ describe('Agent Runner reply-mode prompt contract', () => {
     expect(proactive).toContain(
       '`mcp__happyclaw__send_message` is the only way',
     );
-    expect(tools).toContain(
-      "ctx.interactionMode === 'proactive' && !ctx.isScheduledTask",
-    );
+    // The tool descriptions must gate on the same three conditions as the
+    // prompt selector in the runner, including `currentTaskId`: a
+    // message-triggered task run takes the task contract, not the interactive
+    // Proactive one. Asserting the named predicate rather than an inline
+    // expression keeps the two sides from drifting apart again.
+    expect(tools).toContain('const usesProactiveInteractiveContract =');
+    expect(tools).toContain("ctx.interactionMode === 'proactive' &&");
+    expect(tools).toContain('!ctx.isScheduledTask &&');
+    expect(tools).toContain('!ctx.currentTaskId');
     expect(tools).toContain("presentation: 'native'");
     expect(runner).toContain('!proactiveInteractiveContract &&');
     expect(runner).toContain(
