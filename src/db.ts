@@ -5028,6 +5028,24 @@ export function failExpiredStartedTaskRuns(): number {
   })();
 }
 
+/**
+ * Lease expiry decides who may *take over*, never who may *commit*.
+ *
+ * `renew`/`release`/`complete` fence on `lease_owner` + `lease_token` only. A
+ * worker whose lease lapsed while nobody claimed it still owns its result and
+ * can settle it; the moment another owner claims the row the token advances and
+ * every write from the old worker is rejected. Gating these writes on
+ * `lease_expires_at > now` as well produced the opposite failure: a run that had
+ * actually finished — possibly after already sending its output to the user —
+ * could not be committed, stayed `running`, and was later marked `failed` by
+ * `failExpiredStartedTaskRuns`. Because started runs are deliberately
+ * at-most-once, that lost the execution outright and raised a false failure
+ * alert.
+ *
+ * Every takeover path (`claimNextTaskRun`, `cancelTaskRun`,
+ * `failExpiredStartedTaskRuns`) increments `lease_token`, so dropping the time
+ * condition does not open a double-write window.
+ */
 export function renewTaskRunLease(
   id: string,
   owner: string,
@@ -5041,29 +5059,40 @@ export function renewTaskRunLease(
     .prepare(
       `UPDATE task_runs SET lease_expires_at = ?, updated_at = ?
        WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ? AND lease_expires_at > ?`,
+         AND lease_token = ?`,
     )
-    .run(expiresAt, nowIso, id, owner, token, nowIso);
+    .run(expiresAt, nowIso, id, owner, token);
   return result.changes === 1;
 }
 
+/**
+ * `attempt` is incremented by `claimNextTaskRun`, so it counts claims. A
+ * release that is not the run's own fault must give that budget back, otherwise
+ * process shutdown burns the pre-execution retry allowance: five ordinary
+ * restarts would permanently fail an occurrence that never executed once.
+ * Mirrors the reference runtime's `incrementFailure=false` release.
+ */
 export function releaseTaskRunForRetry(
   id: string,
   owner: string,
   token: number,
   availableAt: string,
   error: string,
+  options: { countsAsAttempt?: boolean } = {},
 ): boolean {
   const now = new Date().toISOString();
+  const attemptExpr =
+    options.countsAsAttempt === false ? 'MAX(0, attempt - 1)' : 'attempt';
   const result = db
     .prepare(
       `UPDATE task_runs
        SET status = 'retry_wait', available_at = ?, error = ?,
+           attempt = ${attemptExpr},
            lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
        WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ? AND lease_expires_at > ?`,
+         AND lease_token = ?`,
     )
-    .run(availableAt, error, now, id, owner, token, now);
+    .run(availableAt, error, now, id, owner, token);
   return result.changes === 1;
 }
 
@@ -5089,13 +5118,13 @@ export function completeTaskRun(
     const current = db
       .prepare('SELECT * FROM task_runs WHERE id = ?')
       .get(id) as TaskRunRow | undefined;
+    // Fencing is owner+token only; see renewTaskRunLease for why an expired
+    // but unclaimed lease must still be able to settle its own result.
     if (
       !current ||
       current.status !== 'running' ||
       current.lease_owner !== owner ||
-      current.lease_token !== token ||
-      !current.lease_expires_at ||
-      current.lease_expires_at <= now
+      current.lease_token !== token
     ) {
       return false;
     }
@@ -5133,7 +5162,7 @@ export function completeTaskRun(
              notification_error = ?, duration_ms = ?, completed_at = ?,
              lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE id = ? AND status = 'running' AND lease_owner = ?
-           AND lease_token = ? AND lease_expires_at > ?`,
+           AND lease_token = ?`,
       )
       .run(
         input.status,
@@ -5147,7 +5176,6 @@ export function completeTaskRun(
         id,
         owner,
         token,
-        now,
       );
     if (changed.changes !== 1) return false;
     const summary = input.error

@@ -233,6 +233,18 @@ Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下
 - `group` 模式注入主 Session；`isolated` 使用独立 Session、IPC 和运行记录。
 - 立即运行使用 idempotency key；取消只影响对应 Run。
 
+定时任务的 IPC/MCP 面授权与 Web 面同源，均为 `canAccessGroup`，**admin 不提供
+全局旁路**：
+
+- 判定实现在 `src/task-acl.ts`，覆盖 `schedule_task`、`pause_task`、
+  `resume_task`、`cancel_task`、`update_task`、`run_task_now`、`stop_task_run`、
+  `restore_task`、`list_task_runs` 以及 `list_tasks` 的可见性过滤。
+- 允许两条路径：目标是 Agent 自身工作区目录；或该工作区属主同样拥有目标群组。
+- `isAdminHome` 只保留为能力判定（Script 任务、Host 执行模式），不参与工作区范围
+  判定。原因：admin Home Agent 是会接触不可信内容的 LLM，而任务 `prompt` 会被按
+  计划重放、以 Bot 身份在目标会话发言、并计费到目标工作区。
+- 任务 `prompt` 属于用户内容，因此 `list_tasks` 不允许跨租户枚举。
+
 ## 11. 修改 ACL 的验证要求
 
 任何 ACL 修改至少补充以下测试维度：

@@ -1765,10 +1765,40 @@ let schedulerDepsRef: SchedulerDependencies | null = null;
 interface ActiveDurableExecution {
   taskId: string;
   kind: 'isolated' | 'group' | 'script';
+  /** Claim generation that registered this entry; see clearActiveDurableExecution. */
+  attempt: number;
   stop?: () => void | Promise<void>;
 }
 
 const activeDurableExecutions = new Map<string, ActiveDurableExecution>();
+
+/**
+ * Compare-and-delete keyed on the claim generation.
+ *
+ * The map is keyed by run id so `cancelTaskRunNow` can find a stopper without
+ * knowing the attempt. If a lapsed lease lets the same run be claimed a second
+ * time, the losing attempt's cleanup must not evict the winning attempt's
+ * stopper — that produced an execution nothing could cancel, with the DB marked
+ * cancelled while the process kept running.
+ */
+function clearActiveDurableExecution(runId: string, attempt: number): void {
+  const current = activeDurableExecutions.get(runId);
+  if (current && current.attempt === attempt) {
+    activeDurableExecutions.delete(runId);
+  }
+}
+
+/**
+ * Scheduler work the group queue cannot see: script runs and notification
+ * retries are started detached, so `queue.shutdown()` neither waits for nor
+ * cancels them. Tracking them here lets `stopSchedulerLoop` drain them.
+ */
+const detachedSchedulerWork = new Set<Promise<unknown>>();
+
+function trackDetachedSchedulerWork(work: Promise<unknown>): void {
+  detachedSchedulerWork.add(work);
+  void work.finally(() => detachedSchedulerWork.delete(work));
+}
 
 function taskFromRunSnapshot(
   current: ScheduledTask,
@@ -1824,11 +1854,21 @@ export function notifyTaskSchedulerChanged(): void {
   if (schedulerRunning) armScheduler(0);
 }
 
+/**
+ * Release a run that never crossed the execution boundary.
+ *
+ * `countsAsAttempt: false` is for releases caused by us rather than by the run
+ * — currently process shutdown. Those return the claim's budget so a rolling
+ * restart cannot exhaust `MAX_SAFE_PRESTART_ATTEMPTS` on an occurrence that has
+ * not executed even once, and they skip the terminal-failure branch entirely.
+ */
 function scheduleSafePrestartRetry(
   claim: ClaimedTaskRun,
   reason: string,
+  options: { countsAsAttempt?: boolean } = {},
 ): void {
-  if (claim.attempt >= MAX_SAFE_PRESTART_ATTEMPTS) {
+  const countsAsAttempt = options.countsAsAttempt !== false;
+  if (countsAsAttempt && claim.attempt >= MAX_SAFE_PRESTART_ATTEMPTS) {
     completeTaskRun(claim.id, claim.lease_owner, claim.lease_token, {
       status: 'failed',
       error: `${reason}; safe pre-execution retry limit reached`,
@@ -1837,13 +1877,14 @@ function scheduleSafePrestartRetry(
     return;
   }
   const exponent = Math.max(0, claim.attempt - 1);
-  const delayMs = Math.min(60_000, 1_000 * 2 ** exponent);
+  const delayMs = countsAsAttempt ? Math.min(60_000, 1_000 * 2 ** exponent) : 0;
   releaseTaskRunForRetry(
     claim.id,
     claim.lease_owner,
     claim.lease_token,
     new Date(Date.now() + delayMs).toISOString(),
     reason,
+    { countsAsAttempt },
   );
 }
 
@@ -2196,7 +2237,7 @@ function executeClaimedTaskRun(
   ) => {
     clearInterval(heartbeat);
     activeDurableTaskIds.delete(task.id);
-    activeDurableExecutions.delete(claim.id);
+    clearActiveDurableExecution(claim.id, claim.attempt);
     finishDurableRunFromLegacyLog(
       claim,
       mode,
@@ -2232,6 +2273,7 @@ function executeClaimedTaskRun(
     activeDurableExecutions.set(claim.id, {
       taskId: task.id,
       kind: 'script',
+      attempt: claim.attempt,
       stop: () => abortController.abort('task_run_cancelled_or_fenced'),
     });
     if (
@@ -2242,32 +2284,34 @@ function executeClaimedTaskRun(
       )
     ) {
       clearInterval(heartbeat);
-      activeDurableExecutions.delete(claim.id);
+      clearActiveDurableExecution(claim.id, claim.attempt);
       return;
     }
     executionStartedAtMs = Date.now();
     activeDurableTaskIds.add(task.id);
-    void runScriptTask(
-      task,
-      executionDeps,
-      targetGroupJid,
-      claim.trigger_type === 'manual',
-      claim,
-      abortController.signal,
-    )
-      .catch((err) =>
-        logger.error(
-          { runId: claim.id, taskId: task.id, err },
-          'V2 script run failed',
-        ),
+    trackDetachedSchedulerWork(
+      runScriptTask(
+        task,
+        executionDeps,
+        targetGroupJid,
+        claim.trigger_type === 'manual',
+        claim,
+        abortController.signal,
       )
-      .finally(() => {
-        if (!leaseLost) finish(heartbeat, 'script');
-        else {
-          activeDurableTaskIds.delete(task.id);
-          activeDurableExecutions.delete(claim.id);
-        }
-      });
+        .catch((err) =>
+          logger.error(
+            { runId: claim.id, taskId: task.id, err },
+            'V2 script run failed',
+          ),
+        )
+        .finally(() => {
+          if (!leaseLost) finish(heartbeat, 'script');
+          else {
+            activeDurableTaskIds.delete(task.id);
+            clearActiveDurableExecution(claim.id, claim.attempt);
+          }
+        }),
+    );
     return;
   }
 
@@ -2279,6 +2323,7 @@ function executeClaimedTaskRun(
     activeDurableExecutions.set(claim.id, {
       taskId: task.id,
       kind: 'group',
+      attempt: claim.attempt,
     });
     if (
       !markTaskRunExecutionStarted(
@@ -2288,7 +2333,7 @@ function executeClaimedTaskRun(
       )
     ) {
       clearInterval(heartbeat);
-      activeDurableExecutions.delete(claim.id);
+      clearActiveDurableExecution(claim.id, claim.attempt);
       return;
     }
     executionStartedAtMs = Date.now();
@@ -2310,7 +2355,7 @@ function executeClaimedTaskRun(
         if (!leaseLost) finish(heartbeat, 'group');
         else {
           activeDurableTaskIds.delete(task.id);
-          activeDurableExecutions.delete(claim.id);
+          clearActiveDurableExecution(claim.id, claim.attempt);
         }
       });
     return;
@@ -2348,15 +2393,17 @@ function executeClaimedTaskRun(
   activeDurableExecutions.set(claim.id, {
     taskId: task.id,
     kind: 'isolated',
+    attempt: claim.attempt,
     stop,
   });
   const onDropped = () => {
     if (settled) return;
     settled = true;
     clearInterval(heartbeat);
-    activeDurableExecutions.delete(claim.id);
+    clearActiveDurableExecution(claim.id, claim.attempt);
     if (!started) {
-      if (claim.trigger_type === 'manual') {
+      const shuttingDown = deps.queue.isShuttingDown?.() === true;
+      if (claim.trigger_type === 'manual' && !shuttingDown) {
         // A manual Run Now request that never crossed the execution boundary is
         // safe to terminate; the user may immediately press Run Now again.
         completeTaskRun(claim.id, claim.lease_owner, claim.lease_token, {
@@ -2365,7 +2412,15 @@ function executeClaimedTaskRun(
           notificationStatus: 'skipped',
         });
       } else {
-        scheduleSafePrestartRetry(claim, 'Task queue dropped the run');
+        // Shutdown is not the run's failure: keep the budget and let the next
+        // process pick it straight back up.
+        scheduleSafePrestartRetry(
+          claim,
+          shuttingDown
+            ? 'Process shut down before the run started'
+            : 'Task queue dropped the run',
+          { countsAsAttempt: !shuttingDown },
+        );
       }
     }
     armScheduler(0);
@@ -2384,7 +2439,7 @@ function executeClaimedTaskRun(
         if (!started) {
           settled = true;
           clearInterval(heartbeat);
-          activeDurableExecutions.delete(claim.id);
+          clearActiveDurableExecution(claim.id, claim.attempt);
           return;
         }
         executionStartedAtMs = Date.now();
@@ -2641,14 +2696,16 @@ function pumpTaskNotificationRetries(deps: SchedulerDependencies): void {
       TASK_RUN_LEASE_MS,
     );
     if (!claim) break;
-    void processClaimedTaskRunNotification(claim, deps, TASK_RUN_LEASE_MS)
-      .catch((err) =>
-        logger.error(
-          { runId: claim.runId, err },
-          'Task notification retry crashed',
-        ),
-      )
-      .finally(() => armScheduler(0));
+    trackDetachedSchedulerWork(
+      processClaimedTaskRunNotification(claim, deps, TASK_RUN_LEASE_MS)
+        .catch((err) =>
+          logger.error(
+            { runId: claim.runId, err },
+            'Task notification retry crashed',
+          ),
+        )
+        .finally(() => armScheduler(0)),
+    );
   }
 }
 
@@ -2684,6 +2741,49 @@ function pumpTaskScheduler(deps: SchedulerDependencies): void {
       armSchedulerFromStore();
     }
   }
+}
+
+/**
+ * Stop materializing new occurrences and drain scheduler-owned detached work.
+ *
+ * Shutdown order is a contract: external intake stops first, then the scheduler
+ * stops taking new work while delivery is still available, and only then are
+ * transports and watchers closed. Without this step `queue.shutdown()` returned
+ * while script runs and notification retries were still in flight, and the
+ * process exited mid-write.
+ *
+ * The drain re-reads the live set each round because settling one item can
+ * enqueue its follow-up (a finished run schedules its notification). Rounds and
+ * wall clock are both bounded so a wedged item cannot block shutdown.
+ */
+export async function stopSchedulerLoop(
+  options: { drainMs?: number } = {},
+): Promise<void> {
+  schedulerRunning = false;
+  if (schedulerTimer) {
+    clearTimeout(schedulerTimer);
+    schedulerTimer = null;
+  }
+  const deadline = Date.now() + (options.drainMs ?? 10_000);
+  for (let round = 0; round < 8; round++) {
+    if (detachedSchedulerWork.size === 0) break;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await Promise.race([
+      Promise.allSettled([...detachedSchedulerWork]),
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, remaining);
+        timer.unref?.();
+      }),
+    ]);
+  }
+  if (detachedSchedulerWork.size > 0) {
+    logger.warn(
+      { pending: detachedSchedulerWork.size },
+      'Scheduler drain timed out with detached work still pending',
+    );
+  }
+  schedulerDepsRef = null;
 }
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {

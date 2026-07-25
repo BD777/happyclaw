@@ -273,10 +273,19 @@ import {
 } from './im-context-isolation.js';
 import { canSendCrossGroupMessage as canSendCrossGroupMessagePure } from './cross-group-acl.js';
 import {
+  canIpcActorAccessGroup,
+  canIpcActorManageTask,
+  type TaskAclDeps,
+} from './task-acl.js';
+import {
   resolveIpcDeliveryTargetGroup,
   resolveIpcImRoute,
 } from './ipc-delivery-routing.js';
-import { invalidateSessionCache, getWebDeps } from './web-context.js';
+import {
+  invalidateSessionCache,
+  getWebDeps,
+  canAccessGroup,
+} from './web-context.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
   AgentBuilderTurnRegistry,
@@ -360,6 +369,7 @@ import {
 } from './group-queue.js';
 import {
   startSchedulerLoop,
+  stopSchedulerLoop,
   triggerTaskNow,
   cancelTaskRunNow,
   notifyTaskSchedulerChanged,
@@ -10295,6 +10305,27 @@ async function processTaskIpc(
     ownerHomeFolderCandidate,
   );
 
+  // Scheduled-task ACL for this IPC surface. The predicate itself lives in
+  // src/task-acl.ts so it is unit-testable and cannot silently regress; see
+  // that module for why `isAdminHome` is deliberately absent.
+  const taskAclDeps: TaskAclDeps = {
+    lookupGroup: (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+    resolveActor: () => {
+      const actorId = sourceGroupEntry?.created_by;
+      if (!actorId) return undefined;
+      const actor = getUserById(actorId);
+      if (!actor) return undefined;
+      return { id: actor.id, role: actor.role, status: actor.status };
+    },
+    canAccessGroup,
+  };
+  const ipcActorCanAccessGroupJid = (targetJid: string): boolean =>
+    canIpcActorAccessGroup(sourceGroup, targetJid, taskAclDeps);
+  const ipcActorCanManageTask = (task: {
+    group_folder: string;
+    chat_jid: string;
+  }): boolean => canIpcActorManageTask(sourceGroup, task, taskAclDeps);
+
   const requireAgentBuilderActor = (): AgentBuilderActor => {
     const ownerId = sourceGroupEntry?.created_by;
     const user = ownerId ? getUserById(ownerId) : undefined;
@@ -10514,8 +10545,10 @@ async function processTaskIpc(
 
         const targetFolder = targetGroupEntry.folder;
 
-        // Authorization: non-admin-home groups can only schedule for themselves
-        if (!isAdminHome && targetFolder !== sourceGroup) {
+        // Authorization: own workspace, or a group this workspace's owner also
+        // owns. Admin home gets no global bypass here — see
+        // ipcActorCanAccessGroupJid.
+        if (!ipcActorCanAccessGroupJid(targetJid)) {
           failSchedule('Not authorized to schedule tasks for another group.');
           break;
         }
@@ -10634,7 +10667,7 @@ async function processTaskIpc(
     case 'pause_task':
       if (data.taskId) {
         const task = getTaskById(data.taskId);
-        if (task && (isAdminHome || task.group_folder === sourceGroup)) {
+        if (task && ipcActorCanManageTask(task)) {
           if (!Number.isInteger(data.expectedRevision)) {
             writeTaskResult(tasksDir, 'pause_task', data.requestId, {
               success: false,
@@ -10696,7 +10729,7 @@ async function processTaskIpc(
     case 'resume_task':
       if (data.taskId) {
         const task = getTaskById(data.taskId);
-        if (task && (isAdminHome || task.group_folder === sourceGroup)) {
+        if (task && ipcActorCanManageTask(task)) {
           if (task.status === 'parsing') {
             writeTaskResult(tasksDir, 'resume_task', data.requestId, {
               success: false,
@@ -10808,7 +10841,7 @@ async function processTaskIpc(
     case 'cancel_task':
       if (data.taskId) {
         const task = getTaskById(data.taskId);
-        if (task && (isAdminHome || task.group_folder === sourceGroup)) {
+        if (task && ipcActorCanManageTask(task)) {
           if (task.execution_type === 'script' && !isAdminHome) {
             writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
               success: false,
@@ -10917,8 +10950,9 @@ async function processTaskIpc(
         failUpdate('Task not found.');
         break;
       }
-      // 授权：仅本组（admin home 可跨组），与 pause/cancel 同款，用 host 派生的 isAdminHome。
-      if (!isAdminHome && task.group_folder !== sourceGroup) {
+      // 授权：本组，或本工作区属主同样拥有的组。与 pause/cancel 同款，
+      // 走 REST 面同一套 canAccessGroup，admin home 不再是全局旁路。
+      if (!ipcActorCanManageTask(task)) {
         failUpdate('Not authorized to update this task.');
         break;
       }
@@ -11049,7 +11083,7 @@ async function processTaskIpc(
         });
         break;
       }
-      if (!isAdminHome && task.group_folder !== sourceGroup) {
+      if (!ipcActorCanManageTask(task)) {
         writeTaskResult(tasksDir, 'run_task_now', data.requestId, {
           success: false,
           error: 'Not authorized to run this task.',
@@ -11112,7 +11146,7 @@ async function processTaskIpc(
         });
         break;
       }
-      if (!isAdminHome && task.group_folder !== sourceGroup) {
+      if (!ipcActorCanManageTask(task)) {
         writeTaskResult(tasksDir, 'stop_task_run', data.requestId, {
           success: false,
           error: 'Not authorized to stop this run.',
@@ -11159,7 +11193,7 @@ async function processTaskIpc(
         });
         break;
       }
-      if (!isAdminHome && task.group_folder !== sourceGroup) {
+      if (!ipcActorCanManageTask(task)) {
         writeTaskResult(tasksDir, 'restore_task', data.requestId, {
           success: false,
           error: 'Not authorized to restore this task.',
@@ -11217,7 +11251,7 @@ async function processTaskIpc(
         break;
       }
       const task = getTaskById(data.taskId);
-      if (!task || (!isAdminHome && task.group_folder !== sourceGroup)) {
+      if (!task || !ipcActorCanManageTask(task)) {
         writeTaskResult(tasksDir, 'list_task_runs', data.requestId, {
           success: false,
           error: 'Task not found or not authorized.',
@@ -11261,10 +11295,12 @@ async function processTaskIpc(
           const allTasks = data.includeDeleted
             ? [...getAllTasks(), ...getDeletedTasks()]
             : getAllTasks();
-          // Admin home sees all tasks, others only see their own group's tasks
-          const filteredTasks = isAdminHome
-            ? allTasks
-            : allTasks.filter((t) => t.group_folder === sourceGroup);
+          // Visibility follows the same ACL as mutation: own workspace plus
+          // groups this workspace's owner also owns. A task's `prompt` is user
+          // content, so admin home must not enumerate other tenants' rows.
+          const filteredTasks = allTasks.filter((t) =>
+            ipcActorCanManageTask(t),
+          );
           const taskList = filteredTasks.map((t) => ({
             id: t.id,
             groupFolder: t.group_folder,
@@ -17740,11 +17776,12 @@ async function main(): Promise<void> {
     unsubscribeChannelReadyRecovery?.();
     unsubscribeChannelReadyRecovery = null;
 
-    try {
-      ipcWatcherManager?.closeAll();
-    } catch (err) {
-      logger.warn({ err }, 'Error closing IPC watchers');
-    }
+    // Phase 0: stop materializing new occurrences and drain scheduler-owned
+    // detached work (script runs, notification retries) that the group queue
+    // does not track. Delivery stays available throughout so those can settle.
+    await stopSchedulerLoop().catch((err) =>
+      logger.warn({ err }, 'Error stopping scheduler loop'),
+    );
 
     try {
       shutdownTerminals();
@@ -17763,6 +17800,16 @@ async function main(): Promise<void> {
         .shutdown(15_000)
         .catch((err) => logger.warn({ err }, 'Error shutting down queue')),
     ]);
+
+    // IPC watchers are the *outbound* consumer, so they must outlive the drain
+    // above. Closing them first left messages an agent wrote during its grace
+    // period unconsumed on disk until the next boot, by which point their run
+    // had already been marked failed.
+    try {
+      ipcWatcherManager?.closeAll();
+    } catch (err) {
+      logger.warn({ err }, 'Error closing IPC watchers');
+    }
 
     // Agent output is now quiescent. Persist any partial text that did not
     // reach a normal result before touching the external card lifecycle.
