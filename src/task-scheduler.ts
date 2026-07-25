@@ -461,6 +461,11 @@ export interface SchedulerDependencies {
       workspaceFolder?: string;
       /** Skip the source channel only after its connector strictly ACKed. */
       sourceAlreadyDelivered?: boolean;
+      /**
+       * The task's recorded delivery binding. Framework-sent notices go here
+       * rather than being resolved by scanning the owner's groups.
+       */
+      deliveryRouteJid?: string | null;
     },
   ) => Promise<void | TaskRunNotificationReceipt>;
   /** Retry one concrete IM delivery without replaying Agent work/Web writes. */
@@ -1304,6 +1309,7 @@ async function runTaskInner(
           // it a second time.  Failures still need the scheduler fallback.
           ownerId: error ? taskOwnerId || undefined : undefined,
           notifyChannels: task.notify_channels,
+          deliveryRouteJid: task.delivery_route_jid ?? task.chat_jid,
           sourceKind: 'sdk_final',
           // Use source workspace folder for IM routing; task sessions are virtual
           // chats under that workspace and should inherit its channel bindings.

@@ -10745,10 +10745,22 @@ async function processTaskIpc(
 
         const taskId = crypto.randomUUID();
 
+        // Capture the concrete route this task was scheduled from, so a task
+        // created inside a Feishu topic delivers back into that topic. The
+        // session owner JID carries the thread/root and account fragments;
+        // `targetJid` is only conversation-level. Cross-workspace scheduling has
+        // no such context, so it binds to the target conversation itself.
+        const scheduleDeliveryRouteJid =
+          targetFolder === sourceGroup
+            ? (getSessionChannelOwner(sourceGroup, ipcAgentId ?? null) ??
+              targetJid)
+            : targetJid;
+
         createTask({
           id: taskId,
           group_folder: targetFolder,
           chat_jid: targetJid,
+          delivery_route_jid: scheduleDeliveryRouteJid,
           prompt: data.prompt || '',
           schedule_type: scheduleType,
           schedule_value: data.schedule_value,
@@ -18883,20 +18895,42 @@ async function main(): Promise<void> {
       }
       const deliveries: Array<{ channel: string; result: Promise<boolean> }> =
         [];
-      broadcastToOwnerIMChannels(
-        options.ownerId,
-        broadcastFolder,
-        alreadySent,
-        (jid) => {
-          deliveries.push({
-            // Notification retries filter on channel type, not the concrete
-            // binding jid. Keep the concrete jid only as a defensive fallback.
-            channel: getChannelType(jid) ?? jid,
-            result: sendImWithRetry(jid, text, localImages),
-          });
-        },
-        options.notifyChannels,
-      );
+      // A task records the exact place it was scheduled from. Deliver there
+      // first: the previous behaviour resolved the target by scanning the
+      // owner's groups and taking the first folder match, with no ORDER BY, so
+      // a failure notice for a task bound to one chat could surface in another.
+      const boundRoute = options.deliveryRouteJid;
+      if (
+        boundRoute &&
+        getChannelType(boundRoute) &&
+        !alreadySent.has(boundRoute)
+      ) {
+        alreadySent.add(boundRoute);
+        deliveries.push({
+          channel: getChannelType(boundRoute) ?? boundRoute,
+          result: sendImWithRetry(boundRoute, text, localImages),
+        });
+      }
+      // Fan-out is opt-in. Without an explicit `notify_channels` the notice
+      // goes only to the binding; it used to reach every channel type the owner
+      // had connected in that workspace, so a task created in Feishu also
+      // notified Telegram.
+      if (options.notifyChannels && options.notifyChannels.length > 0) {
+        broadcastToOwnerIMChannels(
+          options.ownerId,
+          broadcastFolder,
+          alreadySent,
+          (jid) => {
+            deliveries.push({
+              // Notification retries filter on channel type, not the concrete
+              // binding jid. Keep the concrete jid only as a defensive fallback.
+              channel: getChannelType(jid) ?? jid,
+              result: sendImWithRetry(jid, text, localImages),
+            });
+          },
+          options.notifyChannels,
+        );
+      }
       if (deliveries.length === 0) {
         return {
           status: 'skipped',
