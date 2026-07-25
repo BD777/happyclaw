@@ -1408,17 +1408,23 @@ function setupWebSocket(server: any): WebSocketServer {
         chatJid: string;
         runId: string;
         startedAt: string;
-        phase: 'queued' | 'preparing' | 'running';
+        phase: 'preparing' | 'running';
       }> = [];
+      const queuedChatJids: string[] = [];
       for (const g of queueStatus.groups) {
-        // A pending message/retry timer has no exact attempt identity yet.
-        // Emitting runId:null would create a wait state that can never receive
-        // a matching run_finished terminal.
-        if (!g.queryInFlight || !g.queryId) continue;
         const baseJid = stripRuntimeJidSuffix(g.jid);
         const jid = normalizeRuntimeJid(g.jid);
         const allowed = getGroupAllowedUserIds(baseJid);
         if (allowed === null || !allowed.has(userId)) continue;
+        // A pending message/retry timer has no exact attempt identity yet, so
+        // it cannot be a `runs` entry: emitting runId:null would create a wait
+        // state that can never receive a matching run_finished terminal. It
+        // still has to reach the client, or a reload mid-queue shows an idle
+        // composer and invites a duplicate send.
+        if (!g.queryInFlight || !g.queryId) {
+          if (g.pendingMessages) queuedChatJids.push(jid);
+          continue;
+        }
         const hasStreamSnapshot = streamingSnapshots.has(jid);
         runs.push({
           chatJid: jid,
@@ -1432,6 +1438,7 @@ function setupWebSocket(server: any): WebSocketServer {
           JSON.stringify({
             type: 'active_run_snapshot',
             runs,
+            queuedChatJids,
           } satisfies WsMessageOut),
         );
       } catch {
@@ -2988,6 +2995,32 @@ export function broadcastRunnerState(
     state,
   };
   safeBroadcast(msg, isHostGroupJid(baseJid), allowedUserIds);
+  if (state === 'idle') pruneOrphanedAgentSnapshots(jid);
+}
+
+/**
+ * Drop sub-agent stream snapshots that no longer have a live run.
+ *
+ * `broadcastRunFinished` deletes only the exact JID whose runId matched, so a
+ * sub-agent run ending without one — dropped before announceQueryStart, or a
+ * runId mismatch — leaves its snapshot resident until the 30-minute staleness
+ * sweep that runs on the next reconnect. Until then a reconnecting client can
+ * restore a zombie "generating" card.
+ *
+ * Entries still in `activeLogicalRuns` are left alone: those are the live
+ * sub-agents that the narrower deletion was introduced to protect.
+ */
+function pruneOrphanedAgentSnapshots(baseRuntimeJid: string): void {
+  const prefix = `${baseRuntimeJid}#agent:`;
+  for (const key of [...streamingSnapshots.keys()]) {
+    if (!key.startsWith(prefix) || activeLogicalRuns.has(key)) continue;
+    streamingSnapshots.delete(key);
+    streamingFullTexts.delete(key);
+  }
+  for (const key of [...streamingFullTexts.keys()]) {
+    if (!key.startsWith(prefix) || activeLogicalRuns.has(key)) continue;
+    streamingFullTexts.delete(key);
+  }
 }
 
 export function broadcastRunStarted(

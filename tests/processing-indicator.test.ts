@@ -93,3 +93,50 @@ describe('ExactAsyncIndicatorRegistry', () => {
     expect(registry.has(key)).toBe(false);
   });
 });
+
+describe('ExactAsyncIndicatorRegistry capacity', () => {
+  it('evicts the oldest entry and releases its handle once capacity is exceeded', async () => {
+    // Entries are keyed per inbound message, so a turn that dies before its
+    // terminal never clears one. Without a cap those accumulate for the
+    // process lifetime; eviction must also release the provider handle, or
+    // the reaction survives on the provider side with no owner left.
+    const released: string[] = [];
+    const registry = new ExactAsyncIndicatorRegistry<string>(2);
+
+    for (const id of ['a', 'b', 'c']) {
+      await registry.attach(
+        processingIndicatorKey('group:one', id),
+        async () => `handle-${id}`,
+        async (handle) => {
+          released.push(handle);
+        },
+      );
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(registry.size).toBe(2);
+    expect(registry.has(processingIndicatorKey('group:one', 'a'))).toBe(false);
+    expect(registry.has(processingIndicatorKey('group:one', 'c'))).toBe(true);
+    expect(released).toEqual(['handle-a']);
+  });
+
+  it('never evicts the entry being attached', async () => {
+    const registry = new ExactAsyncIndicatorRegistry<string>(1);
+    await registry.attach(
+      processingIndicatorKey('group:one', 'first'),
+      async () => 'handle-first',
+      async () => {},
+    );
+    await registry.attach(
+      processingIndicatorKey('group:one', 'second'),
+      async () => 'handle-second',
+      async () => {},
+    );
+
+    expect(registry.size).toBe(1);
+    expect(registry.has(processingIndicatorKey('group:one', 'second'))).toBe(
+      true,
+    );
+  });
+});

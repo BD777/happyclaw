@@ -800,7 +800,10 @@ export interface ActiveRunSnapshot {
   chatJid: string;
   runId: string;
   startedAt: string;
-  phase: 'queued' | 'preparing' | 'running';
+  // No 'queued': a queued message has no exact attempt identity yet, so it can
+  // never receive a matching run_finished terminal. Queued chats travel in
+  // `queuedChatJids` on the snapshot message instead.
+  phase: 'preparing' | 'running';
 }
 
 export type RunFinishReason =
@@ -874,6 +877,13 @@ export type WsMessageOut =
   | {
       type: 'active_run_snapshot';
       runs: ActiveRunSnapshot[];
+      /**
+       * Chats whose message is enqueued behind a busy runner. They have no run
+       * identity yet, so they cannot be `runs` entries — but the client still
+       * has to show a wait state, otherwise a user who reloads mid-queue sees
+       * an idle composer and sends the same message twice.
+       */
+      queuedChatJids: string[];
     }
   | {
       type: 'follow_up_update';

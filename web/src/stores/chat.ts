@@ -34,6 +34,7 @@ import {
   runsFromAuthoritativeSnapshot,
   shouldApplyRunScopedPayload,
   shouldDiscardStreamForAuthoritativeRun,
+  waitKeysForQueuedChats,
   type ClientActiveRuns,
 } from './run-lifecycle';
 
@@ -181,7 +182,7 @@ export interface ActiveRunSnapshotData {
   chatJid: string;
   runId: string;
   startedAt: string;
-  phase: 'queued' | 'preparing' | 'running';
+  phase: 'preparing' | 'running';
 }
 
 export interface StreamingState {
@@ -468,7 +469,10 @@ interface ChatState {
   handleRunnerState: (chatJid: string, state: string) => void;
   handleRunStarted: (chatJid: string, runId?: string | null) => void;
   handleRunFinished: (chatJid: string, runId: string) => void;
-  handleActiveRunSnapshot: (runs: ActiveRunSnapshotData[]) => void;
+  handleActiveRunSnapshot: (
+    runs: ActiveRunSnapshotData[],
+    queuedChatJids?: string[],
+  ) => void;
   // IM binding actions
   loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
   syncAvailableImGroups: (
@@ -4225,7 +4229,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  handleActiveRunSnapshot: (runs) => {
+  handleActiveRunSnapshot: (runs, queuedChatJids = []) => {
     // The server sends this before stream snapshots on every WS connection. It
     // is authoritative: absent/replaced attempts are no longer running, and
     // their local projection must be gone before the canonical snapshot lands.
@@ -4279,6 +4283,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
         } else {
           nextWaiting[run.chatJid] = true;
         }
+      }
+      // Queued chats have no run identity, so they never enter activeRuns and
+      // never expect a run_finished. They still need the wait state, otherwise
+      // reloading while a message sits behind a busy runner shows an idle
+      // composer. The next authoritative snapshot recomputes this from scratch.
+      const queuedWaitKeys = waitKeysForQueuedChats(queuedChatJids);
+      for (const jid of queuedWaitKeys.waiting) nextWaiting[jid] = true;
+      for (const agentId of queuedWaitKeys.agentWaiting) {
+        nextAgentWaiting[agentId] = true;
       }
       for (const jid of Object.keys(s.streaming)) {
         if (!authoritative[jid]) clearStreamingFromSession(jid);

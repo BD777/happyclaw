@@ -2,7 +2,7 @@ export interface ClientActiveRun {
   chatJid: string;
   runId: string;
   startedAt: string;
-  phase: 'queued' | 'preparing' | 'running';
+  phase: 'preparing' | 'running';
 }
 
 export type ClientActiveRuns = Record<string, ClientActiveRun>;
@@ -66,6 +66,33 @@ export function shouldApplyRunScopedPayload(
   runId?: string,
 ): boolean {
   return !!runId && current[chatJid]?.runId === runId;
+}
+
+/**
+ * Split queued chat JIDs into main-conversation and conversation-Agent wait
+ * keys.
+ *
+ * A queued message sits behind a busy runner and has no run identity yet, so
+ * it can never enter `activeRuns` — nothing would ever deliver its terminal.
+ * It still has to show a wait state, otherwise reloading mid-queue presents an
+ * idle composer and invites the user to send the same message twice.
+ */
+export function waitKeysForQueuedChats(queuedChatJids: string[]): {
+  waiting: string[];
+  agentWaiting: string[];
+} {
+  const waiting: string[] = [];
+  const agentWaiting: string[] = [];
+  const marker = '#agent:';
+  for (const jid of queuedChatJids) {
+    const markerIndex = jid.indexOf(marker);
+    if (markerIndex >= 0) {
+      agentWaiting.push(jid.slice(markerIndex + marker.length));
+    } else {
+      waiting.push(jid);
+    }
+  }
+  return { waiting, agentWaiting };
 }
 
 /** A reconnect replacement must discard the prior attempt's local stream. */

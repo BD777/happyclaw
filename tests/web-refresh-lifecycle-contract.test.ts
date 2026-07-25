@@ -106,7 +106,14 @@ describe('Web logical-run refresh contract', () => {
       web.indexOf('export function broadcastRunStarted'),
     );
     expect(runnerState).not.toMatch(/agentPrefix/);
-    expect(runnerState).not.toMatch(/streamingSnapshots\.delete/);
+    // Idle may still reap sub-agent snapshots that have no live logical run —
+    // run_finished only deletes the exact JID whose runId matched, so a run
+    // ending without one would otherwise stay resident until the 30-minute
+    // sweep. What must never come back is the unconditional prefix wipe: any
+    // delete here has to be guarded by activeLogicalRuns.
+    if (/streamingSnapshots\.delete/.test(runnerState)) {
+      expect(runnerState).toMatch(/activeLogicalRuns\.has/);
+    }
     expect(store).toMatch(/activeRuns: ClientActiveRuns/);
     expect(store).toMatch(/applyRunFinished/);
     expect(store).toMatch(/exactRunActive \|\| holdsRunningWorkflow/);

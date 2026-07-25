@@ -107,7 +107,7 @@ describe('exact processing indicator host contract', () => {
     const strictFeishuRemoval = sourceBetween(
       feishu,
       'async function removeReactionStrict(',
-      'async function removeReactionBestEffort(',
+      'function clearAckForInput(',
     );
     expect(strictFeishuRemoval).toMatch(/messageReaction\.delete/);
     expect(strictFeishuRemoval).not.toMatch(/\bcatch\b/);
@@ -115,13 +115,10 @@ describe('exact processing indicator host contract', () => {
       /ackReactions[\s\S]*removeReactionStrict\(ackMessageId, reactionId\)/,
     );
 
-    const bestEffortFeishuRemoval = sourceBetween(
-      feishu,
-      'async function removeReactionBestEffort(',
-      'function clearAckForInput(',
-    );
-    expect(bestEffortFeishuRemoval).toMatch(/removeReactionStrict/);
-    expect(bestEffortFeishuRemoval).toMatch(/\bcatch\b/);
+    // The best-effort variant is gone along with its only caller, the
+    // chat-level typing reaction that the exact per-input ack replaced.
+    // Reintroducing a swallowing wrapper would silently orphan ack handles.
+    expect(feishu).not.toMatch(/removeReactionBestEffort/);
 
     const discord = fs.readFileSync('src/discord.ts', 'utf8');
     const discordRecall = sourceBetween(

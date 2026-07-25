@@ -191,7 +191,6 @@ export interface FeishuConnection {
     fileName?: string,
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
-  sendReaction(chatId: string, isTyping: boolean): Promise<void>;
   /** Clear the "OnIt" ack reaction owned by one exact inbound input. */
   clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
@@ -1021,7 +1020,6 @@ export function createFeishuConnection(
     messageId: string;
     reactionId: string;
   }>();
-  const typingReactionByChat = new Map<string, string>();
   const inboxHeartbeatByClaim = new Map<string, NodeJS.Timeout>();
   const knownChatIds = new Set<string>();
   const chatTypeById = new Map<string, string>(); // chatId → 'group' | 'p2p'
@@ -1526,17 +1524,6 @@ export function createFeishuConnection(
     await client!.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     });
-  }
-
-  async function removeReactionBestEffort(
-    messageId: string,
-    reactionId: string,
-  ): Promise<void> {
-    try {
-      await removeReactionStrict(messageId, reactionId);
-    } catch (err) {
-      logger.debug({ err, messageId, reactionId }, 'Failed to remove reaction');
-    }
   }
 
   function clearAckForInput(
@@ -3501,34 +3488,6 @@ export function createFeishuConnection(
       }
     },
 
-    async sendReaction(chatId: string, isTyping: boolean): Promise<void> {
-      if (!client) return;
-      const target = requireFeishuRouteTarget(chatId);
-      const reactionKey = target.raw;
-      const lastMsgId = target.rootMessageId || p2pLastMessageId(target);
-      if (!lastMsgId) {
-        logger.debug(
-          { chatId },
-          'Skipping Feishu reaction: route has no trusted message anchor',
-        );
-        return;
-      }
-
-      if (isTyping) {
-        const reactionId = await addReaction(lastMsgId, 'OnIt');
-        if (reactionId) {
-          typingReactionByChat.set(reactionKey, `${lastMsgId}:${reactionId}`);
-        }
-      } else {
-        const stored = typingReactionByChat.get(reactionKey);
-        if (stored) {
-          const [msgId, reactionId] = stored.split(':');
-          await removeReactionBestEffort(msgId, reactionId);
-          typingReactionByChat.delete(reactionKey);
-        }
-      }
-    },
-
     clearAckReaction(chatId: string, inputMessageId: string): Promise<void> {
       return clearAckForInput(chatId, inputMessageId);
     },
@@ -3701,17 +3660,6 @@ export async function sendFeishuMessage(
     return;
   }
   return _defaultInstance.sendMessage(chatId, text, localImagePaths);
-}
-
-/**
- * @deprecated Use FeishuConnection.sendReaction() instead.
- */
-export async function setFeishuTyping(
-  chatId: string,
-  isTyping: boolean,
-): Promise<void> {
-  if (!_defaultInstance) return;
-  return _defaultInstance.sendReaction(chatId, isTyping);
 }
 
 /**

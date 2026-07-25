@@ -161,3 +161,15 @@ describe('database upgrade safety gate', () => {
     );
   });
 });
+
+describe('schema version head', () => {
+  test('pins the head version so a bump stays a reviewed decision', () => {
+    // Deliberately a literal. The migration tests above compare against
+    // CURRENT_SCHEMA_VERSION, which makes each of them tautological on its
+    // own: initDatabase stores the very constant they assert on. This is the
+    // one assertion that fails when the head moves, forcing whoever bumps it
+    // to confirm the matching migration block — and a test covering it —
+    // actually landed. Update the literal in the same commit as the migration.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(63);
+  });
+});

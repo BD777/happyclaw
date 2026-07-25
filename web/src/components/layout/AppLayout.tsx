@@ -82,7 +82,10 @@ export function AppLayout() {
     });
     const unsubSnapshot = wsManager.on('active_run_snapshot', (data: any) => {
       const runs = Array.isArray(data.runs) ? data.runs : [];
-      useChatStore.getState().handleActiveRunSnapshot(runs);
+      const queuedChatJids = Array.isArray(data.queuedChatJids)
+        ? data.queuedChatJids
+        : [];
+      useChatStore.getState().handleActiveRunSnapshot(runs, queuedChatJids);
       for (const run of runs) {
         if (!run?.chatJid) continue;
         if (!run.chatJid.includes('#agent:')) {

@@ -21,6 +21,18 @@ interface AsyncIndicatorEntry<Handle> {
 export class ExactAsyncIndicatorRegistry<Handle> {
   private readonly entries = new Map<string, AsyncIndicatorEntry<Handle>>();
 
+  /**
+   * Entries are keyed per inbound message, not per chat, so the map grows with
+   * message volume rather than with the number of conversations. A turn that
+   * dies before its terminal — runner crash, an exception between attach and
+   * clear — never clears its entry, and `clear`'s failure path deliberately
+   * retains one. Both are unbounded without a cap.
+   *
+   * Eviction releases the provider handle instead of dropping it, so an
+   * evicted indicator does not survive on the provider side either.
+   */
+  constructor(private readonly maxEntries = 512) {}
+
   attach(
     key: string,
     acquire: () => Promise<Handle | null>,
@@ -34,6 +46,7 @@ export class ExactAsyncIndicatorRegistry<Handle> {
       release,
     };
     this.entries.set(key, entry);
+    this.evictOverflow(key);
 
     return entry.ready
       .then(() => undefined)
@@ -67,6 +80,24 @@ export class ExactAsyncIndicatorRegistry<Handle> {
         throw error;
       });
     return entry.clearPromise;
+  }
+
+  /**
+   * Drop the oldest entries once the cap is exceeded, releasing each handle on
+   * the way out. Map iteration is insertion-ordered, so the oldest attach goes
+   * first. The entry just installed is never evicted.
+   */
+  private evictOverflow(protectedKey: string): void {
+    if (this.entries.size <= this.maxEntries) return;
+    for (const key of [...this.entries.keys()]) {
+      if (this.entries.size <= this.maxEntries) break;
+      if (key === protectedKey) continue;
+      // Start the release, then drop the entry whether or not it succeeds.
+      // This entry is already older than `maxEntries` turns; keeping it
+      // forever in the hope of a later retry is the worse failure.
+      void this.clear(key).catch(() => undefined);
+      this.entries.delete(key);
+    }
   }
 
   async clearAll(): Promise<void> {

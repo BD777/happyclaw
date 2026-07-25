@@ -7,6 +7,7 @@ import {
   shouldDiscardStreamForAuthoritativeRun,
   runsFromAuthoritativeSnapshot,
   shouldApplyRunScopedPayload,
+  waitKeysForQueuedChats,
 } from '../web/src/stores/run-lifecycle.js';
 
 const run = (chatJid: string, runId: string) => ({
@@ -112,5 +113,37 @@ describe('Web exact logical-run fencing', () => {
         queryId: 'run-exact',
       }),
     ).toBe(true);
+  });
+});
+
+describe('queued-message wait state', () => {
+  test('a queued chat restores waiting without ever entering activeRuns', () => {
+    // The server cannot give a queued message a runId — it has no attempt yet,
+    // so no run_finished would ever arrive to clear it. It travels outside
+    // `runs` for exactly that reason, but must still surface as waiting or a
+    // reload mid-queue shows an idle composer and invites a duplicate send.
+    const restored = runsFromAuthoritativeSnapshot([]);
+    const keys = waitKeysForQueuedChats(['web:alpha']);
+
+    expect(restored).toEqual({});
+    expect(keys.waiting).toEqual(['web:alpha']);
+    expect(keys.agentWaiting).toEqual([]);
+  });
+
+  test('a queued conversation-Agent chat maps to its agent wait key', () => {
+    const keys = waitKeysForQueuedChats([
+      'web:alpha#agent:agent-1',
+      'web:beta',
+    ]);
+
+    expect(keys.agentWaiting).toEqual(['agent-1']);
+    expect(keys.waiting).toEqual(['web:beta']);
+  });
+
+  test('an empty queue clears nothing and adds nothing', () => {
+    const keys = waitKeysForQueuedChats([]);
+
+    expect(keys.waiting).toEqual([]);
+    expect(keys.agentWaiting).toEqual([]);
   });
 });

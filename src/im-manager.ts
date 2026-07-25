@@ -1823,18 +1823,6 @@ export class IMConnectionManager {
   }
 
   /**
-   * Set typing reaction on a Feishu chat.
-   * @deprecated Use setTyping(jid, isTyping) which auto-routes.
-   */
-  async setFeishuTyping(chatJid: string, isTyping: boolean): Promise<void> {
-    const chatId = extractProviderTarget(chatJid);
-    const channel = this.findChannelForJid(chatJid, 'feishu');
-    if (channel) {
-      await channel.setTyping(chatId, isTyping);
-    }
-  }
-
-  /**
    * Set Telegram typing chat action for a chat.
    * @deprecated Use setTyping(jid, isTyping) which auto-routes.
    */
