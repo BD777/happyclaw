@@ -5,11 +5,13 @@ import path from 'node:path';
 import {
   PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   buildInteractionTextOutboxPayload,
+  isProactiveControlPlaneSuccess,
   isInteractionTurnSettled,
   publishesFrameworkAnswer,
   resolveFrozenIpcInteractionMode,
   resolveRuntimeInteractionMode,
   shouldBroadcastSdkStreamEvent,
+  shouldResolveFrameworkPrimaryAnswer,
   shouldSendProactiveTailInterruptionNotice,
   usesNativeMessagePresentation,
 } from '../src/workspace-interaction-runtime.js';
@@ -40,6 +42,84 @@ describe('workspace interaction runtime policy', () => {
     expect(usesNativeMessagePresentation('assistant')).toBe(false);
     expect(publishesFrameworkAnswer('proactive')).toBe(false);
     expect(usesNativeMessagePresentation('proactive')).toBe(true);
+  });
+
+  test('treats every healthy proactive success as control-plane output', () => {
+    expect(
+      isProactiveControlPlaneSuccess({
+        mode: 'proactive',
+        status: 'success',
+      }),
+    ).toBe(true);
+    expect(
+      isProactiveControlPlaneSuccess({
+        mode: 'proactive',
+        status: 'success',
+        providerFailure: false,
+      }),
+    ).toBe(true);
+    expect(
+      isProactiveControlPlaneSuccess({
+        mode: 'proactive',
+        status: 'success',
+        providerFailure: true,
+      }),
+    ).toBe(false);
+    expect(
+      isProactiveControlPlaneSuccess({
+        mode: 'assistant',
+        status: 'success',
+      }),
+    ).toBe(false);
+    expect(
+      isProactiveControlPlaneSuccess({
+        mode: 'proactive',
+        status: 'error',
+      }),
+    ).toBe(false);
+  });
+
+  test('recovers SDK primary answers only for healthy Assistant finals', () => {
+    expect(
+      shouldResolveFrameworkPrimaryAnswer({
+        mode: 'assistant',
+        status: 'success',
+      }),
+    ).toBe(true);
+    expect(
+      shouldResolveFrameworkPrimaryAnswer({
+        mode: 'assistant',
+        status: 'success',
+        sourceKind: 'sdk_final',
+      }),
+    ).toBe(true);
+    expect(
+      shouldResolveFrameworkPrimaryAnswer({
+        mode: 'proactive',
+        status: 'success',
+        sourceKind: 'sdk_final',
+      }),
+    ).toBe(false);
+    expect(
+      shouldResolveFrameworkPrimaryAnswer({
+        mode: 'assistant',
+        status: 'success',
+        sourceKind: 'overflow_partial',
+      }),
+    ).toBe(false);
+    expect(
+      shouldResolveFrameworkPrimaryAnswer({
+        mode: 'assistant',
+        status: 'success',
+        providerFailure: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldResolveFrameworkPrimaryAnswer({
+        mode: 'assistant',
+        status: 'error',
+      }),
+    ).toBe(false);
   });
 
   test('keeps the legacy assistant Outbox payload hash and extends only native sends', () => {

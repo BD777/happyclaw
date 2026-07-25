@@ -20,14 +20,14 @@ const OPTIONS: Array<{
     value: 'assistant',
     title: 'Assistant 模式（推荐）',
     description:
-      '框架自动发送 Agent 的最终回复。飞书可使用流式卡片，其他渠道按各自能力呈现。',
+      '任务完成后由框架交付一条主回复。Web 可实时展示过程，飞书等渠道按能力使用流式卡片或消息气泡。',
     icon: Bot,
   },
   {
     value: 'proactive',
     title: '主动模式',
     description:
-      'Agent 按 AgentProfile 身份自然发言并决定时机；每次发送一条独立消息，一轮可以发送多条，框架不代发 Assistant 定稿。',
+      'Agent 在处理过程中主动发消息；每次发送立即形成一条独立消息，一轮可以发送多条。身份与语气仍由 Agent Profile 决定。',
     icon: MessagesSquare,
   },
 ];
@@ -37,7 +37,7 @@ export function InteractionModeSelector({
   onChange,
   disabled = false,
   name,
-  description = '选择由框架还是 Agent 控制消息投递。模式不影响身份、Skills、记忆或渠道响应范围。',
+  description = '选择由框架在任务结束时交付一条主回复，还是由 Agent 在处理过程中主动发出多条消息。身份、Skills、记忆与渠道响应范围不变。',
 }: InteractionModeSelectorProps) {
   return (
     <fieldset disabled={disabled}>

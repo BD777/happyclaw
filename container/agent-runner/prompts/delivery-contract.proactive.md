@@ -18,7 +18,8 @@ not an identity or personality instruction.
   error with a card tool or raw channel API, and do not sleep and retry. The
   framework owns user-visible delivery-failure notices.
 - Never place user-visible content only in the final SDK text. After the last
-  useful `send_message`, finish with a minimal internal acknowledgement and do
-  not repeat the delivered messages.
+  useful `send_message`, end the internal turn immediately. Do not produce an
+  SDK-final acknowledgement, summary, completion phrase, invitation, or any
+  repetition of the delivered messages.
 - Use `send_image` or `send_file` for artifacts. Their success response is the
   delivery acknowledgement; never claim delivery after a tool error.

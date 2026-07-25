@@ -81,8 +81,8 @@ export function WorkspaceInteractionModeDialog({
         />
 
         <p className="rounded-md bg-muted/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          模式会作为系统级回复契约注入
-          Agent。切换后工作区运行时会安全重启，尚未处理的消息和下一条新消息将按新模式继续。
+          切换会安全重启该工作区的 Agent
+          运行时；身份、Skills、记忆与渠道绑定保持不变。正在运行的任务会先停止，后续消息按新模式处理。
         </p>
 
         <DialogFooter>
@@ -98,9 +98,12 @@ export function WorkspaceInteractionModeDialog({
             type="button"
             onClick={() => void handleSave()}
             disabled={saving}
+            aria-busy={saving}
           >
-            {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-            保存更改
+            {saving && (
+              <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" />
+            )}
+            {saving ? '正在保存…' : '保存更改'}
           </Button>
         </DialogFooter>
       </DialogContent>

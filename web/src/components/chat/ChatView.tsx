@@ -227,13 +227,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     };
   }, [isOwnHome]);
 
-  // 进入对话时清除未读计数
+  // 未读目前按 Workspace 聚合：进入主会话或切换到任一 Agent 会话，
+  // 都表示用户已经查看当前 Workspace。
   useEffect(() => {
     markChatRead(groupJid);
     const onFocus = () => markChatRead(groupJid);
     window.addEventListener('focus', onFocus);
     return () => window.removeEventListener('focus', onFocus);
-  }, [groupJid, markChatRead]);
+  }, [activeAgentTab, groupJid, markChatRead]);
 
   // Load messages on group select
   const hasMessages = !!groupMessages;
@@ -880,6 +881,11 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                     ? '主动模式：由 Agent 决定何时发送 0～多条独立消息'
                     : 'Assistant 模式：框架在任务完成后交付一条主回复'
                 }
+                aria-label={
+                  interactionMode === 'proactive'
+                    ? '当前为主动模式'
+                    : '当前为 Assistant 模式'
+                }
               >
                 {interactionMode === 'proactive' ? '主动' : 'Assistant'}
               </span>
@@ -913,7 +919,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             <button
               type="button"
               onClick={() => setShowInteractionModeDialog(true)}
-              className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+              className="inline-flex h-11 w-11 items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer sm:h-9 sm:w-auto sm:px-2.5"
               title="工作区设置"
               aria-label="工作区设置"
             >

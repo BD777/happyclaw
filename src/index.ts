@@ -21,6 +21,7 @@ import { interruptibleSleep } from './message-notifier.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
   acknowledgeIpcReplyTurn,
+  decideAssistantPrimaryProjection,
   isGenuineReplyResult,
   setIpcReplyInputTurn,
   shouldSkipRetryAfterLateError,
@@ -212,10 +213,12 @@ import {
 import {
   PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   buildInteractionTextOutboxPayload,
+  isProactiveControlPlaneSuccess,
   publishesFrameworkAnswer,
   resolveFrozenIpcInteractionMode,
   resolveRuntimeInteractionMode,
   shouldBroadcastSdkStreamEvent,
+  shouldResolveFrameworkPrimaryAnswer,
   shouldSendProactiveTailInterruptionNotice,
   usesNativeMessagePresentation,
 } from './workspace-interaction-runtime.js';
@@ -5255,7 +5258,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let channelDeliveryNeedsManualReconciliation = false;
   let channelManualNoticesAcknowledged = true;
   let lastReplyMsgId: string | undefined;
-  let lastSavedTurnId: string | undefined; // tracks last turnId saved to DB, prevents UPSERT overwrite
   const queryTaskIds = new Set<string>();
   const healthyCompletedInputTurns = new Set<string>();
   const processingIndicatorJidsByInput = new Map<string, string>();
@@ -5785,6 +5787,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     });
     turnOutputCoordinators.set(inputTurnId, coordinator);
     return coordinator;
+  };
+  const finalizeProactiveOutputCoordinators = (
+    result: ContainerOutput,
+  ): void => {
+    const inputIds = result.ipcReceipts?.length
+      ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [result.inputTurnId ?? lastProcessed.id];
+    for (const inputId of inputIds) {
+      const coordinator = turnOutputCoordinators.get(inputId);
+      if (!coordinator) continue;
+      coordinator.markFinalized();
+      activeTurnOutputs.unbind(mainAdmissionKey, inputId, coordinator);
+      turnOutputCoordinators.delete(inputId);
+    }
+    // These lanes are Assistant-only invariants. Clear any stale projection
+    // left by an older warm callback so it cannot contaminate the next input.
+    streamingAccumulatedText = '';
+    streamingAccumulatedThinking = '';
+    heldCardParts = [];
+    heldCardUsage = null;
+    heldUsagePatchTarget = null;
+    heldDbTurnId = null;
+    activeWorkflowRuns = [];
+    completedWorkflowRuns = [];
   };
   bindTurnOutputCoordinator(lastProcessed.id);
   activeRouteAdmissions.set(
@@ -6464,16 +6490,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               pendingLedgerUsageBatch = null;
             }
             const streamInputTurnId = result.inputTurnId ?? lastProcessed.id;
-            const streamTurnCoordinator =
-              turnOutputCoordinators.get(streamInputTurnId) ??
-              bindTurnOutputCoordinator(streamInputTurnId);
-            const answerProjection = streamTurnCoordinator.reduceStreamEvent(
-              result.streamEvent,
-            );
-            if (
-              publishesFrameworkAnswer(interactionMode) &&
-              answerProjection.visibleAnswerChanged
-            ) {
+            // Proactive SDK text is private model-loop state. Do not even feed
+            // it into the Assistant answer reducer: a later empty/session-only
+            // success must not be able to recover that hidden text as sdk_final.
+            const answerProjection = publishesFrameworkAnswer(interactionMode)
+              ? (
+                  turnOutputCoordinators.get(streamInputTurnId) ??
+                  bindTurnOutputCoordinator(streamInputTurnId)
+                ).reduceStreamEvent(result.streamEvent)
+              : null;
+            if (answerProjection?.visibleAnswerChanged) {
               streamingAccumulatedText = answerProjection.visibleAnswerText;
             }
 
@@ -6533,7 +6559,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             if (streamingSession) {
               const se = result.streamEvent;
               if (
-                answerProjection.visibleAnswerChanged &&
+                answerProjection?.visibleAnswerChanged &&
                 streamingSession.isActive()
               ) {
                 streamingSession.append(
@@ -6932,19 +6958,31 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // terminal, never a user-visible answer. A healthy turn may have
             // emitted several native messages or intentionally stayed silent.
             result.result = null;
-            if (result.status === 'success' && result.inputTurnCompleted) {
-              if (await completeChannelRuntimesForOutput(result)) {
-                commitCursor(
-                  resolveContainerOutputInputTurnId(result, lastProcessed.id),
-                );
+            if (
+              isProactiveControlPlaneSuccess({
+                mode: interactionMode,
+                status: result.status,
+                providerFailure: result.providerFailure,
+              })
+            ) {
+              if (result.inputTurnCompleted) {
+                if (await completeChannelRuntimesForOutput(result)) {
+                  commitCursor(
+                    resolveContainerOutputInputTurnId(result, lastProcessed.id),
+                  );
+                }
+                finalizeProactiveOutputCoordinators(result);
+                broadcastStreamEvent(chatJid, {
+                  eventType: 'status',
+                  statusText: 'idle',
+                  turnId: result.inputTurnId ?? lastProcessed.id,
+                  sessionId: activeSessionId,
+                });
               }
-              broadcastStreamEvent(chatJid, {
-                eventType: 'status',
-                statusText: 'idle',
-                turnId: result.inputTurnId ?? lastProcessed.id,
-                sessionId: activeSessionId,
-              });
               resetIdleTimer();
+              // Interim background results and SIGTERM's session-only success
+              // intentionally have no inputTurnCompleted flag. They are still
+              // control-plane events and must never fall through to sdk_final.
               return;
             }
           }
@@ -6954,10 +6992,52 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           // authoritative; the staged MCP candidate is only a fallback for a
           // genuinely empty Result, never an independently delivered message.
           if (
-            result.status === 'success' &&
-            (result.sourceKind ?? 'sdk_final') === 'sdk_final'
+            shouldResolveFrameworkPrimaryAnswer({
+              mode: interactionMode,
+              status: result.status,
+              sourceKind: result.sourceKind,
+              providerFailure: result.providerFailure,
+            })
           ) {
-            const resultInputTurnId = result.inputTurnId ?? lastProcessed.id;
+            const resultInputTurnId = resolveContainerOutputInputTurnId(
+              result,
+              lastProcessed.id,
+            );
+            const projectionDecision = decideAssistantPrimaryProjection({
+              canonicalInputTurnId: resultInputTurnId,
+              status: result.status,
+              result: result.result,
+              sourceKind: result.sourceKind,
+              inputTurnId: result.inputTurnId,
+              ipcReceiptCount: result.ipcReceipts?.length,
+              inputTurnCompleted: result.inputTurnCompleted,
+              finalizationReason: result.finalizationReason,
+              pendingBgTasks: result.pendingBgTasks,
+              sdkMessageUuid: result.sdkMessageUuid,
+              primaryAlreadyProjected:
+                genuineReplyDeliveredByInput.get(resultInputTurnId) === true,
+              anyReplyProjected:
+                sentReplyByInput.get(resultInputTurnId) === true,
+            });
+            if (!projectionDecision.project) {
+              result.result = null;
+              if (
+                result.inputTurnCompleted &&
+                (await completeChannelRuntimesForOutput(result))
+              ) {
+                commitCursor(resultInputTurnId);
+              }
+              logger.info(
+                {
+                  group: group.name,
+                  inputTurnId: resultInputTurnId,
+                  reason: projectionDecision.reason,
+                },
+                'Assistant terminal output handled as lifecycle-only',
+              );
+              resetIdleTimer();
+              return;
+            }
             const coordinator =
               turnOutputCoordinators.get(resultInputTurnId) ??
               bindTurnOutputCoordinator(resultInputTurnId);
@@ -7196,11 +7276,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 (streamingCardHandledIM && directImReply) ||
                 routeSwitchedAway ||
                 routeCleared;
-              // When the container stays alive and processes multiple IPC messages,
-              // result.turnId stays the same (set at container start).  If we already
-              // saved a reply with this turnId, the INSERT OR REPLACE would overwrite
-              // the previous reply.  Use a fresh ID to prevent that.
-              const effectiveTurnId = result.turnId || lastProcessed.id;
+              // One immutable user input owns one canonical primary-answer row.
+              // Presentation turnId may rotate or be absent on a trailing host
+              // lifecycle frame; never use that mutable field to fork DB identity.
+              const effectiveTurnId = outputChannelScope.inputId;
               // ── 挂起序列 DB 合并：全渠道一条回复 ──
               // 序列内所有 turn（含收尾）共用第一个 held turn 的 turnId，
               // storeMessageDirect 按 (chat_jid, turn_id) UPSERT 覆盖同一行，
@@ -7217,10 +7296,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 dbText = holdReason ? heldBaseForDb + text : text;
                 if (!holdReason) heldDbTurnId = null; // healthy 收尾，序列结束
               } else {
-                turnIdForDb =
-                  outputAlreadySent && effectiveTurnId === lastSavedTurnId
-                    ? undefined // no turnId → fresh INSERT, no UPSERT dedup
-                    : effectiveTurnId;
+                turnIdForDb = effectiveTurnId;
               }
               const durableOutputIdentity =
                 result.sdkMessageUuid ||
@@ -7363,8 +7439,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 activeWorkflowRuns = [];
                 completedWorkflowRuns = [];
               }
-              lastSavedTurnId = effectiveTurnId;
-
               // For routed IM (web JID with IM source), only send the FIRST
               // substantive reply to IM. Subsequent results (e.g., SDK Task
               // completions) are stored in DB but not spammed to IM.
@@ -12777,6 +12851,30 @@ async function processAgentConversation(
     agentTurnOutputCoordinators.set(inputTurnId, coordinator);
     return coordinator;
   };
+  const finalizeProactiveAgentOutputCoordinators = (
+    output: ContainerOutput,
+  ): void => {
+    const inputIds = output.ipcReceipts?.length
+      ? output.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [output.inputTurnId ?? lastProcessed.id];
+    for (const inputId of inputIds) {
+      const coordinator = agentTurnOutputCoordinators.get(inputId);
+      if (!coordinator) continue;
+      coordinator.markFinalized();
+      activeTurnOutputs.unbind(agentAdmissionKey, inputId, coordinator);
+      agentTurnOutputCoordinators.delete(inputId);
+    }
+    // Proactive output has no framework-owned answer/held lane. Reset any
+    // legacy warm-process residue at the durable input completion boundary.
+    agentStreamingAccText = '';
+    heldAgentParts = [];
+    heldAgentUsage = null;
+    heldAgentUsagePatchPending = false;
+    heldAgentDbMsgId = null;
+    heldAgentDbTurnId = null;
+    activeAgentWorkflowRuns = [];
+    completedAgentWorkflowRuns = [];
+  };
   bindAgentTurnOutputCoordinator(lastProcessed.id);
   activeRouteAdmissions.set(
     agentAdmissionKey,
@@ -12844,6 +12942,8 @@ async function processAgentConversation(
         scope: nextScope,
         lifecycle: nextLifecycle,
       });
+      agentAnyReplyProjectedByInput.set(inputTurnId, false);
+      agentGenuineReplyDeliveredByInput.set(inputTurnId, false);
       const exactInputs =
         coveredInputs && coveredInputs.length > 0
           ? coveredInputs
@@ -12882,6 +12982,8 @@ async function processAgentConversation(
           admittedWarmAgentInputs.delete(inputTurnId);
           agentChannelTurnRuntimes.delete(inputTurnId);
           agentChannelOutboxScopesByInput.delete(inputTurnId);
+          agentAnyReplyProjectedByInput.delete(inputTurnId);
+          agentGenuineReplyDeliveredByInput.delete(inputTurnId);
           activeChannelOutboxScopes.unbind(agentAdmissionKey, admitted.scope);
           if (admitted.runtime) {
             const cardRolledBack = admitted.lifecycle
@@ -12930,6 +13032,7 @@ async function processAgentConversation(
       lastAgentReplyMsgId = undefined;
       lastAgentReplyText = undefined;
       agentReplySentByInput.set(inputTurnId, false);
+      agentAnyReplyProjectedByInput.set(inputTurnId, false);
       agentPhysicalDeliveryAckByInput.set(inputTurnId, false);
       const typingTransportJid = targetSourceJid ?? virtualChatJid;
       const typingReady = setTyping(
@@ -13065,6 +13168,12 @@ async function processAgentConversation(
   let lastAgentReplyMsgId: string | undefined;
   let lastAgentReplyText: string | undefined;
   const agentReplySentByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
+  const agentAnyReplyProjectedByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
+  const agentGenuineReplyDeliveredByInput = new Map<string, boolean>([
     [lastProcessed.id, false],
   ]);
   const agentPhysicalDeliveryAckByInput = new Map<string, boolean>([
@@ -13305,16 +13414,16 @@ async function processAgentConversation(
         pendingAgentLedgerUsageBatch = null;
       }
       const agentStreamInputTurnId = output.inputTurnId ?? lastProcessed.id;
-      const agentTurnCoordinator =
-        agentTurnOutputCoordinators.get(agentStreamInputTurnId) ??
-        bindAgentTurnOutputCoordinator(agentStreamInputTurnId);
-      const agentAnswerProjection = agentTurnCoordinator.reduceStreamEvent(
-        output.streamEvent,
-      );
-      if (
-        publishesFrameworkAnswer(interactionMode) &&
-        agentAnswerProjection.visibleAnswerChanged
-      ) {
+      // Native-message mode has no framework-owned Assistant answer lane.
+      // Keeping hidden deltas out of the reducer also prevents a later empty
+      // success from resurrecting them into the virtual Web conversation.
+      const agentAnswerProjection = publishesFrameworkAnswer(interactionMode)
+        ? (
+            agentTurnOutputCoordinators.get(agentStreamInputTurnId) ??
+            bindAgentTurnOutputCoordinator(agentStreamInputTurnId)
+          ).reduceStreamEvent(output.streamEvent)
+        : null;
+      if (agentAnswerProjection?.visibleAnswerChanged) {
         agentStreamingAccText = agentAnswerProjection.visibleAnswerText;
       }
       if (shouldBroadcastSdkStreamEvent(interactionMode, output.streamEvent)) {
@@ -13325,7 +13434,7 @@ async function processAgentConversation(
       if (agentStreamingSession) {
         const se = output.streamEvent;
         if (
-          agentAnswerProjection.visibleAnswerChanged &&
+          agentAnswerProjection?.visibleAnswerChanged &&
           agentStreamingSession.isActive()
         ) {
           agentStreamingSession.append(
@@ -13511,23 +13620,34 @@ async function processAgentConversation(
 
     if (!publishesFrameworkAnswer(interactionMode) && !output.providerFailure) {
       output.result = null;
-      if (output.status === 'success' && output.inputTurnCompleted) {
-        if (await completeAgentChannelRuntimesForOutput(output)) {
-          commitCursor(
-            resolveContainerOutputInputTurnId(output, lastProcessed.id),
+      if (
+        isProactiveControlPlaneSuccess({
+          mode: interactionMode,
+          status: output.status,
+          providerFailure: output.providerFailure,
+        })
+      ) {
+        if (output.inputTurnCompleted) {
+          if (await completeAgentChannelRuntimesForOutput(output)) {
+            commitCursor(
+              resolveContainerOutputInputTurnId(output, lastProcessed.id),
+            );
+          }
+          finalizeProactiveAgentOutputCoordinators(output);
+          broadcastStreamEvent(
+            chatJid,
+            {
+              eventType: 'status',
+              statusText: 'idle',
+              turnId: output.inputTurnId ?? lastProcessed.id,
+              sessionId: currentAgentSessionId,
+            },
+            agentId,
           );
         }
-        broadcastStreamEvent(
-          chatJid,
-          {
-            eventType: 'status',
-            statusText: 'idle',
-            turnId: output.inputTurnId ?? lastProcessed.id,
-            sessionId: currentAgentSessionId,
-          },
-          agentId,
-        );
         resetIdleTimer();
+        // All successful Proactive outputs are lifecycle data. This covers
+        // background-task interim results and SIGTERM session snapshots too.
         return;
       }
     }
@@ -13563,10 +13683,53 @@ async function processAgentConversation(
     }
 
     if (
-      output.status === 'success' &&
-      (output.sourceKind ?? 'sdk_final') === 'sdk_final'
+      shouldResolveFrameworkPrimaryAnswer({
+        mode: interactionMode,
+        status: output.status,
+        sourceKind: output.sourceKind,
+        providerFailure: output.providerFailure,
+      })
     ) {
-      const resultInputTurnId = output.inputTurnId ?? lastProcessed.id;
+      const resultInputTurnId = resolveContainerOutputInputTurnId(
+        output,
+        lastProcessed.id,
+      );
+      const projectionDecision = decideAssistantPrimaryProjection({
+        canonicalInputTurnId: resultInputTurnId,
+        status: output.status,
+        result: output.result,
+        sourceKind: output.sourceKind,
+        inputTurnId: output.inputTurnId,
+        ipcReceiptCount: output.ipcReceipts?.length,
+        inputTurnCompleted: output.inputTurnCompleted,
+        finalizationReason: output.finalizationReason,
+        pendingBgTasks: output.pendingBgTasks,
+        sdkMessageUuid: output.sdkMessageUuid,
+        primaryAlreadyProjected:
+          agentGenuineReplyDeliveredByInput.get(resultInputTurnId) === true,
+        anyReplyProjected:
+          agentAnyReplyProjectedByInput.get(resultInputTurnId) === true,
+      });
+      if (!projectionDecision.project) {
+        output.result = null;
+        if (
+          output.inputTurnCompleted &&
+          (await completeAgentChannelRuntimesForOutput(output))
+        ) {
+          commitCursor(resultInputTurnId);
+        }
+        logger.info(
+          {
+            chatJid,
+            agentId,
+            inputTurnId: resultInputTurnId,
+            reason: projectionDecision.reason,
+          },
+          'Conversation Assistant terminal output handled as lifecycle-only',
+        );
+        resetIdleTimer();
+        return;
+      }
       const coordinator =
         agentTurnOutputCoordinators.get(resultInputTurnId) ??
         bindAgentTurnOutputCoordinator(resultInputTurnId);
@@ -13660,8 +13823,8 @@ async function processAgentConversation(
         // answer so process narration never becomes part of the conclusion.
         const dbText = holdReason ? heldBaseForDb + text : text;
         const dbTurnId = inHeldSeq
-          ? heldAgentDbTurnId || output.turnId || lastProcessed.id
-          : output.turnId || lastProcessed.id;
+          ? heldAgentDbTurnId || outputAgentScope.inputId
+          : outputAgentScope.inputId;
         lastAgentReplyMsgId = msgId;
         lastAgentReplyText = dbText;
         const timestamp = new Date().toISOString();
@@ -13712,6 +13875,11 @@ async function processAgentConversation(
           },
           agentId,
         );
+        // Persistence/Web projection is independent from physical IM ACK.
+        // A held Feishu card deliberately has no final delivery ACK yet, but
+        // its canonical DB/Web checkpoint must still block a trailing
+        // session-only success from resurrecting the same SDK candidate.
+        agentAnyReplyProjectedByInput.set(outputAgentScope.inputId, true);
         if (!holdReason) {
           activeAgentWorkflowRuns = [];
           completedAgentWorkflowRuns = [];
@@ -13992,6 +14160,7 @@ async function processAgentConversation(
                 finalizationReason: output.finalizationReason,
               })
             ) {
+              agentGenuineReplyDeliveredByInput.set(inputId, true);
               agentTurnOutputCoordinators.get(inputId)?.markFinalized();
             }
           }

@@ -526,6 +526,22 @@ const DEFAULT_STREAMING_STATE: StreamingState = {
   taskStates: {},
 };
 
+const STALE_WAITING_NO_DATA_MS = 60_000;
+const STALE_WAITING_WITH_DATA_MS = 180_000;
+
+/** Decide whether a waiting UI is orphaned and safe to recover locally. */
+export function shouldRecoverStaleWaiting(input: {
+  elapsedMs: number;
+  hasStreamData: boolean;
+  hasActiveRun: boolean;
+}): boolean {
+  if (input.hasActiveRun) return false;
+  const threshold = input.hasStreamData
+    ? STALE_WAITING_WITH_DATA_MS
+    : STALE_WAITING_NO_DATA_MS;
+  return input.elapsedMs > threshold;
+}
+
 /**
  * Transfer SDK Workflow ownership from a finishing Claude turn to the
  * background-wait UI. The acknowledgement is a held result, not the logical
@@ -3032,13 +3048,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
       delivery_run_id: wsMsg.delivery_run_id ?? null,
       delivery_updated_at: wsMsg.delivery_updated_at ?? null,
     };
+    const isProactiveUtterance =
+      msg.is_from_me &&
+      msg.sender !== '__system__' &&
+      source !== 'scheduled_task' &&
+      msg.source_kind === 'sdk_send_message';
 
     // Route to agentMessages if this is a conversation agent message
     if (agentId) {
       let snapshotMessages: Message[] | null = null;
       let snapshotHasMore = false;
+      let didReceiveProactiveUtterance = false;
       set((s) => {
         const existing = s.agentMessages[agentId] || [];
+        const isNewMessage = !existing.some((item) => item.id === msg.id);
         const updated = mergeMessagesChronologically(existing, [msg]);
         snapshotMessages = updated;
         snapshotHasMore = !!s.agentHasMore[agentId];
@@ -3075,11 +3098,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
           : !msg.is_from_me
             ? { ...s.agentWaiting, [agentId]: true }
             : s.agentWaiting;
+        const isHidden = typeof document !== 'undefined' && document.hidden;
+        const isOtherConversation =
+          s.currentGroup !== chatJid || s.activeAgentTab[chatJid] !== agentId;
+        didReceiveProactiveUtterance = isNewMessage && isProactiveUtterance;
+        const nextUnread =
+          didReceiveProactiveUtterance && (isHidden || isOtherConversation)
+            ? {
+                ...s.unreadReplies,
+                [chatJid]: (s.unreadReplies[chatJid] || 0) + 1,
+              }
+            : s.unreadReplies;
 
         return {
           agentMessages: { ...s.agentMessages, [agentId]: updated },
           agentWaiting: nextAgentWaiting,
           agentStreaming: nextAgentStreaming,
+          unreadReplies: nextUnread,
         };
       });
       if (snapshotMessages) {
@@ -3090,11 +3125,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           snapshotHasMore,
         );
       }
+      if (didReceiveProactiveUtterance) {
+        const groupName = get().groups[chatJid]?.name || '对话';
+        const preview = msg.content ? msg.content.slice(0, 80) : '';
+        notifyIfHidden(groupName, preview || '收到新消息');
+      }
       return;
     }
 
     // 闭包外标志：set() 内部计算后传出，用于驱动通知逻辑（避免重复判断条件）
     let didFinalizeAssistant = false;
+    let didReceiveProactiveUtterance = false;
 
     // 强制 flush rAF 缓冲：finalize 会 delete streaming 并把 thinkingText 转存
     // thinkingCache。若某轮最后一帧 thinking_delta/text_delta 仍卡在 pendingDeltas
@@ -3111,9 +3152,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     set((s) => {
       const existing = s.messages[chatJid] || [];
+      const isNewMessage = !existing.some((item) => item.id === msg.id);
 
       // 消息已存在时保留原顺序，仅执行状态收尾（清 waiting/streaming）
       const updated = mergeMessagesChronologically(existing, [msg]);
+      didReceiveProactiveUtterance = isNewMessage && isProactiveUtterance;
 
       const isAgentReply =
         msg.is_from_me &&
@@ -3213,8 +3256,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
         msg.delivery_status !== 'queued' &&
         msg.delivery_status !== 'promoting' &&
         msg.delivery_status !== 'cancelled';
+      const isHidden = typeof document !== 'undefined' && document.hidden;
+      const isOtherChat =
+        s.currentGroup !== chatJid || !!s.activeAgentTab[chatJid];
+      const nextUnread =
+        didReceiveProactiveUtterance && (isHidden || isOtherChat)
+          ? {
+              ...s.unreadReplies,
+              [chatJid]: (s.unreadReplies[chatJid] || 0) + 1,
+            }
+          : s.unreadReplies;
       return {
         messages: { ...s.messages, [chatJid]: updated },
+        unreadReplies: nextUnread,
         ...(startsDirectRun
           ? { waiting: { ...s.waiting, [chatJid]: true } }
           : {}),
@@ -3229,6 +3283,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (typeof document !== 'undefined' && !document.hidden) {
         showNotificationPromptToast();
       }
+    }
+    if (didReceiveProactiveUtterance) {
+      const groupName = get().groups[chatJid]?.name || '对话';
+      const preview = msg.content ? msg.content.slice(0, 80) : '';
+      notifyIfHidden(groupName, preview || '收到新消息');
     }
 
     // query_interrupted 仅作为视觉分隔线，不清理流式状态。
@@ -3536,11 +3595,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  // 切换子 Agent 标签页（在内存中 mirror，URL 是真正的真相源）
+  // 切换子 Agent 标签页（在内存中 mirror，URL 是真正的真相源）。
+  // 未读目前按 Workspace 聚合；在当前 Workspace 内进入主会话或任一
+  // Agent 会话，都视为已经查看该 Workspace。后台 Workspace 的 URL/tab
+  // 同步不得清除其未读。
   setActiveAgentTab: (jid, agentId) => {
-    set((s) => ({
-      activeAgentTab: { ...s.activeAgentTab, [jid]: agentId },
-    }));
+    set((s) => {
+      let nextUnreadReplies = s.unreadReplies;
+      if (s.currentGroup === jid && s.unreadReplies[jid]) {
+        nextUnreadReplies = { ...s.unreadReplies };
+        delete nextUnreadReplies[jid];
+      }
+      return {
+        activeAgentTab: { ...s.activeAgentTab, [jid]: agentId },
+        unreadReplies: nextUnreadReplies,
+      };
+    });
   },
 
   // -- Conversation agent actions --

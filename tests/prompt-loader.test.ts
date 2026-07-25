@@ -145,6 +145,8 @@ describe('prompts/ files', () => {
     expect(proactiveOutput).toContain(
       '[Your previous response had no visible output.',
     );
+    expect(proactiveOutput).toContain('在第一个可能明显耗时的工具调用前');
+    expect(proactive).not.toContain('minimal internal acknowledgement');
     expect(proactiveOutput).not.toContain('最终回复必须自包含');
     expect(taskOutput).toContain('最终 SDK Assistant 文本不会自动发送');
     for (const delivery of [assistant, proactive]) {

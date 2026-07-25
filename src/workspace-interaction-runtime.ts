@@ -22,6 +22,44 @@ export function publishesFrameworkAnswer(mode: InteractionMode): boolean {
 }
 
 /**
+ * A successful Proactive runner output is lifecycle/control-plane data only.
+ *
+ * This deliberately includes interim background-task results and the
+ * session-only success emitted by the runner's SIGTERM handler. Neither has
+ * to carry `inputTurnCompleted`, and allowing either to reach the primary
+ * answer coordinator can resurrect hidden SDK text into a Web `sdk_final`.
+ */
+export function isProactiveControlPlaneSuccess(input: {
+  mode: InteractionMode;
+  status: 'success' | 'error' | 'stream' | 'closed';
+  providerFailure?: boolean;
+}): boolean {
+  return (
+    input.mode === 'proactive' &&
+    input.status === 'success' &&
+    !input.providerFailure
+  );
+}
+
+/**
+ * Only Assistant-mode SDK finals participate in primary-answer recovery.
+ * Proactive speech is already durable at the native send_message boundary.
+ */
+export function shouldResolveFrameworkPrimaryAnswer(input: {
+  mode: InteractionMode;
+  status: 'success' | 'error' | 'stream' | 'closed';
+  sourceKind?: string | null;
+  providerFailure?: boolean;
+}): boolean {
+  return (
+    publishesFrameworkAnswer(input.mode) &&
+    input.status === 'success' &&
+    !input.providerFailure &&
+    (input.sourceKind ?? 'sdk_final') === 'sdk_final'
+  );
+}
+
+/**
  * Assistant turns require a healthy SDK terminal plus a physical reply ACK.
  * Proactive turns may intentionally stay silent; once an utterance was delivered,
  * a later runner error must not replay the user's input and duplicate it.

@@ -54,6 +54,10 @@ describe('Agent Runner reply-mode prompt contract', () => {
     expect(proactiveOutput).toContain(
       '[Your previous response had no visible output.',
     );
+    expect(proactiveOutput).toContain('在第一个可能明显耗时的工具调用前');
+    expect(proactiveOutput).toContain('简单问题直接回答');
+    expect(proactive).not.toContain('minimal internal acknowledgement');
+    expect(proactive).toContain('SDK-final acknowledgement');
     expect(hostPolicy).toContain("return mode === 'assistant';");
     expect(hostPolicy).toContain("return mode === 'proactive';");
   });
