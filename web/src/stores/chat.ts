@@ -18,6 +18,7 @@ import type {
   GroupInfo,
   AgentInfo,
   AvailableImGroup,
+  CreateWorkspaceOptions,
   InteractionMode,
   WorkspaceDeleteImpact,
 } from '../types';
@@ -37,6 +38,7 @@ import {
   waitKeysForQueuedChats,
   type ClientActiveRuns,
 } from './run-lifecycle';
+import { extractErrorMessage } from '../utils/error';
 
 export type { GroupInfo, AgentInfo };
 
@@ -382,15 +384,8 @@ interface ChatState {
   deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
   createFlow: (
     name: string,
-    options?: {
-      execution_mode?: 'container' | 'host';
-      custom_cwd?: string;
-      init_source_path?: string;
-      init_git_url?: string;
-      agent_profile_id?: string;
-      interaction_mode?: InteractionMode;
-    },
-  ) => Promise<{ jid: string; folder: string } | null>;
+    options?: CreateWorkspaceOptions,
+  ) => Promise<{ jid: string; folder: string }>;
   renameFlow: (jid: string, name: string) => Promise<void>;
   updateInteractionMode: (
     jid: string,
@@ -2262,19 +2257,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  createFlow: async (
-    name: string,
-    options?: {
-      execution_mode?: 'container' | 'host';
-      custom_cwd?: string;
-      init_source_path?: string;
-      init_git_url?: string;
-      agent_profile_id?: string;
-      interaction_mode?: InteractionMode;
-    },
-  ) => {
+  createFlow: async (name: string, options?: CreateWorkspaceOptions) => {
     try {
-      const body: Record<string, string> = { name };
+      const body: Record<string, unknown> = { name };
       if (options?.execution_mode) body.execution_mode = options.execution_mode;
       if (options?.custom_cwd) body.custom_cwd = options.custom_cwd;
       if (options?.init_source_path)
@@ -2285,6 +2270,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       body.interaction_mode = normalizeInteractionMode(
         options?.interaction_mode,
       );
+      if (options?.additional_mounts?.length)
+        body.additional_mounts = options.additional_mounts;
 
       const needsLongTimeout = !!(
         options?.init_source_path || options?.init_git_url
@@ -2294,7 +2281,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         jid: string;
         group: GroupInfo;
       }>('/api/groups', body, needsLongTimeout ? 120_000 : undefined);
-      if (!data.success) return null;
+      if (!data.success) {
+        throw new Error('服务器未能创建工作区');
+      }
 
       const group = normalizeGroupInteractionMode(data.group);
       set((s) => ({
@@ -2304,8 +2293,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       return { jid: data.jid, folder: group.folder };
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
-      return null;
+      set({ error: extractErrorMessage(err) });
+      throw err;
     }
   },
 

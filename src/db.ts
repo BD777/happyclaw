@@ -71,6 +71,7 @@ import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 import { channelConversationJid } from './channel-address.js';
 import { getChannelFromJid } from './channel-prefixes.js';
 import { parseAudienceMode } from './im-audience-policy.js';
+import { parseContainerConfig } from './mount-security.js';
 import {
   includeClaudePresetForMode,
   normalizeAgentProfilePrompts,
@@ -8098,24 +8099,45 @@ type RegisteredGroupRow = {
   sender_allowlist: string | null;
 };
 
+function parsePersistedContainerConfig(
+  jid: string,
+  raw: string | null,
+): Pick<RegisteredGroup, 'containerConfig' | 'containerConfigError'> {
+  if (!raw) return {};
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch (err) {
+    const containerConfigError = 'container_config contains malformed JSON';
+    logger.warn(
+      { jid, err, raw: raw.slice(0, 200) },
+      'parseGroupRow: malformed container_config retained as a runtime safety block',
+    );
+    return { containerConfigError };
+  }
+
+  const parsed = parseContainerConfig(decoded);
+  if (parsed.error) {
+    logger.warn(
+      { jid, error: parsed.error },
+      'parseGroupRow: invalid container_config retained as a runtime safety block',
+    );
+    return { containerConfigError: parsed.error };
+  }
+  return parsed.config ? { containerConfig: parsed.config } : {};
+}
+
 /** Convert a raw DB row into a RegisteredGroup domain object. */
 function parseGroupRow(
   row: RegisteredGroupRow,
 ): RegisteredGroup & { jid: string } {
-  // 防御性 JSON.parse：parseGroupRow 在启动期 loadState 路径上被调用，单条
-  // 损坏的 row（手工 SQL / 部分写入 / migration 失误）不能让进程退出。
-  // 用 warn 日志保留可观测性，损坏字段 fallback 到 undefined。
-  let containerConfig: RegisteredGroup['containerConfig'];
-  if (row.container_config) {
-    try {
-      containerConfig = JSON.parse(row.container_config);
-    } catch (err) {
-      logger.warn(
-        { jid: row.jid, err, raw: row.container_config.slice(0, 200) },
-        'parseGroupRow: container_config JSON malformed, dropping',
-      );
-    }
-  }
+  // Invalid container config must not be silently dropped: doing so could turn
+  // a corrupt persisted authorization boundary into an apparently safe group.
+  const parsedContainerConfig = parsePersistedContainerConfig(
+    row.jid,
+    row.container_config,
+  );
   let senderAllowlist: string[] | undefined;
   if (row.sender_allowlist != null) {
     try {
@@ -8147,7 +8169,7 @@ function parseGroupRow(
     folder: row.folder,
     added_at: row.added_at,
     avatar_url: row.avatar_url ?? undefined,
-    containerConfig,
+    ...parsedContainerConfig,
     executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
     customCwd: row.custom_cwd ?? undefined,
     initSourcePath: row.init_source_path ?? undefined,
@@ -8961,6 +8983,18 @@ export function deleteChannelAccount(id: string, ownerUserId: string): boolean {
 }
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
+  if (group.containerConfigError) {
+    throw new Error(
+      `Refusing to persist group with invalid container config: ${group.containerConfigError}`,
+    );
+  }
+  const parsedContainerConfig = parseContainerConfig(group.containerConfig);
+  if (parsedContainerConfig.error) {
+    throw new Error(
+      `Invalid container config for group "${jid}": ${parsedContainerConfig.error}`,
+    );
+  }
+
   db.transaction(() => {
     const existing = getRegisteredGroup(jid);
     db.prepare(
@@ -9003,7 +9037,9 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       group.folder,
       group.added_at,
       group.avatar_url ?? null,
-      group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+      parsedContainerConfig.config
+        ? JSON.stringify(parsedContainerConfig.config)
+        : null,
       group.executionMode ?? 'container',
       group.customCwd ?? null,
       group.initSourcePath ?? null,
@@ -10031,51 +10067,9 @@ export function getGroupsByOwner(
 ): Array<RegisteredGroup & { jid: string }> {
   const rows = db
     .prepare('SELECT * FROM registered_groups WHERE created_by = ?')
-    .all(userId) as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    added_at: string;
-    container_config: string | null;
-    execution_mode: string | null;
-    custom_cwd: string | null;
-    init_source_path: string | null;
-    init_git_url: string | null;
-    created_by: string | null;
-    is_home: number;
-    selected_skills: string | null;
-    target_main_jid: string | null;
-    target_agent_id: string | null;
-  }>;
+    .all(userId) as RegisteredGroupRow[];
 
-  return rows.map((row) => {
-    let containerConfig: RegisteredGroup['containerConfig'];
-    if (row.container_config) {
-      try {
-        containerConfig = JSON.parse(row.container_config);
-      } catch (err) {
-        logger.warn(
-          { jid: row.jid, err },
-          'getGroupsByOwner: container_config JSON malformed, dropping',
-        );
-      }
-    }
-    return {
-      jid: row.jid,
-      name: row.name,
-      folder: row.folder,
-      added_at: row.added_at,
-      containerConfig,
-      executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
-      customCwd: row.custom_cwd ?? undefined,
-      initSourcePath: row.init_source_path ?? undefined,
-      initGitUrl: row.init_git_url ?? undefined,
-      created_by: row.created_by ?? undefined,
-      is_home: row.is_home === 1,
-      target_main_jid: row.target_main_jid ?? undefined,
-      target_agent_id: row.target_agent_id ?? undefined,
-    };
-  });
+  return rows.map(parseGroupRow);
 }
 
 // ===================== Auth CRUD =====================

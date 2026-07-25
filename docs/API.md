@@ -87,6 +87,32 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 它与 `execution_mode` 共享同一道 quiesce 边界，暖 Runner 只能观察到旧契约或新
 契约；停机失败返回 503 并带 `persisted` 标记。
 
+创建 Docker 工作区时，当前有效的管理员可以在 `POST /api/groups` 中提交
+`additional_mounts`（最多 8 项）：
+
+```json
+{
+  "name": "数据分析",
+  "execution_mode": "container",
+  "additional_mounts": [
+    {
+      "host_path": "/srv/datasets",
+      "container_path": "datasets",
+      "readonly": true
+    }
+  ]
+}
+```
+
+`host_path` 是 HappyClaw/Docker 守护进程所在服务器上的绝对目录，不是浏览器
+所在设备的目录；`container_path` 是 `/workspace/extra/` 下的相对路径。来源目录
+必须通过 `config/mount-allowlist.json`，目标不能重复、嵌套、穿越或覆盖运行时
+保留目录。普通用户、停用管理员和 host 模式请求都会被拒绝。权限、allowlist、
+真实路径与目录类型会在每次容器启动前重新校验，因此管理员被降权、目录被删除、
+符号链接被替换或策略收紧后，旧配置不会继续生效。管理界面使用
+`GET /api/browse/directories?purpose=mount` 浏览服务器目录；未配置有效 allowlist
+时该入口 fail-closed。
+
 ## 文件
 
 - `GET|POST /api/groups/:jid/files`

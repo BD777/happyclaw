@@ -1,13 +1,23 @@
-import { useState, useCallback } from 'react';
-import { Folder, FolderPlus, ChevronRight, ArrowLeft, Loader2, FolderCheck } from 'lucide-react';
+import { useCallback, useId, useState } from 'react';
+import {
+  ArrowLeft,
+  ChevronRight,
+  Folder,
+  FolderCheck,
+  FolderPlus,
+  Loader2,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { api } from '../../api/client';
+import { extractErrorMessage } from '../../utils/error';
 
 interface DirectoryEntry {
   name: string;
   path: string;
   hasChildren: boolean;
+  selectable?: boolean;
 }
 
 interface BrowseResponse {
@@ -15,17 +25,42 @@ interface BrowseResponse {
   parentPath: string | null;
   directories: DirectoryEntry[];
   hasAllowlist: boolean;
+  mountingEnabled?: boolean;
+  currentSelectable?: boolean;
 }
 
 interface DirectoryBrowserProps {
   value: string;
-  onChange: (path: string) => void;
+  onChange: (path: string, source?: 'input' | 'browser' | 'created') => void;
   placeholder?: string;
+  label?: string;
+  description?: string;
+  inputId?: string;
+  purpose?: 'mount';
+  allowCreateFolder?: boolean;
+  disabled?: boolean;
 }
 
-export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrowserProps) {
+export function DirectoryBrowser({
+  value,
+  onChange,
+  placeholder,
+  label = '工作目录（可选）',
+  description,
+  inputId,
+  purpose,
+  allowCreateFolder = true,
+  disabled = false,
+}: DirectoryBrowserProps) {
+  const generatedId = useId();
+  const resolvedInputId = inputId ?? `directory-${generatedId}`;
+  const descriptionId = description
+    ? `${resolvedInputId}-description`
+    : undefined;
+  const errorId = `${resolvedInputId}-error`;
   const [browsing, setBrowsing] = useState(false);
   const [currentPath, setCurrentPath] = useState<string | null>(null);
+  const [currentSelectable, setCurrentSelectable] = useState(true);
   const [parentPath, setParentPath] = useState<string | null>(null);
   const [directories, setDirectories] = useState<DirectoryEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -34,23 +69,40 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
   const [newFolderName, setNewFolderName] = useState('');
   const [createLoading, setCreateLoading] = useState(false);
 
-  const fetchDirectories = useCallback(async (targetPath?: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const url = targetPath
-        ? `/api/browse/directories?path=${encodeURIComponent(targetPath)}`
-        : '/api/browse/directories';
-      const data = await api.get<BrowseResponse>(url);
-      setCurrentPath(data.currentPath);
-      setParentPath(data.parentPath);
-      setDirectories(data.directories);
-    } catch (err: any) {
-      setError(err?.message || (err instanceof Error ? err.message : 'Failed to load directories'));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const fetchDirectories = useCallback(
+    async (targetPath?: string) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const params = new URLSearchParams();
+        if (targetPath) params.set('path', targetPath);
+        if (purpose) params.set('purpose', purpose);
+        const query = params.toString();
+        const data = await api.get<BrowseResponse>(
+          `/api/browse/directories${query ? `?${query}` : ''}`,
+        );
+        setCurrentPath(data.currentPath);
+        setCurrentSelectable(data.currentSelectable !== false);
+        setParentPath(data.parentPath);
+        if (
+          purpose === 'mount' &&
+          (data.mountingEnabled === false || data.hasAllowlist === false)
+        ) {
+          setDirectories([]);
+          setError(
+            '宿主机目录挂载尚未配置。请先配置挂载目录白名单并重启 HappyClaw。',
+          );
+          return;
+        }
+        setDirectories(data.directories);
+      } catch (err) {
+        setError(extractErrorMessage(err) || '无法读取服务器目录');
+      } finally {
+        setLoading(false);
+      }
+    },
+    [purpose],
+  );
 
   const handleToggleBrowse = () => {
     if (browsing) {
@@ -61,230 +113,307 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
     setCreating(false);
     setNewFolderName('');
     if (value && value.startsWith('/')) {
-      fetchDirectories(value);
+      void fetchDirectories(value);
     } else {
-      fetchDirectories();
+      void fetchDirectories();
     }
   };
 
   const handleNavigate = (dirPath: string) => {
-    fetchDirectories(dirPath);
+    void fetchDirectories(dirPath);
     setCreating(false);
     setNewFolderName('');
   };
 
   const handleGoUp = () => {
     if (parentPath) {
-      fetchDirectories(parentPath);
+      void fetchDirectories(parentPath);
     } else {
-      fetchDirectories();
+      void fetchDirectories();
     }
     setCreating(false);
     setNewFolderName('');
   };
 
   const handleSelect = (dirPath: string) => {
-    onChange(dirPath);
+    onChange(dirPath, 'browser');
     setBrowsing(false);
   };
 
+  const canSelectCurrent = purpose !== 'mount' || currentSelectable !== false;
+
   const handleCreateFolder = async () => {
     const name = newFolderName.trim();
-    if (!name || !currentPath) return;
+    if (!allowCreateFolder || !name || !currentPath) return;
 
     setCreateLoading(true);
+    setError(null);
     try {
-      const created = await api.post<DirectoryEntry>('/api/browse/directories', { parentPath: currentPath, name });
-      onChange(created.path);
+      const created = await api.post<DirectoryEntry>(
+        '/api/browse/directories',
+        {
+          parentPath: currentPath,
+          name,
+        },
+      );
+      onChange(created.path, 'created');
       setBrowsing(false);
       setCreating(false);
       setNewFolderName('');
-    } catch (err: any) {
-      setError(err?.message || (err instanceof Error ? err.message : 'Failed to create folder'));
+    } catch (err) {
+      setError(extractErrorMessage(err) || '无法创建文件夹');
     } finally {
       setCreateLoading(false);
     }
   };
 
-  // Build breadcrumbs from currentPath
   const breadcrumbs = currentPath
     ? currentPath
         .split('/')
         .filter(Boolean)
-        .map((part, i, arr) => ({
+        .map((part, index, parts) => ({
           name: part,
-          path: '/' + arr.slice(0, i + 1).join('/'),
+          path: `/${parts.slice(0, index + 1).join('/')}`,
         }))
     : [];
 
+  const describedBy = [descriptionId, error ? errorId : null]
+    .filter(Boolean)
+    .join(' ');
+
   return (
     <div>
-      <Label className="mb-1">
-        工作目录（可选）
+      <Label htmlFor={resolvedInputId} className="mb-1.5">
+        {label}
       </Label>
-      <div className="flex gap-2">
+      {description && (
+        <p
+          id={descriptionId}
+          className="mb-2 text-xs leading-5 text-muted-foreground"
+        >
+          {description}
+        </p>
+      )}
+      <div className="flex items-stretch gap-2">
         <Input
+          id={resolvedInputId}
           type="text"
           value={value}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={(event) => onChange(event.target.value, 'input')}
           placeholder={placeholder || '默认: data/groups/{folder}/'}
-          className="flex-1 text-sm"
+          className="h-10 flex-1 text-sm"
+          aria-describedby={describedBy || undefined}
+          aria-invalid={!!error}
+          autoComplete="off"
+          disabled={disabled}
         />
-        <button
+        <Button
           type="button"
+          variant="outline"
           onClick={handleToggleBrowse}
-          className="px-3 py-2 text-sm font-medium text-primary bg-brand-50 border border-brand-200 rounded-lg hover:bg-brand-100 transition-colors cursor-pointer whitespace-nowrap"
+          className="h-10 flex-shrink-0 whitespace-nowrap"
+          aria-expanded={browsing}
+          aria-controls={`${resolvedInputId}-browser`}
+          disabled={disabled}
         >
-          {browsing ? '收起' : '浏览'}
-        </button>
+          {browsing ? '收起' : purpose === 'mount' ? '浏览服务器' : '浏览'}
+        </Button>
       </div>
 
       {browsing && (
-        <div className="mt-2 border border-border rounded-lg overflow-hidden bg-card">
-          {/* Breadcrumbs + select current dir */}
+        <div
+          id={`${resolvedInputId}-browser`}
+          className="mt-2 overflow-hidden rounded-lg border border-border bg-card"
+          aria-busy={loading}
+        >
           {currentPath && (
-            <div className="flex items-center justify-between px-3 py-2 bg-muted border-b border-border">
-              <div className="flex items-center gap-1 text-xs text-muted-foreground overflow-x-auto min-w-0">
+            <div className="flex items-center justify-between gap-2 border-b border-border bg-muted px-3 py-2">
+              <div className="flex min-w-0 items-center gap-1 overflow-x-auto text-xs text-muted-foreground">
                 <button
-                  onClick={() => fetchDirectories()}
-                  className="hover:text-primary transition-colors cursor-pointer flex-shrink-0"
+                  type="button"
+                  onClick={() => void fetchDirectories()}
+                  className="grid h-9 w-9 flex-shrink-0 place-items-center rounded-md transition-colors hover:bg-accent hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label="返回允许的目录根列表"
                 >
-                  <Folder className="w-3.5 h-3.5" />
+                  <Folder className="h-4 w-4" />
                 </button>
-                {breadcrumbs.map((bc, i) => (
-                  <span key={bc.path} className="flex items-center gap-1 flex-shrink-0">
-                    <ChevronRight className="w-3 h-3 text-muted-foreground/50" />
-                    <button
-                      onClick={() =>
-                        i === breadcrumbs.length - 1
-                          ? undefined
-                          : handleNavigate(bc.path)
-                      }
-                      className={`hover:text-primary transition-colors ${
-                        i === breadcrumbs.length - 1
-                          ? 'text-foreground font-medium'
-                          : 'cursor-pointer'
-                      }`}
-                      disabled={i === breadcrumbs.length - 1}
+                {breadcrumbs.map((breadcrumb, index) => {
+                  const isCurrent = index === breadcrumbs.length - 1;
+                  return (
+                    <span
+                      key={breadcrumb.path}
+                      className="flex flex-shrink-0 items-center gap-1"
                     >
-                      {bc.name}
-                    </button>
-                  </span>
-                ))}
+                      <ChevronRight className="h-3 w-3 text-muted-foreground/50" />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          isCurrent
+                            ? undefined
+                            : handleNavigate(breadcrumb.path)
+                        }
+                        className={`min-h-9 rounded px-1.5 transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                          isCurrent
+                            ? 'font-medium text-foreground'
+                            : 'cursor-pointer'
+                        }`}
+                        disabled={isCurrent}
+                      >
+                        {breadcrumb.name}
+                      </button>
+                    </span>
+                  );
+                })}
               </div>
-              <button
+              <Button
+                type="button"
+                size="sm"
                 onClick={() => handleSelect(currentPath)}
-                className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-white bg-primary rounded hover:bg-primary/90 transition-colors cursor-pointer flex-shrink-0 ml-2"
+                className="h-9 flex-shrink-0"
+                disabled={!canSelectCurrent}
               >
-                <FolderCheck className="w-3.5 h-3.5" />
-                选择此目录
-              </button>
+                <FolderCheck className="h-4 w-4" />
+                {canSelectCurrent ? '选择此目录' : '不可挂载'}
+              </Button>
             </div>
           )}
+          {currentPath && !canSelectCurrent && (
+            <p className="border-b border-border bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">
+              此目录仅可用于导航，不能直接挂载。请进入允许挂载的子目录后再选择。
+            </p>
+          )}
 
-          {/* Directory list */}
-          <div className="max-h-64 overflow-y-auto">
+          <div className="max-h-64 overflow-y-auto" aria-live="polite">
             {loading ? (
-              <div className="flex items-center justify-center py-8">
-                <Loader2 className="w-5 h-5 text-muted-foreground animate-spin" />
+              <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                <Loader2 className="h-5 w-5 animate-spin" />
+                正在读取服务器目录…
               </div>
             ) : error ? (
-              <div className="px-3 py-4 text-sm text-error text-center">{error}</div>
+              <div
+                id={errorId}
+                className="px-3 py-4 text-center text-sm text-error"
+                role="alert"
+              >
+                {error}
+              </div>
             ) : (
               <>
-                {/* Go up */}
                 {(parentPath !== null || currentPath !== null) && (
                   <button
+                    type="button"
                     onClick={handleGoUp}
-                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:bg-muted/50 transition-colors cursor-pointer border-b border-border"
+                    className="flex min-h-11 w-full items-center gap-2 border-b border-border px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                   >
-                    <ArrowLeft className="w-4 h-4" />
+                    <ArrowLeft className="h-4 w-4" />
                     返回上级
                   </button>
                 )}
 
                 {directories.length === 0 && (
-                  <div className="px-3 py-4 text-sm text-muted-foreground text-center">
+                  <div className="px-3 py-4 text-center text-sm text-muted-foreground">
                     此目录下没有子目录
                   </div>
                 )}
 
-                {directories.map((dir) => (
-                  <div
-                    key={dir.path}
-                    className="flex items-center justify-between px-3 py-2 hover:bg-muted/50 transition-colors"
-                  >
-                    <button
-                      onClick={() => handleNavigate(dir.path)}
-                      className="flex items-center gap-2 text-sm text-foreground cursor-pointer flex-1 min-w-0"
+                {directories.map((directory) => {
+                  const canSelectDirectory =
+                    purpose !== 'mount' || directory.selectable !== false;
+                  return (
+                    <div
+                      key={directory.path}
+                      className="flex min-h-11 items-center justify-between gap-2 px-3 py-1.5 transition-colors hover:bg-muted/50"
                     >
-                      <Folder className="w-4 h-4 text-primary flex-shrink-0" />
-                      <span className="truncate">{dir.name}</span>
-                      {dir.hasChildren && (
-                        <ChevronRight className="w-3.5 h-3.5 text-muted-foreground/50 flex-shrink-0" />
-                      )}
-                    </button>
-                    <button
-                      onClick={() => handleSelect(dir.path)}
-                      className="px-2 py-1 text-xs font-medium text-primary bg-brand-50 hover:bg-brand-100 rounded transition-colors cursor-pointer flex-shrink-0 ml-2"
-                    >
-                      选择
-                    </button>
-                  </div>
-                ))}
+                      <button
+                        type="button"
+                        onClick={() => handleNavigate(directory.path)}
+                        className="flex min-h-9 min-w-0 flex-1 items-center gap-2 rounded text-left text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <Folder className="h-4 w-4 flex-shrink-0 text-primary" />
+                        <span className="truncate">{directory.name}</span>
+                        {directory.hasChildren && (
+                          <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground/50" />
+                        )}
+                      </button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleSelect(directory.path)}
+                        className="h-9 flex-shrink-0 text-primary"
+                        disabled={!canSelectDirectory}
+                        aria-label={
+                          canSelectDirectory
+                            ? `选择 ${directory.name}`
+                            : `${directory.name} 仅可浏览，不可挂载`
+                        }
+                      >
+                        {canSelectDirectory ? '选择' : '不可挂载'}
+                      </Button>
+                    </div>
+                  );
+                })}
               </>
             )}
           </div>
 
-          {/* New folder section */}
-          {currentPath && (
+          {allowCreateFolder && currentPath && (
             <div className="border-t border-border px-3 py-2">
               {creating ? (
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
                   <Input
                     type="text"
                     value={newFolderName}
-                    onChange={(e) => setNewFolderName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') handleCreateFolder();
-                      if (e.key === 'Escape') {
+                    onChange={(event) => setNewFolderName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') void handleCreateFolder();
+                      if (event.key === 'Escape') {
                         setCreating(false);
                         setNewFolderName('');
                       }
                     }}
                     placeholder="文件夹名称"
-                    className="flex-1 px-2 py-1.5 text-sm h-auto"
+                    className="h-10 min-w-40 flex-1 text-sm"
+                    aria-label="新文件夹名称"
                     autoFocus
                   />
-                  <button
-                    onClick={handleCreateFolder}
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => void handleCreateFolder()}
                     disabled={!newFolderName.trim() || createLoading}
-                    className="px-2.5 py-1.5 text-xs font-medium text-white bg-primary rounded hover:bg-primary/90 disabled:opacity-50 transition-colors cursor-pointer"
+                    className="h-10"
                   >
                     {createLoading ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <Loader2 className="h-4 w-4 animate-spin" />
                     ) : (
                       '创建'
                     )}
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
                     onClick={() => {
                       setCreating(false);
                       setNewFolderName('');
                     }}
-                    className="px-2 py-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                    className="h-10"
                   >
                     取消
-                  </button>
+                  </Button>
                 </div>
               ) : (
-                <button
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
                   onClick={() => setCreating(true)}
-                  className="flex items-center gap-1.5 text-sm text-primary hover:text-primary transition-colors cursor-pointer"
+                  className="h-10 text-primary"
                 >
-                  <FolderPlus className="w-4 h-4" />
+                  <FolderPlus className="h-4 w-4" />
                   新建文件夹
-                </button>
+                </Button>
               )}
             </div>
           )}

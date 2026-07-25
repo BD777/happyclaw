@@ -22,9 +22,12 @@ import {
 } from './effective-mcp-manifest.js';
 import { resolveHostNodeBinary } from './node-resolver.js';
 import {
+  AdditionalMountValidationError,
   loadMountAllowlist,
+  parseContainerConfig,
   validateAdditionalMounts,
 } from './mount-security.js';
+import { canExecuteOnHost } from './host-execution-policy.js';
 import {
   buildContainerEnvLines,
   clearInheritedClaudeProviderEnv,
@@ -960,6 +963,33 @@ export function buildVolumeMounts(
   ipcAgentId?: string,
   agentProfile?: RunnerAgentProfile,
 ): VolumeMount[] {
+  if (group.containerConfigError) {
+    throw new AdditionalMountValidationError([
+      `Persisted container configuration is invalid: ${group.containerConfigError}`,
+    ]);
+  }
+  const parsedContainerConfig = parseContainerConfig(group.containerConfig);
+  if (parsedContainerConfig.error) {
+    throw new AdditionalMountValidationError([parsedContainerConfig.error]);
+  }
+  const configuredAdditionalMounts =
+    parsedContainerConfig.config?.additionalMounts;
+  if (configuredAdditionalMounts && configuredAdditionalMounts.length > 0) {
+    let currentOwner;
+    try {
+      currentOwner = group.created_by
+        ? getUserById(group.created_by)
+        : undefined;
+    } catch {
+      currentOwner = undefined;
+    }
+    if (!canExecuteOnHost(currentOwner)) {
+      throw new Error(
+        'Host directory mounts require a currently active administrator owner',
+      );
+    }
+  }
+
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
   const groupDir = path.join(GROUPS_DIR, group.folder);
@@ -1348,11 +1378,11 @@ export function buildVolumeMounts(
   });
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
-  if (group.containerConfig?.additionalMounts) {
+  if (configuredAdditionalMounts && configuredAdditionalMounts.length > 0) {
     const validatedMounts = validateAdditionalMounts(
-      group.containerConfig.additionalMounts,
+      configuredAdditionalMounts,
       group.name,
-      isAdminHome,
+      group.is_home === true,
     );
     mounts.push(...validatedMounts);
   }

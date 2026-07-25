@@ -10,8 +10,11 @@ import {
   loadMountAllowlist,
   expandPath,
   findAllowedRoot,
+  isHostMountNavigationPathAllowed,
   matchesBlockedPattern,
+  validateMount,
 } from '../mount-security.js';
+import type { AllowedRoot } from '../types.js';
 
 const MAX_ENTRIES = 200;
 
@@ -21,6 +24,7 @@ interface DirectoryEntry {
   name: string;
   path: string;
   hasChildren: boolean;
+  selectable?: boolean;
 }
 
 /**
@@ -29,6 +33,8 @@ interface DirectoryEntry {
 function listSubdirectories(
   dirPath: string,
   blockedPatterns: string[],
+  mountPurpose = false,
+  allowedRoots: AllowedRoot[] = [],
 ): DirectoryEntry[] {
   let entries: fs.Dirent[];
   try {
@@ -44,8 +50,21 @@ function listSubdirectories(
     // Skip hidden directories
     if (entry.name.startsWith('.')) continue;
     // Skip blocked patterns
-    const fullPath = path.join(dirPath, entry.name);
+    let fullPath = path.join(dirPath, entry.name);
     if (matchesBlockedPattern(fullPath, blockedPatterns) !== null) continue;
+    if (mountPurpose) {
+      try {
+        fullPath = fs.realpathSync(fullPath);
+      } catch {
+        continue;
+      }
+      if (
+        !findAllowedRoot(fullPath, allowedRoots) ||
+        !isHostMountNavigationPathAllowed(fullPath)
+      ) {
+        continue;
+      }
+    }
 
     // Check if has subdirectories (for expand indicator)
     let hasChildren = false;
@@ -58,7 +77,23 @@ function listSubdirectories(
       // Permission denied or other error — treat as no children
     }
 
-    dirs.push({ name: entry.name, path: fullPath, hasChildren });
+    dirs.push({
+      name: entry.name,
+      path: fullPath,
+      hasChildren,
+      ...(mountPurpose
+        ? {
+            selectable: validateMount(
+              {
+                hostPath: fullPath,
+                containerPath: 'browse-entry',
+                readonly: true,
+              },
+              false,
+            ).allowed,
+          }
+        : {}),
+    });
 
     if (dirs.length >= MAX_ENTRIES) break;
   }
@@ -70,7 +105,26 @@ function listSubdirectories(
 // GET /api/browse/directories?path=xxx
 browseRoutes.get('/directories', authMiddleware, (c) => {
   const authUser = c.get('user') as AuthUser;
-  if (!hasHostExecutionPermission(authUser)) {
+  const purpose = c.req.query('purpose');
+  if (purpose !== undefined && purpose !== 'mount') {
+    return c.json(
+      { error: 'Unsupported browse purpose', code: 'INVALID_BROWSE_PURPOSE' },
+      400,
+    );
+  }
+  if (
+    purpose === 'mount' &&
+    (authUser.role !== 'admin' || authUser.status !== 'active')
+  ) {
+    return c.json(
+      {
+        error: 'Only an active administrator can browse host mount paths',
+        code: 'HOST_MOUNT_ADMIN_REQUIRED',
+      },
+      403,
+    );
+  }
+  if (purpose !== 'mount' && !hasHostExecutionPermission(authUser)) {
     return c.json({ error: 'Insufficient permissions' }, 403);
   }
 
@@ -78,6 +132,15 @@ browseRoutes.get('/directories', authMiddleware, (c) => {
   const allowlist = loadMountAllowlist();
   const blockedPatterns = allowlist?.blockedPatterns ?? [];
   const hasAllowlist = allowlist !== null && allowlist.allowedRoots.length > 0;
+  if (purpose === 'mount' && !hasAllowlist) {
+    return c.json(
+      {
+        error: 'Host directory mount policy is unavailable',
+        code: 'HOST_MOUNT_POLICY_UNAVAILABLE',
+      },
+      503,
+    );
+  }
 
   // No path → return root listing
   if (!requestedPath) {
@@ -94,6 +157,13 @@ browseRoutes.get('/directories', authMiddleware, (c) => {
         }
         if (!fs.existsSync(realPath) || !fs.statSync(realPath).isDirectory())
           continue;
+        if (
+          purpose === 'mount' &&
+          (!isHostMountNavigationPathAllowed(realPath) ||
+            matchesBlockedPattern(realPath, blockedPatterns) !== null)
+        ) {
+          continue;
+        }
 
         let hasChildren = false;
         try {
@@ -109,6 +179,18 @@ browseRoutes.get('/directories', authMiddleware, (c) => {
           name: root.description || path.basename(realPath),
           path: realPath,
           hasChildren,
+          ...(purpose === 'mount'
+            ? {
+                selectable: validateMount(
+                  {
+                    hostPath: realPath,
+                    containerPath: 'browse-root',
+                    readonly: true,
+                  },
+                  false,
+                ).allowed,
+              }
+            : {}),
         });
       }
 
@@ -117,6 +199,7 @@ browseRoutes.get('/directories', authMiddleware, (c) => {
         parentPath: null,
         directories: roots,
         hasAllowlist: true,
+        ...(purpose === 'mount' ? { mountingEnabled: true } : {}),
       });
     }
 
@@ -146,11 +229,31 @@ browseRoutes.get('/directories', authMiddleware, (c) => {
     return c.json({ error: 'Path is not a directory' }, 400);
   }
 
+  if (
+    purpose === 'mount' &&
+    (matchesBlockedPattern(realPath, blockedPatterns) !== null ||
+      !isHostMountNavigationPathAllowed(realPath))
+  ) {
+    return c.json(
+      {
+        error: 'Path is not eligible for host directory browsing',
+        code: 'HOST_MOUNT_PATH_FORBIDDEN',
+      },
+      403,
+    );
+  }
+
   // Allowlist range check
   if (hasAllowlist) {
     const root = findAllowedRoot(realPath, allowlist!.allowedRoots);
     if (!root) {
-      return c.json({ error: 'Path is not within allowed roots' }, 403);
+      return c.json(
+        {
+          error: 'Path is not within allowed roots',
+          ...(purpose === 'mount' ? { code: 'HOST_MOUNT_PATH_FORBIDDEN' } : {}),
+        },
+        403,
+      );
     }
   }
 
@@ -171,15 +274,52 @@ browseRoutes.get('/directories', authMiddleware, (c) => {
   return c.json({
     currentPath: realPath,
     parentPath,
-    directories: listSubdirectories(realPath, blockedPatterns),
+    directories: listSubdirectories(
+      realPath,
+      blockedPatterns,
+      purpose === 'mount',
+      allowlist?.allowedRoots ?? [],
+    ),
     hasAllowlist,
+    ...(purpose === 'mount'
+      ? {
+          mountingEnabled: true,
+          currentSelectable: validateMount(
+            {
+              hostPath: realPath,
+              containerPath: 'browse-selection',
+              readonly: true,
+            },
+            false,
+          ).allowed,
+        }
+      : {}),
   });
 });
 
 // POST /api/browse/directories — create a new folder
 browseRoutes.post('/directories', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
-  if (!hasHostExecutionPermission(authUser)) {
+  const purpose = c.req.query('purpose');
+  if (purpose !== undefined && purpose !== 'mount') {
+    return c.json(
+      { error: 'Unsupported browse purpose', code: 'INVALID_BROWSE_PURPOSE' },
+      400,
+    );
+  }
+  if (
+    purpose === 'mount' &&
+    (authUser.role !== 'admin' || authUser.status !== 'active')
+  ) {
+    return c.json(
+      {
+        error: 'Only an active administrator can create host mount paths',
+        code: 'HOST_MOUNT_ADMIN_REQUIRED',
+      },
+      403,
+    );
+  }
+  if (purpose !== 'mount' && !hasHostExecutionPermission(authUser)) {
     return c.json({ error: 'Insufficient permissions' }, 403);
   }
 
@@ -219,12 +359,46 @@ browseRoutes.post('/directories', authMiddleware, async (c) => {
   // Allowlist range check
   const allowlist = loadMountAllowlist();
   const hasAllowlist = allowlist !== null && allowlist.allowedRoots.length > 0;
+  if (purpose === 'mount' && !hasAllowlist) {
+    return c.json(
+      {
+        error: 'Host directory mount policy is unavailable',
+        code: 'HOST_MOUNT_POLICY_UNAVAILABLE',
+      },
+      503,
+    );
+  }
 
   if (hasAllowlist) {
     const root = findAllowedRoot(realParent, allowlist!.allowedRoots);
     if (!root) {
-      return c.json({ error: 'Parent path is not within allowed roots' }, 403);
+      return c.json(
+        {
+          error: 'Parent path is not within allowed roots',
+          ...(purpose === 'mount' ? { code: 'HOST_MOUNT_PATH_FORBIDDEN' } : {}),
+        },
+        403,
+      );
     }
+  }
+  if (
+    purpose === 'mount' &&
+    !validateMount(
+      {
+        hostPath: realParent,
+        containerPath: 'browse-create-parent',
+        readonly: true,
+      },
+      false,
+    ).allowed
+  ) {
+    return c.json(
+      {
+        error: 'Parent path is not eligible for host directory mounting',
+        code: 'HOST_MOUNT_PATH_FORBIDDEN',
+      },
+      403,
+    );
   }
 
   // Blocked patterns check

@@ -88,9 +88,11 @@ import {
   resolveDefaultChannelMountForWorkspaceDeletion,
 } from '../channel-mount-service.js';
 import {
+  AdditionalMountValidationError,
   loadMountAllowlist,
   findAllowedRoot,
   matchesBlockedPattern,
+  validateAdditionalMountsStrict,
 } from '../mount-security.js';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -477,7 +479,23 @@ groupRoutes.post('/', authMiddleware, async (c) => {
 
   const validation = GroupCreateSchema.safeParse(body);
   if (!validation.success) {
-    return c.json({ error: 'Invalid request body' }, 400);
+    const flattened = validation.error.flatten().fieldErrors;
+    const fieldErrors = Object.fromEntries(
+      Object.entries(flattened)
+        .filter(([, messages]) => messages && messages.length > 0)
+        .map(([field, messages]) => [field, messages!.join('; ')]),
+    );
+    const mountError = validation.error.issues.some(
+      (issue) => issue.path[0] === 'additional_mounts',
+    );
+    return c.json(
+      {
+        error: 'Invalid request body',
+        code: mountError ? 'INVALID_ADDITIONAL_MOUNTS' : 'INVALID_REQUEST_BODY',
+        field_errors: fieldErrors,
+      },
+      400,
+    );
   }
 
   const name = normalizeGroupName(validation.data.name);
@@ -494,6 +512,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
   const authUser = c.get('user') as AuthUser;
+  const requestedAdditionalMounts = validation.data.additional_mounts ?? [];
   const agentProfile = validation.data.agent_profile_id
     ? getAgentProfileForUser(validation.data.agent_profile_id, authUser.id)
     : getOrCreateDefaultAgentProfile(authUser.id);
@@ -505,6 +524,65 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   const groupLimit = checkGroupLimit(authUser.id, authUser.role);
   if (!groupLimit.allowed) {
     return c.json({ error: groupLimit.reason }, 403);
+  }
+
+  // Host paths are a privileged server capability. Check authorization and
+  // execution mode before touching any submitted path so a member cannot use
+  // this endpoint as a host filesystem existence oracle.
+  if (requestedAdditionalMounts.length > 0) {
+    if (authUser.role !== 'admin' || authUser.status !== 'active') {
+      return c.json(
+        {
+          error:
+            'Only an active administrator can mount host directories into a workspace',
+          code: 'HOST_MOUNT_ADMIN_REQUIRED',
+        },
+        403,
+      );
+    }
+    if (executionMode !== 'container') {
+      return c.json(
+        {
+          error: 'Host directory mounts are only valid for container mode',
+          code: 'HOST_MOUNT_CONTAINER_ONLY',
+        },
+        400,
+      );
+    }
+  }
+
+  let validatedAdditionalMounts: ReturnType<
+    typeof validateAdditionalMountsStrict
+  > = [];
+  if (requestedAdditionalMounts.length > 0) {
+    try {
+      validatedAdditionalMounts = validateAdditionalMountsStrict(
+        requestedAdditionalMounts.map((mount) => ({
+          hostPath: mount.host_path,
+          containerPath: mount.container_path,
+          readonly: mount.readonly,
+        })),
+        name,
+        false,
+      );
+    } catch (err) {
+      if (err instanceof AdditionalMountValidationError) {
+        const conflict = err.conflict;
+        return c.json(
+          {
+            error: conflict
+              ? 'Additional mount targets conflict'
+              : 'Invalid additional mount configuration',
+            code: conflict ? 'HOST_MOUNT_TARGET_CONFLICT' : err.code,
+            field_errors: {
+              additional_mounts: err.issues.join('; '),
+            },
+          },
+          conflict ? 409 : 400,
+        );
+      }
+      throw err;
+    }
   }
 
   // 互斥校验：init_source_path 和 init_git_url 不能同时指定
@@ -730,6 +808,15 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     initSourcePath: executionMode !== 'host' ? initSourcePath : undefined,
     initGitUrl: executionMode !== 'host' ? initGitUrl : undefined,
     created_by: authUser.id,
+    containerConfig:
+      validatedAdditionalMounts.length > 0
+        ? {
+            version: 1,
+            additionalMounts: validatedAdditionalMounts.map(
+              (mount) => mount.persisted,
+            ),
+          }
+        : undefined,
   };
 
   // Initialize private filesystem state before publishing either the

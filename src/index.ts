@@ -438,6 +438,10 @@ import {
   HOST_EXECUTION_FORBIDDEN_ERROR,
 } from './host-execution-policy.js';
 import {
+  parseContainerConfig,
+  validateAdditionalMountsStrict,
+} from './mount-security.js';
+import {
   ensureAgentDirectories,
   isRealpathInside,
   isSystemMaintenanceNoise,
@@ -4782,6 +4786,48 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   ) {
     throw new Error(`registerGroup: invalid folder name: ${group.folder}`);
   }
+
+  // register_group is reachable from an agent IPC channel. Treat its
+  // containerConfig as untrusted and apply the same structural, privilege and
+  // filesystem policy checks as the HTTP creation route.
+  const parsedContainerConfig = parseContainerConfig(group.containerConfig);
+  if (parsedContainerConfig.error) {
+    throw new Error(
+      `registerGroup: invalid container config: ${parsedContainerConfig.error}`,
+    );
+  }
+  const additionalMounts = parsedContainerConfig.config?.additionalMounts ?? [];
+  if (additionalMounts.length > 0) {
+    if (group.executionMode === 'host') {
+      throw new Error(
+        'registerGroup: additional mounts require container execution mode',
+      );
+    }
+    const currentOwner = group.created_by
+      ? getUserById(group.created_by)
+      : undefined;
+    if (!canExecuteOnHost(currentOwner)) {
+      throw new Error(
+        'registerGroup: host directory mounts require a currently active administrator owner',
+      );
+    }
+    const validated = validateAdditionalMountsStrict(
+      additionalMounts,
+      group.name,
+      group.is_home === true,
+    );
+    group = {
+      ...group,
+      containerConfig: {
+        ...parsedContainerConfig.config,
+        version: 1,
+        additionalMounts: validated.map((mount) => mount.persisted),
+      },
+    };
+  } else if (parsedContainerConfig.config) {
+    group = { ...group, containerConfig: parsedContainerConfig.config };
+  }
+
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 

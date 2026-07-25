@@ -1,8 +1,8 @@
 import type { StreamEvent, WorkflowRunSnapshot } from './stream-event.types.js';
 
 export interface AdditionalMount {
-  hostPath: string; // Absolute path on host (supports ~ for home)
-  containerPath?: string; // Optional — defaults to basename of hostPath. Mounted at /workspace/extra/{value}
+  hostPath: string; // Absolute canonical path on host
+  containerPath: string; // Relative suffix mounted below /workspace/extra
   readonly?: boolean; // Default: true for safety
 }
 
@@ -29,6 +29,7 @@ export interface AllowedRoot {
 }
 
 export interface ContainerConfig {
+  version?: 1;
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
 }
@@ -143,6 +144,8 @@ export interface RegisteredGroup {
   /** Provider-hosted avatar URL for an external IM chat. */
   avatar_url?: string;
   containerConfig?: ContainerConfig;
+  /** Invalid persisted JSON is retained as a runtime safety block, never ignored. */
+  containerConfigError?: string;
   executionMode?: ExecutionMode; // 默认 'container'
   customCwd?: string; // 宿主机模式的自定义工作目录（绝对路径）
   initSourcePath?: string; // 容器模式下复制来源的宿主机绝对路径

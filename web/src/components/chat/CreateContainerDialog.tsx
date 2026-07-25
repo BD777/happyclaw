@@ -31,15 +31,73 @@ import { DirectoryBrowser } from '../shared/DirectoryBrowser';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useAgentProfilesStore } from '../../stores/agent-profiles';
-import { getAgentContextSource } from '../../types';
-import type { InteractionMode } from '../../types';
+import {
+  getAgentContextSource,
+  type CreateWorkspaceOptions,
+  type InteractionMode,
+} from '../../types';
 import { workspaceCreationBlockReason } from '../../utils/agent-product';
+import { extractErrorMessage } from '../../utils/error';
 import { InteractionModeSelector } from './InteractionModeSelector';
+import {
+  HostDirectoryMountEditor,
+  type HostDirectoryMountDraft,
+  toAdditionalMountInputs,
+  validateHostDirectoryMounts,
+} from './HostDirectoryMountEditor';
 
 interface CreateContainerDialogProps {
   open: boolean;
   onClose: () => void;
   onCreated: (jid: string, folder: string) => void;
+}
+
+function extractFieldErrors(error: unknown): Record<string, string> {
+  if (typeof error !== 'object' || error === null || !('body' in error)) {
+    return {};
+  }
+  const body = (error as { body?: unknown }).body;
+  if (typeof body !== 'object' || body === null) return {};
+  const raw =
+    (body as Record<string, unknown>).field_errors ??
+    (body as Record<string, unknown>).fieldErrors;
+  const normalizeField = (field: string) => field.replace(/\[(\d+)\]/g, '.$1');
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    return Object.fromEntries(
+      Object.entries(raw).flatMap(([field, message]) => {
+        const normalizedMessage =
+          typeof message === 'string'
+            ? message
+            : Array.isArray(message) &&
+                message.every((item) => typeof item === 'string')
+              ? message.join('；')
+              : '';
+        return normalizedMessage.trim()
+          ? [[normalizeField(field), normalizedMessage] as const]
+          : [];
+      }),
+    );
+  }
+
+  const issues =
+    (body as Record<string, unknown>).issues ??
+    (body as Record<string, unknown>).details;
+  if (!Array.isArray(issues)) return {};
+  return Object.fromEntries(
+    issues.flatMap((issue) => {
+      if (typeof issue !== 'object' || issue === null) return [];
+      const path = (issue as Record<string, unknown>).path;
+      const message = (issue as Record<string, unknown>).message;
+      const field = Array.isArray(path)
+        ? path.map(String).join('.')
+        : typeof path === 'string'
+          ? normalizeField(path)
+          : '';
+      return field && typeof message === 'string' && message.trim()
+        ? [[field, message] as const]
+        : [];
+    }),
+  );
 }
 
 export function CreateContainerDialog({
@@ -60,6 +118,9 @@ export function CreateContainerDialog({
   const [selectedAgentProfileId, setSelectedAgentProfileId] = useState('');
   const [interactionMode, setInteractionMode] =
     useState<InteractionMode>('assistant');
+  const [hostMounts, setHostMounts] = useState<HostDirectoryMountDraft[]>([]);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   const createFlow = useChatStore((s) => s.createFlow);
   const canHostExec = useAuthStore((s) => s.user?.role === 'admin');
@@ -97,6 +158,27 @@ export function CreateContainerDialog({
     setCustomCwd('');
   }, [canHostExec, executionMode]);
 
+  useEffect(() => {
+    if (canHostExec && executionMode === 'container') return;
+    setHostMounts([]);
+    setFieldErrors({});
+    setSubmitError(null);
+  }, [canHostExec, executionMode]);
+
+  useEffect(() => {
+    if (canHostExec) return;
+    setInitMode((current) =>
+      current === 'local' || current === 'git' ? 'empty' : current,
+    );
+    setInitSourcePath('');
+    setInitGitUrl('');
+  }, [canHostExec]);
+
+  const clearSubmissionErrors = () => {
+    setSubmitError(null);
+    setFieldErrors({});
+  };
+
   const reset = () => {
     setName('');
     setAdvancedOpen(false);
@@ -107,6 +189,9 @@ export function CreateContainerDialog({
     setInitGitUrl('');
     setSelectedAgentProfileId('');
     setInteractionMode('assistant');
+    setHostMounts([]);
+    setSubmitError(null);
+    setFieldErrors({});
   };
 
   const handleClose = () => {
@@ -125,17 +210,32 @@ export function CreateContainerDialog({
     });
     if (blocked) return;
 
+    const mountErrors =
+      canHostExec && executionMode === 'container'
+        ? validateHostDirectoryMounts(hostMounts)
+        : {};
+    if (Object.keys(mountErrors).length > 0) {
+      setFieldErrors(mountErrors);
+      setSubmitError('请检查宿主机目录挂载配置');
+      return;
+    }
+
+    clearSubmissionErrors();
     setLoading(true);
     try {
-      const options: Record<string, string> = {};
+      const options: CreateWorkspaceOptions = {};
       if (executionMode === 'host' && canHostExec) {
         options.execution_mode = 'host';
         if (customCwd.trim()) options.custom_cwd = customCwd.trim();
       } else {
-        if (initMode === 'local' && initSourcePath.trim()) {
+        if (canHostExec && initMode === 'local' && initSourcePath.trim()) {
           options.init_source_path = initSourcePath.trim();
-        } else if (initMode === 'git' && initGitUrl.trim()) {
+        } else if (canHostExec && initMode === 'git' && initGitUrl.trim()) {
           options.init_git_url = initGitUrl.trim();
+        }
+        if (canHostExec && hostMounts.length > 0) {
+          options.execution_mode = 'container';
+          options.additional_mounts = toAdditionalMountInputs(hostMounts);
         }
       }
       if (selectedAgentProfileId)
@@ -145,14 +245,13 @@ export function CreateContainerDialog({
         trimmed,
         Object.keys(options).length ? options : undefined,
       );
-      if (created) {
-        onCreated(created.jid, created.folder);
-        handleClose();
-      } else {
-        toast.error('创建失败，请重试');
-      }
+      onCreated(created.jid, created.folder);
+      handleClose();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : '创建失败');
+      const message = extractErrorMessage(err) || '创建失败，请重试';
+      setSubmitError(message);
+      setFieldErrors(extractFieldErrors(err));
+      toast.error(message);
     } finally {
       setLoading(false);
     }
@@ -160,23 +259,31 @@ export function CreateContainerDialog({
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-xl">
+        <DialogHeader className="flex-shrink-0">
           <DialogTitle>为 Agent 新建工作区</DialogTitle>
           <DialogDescription>
             选择 Agent，并确认工作区的回复模式、运行位置和上下文。
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
           <div>
-            <label className="block text-sm font-medium mb-2">Agent</label>
+            <label
+              htmlFor="workspace-agent-profile"
+              className="mb-2 block text-sm font-medium"
+            >
+              Agent
+            </label>
             <Select
               value={selectedAgentProfileId}
-              onValueChange={setSelectedAgentProfileId}
+              onValueChange={(value) => {
+                setSelectedAgentProfileId(value);
+                clearSubmissionErrors();
+              }}
               disabled={profilesLoading || profiles.length === 0}
             >
-              <SelectTrigger className="w-full">
+              <SelectTrigger id="workspace-agent-profile" className="w-full">
                 <SelectValue
                   placeholder={
                     profilesLoading ? '正在加载 Agent...' : '选择 Agent'
@@ -237,10 +344,19 @@ export function CreateContainerDialog({
 
           {/* Name input */}
           <div>
-            <label className="block text-sm font-medium mb-2">工作区名称</label>
+            <label
+              htmlFor="workspace-name"
+              className="mb-2 block text-sm font-medium"
+            >
+              工作区名称
+            </label>
             <Input
+              id="workspace-name"
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value);
+                clearSubmissionErrors();
+              }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') handleConfirm();
               }}
@@ -327,6 +443,7 @@ export function CreateContainerDialog({
                         onChange={() => {
                           setExecutionMode('container');
                           setCustomCwd('');
+                          clearSubmissionErrors();
                         }}
                         className="mt-0.5 accent-primary"
                       />
@@ -357,6 +474,8 @@ export function CreateContainerDialog({
                             setInitMode('empty');
                             setInitSourcePath('');
                             setInitGitUrl('');
+                            setHostMounts([]);
+                            clearSubmissionErrors();
                           }}
                           className="mt-0.5 accent-primary"
                         />
@@ -378,7 +497,7 @@ export function CreateContainerDialog({
 
                 {/* Container mode: workspace source */}
                 {executionMode === 'container' && (
-                  <div className="pt-1">
+                  <div className="space-y-4 pt-1">
                     <label className="block text-sm font-medium mb-2">
                       工作区来源
                     </label>
@@ -389,7 +508,10 @@ export function CreateContainerDialog({
                           name="init_mode"
                           value="empty"
                           checked={initMode === 'empty'}
-                          onChange={() => setInitMode('empty')}
+                          onChange={() => {
+                            setInitMode('empty');
+                            clearSubmissionErrors();
+                          }}
                           className="mt-0.5 accent-primary"
                         />
                         <div>
@@ -408,7 +530,10 @@ export function CreateContainerDialog({
                             name="init_mode"
                             value="local"
                             checked={initMode === 'local'}
-                            onChange={() => setInitMode('local')}
+                            onChange={() => {
+                              setInitMode('local');
+                              clearSubmissionErrors();
+                            }}
                             className="mt-0.5 accent-primary"
                           />
                           <div className="flex-1">
@@ -428,42 +553,79 @@ export function CreateContainerDialog({
                         <div className="ml-6">
                           <DirectoryBrowser
                             value={initSourcePath}
-                            onChange={setInitSourcePath}
+                            onChange={(path) => {
+                              setInitSourcePath(path);
+                              clearSubmissionErrors();
+                            }}
+                            inputId="workspace-init-source"
+                            label="要复制的服务器目录"
+                            description="创建时复制一次，之后不会与宿主机源目录同步。"
                             placeholder="选择要复制的目录"
                           />
                         </div>
                       )}
-                      <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
-                        <input
-                          type="radio"
-                          name="init_mode"
-                          value="git"
-                          checked={initMode === 'git'}
-                          onChange={() => setInitMode('git')}
-                          className="mt-0.5 accent-primary"
-                        />
-                        <div className="flex-1">
-                          <div className="flex items-center gap-1.5">
-                            <GitBranch className="w-4 h-4 text-muted-foreground" />
-                            <span className="text-sm font-medium">
-                              克隆 Git 仓库
-                            </span>
-                          </div>
-                          <p className="text-xs text-muted-foreground mt-0.5">
-                            从 GitHub 等平台克隆仓库到工作区
-                          </p>
-                        </div>
-                      </label>
-                      {initMode === 'git' && (
-                        <div className="ml-6">
-                          <Input
-                            value={initGitUrl}
-                            onChange={(e) => setInitGitUrl(e.target.value)}
-                            placeholder="https://github.com/user/repo"
-                          />
-                        </div>
+                      {canHostExec && (
+                        <>
+                          <label className="flex cursor-pointer items-start gap-3 rounded-lg border p-2 transition-colors hover:bg-accent/50">
+                            <input
+                              type="radio"
+                              name="init_mode"
+                              value="git"
+                              checked={initMode === 'git'}
+                              onChange={() => {
+                                setInitMode('git');
+                                clearSubmissionErrors();
+                              }}
+                              className="mt-0.5 accent-primary"
+                            />
+                            <div className="flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <GitBranch className="h-4 w-4 text-muted-foreground" />
+                                <span className="text-sm font-medium">
+                                  克隆 Git 仓库
+                                </span>
+                              </div>
+                              <p className="mt-0.5 text-xs text-muted-foreground">
+                                从 GitHub 等平台克隆仓库到工作区
+                              </p>
+                            </div>
+                          </label>
+                          {initMode === 'git' && (
+                            <div className="ml-6">
+                              <label
+                                htmlFor="workspace-init-git-url"
+                                className="sr-only"
+                              >
+                                Git 仓库地址
+                              </label>
+                              <Input
+                                id="workspace-init-git-url"
+                                value={initGitUrl}
+                                onChange={(e) => {
+                                  setInitGitUrl(e.target.value);
+                                  clearSubmissionErrors();
+                                }}
+                                placeholder="https://github.com/user/repo"
+                              />
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
+
+                    {canHostExec && (
+                      <div className="border-t border-border pt-4">
+                        <HostDirectoryMountEditor
+                          mounts={hostMounts}
+                          onChange={(mounts) => {
+                            setHostMounts(mounts);
+                            clearSubmissionErrors();
+                          }}
+                          fieldErrors={fieldErrors}
+                          disabled={loading}
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -472,7 +634,13 @@ export function CreateContainerDialog({
                   <>
                     <DirectoryBrowser
                       value={customCwd}
-                      onChange={setCustomCwd}
+                      onChange={(path) => {
+                        setCustomCwd(path);
+                        clearSubmissionErrors();
+                      }}
+                      inputId="workspace-custom-cwd"
+                      label="宿主机工作目录（可选）"
+                      description="Agent 将直接在 HappyClaw 服务器上的这个目录中运行。"
                       placeholder="默认: data/groups/{folder}/"
                     />
                     <div className="flex items-start gap-2 p-2 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
@@ -487,13 +655,29 @@ export function CreateContainerDialog({
               </div>
             )}
           </div>
+
+          {submitError && (
+            <div
+              className="rounded-lg border border-error/30 bg-error-bg px-3 py-2 text-sm text-error"
+              role="alert"
+              aria-live="assertive"
+            >
+              {submitError}
+            </div>
+          )}
         </div>
 
-        <DialogFooter>
-          <Button variant="outline" onClick={handleClose} disabled={loading}>
+        <DialogFooter className="flex-shrink-0">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleClose}
+            disabled={loading}
+          >
             取消
           </Button>
           <Button
+            type="button"
             onClick={handleConfirm}
             disabled={
               workspaceCreationBlockReason({

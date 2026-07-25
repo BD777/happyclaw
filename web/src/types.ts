@@ -34,6 +34,24 @@ export interface GroupInfo {
   agent_profile_avatar_url?: string | null;
 }
 
+export interface AdditionalMountInput {
+  host_path: string;
+  /** Relative suffix mounted below /workspace/extra/. */
+  container_path: string;
+  /** Host directory mounts are read-only in the current product contract. */
+  readonly: true;
+}
+
+export interface CreateWorkspaceOptions {
+  execution_mode?: 'container' | 'host';
+  custom_cwd?: string;
+  init_source_path?: string;
+  init_git_url?: string;
+  agent_profile_id?: string;
+  interaction_mode?: InteractionMode;
+  additional_mounts?: AdditionalMountInput[];
+}
+
 export interface AgentProfile {
   id: string;
   owner_user_id: string;
