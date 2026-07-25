@@ -97,6 +97,7 @@ export interface SystemSettings {
   maxConcurrentScripts: number;
   scriptTimeout: number;
   taskBackfillGraceMs: number;
+  maxRepliesPerTurn: number;
   fallbackModel: string;
 }
 

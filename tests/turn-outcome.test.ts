@@ -301,8 +301,11 @@ describe('resolveTurnOutcome', () => {
     expect(branch).toContain('ipcAgentId,');
     expect(branch).toContain('data.inputTurnId');
     expect(branch).toContain('const messageScopeKey = channelTurnScope(');
-    expect(branch).toContain(
-      'sendImWithRetry(\n                        ipcImRoute,\n                        data.text,',
+    // The IM leg must receive the raw native payload, not the Web projection.
+    // Whitespace-insensitive so nesting changes (e.g. adding a guard around the
+    // send) do not break an assertion about argument order.
+    expect(branch.replace(/\s+/g, ' ')).toContain(
+      'sendImWithRetry( ipcImRoute, data.text,',
     );
     expect(branch.indexOf('sendImWithRetry(')).toBeLessThan(
       branch.indexOf('const sendOutcome = await sendMessageWithOutcome'),

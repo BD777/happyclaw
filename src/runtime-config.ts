@@ -3843,6 +3843,13 @@ export interface SystemSettings {
   // 跨天积压任务集体在重启那一秒并发 fire 刷屏。
   // 0 = 关闭（保留旧行为：无视逾期时长全部 backfill）。默认 300000 (5 分钟)。
   taskBackfillGraceMs: number;
+  // 单个 Agent turn 内允许送达的用户可见消息条数上限（send_message / send_image /
+  // send_file / feishu_send_card 共用）。这是防止模型进入重复发送循环的保险丝，
+  // 不是 UX 限制：正常轮次（确认 → 执行 → 进展 → 结果）远达不到。达到上限后
+  // 后续投递被拒绝并向模型返回 reply_limit_reached，已送达内容不受影响。
+  // 该数字刻意不写进 Prompt，避免模型把它当成可以用满的配额。
+  // 0 = 关闭。默认 20。
+  maxRepliesPerTurn: number;
 }
 
 // Upper bound for the login lockout window. auth.ts reclaims login-attempt
@@ -3874,6 +3881,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   fallbackModel: '',
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
+  maxRepliesPerTurn: 20,
 };
 
 type SystemSettingsSource = 'file' | 'env' | 'api';
@@ -3934,6 +3942,13 @@ function normalizeSystemSettings(
   if (taskBackfillGraceMs !== taskBackfillRaw) {
     invalidFields.add('taskBackfillGraceMs');
   }
+
+  const maxRepliesPerTurn = numberField(
+    'maxRepliesPerTurn',
+    DEFAULT_SYSTEM_SETTINGS.maxRepliesPerTurn,
+    0,
+    500,
+  );
 
   // Accept the former system-wide key as the main Agent default during upgrade.
   if (
@@ -4108,6 +4123,7 @@ function normalizeSystemSettings(
       DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
     ),
     taskBackfillGraceMs,
+    maxRepliesPerTurn,
   };
 
   if (invalidFields.size > 0) {

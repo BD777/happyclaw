@@ -21,7 +21,8 @@ type NumericSettingKey =
   | 'loginLockoutMinutes'
   | 'maxConcurrentScripts'
   | 'scriptTimeout'
-  | 'taskBackfillGraceMs';
+  | 'taskBackfillGraceMs'
+  | 'maxRepliesPerTurn';
 
 interface FieldConfig {
   key: NumericSettingKey;
@@ -167,6 +168,18 @@ const fieldGroups: FieldGroup[] = [
         toStored: (value) => value * 60_000,
         min: 0,
         max: 1440,
+        step: 1,
+      },
+      {
+        key: 'maxRepliesPerTurn',
+        label: '单轮消息条数上限',
+        description:
+          '一次回合内 Agent 最多送达多少条用户可见消息，用于兜住异常的重复发送循环；正常对话远达不到。0 表示不限制。',
+        unit: '条',
+        toDisplay: (value) => value,
+        toStored: (value) => value,
+        min: 0,
+        max: 500,
         step: 1,
       },
     ],

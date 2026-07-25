@@ -200,6 +200,7 @@ import {
 import {
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
+  CHANNEL_RELIABILITY_TERMINAL_STATUSES,
 } from './channel-reliability-store.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
@@ -407,6 +408,7 @@ import {
   FollowUpMode,
   QueuedFollowUp,
   FollowUpActionResult,
+  TaskRunStatus,
 } from './types.js';
 import {
   buildNativeThreadRouteJid,
@@ -1220,7 +1222,9 @@ const activeIpcReplyTurnTrackers = new Map<string, IpcReplyTurnTracker>();
 // Foreground send_message(progress/final) joins the one host-owned primary
 // reply instead of creating an independent provider message. Bindings are
 // exact to (workspace/agent scope, immutable input turn).
-const activeTurnOutputs = new ActiveTurnOutputRegistry();
+const activeTurnOutputs = new ActiveTurnOutputRegistry(
+  () => getSystemSettings().maxRepliesPerTurn,
+);
 
 // Host-owned current-turn registry. Agent Builder authorization never trusts
 // turn/chat/task claims from the runner's writable IPC JSON.
@@ -2360,6 +2364,30 @@ async function deliverScopedChannelOutput(
     );
     return false;
   }
+  // The scope projection deliberately outlives a single input turn so a late
+  // duplicate callback resolves the same delivered Outbox row. That must not
+  // become an open window: once the turn itself reached a terminal state, its
+  // output window is closed and anything still arriving is out of bounds.
+  // Proactive mode makes this reachable in normal operation, because the
+  // contract explicitly lets a model keep working after a send.
+  const scopeTurnRun = getChannelTurnRun(scope.turnRunId);
+  if (
+    !scopeTurnRun ||
+    (CHANNEL_RELIABILITY_TERMINAL_STATUSES.turns as readonly string[]).includes(
+      scopeTurnRun.status,
+    )
+  ) {
+    logger.error(
+      {
+        targetJid,
+        turnRunId: scope.turnRunId,
+        turnStatus: scopeTurnRun?.status ?? 'missing',
+        operationKey: ref.operationKey,
+      },
+      'Suppressed channel side effect because its turn already closed its output window',
+    );
+    return false;
+  }
   const uncertainSibling = getUncertainChannelOutboxForTurn(scope.turnRunId);
   if (uncertainSibling) {
     logger.warn(
@@ -2836,10 +2864,40 @@ async function sendTaskFileWithRetry(
   );
 }
 
+/**
+ * Statuses that may still emit user-visible output.
+ *
+ * This is an allow-list on purpose. The previous deny-list rejected only
+ * `cancelled` and `missed`, so a warm runner could keep delivering into a run
+ * that had already settled as `success` or `failed` — output attributed to a
+ * finished occurrence, after its result was recorded.
+ *
+ * `delivered` is included because it is not an execution terminal: group-mode
+ * runs are marked `delivered` the moment the prompt is injected, and the real
+ * Agent turn produces its output afterwards. Narrowing that is tracked
+ * separately; doing it here would silently suppress group-mode task output.
+ */
+/**
+ * Stable, machine-readable refusal for the per-turn reply fuse.
+ *
+ * The model must be able to tell "stop talking" from "retry later"; collapsing
+ * every failure into one opaque string is what makes a looping model retry
+ * forever. The limit itself is never stated, so it cannot be treated as a quota.
+ */
+const REPLY_LIMIT_REACHED_ERROR =
+  'reply_limit_reached: this turn has already delivered its maximum number of user-visible messages. Do not retry or rephrase; end the turn now.';
+
+const TASK_RUN_STATUSES_ACCEPTING_OUTPUT: ReadonlySet<TaskRunStatus> = new Set([
+  'queued',
+  'running',
+  'retry_wait',
+  'delivered',
+]);
+
 function taskRunAcceptsLateIpcOutput(runId: string | null): boolean {
   if (!runId) return true;
   const run = getTaskRunById(runId);
-  return Boolean(run && run.status !== 'cancelled' && run.status !== 'missed');
+  return Boolean(run && TASK_RUN_STATUSES_ACCEPTING_OUTPUT.has(run.status));
 }
 
 async function settleAndRecordTaskIpcDeliveries(
@@ -9348,33 +9406,76 @@ function startIpcWatcher(): void {
                           data.inputTurnId,
                           ipcImRoute,
                         );
-                      messageDelivered = await sendImWithRetry(
-                        ipcImRoute,
-                        data.text,
-                        extractLocalImImagePaths(data.text, sourceGroup),
-                        channelOutboxRefForInput(
-                          messageScopeKey,
-                          ipcImRoute,
-                          data.inputTurnId,
-                          `ipc-message:${messageRequestId ?? file}`,
-                        ),
-                        usesNativeMessagePresentation(ipcInteractionMode)
-                          ? { presentation: 'native' }
-                          : undefined,
-                      );
                       if (
-                        !messageDelivered &&
-                        messageScope &&
-                        getUncertainChannelOutboxForTurn(messageScope.turnRunId)
+                        !activeTurnOutputs.canDeliverUtterance({
+                          scopeKey: messageScopeKey,
+                          inputTurnId: data.inputTurnId,
+                        })
                       ) {
-                        messageDeliveryError =
-                          'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
+                        // Runaway-loop fuse. Already delivered messages stand;
+                        // the model gets a stable machine-readable reason so it
+                        // can tell "stop talking" from "retry later".
+                        messageDelivered = false;
+                        messageDeliveryError = REPLY_LIMIT_REACHED_ERROR;
+                        logger.warn(
+                          {
+                            sourceGroup,
+                            agentId: ipcAgentId,
+                            inputTurnId: data.inputTurnId,
+                          },
+                          'Suppressed IPC send_message: per-turn reply limit reached',
+                        );
+                      } else {
+                        messageDelivered = await sendImWithRetry(
+                          ipcImRoute,
+                          data.text,
+                          extractLocalImImagePaths(data.text, sourceGroup),
+                          channelOutboxRefForInput(
+                            messageScopeKey,
+                            ipcImRoute,
+                            data.inputTurnId,
+                            `ipc-message:${messageRequestId ?? file}`,
+                          ),
+                          usesNativeMessagePresentation(ipcInteractionMode)
+                            ? { presentation: 'native' }
+                            : undefined,
+                        );
+                        if (
+                          !messageDelivered &&
+                          messageScope &&
+                          getUncertainChannelOutboxForTurn(
+                            messageScope.turnRunId,
+                          )
+                        ) {
+                          messageDeliveryError =
+                            'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
+                        }
                       }
                     }
+                  } else if (
+                    getSessionChannelOwner(sourceGroup, ipcAgentId ?? null)
+                  ) {
+                    // The session is owned by a native channel, so a missing
+                    // route means the route is unavailable — not that this is a
+                    // Web-only session. Reporting "delivered" here told the
+                    // model its message had reached the user while the IM side
+                    // stayed silent, which in Proactive mode (no published SDK
+                    // final) meant the user saw nothing at all.
+                    messageDelivered = false;
+                    messageDeliveryError =
+                      'Message could not be delivered: this session is bound to a native channel whose route is currently unavailable.';
+                    logger.error(
+                      {
+                        sourceGroup,
+                        agentId: ipcAgentId,
+                        chatJid: data.chatJid,
+                      },
+                      'Suppressed IPC send_message: native-owned session has no resolvable route',
+                    );
                   } else {
-                    // A Web-only logical session is delivered by durable
-                    // persistence/broadcast below; it has no native provider
-                    // side effect to acknowledge first.
+                    // A genuinely Web-only logical session is delivered by
+                    // durable persistence/broadcast below; it has no native
+                    // provider side effect to acknowledge first.
                     messageDelivered = true;
                   }
                 }
@@ -9803,6 +9904,19 @@ function startIpcWatcher(): void {
                               : 'Image could not be delivered to its IM target.',
                           },
                     );
+                    // An image is user-visible speech. Without this the turn
+                    // looks silent, so a later runner error replays the input
+                    // and the user receives the artifact twice.
+                    if (
+                      regularImageDelivered &&
+                      typeof data.inputTurnId === 'string' &&
+                      data.inputTurnId
+                    ) {
+                      activeTurnOutputs.recordDeliveredUtterance({
+                        scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
+                        inputTurnId: data.inputTurnId,
+                      });
+                    }
                   }
 
                   logger.info(
@@ -11429,6 +11543,19 @@ async function processTaskIpc(
             request,
           );
         }
+        // `send_card` is the only capability that emits new user-visible
+        // content, so it is the only one that counts as speech for turn
+        // settlement. Reactions, edits and recalls act on existing messages.
+        if (
+          request.operation === 'send_card' &&
+          typeof data.inputTurnId === 'string' &&
+          data.inputTurnId
+        ) {
+          activeTurnOutputs.recordDeliveredUtterance({
+            scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
+            inputTurnId: data.inputTurnId,
+          });
+        }
         writeTaskResult(tasksDir, 'feishu_capability', data.requestId, {
           success: true,
           ...result,
@@ -11916,6 +12043,18 @@ async function processTaskIpc(
                     // ignore — failure notification itself failing should not crash
                   }
                 }
+              }
+              // A delivered file is user-visible speech; record it so the turn
+              // is not treated as silent and replayed.
+              if (
+                sent &&
+                typeof data.inputTurnId === 'string' &&
+                data.inputTurnId
+              ) {
+                activeTurnOutputs.recordDeliveredUtterance({
+                  scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
+                  inputTurnId: data.inputTurnId,
+                });
               }
               finishSendFile(
                 sent,
