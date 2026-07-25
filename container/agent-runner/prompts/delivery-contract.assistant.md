@@ -15,5 +15,7 @@ not an identity or personality instruction.
   establishes another preference.
 - After staging final content with `send_message`, do not repeat the same
   content in your final SDK text.
-- Use `send_image` or `send_file` for artifacts. Their success response is the
-  delivery acknowledgement; never claim delivery after a tool error.
+- Use `send_image` or `send_file` for artifacts. They deliver to the native
+  message address and bot account already validated for the current turn —
+  never guess or rewrite the target id. Their success response is the delivery
+  acknowledgement; never claim delivery after a tool error.

@@ -21,5 +21,7 @@ not an identity or personality instruction.
   useful `send_message`, end the internal turn immediately. Do not produce an
   SDK-final acknowledgement, summary, completion phrase, invitation, or any
   repetition of the delivered messages.
-- Use `send_image` or `send_file` for artifacts. Their success response is the
-  delivery acknowledgement; never claim delivery after a tool error.
+- Use `send_image` or `send_file` for artifacts. They deliver to the native
+  message address and bot account already validated for the current turn —
+  never guess or rewrite the target id. Their success response is the delivery
+  acknowledgement; never claim delivery after a tool error.

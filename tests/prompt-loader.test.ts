@@ -158,3 +158,46 @@ describe('prompts/ files', () => {
     }
   });
 });
+
+describe('rules that must survive prompt-variant splits', () => {
+  const readPrompt = (name: string): string =>
+    fs.readFileSync(path.join(PROMPTS_DIR, name), 'utf-8');
+
+  test('every output variant forbids absolute image paths', () => {
+    // Splitting output.md into three mutually exclusive variants left this
+    // rule in the assistant one only, so tasks and proactive turns emitted
+    // /workspace/... references that render as broken images. The rule has to
+    // hold wherever an agent can write Markdown, not just in one variant.
+    for (const name of [
+      'output.assistant.md',
+      'output.proactive.md',
+      'output.task.md',
+    ]) {
+      const body = readPrompt(name);
+      expect(body, `${name} must forbid absolute image paths`).toContain(
+        '绝对路径',
+      );
+      expect(body, `${name} must show the relative form`).toContain(
+        '![描述](filename.png)',
+      );
+    }
+  });
+
+  test('every delivery surface forbids guessing the target id', () => {
+    // Repo CLAUDE.md §6.2: file/image delivery must use the current turn's
+    // ChannelTurnContext and must not guess the target from recent messages.
+    // The prompt-side reinforcement of that rule was dropped when the single
+    // delivery-contract.md became per-mode variants.
+    for (const name of [
+      'delivery-contract.assistant.md',
+      'delivery-contract.proactive.md',
+    ]) {
+      expect(
+        readPrompt(name),
+        `${name} must forbid target-id guessing`,
+      ).toMatch(/never guess or rewrite the target id/i);
+    }
+    // Task runs get no delivery contract — output.task.md carries the rule.
+    expect(readPrompt('output.task.md')).toContain('不要猜测或改写目标 ID');
+  });
+});
