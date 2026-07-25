@@ -85,6 +85,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [showInteractionModeDialog, setShowInteractionModeDialog] =
     useState(false);
   const [resetLoading, setResetLoading] = useState(false);
+  const [creatingSession, setCreatingSession] = useState(false);
   const [resetAgentId, setResetAgentId] = useState<string | null>(null);
   // Desktop: visible controls panel height, mounted controls terminal lifecycle.
   const [terminalVisible, setTerminalVisible] = useState(false);
@@ -570,10 +571,19 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   };
 
   const handleCreateSession = useCallback(async () => {
-    const agent = await createConversation(groupJid, '');
-    if (!agent) return;
-    selectTab(agent.id);
-  }, [createConversation, groupJid, selectTab]);
+    if (creatingSession) return;
+    setCreatingSession(true);
+    try {
+      const agent = await createConversation(groupJid, '');
+      if (!agent) {
+        toast.error(useChatStore.getState().error || '创建 Web 会话失败');
+        return;
+      }
+      selectTab(agent.id);
+    } finally {
+      setCreatingSession(false);
+    }
+  }, [createConversation, creatingSession, groupJid, selectTab]);
 
   const handleDeleteSession = useCallback(
     (id: string) => {
@@ -725,6 +735,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         selectTab(id);
       }}
       onCreateSession={() => void handleCreateSession()}
+      isCreatingSession={creatingSession}
       onRenameSession={(id, currentName) => {
         setRenameTarget({ agentId: id, name: currentName });
       }}
