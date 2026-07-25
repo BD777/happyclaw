@@ -82,7 +82,12 @@ import {
 } from './channel-reliability-store.js';
 
 let db: InstanceType<typeof Database>;
-const CURRENT_SCHEMA_VERSION = 62;
+/**
+ * Exported so migration tests can assert "an old database reaches head" without
+ * restating the number. Hardcoding it meant every schema bump edited a dozen
+ * unrelated test files, which is churn that hides real assertion changes.
+ */
+export const CURRENT_SCHEMA_VERSION = 63;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -1197,6 +1202,18 @@ export function initDatabase(): void {
   ensureColumn('scheduled_tasks', 'revision', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('scheduled_tasks', 'updated_at', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('scheduled_tasks', 'deleted_at', 'TEXT');
+  // v62 -> v63: a task stored only the workspace-level `chat_jid`, so execution
+  // had to re-derive its target and fell back to "any group in this folder,
+  // preferring web:". Capture the concrete delivery route instead — HappyClaw's
+  // JID already encodes provider, external chat, channel account and Feishu
+  // thread/root, so one column carries the whole binding. Existing rows are
+  // backfilled from `chat_jid`, which is exactly the route they used before.
+  ensureColumn('scheduled_tasks', 'delivery_route_jid', 'TEXT');
+  db.prepare(
+    `UPDATE scheduled_tasks
+     SET delivery_route_jid = chat_jid
+     WHERE delivery_route_jid IS NULL AND chat_jid IS NOT NULL`,
+  ).run();
   ensureColumn('task_runs', 'notification_summary', 'TEXT');
   ensureColumn('task_runs', 'notification_payload', 'TEXT');
   ensureColumn(
@@ -4071,8 +4088,8 @@ export function createTask(
   const updatedAt = task.updated_at ?? task.created_at;
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, execution_mode, next_run, status, created_at, created_by, notify_channels, revision, updated_at, deleted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, execution_mode, next_run, status, created_at, created_by, notify_channels, revision, updated_at, deleted_at, delivery_route_jid)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -4095,6 +4112,9 @@ export function createTask(
     task.revision ?? 1,
     updatedAt,
     task.deleted_at ?? null,
+    // Fall back to chat_jid so a caller that has no concrete route still records
+    // an explicit binding rather than leaving execution to re-derive one.
+    task.delivery_route_jid ?? task.chat_jid,
   );
 }
 
@@ -4117,6 +4137,11 @@ function mapTaskRow(row: unknown): ScheduledTask {
   if (!Number.isInteger(r.revision) || r.revision < 1) r.revision = 1;
   if (!r.updated_at) r.updated_at = r.created_at;
   if (r.deleted_at === undefined) r.deleted_at = null;
+  // Rows written before the column existed behave as if bound to chat_jid,
+  // which is the route they actually used.
+  if (r.delivery_route_jid === undefined || r.delivery_route_jid === null) {
+    r.delivery_route_jid = r.chat_jid ?? null;
+  }
   // Defensive: legacy BLOB cells in TEXT-affinity columns come back as Buffer.
   r.prompt = toUtf8String(r.prompt);
   if (r.script_command !== undefined)

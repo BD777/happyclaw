@@ -485,6 +485,16 @@ export interface ScheduledTask {
   created_at: string;
   created_by?: string;
   notify_channels?: string[] | null;
+  /**
+   * Concrete delivery route captured when the task was created.
+   *
+   * `chat_jid` is workspace-level, so execution used to re-derive its target and
+   * could fall back to another group in the same folder. This JID carries the
+   * whole binding — provider, external chat, channel account and Feishu
+   * thread/root — so a run either reaches the place it was scheduled from or
+   * fails; it never silently picks somewhere else.
+   */
+  delivery_route_jid?: string | null;
   /** Optimistic-concurrency revision for edits made through REST/MCP/UI. */
   revision: number;
   updated_at: string;

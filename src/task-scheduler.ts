@@ -11,6 +11,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { getSystemSettings } from './runtime-config.js';
+import { channelConversationJid } from './channel-address.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -122,20 +123,28 @@ export function shouldFinalizeScheduledRunOutput(
  * Resolve the actual group JID to send a task to.
  * Falls back from the task's stored chat_jid to any group matching the same folder.
  */
+/**
+ * Resolve where this task delivers, or nothing.
+ *
+ * This used to fall back to "any group in the same folder, preferring `web:`"
+ * when the stored target did not resolve, so a task bound to one Feishu group
+ * could silently start answering in another group — or on the Web — after a
+ * rebind or folder migration. CLAUDE.md section 6.4 forbids exactly that: the
+ * response target must not degrade to a default. A run now either reaches its
+ * recorded binding or fails terminally, which the caller surfaces.
+ *
+ * The binding may carry Feishu thread/root fragments while `registered_groups`
+ * is keyed by the conversation JID, so both spellings are accepted.
+ */
 function resolveTargetGroupJid(
   task: ScheduledTask,
   groups: Record<string, RegisteredGroup>,
 ): string {
-  const directTarget = groups[task.chat_jid];
-  if (directTarget && directTarget.folder === task.group_folder) {
-    return task.chat_jid;
-  }
-  const sameFolder = Object.entries(groups).filter(
-    ([, g]) => g.folder === task.group_folder,
-  );
-  const preferred =
-    sameFolder.find(([jid]) => jid.startsWith('web:')) || sameFolder[0];
-  return preferred?.[0] || '';
+  const route = task.delivery_route_jid || task.chat_jid;
+  if (!route) return '';
+  const bound = groups[route] ?? groups[channelConversationJid(route)];
+  if (bound && bound.folder === task.group_folder) return route;
+  return '';
 }
 
 function resolveTaskExecutionMode(

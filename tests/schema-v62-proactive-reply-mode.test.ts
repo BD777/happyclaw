@@ -64,7 +64,9 @@ describe('schema v62 proactive reply-mode migration', () => {
     const db = await import('../src/db.js');
     db.initDatabase();
 
-    expect(db.getRouterState('schema_version')).toBe('62');
+    expect(db.getRouterState('schema_version')).toBe(
+      String(db.CURRENT_SCHEMA_VERSION),
+    );
     expect(
       db.getWorkspaceAgentProfileBinding('legacy-proactive-workspace'),
     ).toMatchObject({
@@ -87,7 +89,11 @@ describe('schema v62 proactive reply-mode migration', () => {
     migrated.close();
 
     const backups = fs.readdirSync(path.join(storeDir, 'migration-backups'));
-    expect(backups.some((name) => name.includes('v61-to-v62'))).toBe(true);
+    expect(
+      backups.some((name) =>
+        name.includes(`v61-to-v${db.CURRENT_SCHEMA_VERSION}`),
+      ),
+    ).toBe(true);
 
     db.initDatabase();
     expect(db.getWorkspaceInteractionMode('legacy-proactive-workspace')).toBe(

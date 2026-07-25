@@ -39,7 +39,9 @@ afterAll(() => {
 
 describe('channel reliability schema v60', () => {
   test('creates all four ledgers and nonterminal indexes idempotently', () => {
-    expect(db.getRouterState('schema_version')).toBe('62');
+    expect(db.getRouterState('schema_version')).toBe(
+      String(db.CURRENT_SCHEMA_VERSION),
+    );
     db.closeDatabase();
 
     const probe = new Database(path.join(storeDir, 'messages.db'), {
@@ -77,7 +79,9 @@ describe('channel reliability schema v60', () => {
     probe.close();
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('62');
+    expect(db.getRouterState('schema_version')).toBe(
+      String(db.CURRENT_SCHEMA_VERSION),
+    );
   });
 
   test('advances provider cursors monotonically and scopes them by chat', () => {

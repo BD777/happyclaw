@@ -39,6 +39,7 @@ import { resolveAdmittedChannelRoute } from './channel-admission.js';
 import {
   extractProviderTarget,
   parseChannelAddress,
+  scopeChannelJid,
 } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
@@ -671,8 +672,28 @@ export function buildFeishuRouteTarget(
   return parseFeishuRouteTarget(parts.join('#'));
 }
 
-function feishuRouteToJid(target: FeishuRouteTarget): string {
-  return `feishu:${target.raw}`;
+/**
+ * Build a route JID for a thread/root target.
+ *
+ * `target.raw` is assembled from the raw provider `chat_id`, so it carries no
+ * account scope. Emitting it directly produced a JID that `getRegisteredGroup`
+ * could not match once inbound JIDs were account-scoped, which made the whole
+ * turn fail closed: no outbound route, no warm-session admission, not even the
+ * tail interruption notice. Re-apply the scope from the already-normalized base
+ * JID — `scopeChannelJid` preserves provider-native thread/root fragments.
+ *
+ * The native-topic branch keeps its own builder (`buildNativeThreadRouteJid`),
+ * which appends onto the normalized JID for the same reason.
+ */
+function feishuRouteToJid(
+  target: FeishuRouteTarget,
+  accountScopedBaseJid?: string,
+): string {
+  const jid = `feishu:${target.raw}`;
+  const accountId = accountScopedBaseJid
+    ? parseChannelAddress(accountScopedBaseJid)?.channelAccountId
+    : undefined;
+  return accountId ? scopeChannelJid(jid, accountId) : jid;
 }
 
 /**
@@ -2486,7 +2507,7 @@ export function createFeishuConnection(
       const routeSourceJid =
         agentRouting?.sourceJid ??
         (messageRouteTarget.threadId || messageRouteTarget.rootMessageId
-          ? feishuRouteToJid(messageRouteTarget)
+          ? feishuRouteToJid(messageRouteTarget, chatJid)
           : chatJid);
 
       // ── Ack Reaction：确认已收到消息（在 mention 过滤之后，避免对未处理的消息加表情） ──
@@ -2617,8 +2638,12 @@ export function createFeishuConnection(
         broadcastFollowUpUpdate(targetJid);
         const position = followUp.position ?? 1;
         if (followUp.runId) {
-          const queuedReplyTarget = routeSourceJid.startsWith('feishu:')
-            ? routeSourceJid.slice('feishu:'.length)
+          // Strip the prefix through the shared helper, which also drops the
+          // account fragment. Slicing by hand left `#account:` in place, and
+          // requireFeishuRouteTarget only accepts thread/root fragments — so
+          // every account-scoped route threw here instead of sending the card.
+          const queuedReplyTarget = routeSourceJid
+            ? extractProviderTarget(routeSourceJid)
             : messageRouteTarget.raw;
           await sendToFeishu(
             queuedReplyTarget,
