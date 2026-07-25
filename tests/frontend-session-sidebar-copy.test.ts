@@ -28,9 +28,11 @@ describe('session sidebar copy', () => {
     );
     expect(sidebar).toContain("'新建 Web 会话'");
     expect(sidebar).toContain("const sessionNoun = '会话'");
+    expect(sidebar).toContain("{title || '会话'}");
     expect(sidebar).toContain(
       'onBindSession ? () => onBindSession(null) : undefined',
     );
+    expect(sidebar).toContain('onBindSession && !nativeManaged');
     expect(chatView).toContain('isCreatingSession={creatingSession}');
     expect(chatView).toContain("'创建 Web 会话失败'");
     expect(routes).not.toContain(

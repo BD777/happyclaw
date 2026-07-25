@@ -162,7 +162,7 @@ export function SessionSidebar({
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <div className="truncate text-[13px] font-semibold text-foreground">
-                {title || (isTopicWorkspace ? '飞书话题' : '会话')}
+                {title || '会话'}
               </div>
               <span className="rounded-md bg-brand-50 px-1.5 py-0.5 text-[10px] font-medium text-primary dark:bg-brand-700/15 dark:text-brand-300">
                 {totalCount}
@@ -289,7 +289,7 @@ export function SessionSidebar({
                     readonlyTitle={nativeManaged}
                     onSelect={() => onSelectSession(session.id)}
                     onBind={
-                      onBindSession
+                      onBindSession && !nativeManaged
                         ? () => onBindSession(session.id)
                         : undefined
                     }

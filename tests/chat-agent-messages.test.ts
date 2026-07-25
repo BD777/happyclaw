@@ -545,6 +545,19 @@ describe('exact Web run state sequences', () => {
       currentGroup: jid,
       activeAgentTab: { [jid]: null },
       agentWaiting: { [agentId]: true },
+      agents: {
+        [jid]: [
+          {
+            id: agentId,
+            name: '主动调研',
+            prompt: '',
+            status: 'running',
+            kind: 'conversation',
+            created_at: '2026-07-25T00:00:00.000Z',
+            latest_message: null,
+          },
+        ],
+      },
     });
 
     useChatStore.getState().handleWsNewMessage(
@@ -565,6 +578,13 @@ describe('exact Web run state sequences', () => {
     let state = useChatStore.getState();
     expect(state.unreadReplies[jid]).toBe(1);
     expect(state.agentWaiting[agentId]).toBe(true);
+    expect(state.agents[jid][0]).toMatchObject({
+      last_active_at: '2026-07-25T00:00:30.000Z',
+      latest_message: {
+        content: '我先给你一个阶段结论。',
+        timestamp: '2026-07-25T00:00:30.000Z',
+      },
+    });
     expect(notifyIfHiddenMock).toHaveBeenCalledTimes(1);
     expect(showNotificationPromptToastMock).not.toHaveBeenCalled();
 

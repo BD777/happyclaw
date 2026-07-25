@@ -3109,12 +3109,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 [chatJid]: (s.unreadReplies[chatJid] || 0) + 1,
               }
             : s.unreadReplies;
+        const currentAgents = s.agents[chatJid];
+        const nextAgents = currentAgents?.map((agent) =>
+          agent.id === agentId
+            ? {
+                ...agent,
+                last_active_at: msg.timestamp,
+                latest_message: {
+                  content: msg.content,
+                  timestamp: msg.timestamp,
+                },
+              }
+            : agent,
+        );
 
         return {
           agentMessages: { ...s.agentMessages, [agentId]: updated },
           agentWaiting: nextAgentWaiting,
           agentStreaming: nextAgentStreaming,
           unreadReplies: nextUnread,
+          ...(nextAgents
+            ? { agents: { ...s.agents, [chatJid]: nextAgents } }
+            : {}),
         };
       });
       if (snapshotMessages) {
