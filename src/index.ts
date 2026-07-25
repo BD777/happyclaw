@@ -69,8 +69,7 @@ import {
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   closeDatabase,
-  createTask,
-  countTasksByOwner,
+  createTaskWithinOwnerLimit,
   deleteExpiredSessions,
   getExpiredSessionIds,
   deleteTask,
@@ -10833,20 +10832,7 @@ async function processTaskIpc(
           break;
         }
 
-        // Same capacity fuse as the REST surface: an Agent can create schedules
-        // in a loop, and `findDuplicateActiveAgentTask` only blocks byte-identical
-        // definitions, so one changed word is a new task.
         const ipcTaskCap = getSystemSettings().maxTasksPerUser;
-        if (
-          ipcTaskCap > 0 &&
-          taskCreatedBy &&
-          countTasksByOwner(taskCreatedBy) >= ipcTaskCap
-        ) {
-          failSchedule(
-            `Scheduled-task limit reached (${ipcTaskCap}). Delete an existing task first.`,
-          );
-          break;
-        }
 
         const taskId = crypto.randomUUID();
 
@@ -10861,24 +10847,33 @@ async function processTaskIpc(
               targetJid)
             : targetJid;
 
-        createTask({
-          id: taskId,
-          group_folder: targetFolder,
-          chat_jid: targetJid,
-          delivery_route_jid: scheduleDeliveryRouteJid,
-          prompt: data.prompt || '',
-          schedule_type: scheduleType,
-          schedule_value: data.schedule_value,
-          context_mode: contextMode,
-          execution_type: execType,
-          execution_mode: executionMode,
-          script_command: data.script_command ?? null,
-          next_run: nextRun,
-          status: 'active',
-          created_at: new Date().toISOString(),
-          created_by: taskCreatedBy,
-          notify_channels: null,
-        });
+        const creation = createTaskWithinOwnerLimit(
+          {
+            id: taskId,
+            group_folder: targetFolder,
+            chat_jid: targetJid,
+            delivery_route_jid: scheduleDeliveryRouteJid,
+            prompt: data.prompt || '',
+            schedule_type: scheduleType,
+            schedule_value: data.schedule_value,
+            context_mode: contextMode,
+            execution_type: execType,
+            execution_mode: executionMode,
+            script_command: data.script_command ?? null,
+            next_run: nextRun,
+            status: 'active',
+            created_at: new Date().toISOString(),
+            created_by: taskCreatedBy,
+            notify_channels: null,
+          },
+          ipcTaskCap,
+        );
+        if (creation.status === 'limit_reached') {
+          failSchedule(
+            `Scheduled-task limit reached (${creation.limit}). Delete an existing task first.`,
+          );
+          break;
+        }
         notifyTaskSchedulerChanged();
         logger.info(
           { taskId, sourceGroup, targetFolder, contextMode, execType },
@@ -11468,7 +11463,11 @@ async function processTaskIpc(
         });
         break;
       }
-      const mutation = restoreTaskWithRevision(task.id, data.expectedRevision!);
+      const mutation = restoreTaskWithRevision(
+        task.id,
+        data.expectedRevision!,
+        getSystemSettings().maxTasksPerUser,
+      );
       if (mutation.status === 'conflict') {
         writeTaskResult(tasksDir, 'restore_task', data.requestId, {
           success: false,
@@ -11482,6 +11481,12 @@ async function processTaskIpc(
           success: true,
           taskId: task.id,
           revision: mutation.task.revision,
+        });
+      } else if (mutation.status === 'limit_reached') {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          code: 'TASK_LIMIT_REACHED',
+          error: `Scheduled-task limit reached (${mutation.limit}). Delete an existing task first.`,
         });
       } else {
         writeTaskResult(tasksDir, 'restore_task', data.requestId, {

@@ -4078,13 +4078,13 @@ export function getMessagesSince(
   return rows.map((row) => normalizeMessageRow(row));
 }
 
-export function createTask(
-  task: Omit<
-    ScheduledTask,
-    'last_run' | 'last_result' | 'revision' | 'updated_at' | 'deleted_at'
-  > &
-    Partial<Pick<ScheduledTask, 'revision' | 'updated_at' | 'deleted_at'>>,
-): void {
+type CreateTaskInput = Omit<
+  ScheduledTask,
+  'last_run' | 'last_result' | 'revision' | 'updated_at' | 'deleted_at'
+> &
+  Partial<Pick<ScheduledTask, 'revision' | 'updated_at' | 'deleted_at'>>;
+
+export function createTask(task: CreateTaskInput): void {
   const updatedAt = task.updated_at ?? task.created_at;
   db.prepare(
     `
@@ -4116,6 +4116,39 @@ export function createTask(
     // an explicit binding rather than leaving execution to re-derive one.
     task.delivery_route_jid ?? task.chat_jid,
   );
+}
+
+export type TaskCapacityCreateResult =
+  | { status: 'created' }
+  | { status: 'limit_reached'; limit: number; count: number };
+
+/**
+ * Atomically enforce the per-owner live-task fuse and insert a definition.
+ *
+ * Every production writer must use this boundary. Keeping the COUNT and INSERT
+ * in one IMMEDIATE transaction prevents concurrent REST/IPC processes from
+ * observing the same remaining slot.
+ */
+export function createTaskWithinOwnerLimit(
+  task: CreateTaskInput,
+  maxTasksPerUser: number,
+): TaskCapacityCreateResult {
+  return db
+    .transaction((): TaskCapacityCreateResult => {
+      if (maxTasksPerUser > 0 && task.created_by) {
+        const count = countTasksByOwner(task.created_by);
+        if (count >= maxTasksPerUser) {
+          return {
+            status: 'limit_reached',
+            limit: maxTasksPerUser,
+            count,
+          };
+        }
+      }
+      createTask(task);
+      return { status: 'created' };
+    })
+    .immediate();
 }
 
 /** Parse notify_channels from JSON string stored in DB and normalize new fields */
@@ -4214,6 +4247,7 @@ export function updateTask(
       | 'status'
       | 'notify_channels'
       | 'chat_jid'
+      | 'delivery_route_jid'
       | 'group_folder'
     >
   >,
@@ -4276,6 +4310,10 @@ export function updateTask(
     fields.push('chat_jid = ?');
     values.push(updates.chat_jid);
   }
+  if (updates.delivery_route_jid !== undefined) {
+    fields.push('delivery_route_jid = ?');
+    values.push(updates.delivery_route_jid);
+  }
   if (updates.group_folder !== undefined) {
     fields.push('group_folder = ?');
     values.push(updates.group_folder);
@@ -4301,6 +4339,15 @@ export type TaskRevisionMutationResult =
 export type TaskSoftDeleteMutationResult =
   | TaskRevisionMutationResult
   | { status: 'active_run'; task: ScheduledTask; run: TaskRun };
+
+export type TaskRestoreMutationResult =
+  | TaskRevisionMutationResult
+  | {
+      status: 'limit_reached';
+      task: ScheduledTask;
+      limit: number;
+      count: number;
+    };
 
 /**
  * Optimistic mutation used by V2 REST/MCP callers. Legacy updateTask remains
@@ -4357,6 +4404,8 @@ export function updateTaskWithRevision(
     );
   }
   if (updates.chat_jid !== undefined) pushText('chat_jid', updates.chat_jid);
+  if (updates.delivery_route_jid !== undefined)
+    pushText('delivery_route_jid', updates.delivery_route_jid);
   if (updates.group_folder !== undefined)
     pushText('group_folder', updates.group_folder);
 
@@ -4423,27 +4472,43 @@ export function softDeleteTaskWithRevision(
 export function restoreTaskWithRevision(
   id: string,
   expectedRevision: number,
-): TaskRevisionMutationResult {
-  const current = getTaskById(id);
-  if (!current) return { status: 'not_found' };
-  if (current.revision !== expectedRevision) {
-    return { status: 'conflict', task: current };
-  }
-  if (!current.deleted_at) return { status: 'updated', task: current };
-  const now = new Date().toISOString();
-  const result = db
-    .prepare(
-      `UPDATE scheduled_tasks
-       SET deleted_at = NULL, status = 'paused', next_run = NULL,
-           revision = revision + 1, updated_at = ?
-       WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL`,
-    )
-    .run(now, id, expectedRevision);
-  const latest = getTaskById(id);
-  if (result.changes === 1 && latest)
-    return { status: 'updated', task: latest };
-  if (!latest) return { status: 'not_found' };
-  return { status: 'conflict', task: latest };
+  maxTasksPerUser = 0,
+): TaskRestoreMutationResult {
+  return db
+    .transaction((): TaskRestoreMutationResult => {
+      const current = getTaskById(id);
+      if (!current) return { status: 'not_found' };
+      if (current.revision !== expectedRevision) {
+        return { status: 'conflict', task: current };
+      }
+      if (!current.deleted_at) return { status: 'updated', task: current };
+      if (maxTasksPerUser > 0 && current.created_by) {
+        const count = countTasksByOwner(current.created_by);
+        if (count >= maxTasksPerUser) {
+          return {
+            status: 'limit_reached',
+            task: current,
+            limit: maxTasksPerUser,
+            count,
+          };
+        }
+      }
+      const now = new Date().toISOString();
+      const result = db
+        .prepare(
+          `UPDATE scheduled_tasks
+           SET deleted_at = NULL, status = 'paused', next_run = NULL,
+               revision = revision + 1, updated_at = ?
+           WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL`,
+        )
+        .run(now, id, expectedRevision);
+      const latest = getTaskById(id);
+      if (result.changes === 1 && latest)
+        return { status: 'updated', task: latest };
+      if (!latest) return { status: 'not_found' };
+      return { status: 'conflict', task: latest };
+    })
+    .immediate();
 }
 
 export function updateTaskWorkspace(
@@ -4651,6 +4716,7 @@ function taskDefinitionSnapshot(
     prompt: task.prompt,
     group_folder: task.group_folder,
     chat_jid: task.chat_jid,
+    delivery_route_jid: task.delivery_route_jid ?? task.chat_jid,
     context_mode: task.context_mode,
     execution_type: task.execution_type,
     execution_mode: task.execution_mode ?? null,
@@ -4663,11 +4729,15 @@ function mapTaskRunRow(row: TaskRunRow): TaskRun {
   let snapshot: TaskRunDefinitionSnapshot;
   try {
     snapshot = JSON.parse(row.definition_snapshot) as TaskRunDefinitionSnapshot;
+    if (snapshot.delivery_route_jid === undefined) {
+      snapshot.delivery_route_jid = snapshot.chat_jid || null;
+    }
   } catch {
     snapshot = {
       prompt: '',
       group_folder: '',
       chat_jid: '',
+      delivery_route_jid: null,
       context_mode: 'isolated',
       execution_type: 'agent',
       execution_mode: null,

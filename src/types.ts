@@ -542,6 +542,7 @@ export interface TaskRunDefinitionSnapshot {
   prompt: string;
   group_folder: string;
   chat_jid: string;
+  delivery_route_jid: string | null;
   context_mode: 'group' | 'isolated';
   execution_type: 'agent' | 'script';
   execution_mode: 'host' | 'container' | null;
