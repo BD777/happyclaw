@@ -51,16 +51,34 @@ export const ChannelAccountPatchSchema = z.object({
   credentials: ChannelCredentialsSchema.optional(),
 });
 
+/**
+ * A schedule's prompt is replayed on a timer, so it is stored content with no
+ * natural bound.
+ *
+ * Exported because the REST schemas are not the only writers: the MCP/IPC
+ * `schedule_task` and `update_task` handlers call createTask/updateTask
+ * directly. The Agent path is the one this cap exists for, so it must use the
+ * same number rather than leave the hole open.
+ */
+export const MAX_TASK_PROMPT_LENGTH = 16384;
+
+/** Same reasoning as MAX_TASK_PROMPT_LENGTH, for script tasks. */
+export const MAX_TASK_SCRIPT_COMMAND_LENGTH = 4096;
+
 export const TaskPatchSchema = z.object({
   chat_jid: z.string().min(1).optional(),
   // Same bound as TaskCreateSchema; an update must not be a way around it.
-  prompt: z.string().max(16384).optional(),
+  prompt: z.string().max(MAX_TASK_PROMPT_LENGTH).optional(),
   schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
   schedule_value: z.string().optional(),
   context_mode: z.enum(['group', 'isolated']).optional(),
   execution_type: z.enum(['agent', 'script']).optional(),
   execution_mode: z.enum(['host', 'container']).optional(),
-  script_command: z.string().max(4096).nullable().optional(),
+  script_command: z
+    .string()
+    .max(MAX_TASK_SCRIPT_COMMAND_LENGTH)
+    .nullable()
+    .optional(),
   status: z.enum(['active', 'paused']).optional(),
   // next_run 必须是可解析的 ISO 日期。schedule_value 在 PATCH 路由里随
   // schedule_type 决定语义（cron/interval/once 各有要求），路由层会单独检查。
@@ -104,16 +122,14 @@ export const TaskCreateSchema = z
   .object({
     group_folder: z.string().min(1).optional(),
     chat_jid: z.string().min(1).optional(),
-    // A schedule's prompt is replayed on a timer, so it is stored content with
-    // no natural bound. `script_command` was already capped; this closes the
-    // same hole on the Agent path.
-    prompt: z.string().max(16384).optional().default(''),
+    // See MAX_TASK_PROMPT_LENGTH: the same bound applies on every writer.
+    prompt: z.string().max(MAX_TASK_PROMPT_LENGTH).optional().default(''),
     schedule_type: z.enum(['cron', 'interval', 'once']),
     schedule_value: z.string().min(1),
     context_mode: z.enum(['group', 'isolated']).optional(),
     execution_type: z.enum(['agent', 'script']).optional(),
     execution_mode: z.enum(['host', 'container']).optional(),
-    script_command: z.string().max(4096).optional(),
+    script_command: z.string().max(MAX_TASK_SCRIPT_COMMAND_LENGTH).optional(),
     notify_channels: z
       .array(
         z.enum([

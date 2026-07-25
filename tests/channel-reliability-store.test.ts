@@ -1200,3 +1200,109 @@ describe('durable streaming card state and cleanup', () => {
     expect(reliability.getStreamingCardRecord(card.id)).toBeUndefined();
   });
 });
+
+describe('uncertain outbox operator surface', () => {
+  test('lists uncertain rows oldest-first so an operator can reach them', () => {
+    // An uncertain row fences its whole turn until a human decides whether the
+    // provider accepted the message. Nothing in the runtime can make that
+    // call, so without a way to enumerate them the fence has no release and
+    // the rows are unreachable — the turn can then never reach 'completed'.
+    const run = reliability.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'outbox-turn:operator-listing',
+      now: '2026-07-23T03:00:00.000Z',
+    }).run;
+
+    const before = reliability.listUncertainChannelOutbox().length;
+
+    const created = reliability.enqueueChannelOutbox({
+      ...route,
+      turnRunId: run.id,
+      ordinal: 0,
+      kind: 'text',
+      payload: { text: 'ack lost mid-send' },
+      now: '2026-07-23T03:00:00.100Z',
+    }).item;
+    const claim = reliability.claimChannelOutboxById(
+      created.id,
+      'operator-sender',
+      1_000,
+      '2026-07-23T03:00:00.200Z',
+    )!;
+    reliability.markChannelOutboxSending(claim, '2026-07-23T03:00:00.300Z');
+    reliability.reconcileExpiredChannelOutbox('2026-07-23T03:00:01.400Z');
+
+    const listed = reliability.listUncertainChannelOutbox();
+    expect(listed.length).toBe(before + 1);
+    const mine = listed.find((item) => item.id === created.id)!;
+    expect(mine.status).toBe('uncertain');
+    expect(mine.turnRunId).toBe(run.id);
+
+    // Resolving it removes it from the operator queue.
+    expect(
+      reliability.resolveUncertainChannelOutbox(mine.id, mine.revision, {
+        resolution: 'failed',
+        error: 'operator confirmed the provider never accepted it',
+        now: '2026-07-23T03:00:02.000Z',
+      }),
+    ).toBe(true);
+    expect(
+      reliability
+        .listUncertainChannelOutbox()
+        .some((item) => item.id === created.id),
+    ).toBe(false);
+  });
+
+  test('a stale revision cannot resolve the row twice', () => {
+    const run = reliability.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'outbox-turn:operator-cas',
+      now: '2026-07-23T04:00:00.000Z',
+    }).run;
+    const created = reliability.enqueueChannelOutbox({
+      ...route,
+      turnRunId: run.id,
+      ordinal: 0,
+      kind: 'text',
+      payload: { text: 'double-resolve guard' },
+      now: '2026-07-23T04:00:00.100Z',
+    }).item;
+    const claim = reliability.claimChannelOutboxById(
+      created.id,
+      'cas-sender',
+      1_000,
+      '2026-07-23T04:00:00.200Z',
+    )!;
+    reliability.markChannelOutboxSending(claim, '2026-07-23T04:00:00.300Z');
+    reliability.reconcileExpiredChannelOutbox('2026-07-23T04:00:01.400Z');
+
+    const uncertain = reliability.getChannelOutboxItem(created.id)!;
+    expect(
+      reliability.resolveUncertainChannelOutbox(
+        uncertain.id,
+        uncertain.revision,
+        {
+          resolution: 'delivered',
+          providerMessageId: 'confirmed-by-operator',
+          now: '2026-07-23T04:00:02.000Z',
+        },
+      ),
+    ).toBe(true);
+    // Replaying the same revision must not flip a settled row again.
+    expect(
+      reliability.resolveUncertainChannelOutbox(
+        uncertain.id,
+        uncertain.revision,
+        {
+          resolution: 'failed',
+          error: 'stale replay',
+          now: '2026-07-23T04:00:03.000Z',
+        },
+      ),
+    ).toBe(false);
+    expect(reliability.getChannelOutboxItem(created.id)).toMatchObject({
+      status: 'delivered',
+      providerMessageId: 'confirmed-by-operator',
+    });
+  });
+});

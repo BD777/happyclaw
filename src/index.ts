@@ -354,6 +354,10 @@ import {
   saveUserWeChatConfig,
   updateAllSessionCredentials,
 } from './runtime-config.js';
+import {
+  MAX_TASK_PROMPT_LENGTH,
+  MAX_TASK_SCRIPT_COMMAND_LENGTH,
+} from './schemas.js';
 import type {
   FeishuConnectConfig,
   TelegramConnectConfig,
@@ -1226,6 +1230,29 @@ const activeIpcReplyTurnTrackers = new Map<string, IpcReplyTurnTracker>();
 const activeTurnOutputs = new ActiveTurnOutputRegistry(
   () => getSystemSettings().maxRepliesPerTurn,
 );
+
+/**
+ * Per-turn reply fuse shared by every user-visible IPC delivery path.
+ *
+ * `send_message`, `send_image`, `send_file` and `feishu_send_card` all spend
+ * the same budget through `recordDeliveredUtterance`, so they must all consult
+ * it before delivering. Gating only one of them lets the unchecked paths drain
+ * the budget silently and then refuse the single path that does check.
+ *
+ * A delivery without an `inputTurnId` is never blocked: it is not recorded
+ * against a turn either, so it spends nothing.
+ */
+function canDeliverTurnUtterance(
+  sourceGroup: string,
+  ipcAgentId: string | null | undefined,
+  inputTurnId: unknown,
+): boolean {
+  if (typeof inputTurnId !== 'string' || !inputTurnId) return true;
+  return activeTurnOutputs.canDeliverUtterance({
+    scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
+    inputTurnId,
+  });
+}
 
 // Host-owned current-turn registry. Agent Builder authorization never trusts
 // turn/chat/task claims from the runner's writable IPC JSON.
@@ -9730,6 +9757,45 @@ function startIpcWatcher(): void {
                     await fsp.unlink(filePath);
                     continue;
                   }
+                  // Runaway-loop fuse, sharing send_message's budget. An image
+                  // is an irreversible side effect in a real chat, so it must
+                  // be gated too: otherwise images drain the budget silently
+                  // and the turn's actual answer is the delivery that gets
+                  // refused. Task images keep their own accounting.
+                  if (
+                    !isTaskIpcImage &&
+                    !canDeliverTurnUtterance(
+                      sourceGroup,
+                      ipcAgentId,
+                      data.inputTurnId,
+                    )
+                  ) {
+                    logger.warn(
+                      {
+                        sourceGroup,
+                        agentId: ipcAgentId,
+                        inputTurnId: data.inputTurnId,
+                      },
+                      'Suppressed IPC send_image: per-turn reply limit reached',
+                    );
+                    messageResultWritten = writeIpcMessageResult(
+                      messageResultsDir,
+                      messageRequestId,
+                      { success: false, error: REPLY_LIMIT_REACHED_ERROR },
+                    );
+                    if (
+                      !canDeleteAcknowledgedIpcSource(
+                        messageRequestId,
+                        messageResultWritten,
+                      )
+                    ) {
+                      throw new Error(
+                        'Failed to acknowledge reply-limited image request',
+                      );
+                    }
+                    await fsp.unlink(filePath);
+                    continue;
+                  }
                   const imgImRoute = isTaskIpcImage
                     ? null
                     : resolveImRoute({
@@ -10641,6 +10707,29 @@ async function processTaskIpc(
           break;
         }
 
+        // Same bound the REST surface enforces. This is the path the cap was
+        // written for: an Agent exposed to untrusted content can otherwise
+        // write an unbounded prompt into scheduled_tasks, where it is stored
+        // and replayed on every tick.
+        if (
+          typeof data.prompt === 'string' &&
+          data.prompt.length > MAX_TASK_PROMPT_LENGTH
+        ) {
+          failSchedule(
+            `prompt exceeds the maximum length of ${MAX_TASK_PROMPT_LENGTH} characters.`,
+          );
+          break;
+        }
+        if (
+          typeof data.script_command === 'string' &&
+          data.script_command.length > MAX_TASK_SCRIPT_COMMAND_LENGTH
+        ) {
+          failSchedule(
+            `script_command exceeds the maximum length of ${MAX_TASK_SCRIPT_COMMAND_LENGTH} characters.`,
+          );
+          break;
+        }
+
         // Only admin home can create script tasks
         if (execType === 'script' && !isAdminHome) {
           failSchedule(
@@ -11117,6 +11206,25 @@ async function processTaskIpc(
         patch.execution_mode =
           data.execution_mode === 'host' ? 'host' : 'container';
       }
+      // An update must not be a way around the create-time bound.
+      if (
+        typeof data.prompt === 'string' &&
+        data.prompt.length > MAX_TASK_PROMPT_LENGTH
+      ) {
+        failUpdate(
+          `prompt exceeds the maximum length of ${MAX_TASK_PROMPT_LENGTH} characters.`,
+        );
+        break;
+      }
+      if (
+        typeof data.script_command === 'string' &&
+        data.script_command.length > MAX_TASK_SCRIPT_COMMAND_LENGTH
+      ) {
+        failUpdate(
+          `script_command exceeds the maximum length of ${MAX_TASK_SCRIPT_COMMAND_LENGTH} characters.`,
+        );
+        break;
+      }
       if (data.prompt !== undefined) patch.prompt = data.prompt;
       if (data.script_command !== undefined)
         patch.script_command = data.script_command;
@@ -11520,6 +11628,24 @@ async function processTaskIpc(
           operation: data.operation as FeishuCapabilityOperation,
           params: data.params,
         };
+        // Runaway-loop fuse, sharing send_message's budget. `send_card` is the
+        // only capability that emits new user-visible content, and it is the
+        // only one recorded against the turn — so it is the only one gated.
+        // Reactions, edits and recalls act on existing messages.
+        if (
+          request.operation === 'send_card' &&
+          !canDeliverTurnUtterance(sourceGroup, ipcAgentId, data.inputTurnId)
+        ) {
+          logger.warn(
+            {
+              sourceGroup,
+              agentId: ipcAgentId,
+              inputTurnId: data.inputTurnId,
+            },
+            'Suppressed IPC feishu send_card: per-turn reply limit reached',
+          );
+          throw new Error(REPLY_LIMIT_REACHED_ERROR);
+        }
         let result;
         if (isFeishuCapabilityMutation(request)) {
           const outboxScope = activeChannelOutboxScopes.resolveInput(
@@ -12045,6 +12171,26 @@ async function processTaskIpc(
                   ? undefined
                   : delivery.receipt.error || 'File delivery failed.',
               );
+            } else if (
+              regularFileImRoute &&
+              !canDeliverTurnUtterance(
+                sourceGroup,
+                ipcAgentId,
+                data.inputTurnId,
+              )
+            ) {
+              // Runaway-loop fuse, sharing send_message's budget. A delivered
+              // file is user-visible speech and is recorded against the turn,
+              // so it must be gated by the same bound.
+              logger.warn(
+                {
+                  sourceGroup,
+                  agentId: ipcAgentId,
+                  inputTurnId: data.inputTurnId,
+                },
+                'Suppressed IPC send_file: per-turn reply limit reached',
+              );
+              finishSendFile(false, REPLY_LIMIT_REACHED_ERROR);
             } else if (regularFileImRoute) {
               const regularFileOutboxRef = channelOutboxRefForInput(
                 channelTurnScope(sourceGroup, ipcAgentId),

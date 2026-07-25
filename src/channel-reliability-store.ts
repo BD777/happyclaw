@@ -1704,6 +1704,26 @@ export function hasUncertainChannelOutbox(turnRunId: string): boolean {
   return Boolean(getUncertainChannelOutboxForTurn(turnRunId));
 }
 
+/**
+ * Every uncertain side effect awaiting reconciliation, oldest first.
+ *
+ * An uncertain row fences its whole turn until someone decides whether the
+ * provider actually accepted the message. Nothing in the runtime can make that
+ * call, so this backs the operator surface that does — without it the fence
+ * has no release and the rows are unreachable.
+ */
+export function listUncertainChannelOutbox(limit = 100): ChannelOutboxItem[] {
+  const bounded = Math.min(Math.max(Math.trunc(limit) || 0, 1), 500);
+  const rows = requireDatabase()
+    .prepare(
+      `SELECT * FROM channel_outbox
+       WHERE status = 'uncertain'
+       ORDER BY updated_at, id LIMIT ?`,
+    )
+    .all(bounded) as OutboxRow[];
+  return rows.map(mapOutbox);
+}
+
 export function claimNextChannelOutbox(
   owner: string,
   leaseMs: number,

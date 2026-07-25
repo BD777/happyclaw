@@ -149,6 +149,7 @@ Home Workspace 永远不可删除。其他工作区必须通过 Modify，删除�
 | 审计日志和导出                                    | `view_audit_log`                                   |
 | `/api/billing/admin/*`                            | `manage_billing`                                   |
 | `/api/docker/build`、运行监控管理                 | `manage_system_config`                             |
+| `/api/status/channel-outbox/*` 人工裁决           | `manage_system_config`                             |
 | `POST /api/groups/:jid/reset-owner`               | admin break-glass，同时仍验证目标资源              |
 
 系统 MCP 默认仅 admin 可用；只有显式设置为 shared 后，普通成员的 Agent 才能进入

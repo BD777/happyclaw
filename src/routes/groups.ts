@@ -111,6 +111,13 @@ import {
 const execFileAsync = promisify(execFile);
 
 /**
+ * The workspace lost its AgentProfile binding between the PATCH pre-check and
+ * the commit. interaction_mode is stored on that row, so the update cannot be
+ * persisted — a client-correctable conflict, never a server fault.
+ */
+class WorkspaceAgentProfileMissingError extends Error {}
+
+/**
  * 检查 hostname 是否为内网地址（SSRF 防护）。
  * 拒绝 127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, ::1, fd00::, fe80:: 等。
  *
@@ -1000,6 +1007,25 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     unpinGroup(authUser.id, jid);
   }
 
+  // interaction_mode lives on the Workspace↔AgentProfile binding row, so a
+  // workspace without one cannot store it. The startup backfill only maps
+  // web workspaces whose created_by is set, leaving legacy ownerless rows
+  // unbound. Refuse up front: throwing inside commitUpdate would surface as a
+  // 500 and, on the quiesce path, only after the runtime was already stopped.
+  if (
+    interaction_mode !== undefined &&
+    !getWorkspaceAgentProfileId(existing.folder)
+  ) {
+    return c.json(
+      {
+        error:
+          'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+        code: 'WORKSPACE_AGENT_PROFILE_MISSING',
+      },
+      409,
+    );
+  }
+
   // Interaction mode is stored on the Workspace↔AgentProfile binding rather
   // than registered_groups. It still shares the execution-mode quiesce
   // boundary so a warm runner can observe only the old or the new contract.
@@ -1044,7 +1070,10 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         interaction_mode !== undefined &&
         !setWorkspaceInteractionMode(existing.folder, interaction_mode)
       ) {
-        throw new Error(
+        // The pre-check above already rejected unbound workspaces, so reaching
+        // here means the binding was deleted concurrently. Keep it a typed
+        // error so both commit paths answer 409 instead of leaking a 500.
+        throw new WorkspaceAgentProfileMissingError(
           `Workspace ${jid} has no AgentProfile binding for interaction mode update`,
         );
       }
@@ -1090,6 +1119,17 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         );
         deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
       } catch (err) {
+        if (err instanceof WorkspaceAgentProfileMissingError) {
+          deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
+          return c.json(
+            {
+              error:
+                'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+              code: 'WORKSPACE_AGENT_PROFILE_MISSING',
+            },
+            409,
+          );
+        }
         if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
         if (err.persisted) {
           deps.queue?.blockGroupsForRuntimeSafety?.(
@@ -1109,7 +1149,19 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         );
       }
     } else {
-      commitUpdate();
+      try {
+        commitUpdate();
+      } catch (err) {
+        if (!(err instanceof WorkspaceAgentProfileMissingError)) throw err;
+        return c.json(
+          {
+            error:
+              'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+            code: 'WORKSPACE_AGENT_PROFILE_MISSING',
+          },
+          409,
+        );
+      }
     }
   }
 
