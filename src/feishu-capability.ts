@@ -122,6 +122,107 @@ function boundedInt(
     : fallback;
 }
 
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): boolean {
+  const allowedKeys = new Set(allowed);
+  return Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+/**
+ * Models frequently remember the legacy interactive-card wrappers while also
+ * selecting Schema 2.0. Feishu rejects that mixed shape with HTTP 400 even
+ * though the user-visible intent is unambiguous. Normalize only exact,
+ * content-preserving legacy shapes at the trusted broker boundary:
+ *
+ * - `action.actions[]` -> standalone Schema 2.0 action elements
+ * - `note` -> notation-sized markdown
+ * - `header.theme.color_style` -> `header.template`
+ *
+ * Unknown elements remain untouched so the provider can return a definitive
+ * validation error instead of the broker silently dropping content.
+ */
+export function normalizeFeishuCardForSend(
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  const card = { ...input };
+  if (card.schema !== '2.0') return card;
+
+  const header = record(card.header);
+  if (Object.keys(header).length > 0) {
+    const normalizedHeader = { ...header };
+    const theme = record(normalizedHeader.theme);
+    const legacyTemplate = optionalString(theme.color_style);
+    if (
+      !optionalString(normalizedHeader.template) &&
+      legacyTemplate &&
+      hasOnlyKeys(theme, ['color_style'])
+    ) {
+      normalizedHeader.template = legacyTemplate;
+      delete normalizedHeader.theme;
+    }
+    card.header = normalizedHeader;
+  }
+
+  const body = record(card.body);
+  if (Object.keys(body).length === 0 || !Array.isArray(body.elements)) {
+    return card;
+  }
+
+  const elements: Record<string, unknown>[] = [];
+  for (const value of body.elements) {
+    const element = record(value);
+    const tag = optionalString(element.tag);
+
+    if (tag === 'action') {
+      const actions = Array.isArray(element.actions) ? element.actions : [];
+      const buttons = actions.map(record);
+      const canFlatten =
+        hasOnlyKeys(element, ['tag', 'actions']) &&
+        buttons.length > 0 &&
+        buttons.every(
+          (button) =>
+            optionalString(button.tag) === 'button' &&
+            Object.keys(button).length > 1,
+        );
+      if (canFlatten) {
+        elements.push(...buttons.map((button) => ({ ...button })));
+        continue;
+      }
+    }
+
+    if (tag === 'note') {
+      const notes = Array.isArray(element.elements) ? element.elements : [];
+      const plainTexts = notes.map(record);
+      const canConvert =
+        hasOnlyKeys(element, ['tag', 'elements']) &&
+        plainTexts.length > 0 &&
+        plainTexts.every(
+          (text) =>
+            optionalString(text.tag) === 'plain_text' &&
+            Boolean(optionalString(text.content)) &&
+            hasOnlyKeys(text, ['tag', 'content']),
+        );
+      if (canConvert) {
+        elements.push({
+          tag: 'markdown',
+          content: plainTexts
+            .map((text) => optionalString(text.content)!)
+            .join(' · '),
+          text_size: 'notation',
+        });
+        continue;
+      }
+    }
+
+    elements.push({ ...element });
+  }
+
+  card.body = { ...body, elements };
+  return card;
+}
+
 function assertApiSuccess(operation: string, response: unknown): void {
   const result = record(response);
   if (typeof result.code === 'number' && result.code !== 0) {
@@ -129,6 +230,40 @@ function assertApiSuccess(operation: string, response: unknown): void {
       `${operation} failed (code=${result.code}, msg=${optionalString(result.msg) || 'unknown'})`,
     );
   }
+}
+
+/**
+ * The Lark SDK throws Axios-style errors for HTTP-level 4xx responses before
+ * `assertApiSuccess()` can inspect the Feishu body. A received 4xx response is
+ * still authoritative evidence that the provider rejected the mutation; only
+ * timeouts/disconnects without a response remain uncertain.
+ */
+export function definitiveFeishuHttpRejection(
+  error: unknown,
+): DefinitiveFeishuCapabilityError | null {
+  if (error instanceof DefinitiveFeishuCapabilityError) return error;
+  const response = record(record(error).response);
+  const status =
+    typeof response.status === 'number' ? response.status : undefined;
+  // HTTP 408 is commonly synthesized by an intermediary after the upstream
+  // may already have accepted the request, so it retains the uncertain fence.
+  if (status === undefined || status < 400 || status >= 500 || status === 408) {
+    return null;
+  }
+
+  const data = record(response.data);
+  const code =
+    typeof data.code === 'number' || typeof data.code === 'string'
+      ? String(data.code)
+      : 'unknown';
+  const detail = (optionalString(data.msg) || 'request rejected').slice(
+    0,
+    1000,
+  );
+  return new DefinitiveFeishuCapabilityError(
+    `Feishu rejected the request (http=${status}, code=${code}, msg=${detail})`,
+    { cause: error },
+  );
 }
 
 function currentChatId(context: ChannelTurnContext): string {
@@ -478,7 +613,7 @@ export async function executeFeishuCapability(
       if (requestedMessageId) {
         await assertMessageInCurrentChat(client, context, requestedMessageId);
       }
-      const card = record(params.card);
+      const card = normalizeFeishuCardForSend(record(params.card));
       if (Object.keys(card).length === 0) {
         throw new DefinitiveFeishuCapabilityError('Card is required');
       }

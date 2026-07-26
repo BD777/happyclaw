@@ -18,7 +18,10 @@ import type {
   FeishuCapabilityRequest,
   FeishuCapabilityResult,
 } from './feishu-capability.js';
-import { DefinitiveFeishuCapabilityError } from './feishu-capability.js';
+import {
+  definitiveFeishuHttpRejection,
+  DefinitiveFeishuCapabilityError,
+} from './feishu-capability.js';
 
 export interface DeliverFeishuCapabilityMutationInput extends ChannelRouteSnapshot {
   turnRunId: string;
@@ -81,9 +84,13 @@ export async function deliverFeishuCapabilityMutation(
         try {
           providerResult = await input.execute();
         } catch (error) {
-          if (error instanceof DefinitiveFeishuCapabilityError) {
-            throw new DefinitiveChannelDeliveryError(error.message, {
-              cause: error,
+          const rejection =
+            error instanceof DefinitiveFeishuCapabilityError
+              ? error
+              : definitiveFeishuHttpRejection(error);
+          if (rejection) {
+            throw new DefinitiveChannelDeliveryError(rejection.message, {
+              cause: rejection,
             });
           }
           throw error;

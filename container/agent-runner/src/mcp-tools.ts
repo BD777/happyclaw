@@ -394,7 +394,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     ),
     tool(
       'feishu_send_card',
-      'Send an interactive Feishu card to the current chat/thread as the Bot bound to this turn. The host locks the destination to the current context.',
+      'Send a Schema 2.0 interactive Feishu card to the current chat/thread as the Bot bound to this turn. The host locks the destination to the current context. Put standalone button elements directly in body.elements (never wrap them in tag=action); use header.template instead of header.theme, and notation-sized markdown instead of tag=note. If the provider rejects the card, send the final result with send_message instead.',
       {
         card: z.record(z.string(), z.unknown()),
         reply_to_message_id: z.string().optional(),

@@ -5721,6 +5721,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         utteranceDelivered:
           channelPhysicalDeliveryAckByInput.get(inputTurnId) === true,
         runnerFailed: true,
+        healthyInputTurnCompleted: healthyCompletedInputTurns.has(inputTurnId),
       })
     ) {
       return false;
@@ -8220,6 +8221,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       mode: interactionMode,
       utteranceDelivered: ipcReplyTurnTracker.delivered,
       runnerFailed: isErrorExit,
+      healthyInputTurnCompleted: healthyCompletedInputTurns.has(
+        ipcReplyTurnTracker.inputTurnId,
+      ),
     })
   ) {
     await notifyProactiveTailInterruption(ipcReplyTurnTracker.inputTurnId);
@@ -13590,6 +13594,8 @@ async function processAgentConversation(
         utteranceDelivered:
           agentPhysicalDeliveryAckByInput.get(inputTurnId) === true,
         runnerFailed: true,
+        healthyInputTurnCompleted:
+          healthyAgentCompletedInputTurns.has(inputTurnId),
       })
     ) {
       return false;
@@ -15292,6 +15298,9 @@ async function processAgentConversation(
         utteranceDelivered:
           agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true,
         runnerFailed: hadError || agentClosed,
+        healthyInputTurnCompleted: healthyAgentCompletedInputTurns.has(
+          activeAgentInputTurnId,
+        ),
       })
     ) {
       await notifyProactiveAgentTailInterruption(activeAgentInputTurnId);

@@ -146,8 +146,12 @@ export function shouldSendProactiveTailInterruptionNotice(input: {
   mode: InteractionMode;
   utteranceDelivered: boolean;
   runnerFailed: boolean;
+  healthyInputTurnCompleted: boolean;
 }): boolean {
   return (
-    input.mode === 'proactive' && input.utteranceDelivered && input.runnerFailed
+    input.mode === 'proactive' &&
+    input.utteranceDelivered &&
+    input.runnerFailed &&
+    !input.healthyInputTurnCompleted
   );
 }

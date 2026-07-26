@@ -300,6 +300,7 @@ describe('workspace interaction runtime policy', () => {
         mode: 'proactive',
         utteranceDelivered: true,
         runnerFailed: true,
+        healthyInputTurnCompleted: false,
       }),
     ).toBe(true);
     expect(PROACTIVE_TAIL_INTERRUPTION_NOTICE).toContain('可能不完整');
@@ -308,6 +309,7 @@ describe('workspace interaction runtime policy', () => {
         mode: 'proactive',
         utteranceDelivered: false,
         runnerFailed: true,
+        healthyInputTurnCompleted: false,
       }),
     ).toBe(false);
     expect(
@@ -315,6 +317,15 @@ describe('workspace interaction runtime policy', () => {
         mode: 'assistant',
         utteranceDelivered: true,
         runnerFailed: true,
+        healthyInputTurnCompleted: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSendProactiveTailInterruptionNotice({
+        mode: 'proactive',
+        utteranceDelivered: true,
+        runnerFailed: true,
+        healthyInputTurnCompleted: true,
       }),
     ).toBe(false);
   });
@@ -337,6 +348,12 @@ describe('workspace interaction runtime policy', () => {
     );
     expect(source).toContain(
       'await notifyProactiveAgentTailInterruption(activeAgentInputTurnId)',
+    );
+    expect(source).toContain(
+      'healthyInputTurnCompleted: healthyCompletedInputTurns.has(inputTurnId)',
+    );
+    expect(source).toContain(
+      'healthyAgentCompletedInputTurns.has(inputTurnId)',
     );
   });
 });
