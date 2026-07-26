@@ -51,7 +51,8 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
-const { buildVolumeMounts } = await import('../src/container-runner.js');
+const { buildVolumeMounts, getContainerRuntimeEnvDir } =
+  await import('../src/container-runner.js');
 
 function writeMcpStore(
   ownerId: string,
@@ -166,6 +167,46 @@ afterAll(() => {
 });
 
 describe('managed MCP runtime secret boundary', () => {
+  test('isolates generated env paths by Bot identity and runtime', () => {
+    const botAAgent = getContainerRuntimeEnvDir(
+      'workspace',
+      'agent-a',
+      undefined,
+      'account-a',
+    );
+    const botBAgent = getContainerRuntimeEnvDir(
+      'workspace',
+      'agent-a',
+      undefined,
+      'account-b',
+    );
+    const botAMain = getContainerRuntimeEnvDir(
+      'workspace',
+      undefined,
+      undefined,
+      'account-a',
+    );
+    const botATask = getContainerRuntimeEnvDir(
+      'workspace',
+      undefined,
+      'task-a',
+      'account-a',
+    );
+
+    expect(new Set([botAAgent, botBAgent, botAMain, botATask]).size).toBe(4);
+    expect(botAAgent).toContain(
+      path.join('channel-accounts', 'account-a', 'agents', 'agent-a'),
+    );
+    expect(() =>
+      getContainerRuntimeEnvDir(
+        'workspace',
+        '../escape',
+        undefined,
+        'account-a',
+      ),
+    ).toThrow(/Invalid agent id/);
+  });
+
   test('member runtime receives only explicitly shared system MCP, regardless of where tokens are stored', () => {
     const ownerId = 'member-owner';
     ownerRoles.set(ownerId, 'member');

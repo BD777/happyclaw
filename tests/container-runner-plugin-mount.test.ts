@@ -470,7 +470,7 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
 
 describe('buildVolumeMounts — AgentProfile runtime policy', () => {
   test('does not write retired Agent tool restrictions into the container env', () => {
-    buildVolumeMounts(
+    const mounts = buildVolumeMounts(
       fakeGroup('grp-policy-tools', USER) as any,
       false,
       true,
@@ -493,7 +493,11 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       },
     );
 
-    const envFile = path.join(tmpDataDir, 'env', 'grp-policy-tools', 'env');
+    const envMount = mounts.find(
+      (mount) => mount.containerPath === '/workspace/env-dir',
+    );
+    expect(envMount).toBeTruthy();
+    const envFile = path.join(envMount!.hostPath, 'env');
     const envContent = fs.readFileSync(envFile, 'utf-8');
     expect(envContent).not.toContain('HAPPYCLAW_AGENT_DISALLOWED_TOOLS=');
     expect(envContent).not.toContain('HAPPYCLAW_AGENT_TOOL_POLICY=');
@@ -733,7 +737,7 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       }),
     );
 
-    buildVolumeMounts(
+    const mounts = buildVolumeMounts(
       fakeGroup('grp-policy-mcp', USER) as any,
       false,
       true,
@@ -771,7 +775,11 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       'projectDb',
     ]);
     expect(settings.mcpServers).not.toHaveProperty('slack');
-    const envFile = path.join(tmpDataDir, 'env', 'grp-policy-mcp', 'env');
+    const envMount = mounts.find(
+      (mount) => mount.containerPath === '/workspace/env-dir',
+    );
+    expect(envMount).toBeTruthy();
+    const envFile = path.join(envMount!.hostPath, 'env');
     expect(fs.readFileSync(envFile, 'utf8')).toContain(
       "HAPPYCLAW_AGENT_MCP_POLICY='custom'",
     );

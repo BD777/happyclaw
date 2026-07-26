@@ -102,6 +102,12 @@ import {
   writeRunLog,
   type CloseHandlerContext,
 } from './agent-output-parser.js';
+import {
+  applyFeishuCliBindingToEnvironment,
+  applyFeishuCliBindingToEnvLines,
+  prepareFeishuCliRuntimeBinding,
+  type FeishuCliRuntimeBinding,
+} from './feishu-cli-runtime.js';
 
 /**
  * 宿主机的 ~/.claude.json 路径。
@@ -952,6 +958,49 @@ export function applyFallbackModelToEnvLines(
   envLines.push(`HAPPYCLAW_FALLBACK_MODEL=${fallbackModel}`);
 }
 
+function assertRuntimeEnvPathSegment(value: string, label: string): string {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new Error(`Invalid ${label} for container environment isolation`);
+  }
+  return value;
+}
+
+/**
+ * Keep generated env files isolated by both runtime and Feishu Bot identity.
+ *
+ * Conversation agents and task runs can execute concurrently inside one
+ * workspace. A bound channel account is also included so two Bots routed to
+ * the same main workspace can never overwrite each other's credentials.
+ */
+export function getContainerRuntimeEnvDir(
+  groupFolder: string,
+  ipcAgentId?: string,
+  taskRunId?: string,
+  feishuChannelAccountId?: string | null,
+): string {
+  const identityPath = feishuChannelAccountId
+    ? [
+        'channel-accounts',
+        assertRuntimeEnvPathSegment(
+          feishuChannelAccountId,
+          'Feishu channel account id',
+        ),
+      ]
+    : ['default'];
+  const runtimePath = ipcAgentId
+    ? ['agents', assertRuntimeEnvPathSegment(ipcAgentId, 'agent id')]
+    : taskRunId
+      ? ['tasks-run', assertRuntimeEnvPathSegment(taskRunId, 'task run id')]
+      : ['main'];
+  return path.join(
+    DATA_DIR,
+    'env',
+    groupFolder,
+    ...identityPath,
+    ...runtimePath,
+  );
+}
+
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
@@ -962,6 +1011,7 @@ export function buildVolumeMounts(
   resolvedProvider?: ResolvedProvider,
   ipcAgentId?: string,
   agentProfile?: RunnerAgentProfile,
+  channelContext?: ChannelTurnContext,
 ): VolumeMount[] {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -991,6 +1041,7 @@ export function buildVolumeMounts(
   }
 
   const mounts: VolumeMount[] = [];
+  let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
   const projectRoot = process.cwd();
   const groupDir = path.join(GROUPS_DIR, group.folder);
 
@@ -1173,6 +1224,18 @@ export function buildVolumeMounts(
       containerPath: '/home/node/.feishu-cli',
       readonly: false,
     });
+    feishuCliBinding = prepareFeishuCliRuntimeBinding({
+      ownerUserId: ownerId,
+      channelContext,
+      workspaceChannelAccountId: group.channel_account_id,
+      profileRoot: userFeishuCliDir,
+    });
+  } else {
+    feishuCliBinding = prepareFeishuCliRuntimeBinding({
+      ownerUserId: ownerId,
+      channelContext,
+      workspaceChannelAccountId: group.channel_account_id,
+    });
   }
 
   // Claude Code plugins (per-user runtime): read-only mount so the CLI inside
@@ -1240,7 +1303,14 @@ export function buildVolumeMounts(
 
   // Per-container environment file (keeps credentials out of process listings)
   // Global config merged with per-container overrides.
-  const envDir = path.join(DATA_DIR, 'env', group.folder);
+  const envDir = getContainerRuntimeEnvDir(
+    group.folder,
+    ipcAgentId,
+    taskRunId,
+    feishuCliBinding?.source === 'channel_account'
+      ? feishuCliBinding.accountId
+      : null,
+  );
   fs.mkdirSync(envDir, { recursive: true });
   const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
   const containerOverride = getContainerEnvConfig(group.folder);
@@ -1273,6 +1343,7 @@ export function buildVolumeMounts(
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
   applyFallbackModelToEnvLines(envLines);
+  applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -1474,6 +1545,7 @@ export async function runContainerAgent(
       resolvedProvider,
       input.agentId,
       input.agentProfile,
+      input.channelContext,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
@@ -2266,6 +2338,13 @@ export async function runHostAgent(
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }
+    const feishuCliBinding = prepareFeishuCliRuntimeBinding({
+      ownerUserId: group.created_by,
+      channelContext: input.channelContext,
+      workspaceChannelAccountId: group.channel_account_id,
+      profileRoot: path.join(os.homedir(), '.feishu-cli'),
+    });
+    applyFeishuCliBindingToEnvironment(hostEnv, feishuCliBinding);
     const fallbackModel = getSystemSettings().fallbackModel?.trim();
     if (fallbackModel) {
       hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = fallbackModel;
