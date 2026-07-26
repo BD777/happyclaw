@@ -267,27 +267,27 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
     );
 
     expect(mounts).toContainEqual({
-      hostPath: path.join(external, 'CLAUDE.md'),
+      hostPath: fs.realpathSync(path.join(external, 'CLAUDE.md')),
       containerPath: '/home/node/.claude/CLAUDE.md',
       readonly: true,
     });
     expect(mounts).toContainEqual({
-      hostPath: path.join(external, 'rules'),
+      hostPath: fs.realpathSync(path.join(external, 'rules')),
       containerPath: '/home/node/.claude/rules',
       readonly: true,
     });
     expect(mounts).toContainEqual({
-      hostPath: path.join(external, 'agents'),
+      hostPath: fs.realpathSync(path.join(external, 'agents')),
       containerPath: '/home/node/.claude/agents',
       readonly: true,
     });
     expect(mounts).toContainEqual({
-      hostPath: path.join(external, 'commands'),
+      hostPath: fs.realpathSync(path.join(external, 'commands')),
       containerPath: '/home/node/.claude/commands',
       readonly: true,
     });
     expect(mounts).toContainEqual({
-      hostPath: path.join(external, 'skills', 'admin-skill'),
+      hostPath: fs.realpathSync(path.join(external, 'skills', 'admin-skill')),
       containerPath: '/workspace/effective-skills/admin-skill',
       readonly: true,
     });
@@ -360,7 +360,7 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
       profile('host_claude'),
     );
     expect(inheritedMounts).toContainEqual({
-      hostPath: path.join(external, 'commands'),
+      hostPath: fs.realpathSync(path.join(external, 'commands')),
       containerPath: '/home/node/.claude/commands',
       readonly: true,
     });
@@ -541,7 +541,7 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         (mount) => mount.containerPath === '/workspace/effective-skills/review',
       ),
     ).toMatchObject({
-      hostPath: path.join(sourceRoot, 'review'),
+      hostPath: fs.realpathSync(path.join(sourceRoot, 'review')),
       readonly: true,
     });
     expect(
@@ -596,7 +596,9 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         (mount) =>
           mount.containerPath === '/workspace/effective-skills/selected',
       ),
-    ).toMatchObject({ hostPath: path.join(sourceRoot, 'selected') });
+    ).toMatchObject({
+      hostPath: fs.realpathSync(path.join(sourceRoot, 'selected')),
+    });
   });
 
   test('custom Skill profiles expose only the selected per-Skill mount', () => {
@@ -645,7 +647,9 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
           (mount) =>
             mount.containerPath === '/workspace/effective-skills/review',
         ),
-      ).toMatchObject({ hostPath: path.join(sourceRoot, 'review') });
+      ).toMatchObject({
+        hostPath: fs.realpathSync(path.join(sourceRoot, 'review')),
+      });
       expect(
         mounts.some(
           (mount) => mount.containerPath === '/workspace/user-skills',
