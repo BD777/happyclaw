@@ -964,7 +964,7 @@ skillsRoutes.patch('/:id', authMiddleware, async (c) => {
       if (referencedByProfiles.length > 0) {
         return c.json(
           {
-            error: 'Skill is selected by one or more Agents',
+            error: '一个或多个智能体正在使用该 Skill',
             referencedByProfiles,
           },
           409,
@@ -1036,7 +1036,7 @@ function deleteSkillForUserUnlocked(
   if (referencedByProfiles.length > 0) {
     return {
       success: false,
-      error: `Skill is selected by Agent(s): ${referencedByProfiles
+      error: `以下智能体正在使用该 Skill：${referencedByProfiles
         .map((profile) => profile.name)
         .join(', ')}`,
     };
@@ -1137,7 +1137,7 @@ async function deleteSkillForUser(
     if (referencedByProfiles.length > 0) {
       return {
         success: false,
-        error: `Skill is selected by Agent(s): ${referencedByProfiles
+        error: `以下智能体正在使用该 Skill：${referencedByProfiles
           .map((profile) => profile.name)
           .join(', ')}`,
       };
@@ -1185,7 +1185,7 @@ skillsRoutes.delete('/user-all', authMiddleware, async (c) => {
     if (referencedByProfiles.length > 0) {
       return c.json(
         {
-          error: 'One or more Skills are selected by Agents',
+          error: '一个或多个 Skill 正被智能体使用',
           referencedByProfiles,
         },
         409,
@@ -1266,7 +1266,7 @@ skillsRoutes.delete('/:id', authMiddleware, async (c) => {
         ? 400
         : result.error?.includes('not found')
           ? 404
-          : result.error?.startsWith('Skill is selected by Agent(s):')
+          : result.error?.startsWith('以下智能体正在使用该 Skill：')
             ? 409
             : 500;
     return c.json({ error: result.error }, status);

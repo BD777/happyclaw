@@ -194,7 +194,7 @@ export function LoginPage() {
               <h1 className="mt-4 lg:mt-6 text-3xl sm:text-4xl lg:text-6xl font-bold text-foreground tracking-tight leading-[1.1]">
                 你的私有
                 <br />
-                <span className="landing-gradient-text">AI Agent 平台</span>
+                <span className="landing-gradient-text">AI 智能体平台</span>
               </h1>
 
               <p className="mt-4 lg:mt-6 text-sm sm:text-base lg:text-lg text-muted-foreground leading-relaxed max-w-lg mx-auto lg:mx-0">
@@ -205,17 +205,23 @@ export function LoginPage() {
               {/* Stats — hidden on small mobile to save space */}
               <div className="mt-6 lg:mt-8 hidden sm:flex items-center justify-center lg:justify-start gap-6 lg:gap-8">
                 <div>
-                  <div className="text-xl lg:text-2xl font-bold text-foreground">5+</div>
+                  <div className="text-xl lg:text-2xl font-bold text-foreground">
+                    5+
+                  </div>
                   <div className="text-xs text-muted-foreground">接入渠道</div>
                 </div>
                 <div className="w-px h-8 bg-border" />
                 <div>
-                  <div className="text-xl lg:text-2xl font-bold text-foreground">Docker</div>
+                  <div className="text-xl lg:text-2xl font-bold text-foreground">
+                    Docker
+                  </div>
                   <div className="text-xs text-muted-foreground">安全隔离</div>
                 </div>
                 <div className="w-px h-8 bg-border" />
                 <div>
-                  <div className="text-xl lg:text-2xl font-bold text-foreground">24/7</div>
+                  <div className="text-xl lg:text-2xl font-bold text-foreground">
+                    24/7
+                  </div>
                   <div className="text-xs text-muted-foreground">自主运行</div>
                 </div>
               </div>
@@ -247,7 +253,10 @@ export function LoginPage() {
                 </p>
 
                 {error && (
-                  <div role="alert" className="mb-4 p-3 bg-error-bg border border-error/30 rounded-lg text-left">
+                  <div
+                    role="alert"
+                    className="mb-4 p-3 bg-error-bg border border-error/30 rounded-lg text-left"
+                  >
                     <p className="text-sm text-error">{error}</p>
                   </div>
                 )}
@@ -257,7 +266,10 @@ export function LoginPage() {
                   <>
                     <form onSubmit={handleLogin} className="text-left">
                       <div className="mb-3 lg:mb-4">
-                        <Label htmlFor="login-username" className="mb-1.5 text-sm">
+                        <Label
+                          htmlFor="login-username"
+                          className="mb-1.5 text-sm"
+                        >
                           用户名
                         </Label>
                         <Input
@@ -273,7 +285,10 @@ export function LoginPage() {
                       </div>
 
                       <div className="mb-5 lg:mb-6">
-                        <Label htmlFor="login-password" className="mb-1.5 text-sm">
+                        <Label
+                          htmlFor="login-password"
+                          className="mb-1.5 text-sm"
+                        >
                           密码
                         </Label>
                         <Input
@@ -287,7 +302,11 @@ export function LoginPage() {
                         />
                       </div>
 
-                      <Button type="submit" disabled={loading} className="w-full h-9">
+                      <Button
+                        type="submit"
+                        disabled={loading}
+                        className="w-full h-9"
+                      >
                         {loading && <Loader2 className="size-4 animate-spin" />}
                         {loading ? '登录中...' : '登录'}
                       </Button>
@@ -295,7 +314,9 @@ export function LoginPage() {
 
                     {regStatus.allowRegistration && (
                       <p className="text-center text-sm text-muted-foreground mt-4">
-                        {regStatus.requireInviteCode ? '有邀请码？' : '还没有账户？'}
+                        {regStatus.requireInviteCode
+                          ? '有邀请码？'
+                          : '还没有账户？'}
                         <button
                           type="button"
                           onClick={() => switchTab('register')}
@@ -314,7 +335,10 @@ export function LoginPage() {
                     <form onSubmit={handleRegister} className="text-left">
                       {regStatus.requireInviteCode && (
                         <div className="mb-3">
-                          <Label htmlFor="reg-invite" className="mb-1.5 text-sm">
+                          <Label
+                            htmlFor="reg-invite"
+                            className="mb-1.5 text-sm"
+                          >
                             邀请码
                           </Label>
                           <Input
@@ -331,7 +355,10 @@ export function LoginPage() {
                       )}
 
                       <div className="mb-3">
-                        <Label htmlFor="reg-username" className="mb-1.5 text-sm">
+                        <Label
+                          htmlFor="reg-username"
+                          className="mb-1.5 text-sm"
+                        >
                           用户名
                         </Label>
                         <Input
@@ -349,7 +376,9 @@ export function LoginPage() {
                       <div className="mb-3">
                         <Label htmlFor="reg-display" className="mb-1.5 text-sm">
                           显示名称{' '}
-                          <span className="text-muted-foreground font-normal">(可选)</span>
+                          <span className="text-muted-foreground font-normal">
+                            (可选)
+                          </span>
                         </Label>
                         <Input
                           id="reg-display"
@@ -362,7 +391,10 @@ export function LoginPage() {
                       </div>
 
                       <div className="mb-5 lg:mb-6">
-                        <Label htmlFor="reg-password" className="mb-1.5 text-sm">
+                        <Label
+                          htmlFor="reg-password"
+                          className="mb-1.5 text-sm"
+                        >
                           密码
                         </Label>
                         <Input
@@ -376,7 +408,11 @@ export function LoginPage() {
                         />
                       </div>
 
-                      <Button type="submit" disabled={loading} className="w-full h-9">
+                      <Button
+                        type="submit"
+                        disabled={loading}
+                        className="w-full h-9"
+                      >
                         {loading && <Loader2 className="size-4 animate-spin" />}
                         {loading ? '注册中...' : '注册'}
                       </Button>

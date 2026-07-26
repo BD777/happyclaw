@@ -108,9 +108,9 @@ export function workspaceCreationBlockReason(input: {
 }): string | null {
   if (!input.name.trim()) return '请输入工作区名称';
   if (input.submitting) return '正在创建工作区';
-  if (input.profilesLoading) return '正在加载 Agent';
-  if (input.profilesError) return 'Agent 列表加载失败';
-  if (!input.selectedAgentProfileId) return '请选择 Agent';
+  if (input.profilesLoading) return '正在加载智能体';
+  if (input.profilesError) return '智能体列表加载失败';
+  if (!input.selectedAgentProfileId) return '请选择智能体';
   return null;
 }
 

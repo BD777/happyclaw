@@ -477,7 +477,7 @@ describe('scheduled task workspace/session contract', () => {
     expect(queue.enqueueMessageCheck).toHaveBeenCalledWith(GROUP_JID);
     expect(db.getTaskRunLogs(taskId, 1)[0]).toMatchObject({
       status: 'queued',
-      result: '已排队到源工作区，等待 Agent 执行',
+      result: '已排队到源工作区，等待智能体执行',
       error: null,
     });
   });

@@ -67,7 +67,7 @@ function AskUserQuestionCard({
             </div>
           )}
           <div className="text-xs text-muted-foreground mt-2">
-            请在 Agent 终端中回复
+            请在智能体终端中回复
           </div>
         </div>
       ))}

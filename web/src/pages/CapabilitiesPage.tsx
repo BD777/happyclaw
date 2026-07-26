@@ -46,7 +46,7 @@ export function CapabilitiesPage() {
 
       <div className="border-b border-border/70 bg-muted/30 px-4 py-2.5 lg:px-6">
         <p className="mx-auto max-w-7xl text-xs leading-5 text-muted-foreground">
-          在这里安装和管理可复用资源；到具体 Agent 的“能力配置”中决定是否启用。
+          在这里安装和管理可复用资源；到具体智能体的“能力配置”中决定是否启用。
           工作区自带的 CLAUDE.md、.claude/skills 与项目 MCP 不在这里分配。
         </p>
       </div>

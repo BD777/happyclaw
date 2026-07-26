@@ -44,7 +44,7 @@ export function AgentSkillsPolicyEditor({
     <div className="space-y-6">
       <SkillSourceSection
         title="HappyClaw Skills"
-        description="控制 HappyClaw 为这个 Agent 附加的用户级 Skills；系统内置 Skills 始终生效。"
+        description="控制 HappyClaw 为这个智能体附加的用户级 Skills；系统内置 Skills 始终生效。"
       >
         <PolicyModeCards
           label="HappyClaw Skills 使用方式"
@@ -97,7 +97,7 @@ export function AgentSkillsPolicyEditor({
                 {
                   value: 'disabled',
                   label: '不使用',
-                  description: '这个 Agent 不加载宿主机 Skill。',
+                  description: '这个智能体不加载宿主机 Skill。',
                 },
                 {
                   value: 'custom',
@@ -134,7 +134,7 @@ export function AgentSkillsPolicyEditor({
 
       <SkillSourceSection
         title="工作区 Skills"
-        description="随实际运行的工作区自动加载，不能在 Agent 级别固定选择。创建后可在“最终生效能力”中按工作区预览。"
+        description="随实际运行的工作区自动加载，不能在智能体级别固定选择。创建后可在“最终生效能力”中按工作区预览。"
         badge="自动"
       />
     </div>

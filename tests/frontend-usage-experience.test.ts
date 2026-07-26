@@ -313,10 +313,10 @@ describe('usage page product and accessibility surface', () => {
     const auth = read('web/src/stores/auth.ts');
     expect(page).toMatch(/统计范围：|时区：|更新时间：/);
     expect(page).toMatch(
-      /总 Token|Agent 运行次数|模型估算费用 \(USD\)|平均每次成本/,
+      /总 Token|智能体运行次数|模型估算费用 \(USD\)|平均每次成本/,
     );
     expect(page).toMatch(/普通输入|缓存读取|缓存写入|输出/);
-    expect(page).toMatch(/统计用户|模型|Agent|工作区|来源/);
+    expect(page).toMatch(/统计用户|模型|智能体|工作区|来源/);
     expect(page).toMatch(/aria-busy=|aria-pressed=|role="alert"/);
     expect(page).toMatch(/用量数据加载失败|重试加载/);
     expect(page).toMatch(/当前筛选没有用量数据|开始一次对话/);

@@ -97,6 +97,6 @@ describe('AgentProfile AI generation', () => {
 
     await expect(
       generateAgentProfileDraft('generate and send receipts'),
-    ).rejects.toThrow('AI 生成的 Agent 配置格式无效');
+    ).rejects.toThrow('AI 生成的智能体配置格式无效');
   });
 });

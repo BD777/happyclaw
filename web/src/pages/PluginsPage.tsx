@@ -77,7 +77,7 @@ export function PluginsPage() {
       await toggleEnabled(plugin.fullId, newEnabled);
       if (newEnabled) {
         toast.success(
-          `已启用 ${plugin.fullId}。变更在下次新建会话时生效；已运行的 agent 进程不会自动加载。`,
+          `已启用 ${plugin.fullId}。变更在下次新建会话时生效；已运行的智能体进程不会自动加载。`,
         );
       } else {
         toast.success(`已禁用 ${plugin.fullId}。下次新会话生效。`);
@@ -164,7 +164,7 @@ export function PluginsPage() {
           <div>
             Plugin Catalog
             由管理员从宿主机导入并全局共享；下方启用状态仅属于当前用户。
-            更改会在新建会话时生效，已运行的 Agent 不会热加载。
+            更改会在新建会话时生效，已运行的智能体不会热加载。
           </div>
         </div>
 

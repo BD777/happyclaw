@@ -21,7 +21,7 @@ export function AboutSection() {
           HappyClaw
         </h2>
         <p className="text-sm text-muted-foreground">
-          基于 Claude Agent SDK 的自托管多 Agent 工作平台
+          基于 Claude Agent SDK 的自托管多智能体工作平台
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           版本 1.0.0 · MIT License
@@ -100,8 +100,8 @@ export function AboutSection() {
               <ExternalLink className="w-3 h-3" />
             </a>
             <p className="mt-1 leading-relaxed">
-              自托管个人 Agent 产品方向的重要参考。HappyClaw 选择复用 Claude
-              Agent SDK，并在此基础上构建工作区、渠道与多 Agent 管理能力。
+              自托管个人智能体产品方向的重要参考。HappyClaw 选择复用 Claude
+              Agent SDK，并在此基础上构建工作区、渠道与多智能体管理能力。
             </p>
           </div>
         </div>

@@ -147,7 +147,7 @@ export function AddMcpServerDialog({
               <div className="grid grid-cols-2 gap-2">
                 {(
                   [
-                    ['user', '我的 MCP', '仅你和你的 Agents 可用'],
+                    ['user', '我的 MCP', '仅你和你的智能体可用'],
                     ['system', '系统 MCP', '所有用户可见，管理员维护'],
                   ] as const
                 ).map(([value, title, description]) => (
@@ -178,8 +178,8 @@ export function AddMcpServerDialog({
               <div className="grid grid-cols-2 gap-2">
                 {(
                   [
-                    ['admin_only', '仅管理员', '普通成员的 Agent 不可使用'],
-                    ['shared', '共享给成员', '允许普通成员的 Agent 使用'],
+                    ['admin_only', '仅管理员', '普通成员的智能体不可使用'],
+                    ['shared', '共享给成员', '允许普通成员的智能体使用'],
                   ] as const
                 ).map(([value, title, description]) => (
                   <button
@@ -204,7 +204,7 @@ export function AddMcpServerDialog({
               {memberAccess === 'shared' && (
                 <p className="mt-2 rounded-lg border border-warning/20 bg-warning-bg px-3 py-2 text-xs leading-5 text-warning">
                   共享会把完整 command、args、url、env 和 headers
-                  配置交给普通成员的 Agent
+                  配置交给普通成员的智能体
                   运行。请确认其中所有凭据都允许成员使用。
                 </p>
               )}

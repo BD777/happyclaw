@@ -168,7 +168,7 @@ export function CreateTaskForm({
       <p className="mt-1 text-xs text-muted-foreground">
         {isScript
           ? '脚本仅可选择管理员宿主机工作区，并直接在该宿主机目录中执行。'
-          : '任务会在这个工作区的目录和环境中执行，并继承该工作区的 Agent。'}
+          : '任务会在这个工作区的目录和环境中执行，并继承该工作区的智能体。'}
       </p>
     </div>
   );
@@ -488,7 +488,7 @@ export function CreateTaskForm({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
-                    <SelectItem value="agent">Agent（AI 代理）</SelectItem>
+                    <SelectItem value="agent">智能体（AI 执行）</SelectItem>
                     <SelectItem value="script">脚本（Shell 命令）</SelectItem>
                   </SelectContent>
                 </Select>

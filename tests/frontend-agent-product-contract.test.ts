@@ -116,7 +116,7 @@ describe('Agent-first frontend product contracts', () => {
         profilesError: 'network down',
         selectedAgentProfileId: '',
       }),
-    ).toBe('Agent 列表加载失败');
+    ).toBe('智能体列表加载失败');
   });
 
   it('preserves Agent hierarchy for workspace collections', () => {

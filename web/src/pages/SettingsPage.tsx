@@ -146,7 +146,7 @@ export function SettingsPage() {
     'my-channels': '消息渠道',
     security: '安全与设备',
     groups: '会话管理',
-    'agent-profiles': 'Agent',
+    'agent-profiles': '智能体',
     memory: '记忆管理',
     skills: '技能(Skill)管理',
     'mcp-servers': 'MCP 服务器',
@@ -160,7 +160,7 @@ export function SettingsPage() {
 
   const sectionDescription: Partial<Record<SettingsTab, string>> = {
     'main-agent':
-      '管理主 Agent 的头像、系统附加能力、宿主机配置继承和上下文压缩策略。',
+      '管理主智能体的头像、系统附加能力、宿主机配置继承和上下文压缩策略。',
     'host-integration':
       '管理宿主机 Claude 目录以及共享 Plugin Catalog 的来源。',
   };

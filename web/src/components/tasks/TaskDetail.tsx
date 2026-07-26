@@ -492,7 +492,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
         <div>
           <div className="text-xs text-muted-foreground mb-1">执行方式</div>
           <div className="text-sm text-foreground">
-            {task.execution_type === 'script' ? '脚本' : 'Agent'}
+            {task.execution_type === 'script' ? '脚本' : '智能体'}
           </div>
         </div>
 

@@ -162,9 +162,9 @@ export function McpServersPage() {
         </div>
 
         <div className="mx-6 mt-4 rounded-lg border border-warning/20 bg-warning-bg px-4 py-3 text-xs leading-5 text-warning">
-          这里管理 HappyClaw 额外提供的 MCP，再由各 Agent 决定是否允许使用。
-          继承宿主机 ~/.claude 的 Agent 会自动获得宿主机全部
-          MCP，无需导入或勾选。 密钥写入后不会再次显示；STDIO 命令会在 Agent
+          这里管理 HappyClaw 额外提供的 MCP，再由各智能体决定是否允许使用。
+          继承宿主机 ~/.claude 的智能体会自动获得宿主机全部
+          MCP，无需导入或勾选。 密钥写入后不会再次显示；STDIO 命令会在智能体
           的实际运行环境中执行。
         </div>
 
@@ -239,7 +239,7 @@ export function McpServersPage() {
                       </h2>
                       <p className="mb-3 text-xs leading-5 text-muted-foreground">
                         系统列表对所有用户可见，仅管理员可修改；是否允许成员的
-                        Agent
+                        智能体
                         使用由每项配置决定。系统与个人存在同名配置时，个人配置优先。
                       </p>
                       <div className="space-y-2">

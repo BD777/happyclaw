@@ -50,16 +50,16 @@ type SortDirection = 'desc' | 'asc';
 
 const DIMENSION_LABELS: Record<AttributionDimension, string> = {
   model: '模型',
-  agent: 'Agent',
+  agent: '智能体',
   workspace: '工作区',
   source: '来源',
 };
 
 const SOURCE_LABELS: Record<string, string> = {
-  agent: 'Agent 对话',
-  main: '主 Agent',
-  'main-agent': '主 Agent',
-  'custom-agent': '自定义 Agent',
+  agent: '智能体对话',
+  main: '主智能体',
+  'main-agent': '主智能体',
+  'custom-agent': '自定义智能体',
   scheduled_task: '定时任务',
   task: '定时任务',
   automation: '自动化任务',
@@ -221,7 +221,7 @@ function attributionKey(
   if (dimension === 'agent') {
     return {
       key: row.agent_id || 'unknown',
-      label: row.agent_name || row.agent_id || '未标记 Agent',
+      label: row.agent_name || row.agent_id || '未标记智能体',
     };
   }
   if (dimension === 'workspace') {
@@ -297,7 +297,7 @@ function buildFallbackCsv(rows: UsageBreakdown[]): string {
     '日期',
     '模型',
     '用户 ID',
-    'Agent ID',
+    '智能体 ID',
     '工作区',
     '来源',
     '普通输入 Token',
@@ -307,7 +307,7 @@ function buildFallbackCsv(rows: UsageBreakdown[]): string {
     '推理 Token',
     '模型估算费用 USD',
     '账单扣费 USD',
-    'Agent 运行次数',
+    '智能体运行次数',
     '模型调用次数',
   ];
   const body = rows.map((row) =>
@@ -541,7 +541,7 @@ export function UsagePage() {
               <Badge variant="outline">{scopeLabel}</Badge>
             </div>
             <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-              查看 Agent 运行、Token
+              查看智能体运行、Token
               与模型成本估算。模型估算费用用于分析资源消耗，不等同于账单扣费。
             </p>
             <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
@@ -584,7 +584,7 @@ export function UsagePage() {
           {visibleLoading
             ? '正在更新用量数据'
             : visibleSummary
-              ? `用量数据已更新，共 ${visibleSummary.runCount} 次 Agent 运行`
+              ? `用量数据已更新，共 ${visibleSummary.runCount} 次智能体运行`
               : ''}
         </p>
 
@@ -655,11 +655,11 @@ export function UsagePage() {
             />
             <FilterSelect
               id="usage-agent"
-              label="Agent"
+              label="智能体"
               value={query.agentId || ALL_VALUE}
               onChange={(value) => updateFilter('agentId', value)}
               options={[
-                { value: ALL_VALUE, label: '全部 Agent' },
+                { value: ALL_VALUE, label: '全部智能体' },
                 ...availableAgents.map((agentId) => ({
                   value: agentId,
                   label: agentNames[agentId] || agentId,
@@ -764,7 +764,7 @@ export function UsagePage() {
                   exactValue={formatInteger(visibleSummary.totalTokens)}
                 />
                 <MetricItem
-                  label="Agent 运行次数"
+                  label="智能体运行次数"
                   value={metricValue(visibleSummary, 'runs')}
                   note={`${formatInteger(visibleSummary.modelCallCount)} 次模型调用`}
                 />
@@ -782,7 +782,7 @@ export function UsagePage() {
                 <MetricItem
                   label="平均每次成本"
                   value={metricValue(visibleSummary, 'average')}
-                  note="模型估算费用 ÷ Agent 运行次数"
+                  note="模型估算费用 ÷ 智能体运行次数"
                 />
               </dl>
             </section>
@@ -839,7 +839,7 @@ export function UsagePage() {
                     </h2>
                     <p className="mt-0.5 text-xs text-muted-foreground">
                       费用按咖宝模型价格在 UTC 30
-                      分钟桶内统一取整；运行次数按完成的 Agent 用量事件计数。
+                      分钟桶内统一取整；运行次数按完成的智能体用量事件计数。
                     </p>
                   </div>
                   <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
@@ -1113,7 +1113,7 @@ function UsageTrendTable({
             ? '每日 Token 分类数据'
             : metric === 'cost'
               ? '每日模型估算费用数据'
-              : '每日 Agent 运行次数数据'}
+              : '每日智能体运行次数数据'}
         </caption>
         <thead className="sticky top-0 bg-muted text-xs text-muted-foreground">
           <tr>
@@ -1139,7 +1139,7 @@ function UsageTrendTable({
             {metric === 'runs' && (
               <>
                 <th className="px-3 py-3 text-right font-medium">
-                  Agent 运行次数
+                  智能体运行次数
                 </th>
                 <th className="px-3 py-3 text-right font-medium">
                   模型调用次数
@@ -1235,7 +1235,7 @@ function AttributionTable({
               {DIMENSION_LABELS[dimension]}
             </th>
             <th className="px-3 py-3 text-right font-medium">总 Token</th>
-            <th className="px-3 py-3 text-right font-medium">Agent 运行次数</th>
+            <th className="px-3 py-3 text-right font-medium">智能体运行次数</th>
             <th className="px-3 py-3 text-right font-medium">模型调用次数</th>
             <th className="px-3 py-3 text-right font-medium">模型估算费用</th>
             <th className="px-3 py-3 text-right font-medium">费用占比</th>
@@ -1301,12 +1301,12 @@ function UsageEmptyState({
         <Zap className="size-5" />
       </div>
       <h2 className="mt-4 text-base font-semibold text-foreground">
-        {filtered ? '当前筛选没有用量数据' : '还没有 Agent 用量数据'}
+        {filtered ? '当前筛选没有用量数据' : '还没有智能体用量数据'}
       </h2>
       <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-muted-foreground">
         {filtered
           ? '尝试扩大时间范围或清除筛选，即可继续查看成本和 Token 趋势。'
-          : '完成一次 AI 对话或 Agent 任务后，这里会展示运行次数、Token 构成和模型成本估算。'}
+          : '完成一次 AI 对话或智能体任务后，这里会展示运行次数、Token 构成和模型成本估算。'}
       </p>
       <div className="mt-5 flex justify-center">
         {filtered ? (

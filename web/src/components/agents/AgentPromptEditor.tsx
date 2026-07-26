@@ -50,7 +50,7 @@ export function AgentPromptEditor({
         <div className="min-w-0">
           <h2 className="text-sm font-semibold text-foreground">提示词</h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            分别定义 Agent 的身份、人格、行为与工具规则，运行时按固定顺序组合。
+            分别定义智能体的身份、人格、行为与工具规则，运行时按固定顺序组合。
           </p>
         </div>
         <Button
@@ -100,7 +100,7 @@ export function AgentPromptEditor({
             />
           </div>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            主动模式始终使用 AgentProfile 与 HappyClaw
+            主动模式始终使用智能体配置与 HappyClaw
             运行规则组成的独立系统提示词，不继承 Assistant 导向的 Claude Code
             默认提示词；此选项仅影响 Assistant 模式。
           </p>
@@ -109,7 +109,7 @@ export function AgentPromptEditor({
         <div className="grid gap-4 lg:grid-cols-[190px_minmax(0,1fr)]">
           <div
             role="tablist"
-            aria-label="Agent 提示词分段"
+            aria-label="智能体提示词分段"
             className="flex gap-2 overflow-x-auto pb-1 lg:block lg:space-y-1 lg:overflow-visible"
           >
             {AGENT_PROMPT_SECTIONS.map((section) => {

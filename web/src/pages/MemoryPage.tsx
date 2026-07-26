@@ -530,7 +530,7 @@ export function MemoryPage() {
                         {!extCollapsed && (
                           <div className="space-y-1 ml-1">
                             <div className="text-[11px] text-amber-700 dark:text-amber-500 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 rounded-lg px-2.5 py-1.5 mb-1">
-                              ⚠️ host 模式下 Agent 可直接编辑这些 CLAUDE.md /
+                              ⚠️ host 模式下智能体可直接编辑这些 CLAUDE.md /
                               rules，改动会写回本机{' '}
                               <code className="font-mono">~/.claude/</code>
                               ，影响你这台机器上所有 Claude Code 项目。

@@ -277,7 +277,7 @@ function RunContextRow({
           {isStale && (
             <Badge variant="destructive">
               {status === 'stale_profile'
-                ? '来自旧 Agent 配置'
+                ? '来自旧智能体配置'
                 : '来自旧能力配置'}
             </Badge>
           )}

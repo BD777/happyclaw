@@ -311,7 +311,7 @@ export function ChatPage() {
                     id="mobile-primary-agent-heading"
                     className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
                   >
-                    主 Agent · {agentPartitions.primary.name}
+                    主智能体 · {agentPartitions.primary.name}
                   </h2>
                   {renderMobilePrimaryAgentWorkspaces(agentPartitions.primary)}
                 </section>
@@ -325,7 +325,7 @@ export function ChatPage() {
                     id="mobile-custom-agent-heading"
                     className="px-3 pb-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
                   >
-                    自定义 Agent
+                    自定义智能体
                   </h2>
                   {agentPartitions.custom.map(renderMobileAgentSection)}
                 </section>
@@ -338,7 +338,7 @@ export function ChatPage() {
                 alt={appearance?.appName || 'HappyClaw'}
                 className="h-12 mb-6"
               />
-              <p className="text-muted-foreground text-sm">暂无 Agent 工作区</p>
+              <p className="text-muted-foreground text-sm">暂无智能体工作区</p>
             </div>
           )}
         </div>

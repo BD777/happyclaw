@@ -261,9 +261,9 @@ export function CreateContainerDialog({
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
       <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-xl">
         <DialogHeader className="flex-shrink-0">
-          <DialogTitle>为 Agent 新建工作区</DialogTitle>
+          <DialogTitle>为智能体新建工作区</DialogTitle>
           <DialogDescription>
-            选择 Agent，并确认工作区的回复模式、运行位置和上下文。
+            选择智能体，并确认工作区的回复模式、运行位置和上下文。
           </DialogDescription>
         </DialogHeader>
 
@@ -273,7 +273,7 @@ export function CreateContainerDialog({
               htmlFor="workspace-agent-profile"
               className="mb-2 block text-sm font-medium"
             >
-              Agent
+              智能体
             </label>
             <Select
               value={selectedAgentProfileId}
@@ -286,7 +286,7 @@ export function CreateContainerDialog({
               <SelectTrigger id="workspace-agent-profile" className="w-full">
                 <SelectValue
                   placeholder={
-                    profilesLoading ? '正在加载 Agent...' : '选择 Agent'
+                    profilesLoading ? '正在加载智能体...' : '选择智能体'
                   }
                 />
               </SelectTrigger>
@@ -308,7 +308,7 @@ export function CreateContainerDialog({
             {profilesError && (
               <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-error/20 bg-error-bg px-2.5 py-2 text-xs text-error">
                 <span className="min-w-0">
-                  Agent 列表加载失败：{profilesError}
+                  智能体列表加载失败：{profilesError}
                 </span>
                 <Button
                   type="button"
@@ -324,13 +324,13 @@ export function CreateContainerDialog({
             )}
             {!profilesLoading && !profilesError && profiles.length === 0 && (
               <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
-                暂无可用 Agent，请先到 Agent 页面创建。
+                暂无可用智能体，请先到智能体页面创建。
               </p>
             )}
             {profiles.length > 0 && (
               <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
                 {selectedProfile?.identity_prompt ||
-                  '使用默认 Agent 行为，不追加额外身份提示词。'}
+                  '使用默认智能体行为，不追加额外身份提示词。'}
               </p>
             )}
           </div>
@@ -360,7 +360,7 @@ export function CreateContainerDialog({
               onKeyDown={(e) => {
                 if (e.key === 'Enter') handleConfirm();
               }}
-              placeholder="输入这个 Agent 工作区的名称"
+              placeholder="输入这个智能体工作区的名称"
               autoFocus
             />
           </div>
@@ -385,7 +385,7 @@ export function CreateContainerDialog({
                 </div>
                 <div className="min-w-0">
                   <div className="text-[11px] font-medium text-muted-foreground">
-                    Agent 上下文
+                    智能体上下文
                   </div>
                   <div className="mt-1 text-sm font-medium text-foreground">
                     {inheritsHostClaude ? '继承 ~/.claude' : 'HappyClaw 管理'}
@@ -405,9 +405,9 @@ export function CreateContainerDialog({
               <p className="mt-2 border-t pt-2 text-[11px] leading-5 text-muted-foreground">
                 {canHostExec
                   ? inheritsHostClaude
-                    ? `运行位置只决定命令在哪里执行。该 Agent 会将完整 ~/.claude 作为用户配置层叠加，工作区仍是 cwd；宿主机 Skills：${hostSkillsMode === 'inherit' ? '全部使用' : hostSkillsMode === 'custom' ? `选择 ${selectedProfile?.runtime_policy.skills.host?.ids.length ?? 0} 项` : '不使用'}。`
-                    : '运行位置只决定命令在哪里执行。该 Agent 使用 HappyClaw 管理的上下文与附加能力。'
-                  : '工作区固定在 Docker 容器中运行，并使用 HappyClaw 管理的 Agent 上下文与附加能力。'}
+                    ? `运行位置只决定命令在哪里执行。该智能体会将完整 ~/.claude 作为用户配置层叠加，工作区仍是 cwd；宿主机 Skills：${hostSkillsMode === 'inherit' ? '全部使用' : hostSkillsMode === 'custom' ? `选择 ${selectedProfile?.runtime_policy.skills.host?.ids.length ?? 0} 项` : '不使用'}。`
+                    : '运行位置只决定命令在哪里执行。该智能体使用 HappyClaw 管理的上下文与附加能力。'
+                  : '工作区固定在 Docker 容器中运行，并使用 HappyClaw 管理的智能体上下文与附加能力。'}
               </p>
             </div>
           )}
@@ -640,13 +640,13 @@ export function CreateContainerDialog({
                       }}
                       inputId="workspace-custom-cwd"
                       label="宿主机工作目录（可选）"
-                      description="Agent 将直接在 HappyClaw 服务器上的这个目录中运行。"
+                      description="智能体将直接在 HappyClaw 服务器上的这个目录中运行。"
                       placeholder="默认: data/groups/{folder}/"
                     />
                     <div className="flex items-start gap-2 p-2 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
                       <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
                       <p className="text-xs text-amber-700 dark:text-amber-300">
-                        宿主机模式下 Agent
+                        宿主机模式下智能体
                         可访问完整文件系统和工具链，请谨慎使用。
                       </p>
                     </div>

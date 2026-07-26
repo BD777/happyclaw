@@ -270,8 +270,8 @@ export function UnifiedSidebar({
                 <TooltipContent side="right">
                   {isChatItem && isChatRoute
                     ? collapsed
-                      ? '展开 Agent 工作台'
-                      : '收起 Agent 工作台'
+                      ? '展开智能体工作台'
+                      : '收起智能体工作台'
                     : label}
                 </TooltipContent>
               </Tooltip>
@@ -368,7 +368,7 @@ export function UnifiedSidebar({
               ) : agentSections.length === 0 ? (
                 <div className="flex h-32 flex-col items-center justify-center px-4">
                   <p className="text-center text-xs text-muted-foreground">
-                    暂无 Agent 工作区
+                    暂无智能体工作区
                   </p>
                 </div>
               ) : (
@@ -379,7 +379,7 @@ export function UnifiedSidebar({
                         id="primary-agent-heading"
                         className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
                       >
-                        主 Agent · {agentPartitions.primary.name}
+                        主智能体 · {agentPartitions.primary.name}
                       </h2>
                       {renderPrimaryAgentWorkspaces(agentPartitions.primary)}
                     </section>
@@ -393,7 +393,7 @@ export function UnifiedSidebar({
                         id="custom-agent-heading"
                         className="px-3 pb-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
                       >
-                        自定义 Agent
+                        自定义智能体
                       </h2>
                       {agentPartitions.custom.map(renderAgentSection)}
                     </section>

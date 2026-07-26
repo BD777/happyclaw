@@ -1020,7 +1020,7 @@ describe('buildAskQuestionText', () => {
     expect(text).toContain('<text_tag');
     expect(text).toContain('Alpha');
     expect(text).toContain('beta');
-    expect(text).toContain('请在 Agent 终端回复');
+    expect(text).toContain('请在智能体终端回复');
   });
 
   test('empty options → just the bold question', () => {

@@ -140,7 +140,7 @@ export function AgentPromptAssistant({
 
   const handleApply = (prompts: AgentPromptParts) => {
     onApply(prompts);
-    toast.success('候选四段提示词已应用，请保存 Agent');
+    toast.success('候选四段提示词已应用，请保存智能体');
   };
 
   const activeLabel = AGENT_PROMPT_SECTIONS.find(
@@ -177,7 +177,7 @@ export function AgentPromptAssistant({
             <Bot className="h-3.5 w-3.5" />
           </div>
           <div className="max-w-[min(86%,680px)] rounded-xl rounded-tl-sm border border-border bg-background px-3.5 py-3 text-sm leading-6 text-foreground shadow-sm">
-            告诉我你希望「{agentName || '这个 Agent'}
+            告诉我你希望「{agentName || '这个智能体'}
             」如何工作。我会基于当前提示词修改，并先给你确认，不会自动保存。
           </div>
         </div>
@@ -294,7 +294,7 @@ export function AgentPromptAssistant({
             }}
             className="min-h-[72px] max-h-36 resize-none text-sm leading-6"
             placeholder="例如：以后回答先给结论，再列风险和下一步；语气更直接一些。"
-            aria-label="告诉 AI 如何调整 Agent 提示词"
+            aria-label="告诉 AI 如何调整智能体提示词"
           />
           <Button
             type="submit"
@@ -312,7 +312,7 @@ export function AgentPromptAssistant({
         </div>
         <div className="mt-2 flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
           <span>Enter 发送，Shift + Enter 换行</span>
-          <span>应用后仍需保存 Agent</span>
+          <span>应用后仍需保存智能体</span>
         </div>
       </form>
     </section>

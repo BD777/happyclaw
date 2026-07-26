@@ -63,7 +63,7 @@ export function UsageTrendChart({
           ? '每日 Token 趋势图，按普通输入、缓存读取、缓存写入、输出和推理堆叠展示'
           : metric === 'cost'
             ? '每日模型估算费用趋势图'
-            : '每日 Agent 运行次数趋势图'
+            : '每日智能体运行次数趋势图'
       }
     >
       <ResponsiveContainer width="100%" height="100%">
@@ -106,7 +106,7 @@ export function UsageTrendChart({
                 ? TOKEN_LABELS[String(name)] || String(name)
                 : metric === 'cost'
                   ? '模型估算费用'
-                  : 'Agent 运行次数',
+                  : '智能体运行次数',
             ]}
             labelFormatter={(label) => `日期：${label}`}
           />

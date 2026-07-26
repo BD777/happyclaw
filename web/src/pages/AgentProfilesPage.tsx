@@ -441,7 +441,7 @@ export function AgentProfilesPage() {
   useEffect(() => {
     if (draftMode || !selected) return;
     void loadProfileGovernance(selected.id).catch((err) => {
-      toast.error(getErrorMessage(err, '加载 Agent 治理数据失败'));
+      toast.error(getErrorMessage(err, '加载智能体治理数据失败'));
     });
   }, [draftMode, loadProfileGovernance, selected?.id]);
 
@@ -497,7 +497,7 @@ export function AgentProfilesPage() {
 
   useEffect(() => {
     if (navigationBlocker.state !== 'blocked') return;
-    if (confirm('当前 Agent 有未保存修改，离开页面会丢失。是否继续？')) {
+    if (confirm('当前智能体有未保存修改，离开页面会丢失。是否继续？')) {
       navigationBlocker.proceed();
     } else {
       navigationBlocker.reset();
@@ -578,10 +578,10 @@ export function AgentProfilesPage() {
 
   const confirmDiscardUnsavedChanges = () =>
     !hasUnsavedChanges ||
-    confirm('当前 Agent 有未保存修改，继续会丢失。是否继续？');
+    confirm('当前智能体有未保存修改，继续会丢失。是否继续？');
   const confirmDiscardEditorChanges = () =>
     !editorUnsavedChanges ||
-    confirm('当前 Agent 有未保存修改，继续会丢失。是否继续？');
+    confirm('当前智能体有未保存修改，继续会丢失。是否继续？');
 
   const handleSelectProfile = (profileId: string) => {
     if (profileId === selectedId && !draftMode) {
@@ -632,7 +632,7 @@ export function AgentProfilesPage() {
       applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
       setCreateDescription('');
       setCreatePanelOpen(false);
-      toast.success('已生成 Agent 配置');
+      toast.success('已生成智能体配置');
     } catch (err) {
       toast.error(getErrorMessage(err, '生成失败'));
     } finally {
@@ -663,7 +663,7 @@ export function AgentProfilesPage() {
   };
 
   const handleDiscardDraft = () => {
-    if (draftDirty && !confirm('确认放弃当前 Agent 草稿？')) return;
+    if (draftDirty && !confirm('确认放弃当前智能体草稿？')) return;
     setDraftMode(false);
     setCreatePanelOpen(true);
     const fallback = customProfiles[0];
@@ -688,7 +688,7 @@ export function AgentProfilesPage() {
       setCreatePanelOpen(false);
       setSelectedId(profile.id);
       setAllowedSearchParams({ agent: profile.id }, { replace: true });
-      toast.success('已创建 Agent');
+      toast.success('已创建智能体');
     } catch (err) {
       toast.error(getErrorMessage(err, '创建失败'));
     } finally {
@@ -753,7 +753,7 @@ export function AgentProfilesPage() {
     try {
       const profile = await uploadProfileAvatar(selected.id, file);
       setAvatarUrl(profile.avatar_url);
-      toast.success('Agent 头像已更新');
+      toast.success('智能体头像已更新');
     } catch (error) {
       toast.error(getErrorMessage(error, '上传头像失败'));
     } finally {
@@ -797,7 +797,7 @@ export function AgentProfilesPage() {
     try {
       await setWorkspaceAgentProfile(workspaceJid, targetProfileId);
       const target = profiles.find((profile) => profile.id === targetProfileId);
-      toast.success(`工作区已迁移到「${target?.name ?? '目标 Agent'}」`);
+      toast.success(`工作区已迁移到「${target?.name ?? '目标智能体'}」`);
       await Promise.allSettled([
         loadProfileGovernance(selected.id),
         loadProfileGovernance(targetProfileId),
@@ -840,7 +840,7 @@ export function AgentProfilesPage() {
             (profile) => profile.id !== selected.id && profile.is_default,
           );
         if (!fallback) {
-          toast.error('没有可迁移工作区的目标 Agent');
+          toast.error('没有可迁移工作区的目标智能体');
           return;
         }
         setDeleteTargetId(fallback.id);
@@ -848,10 +848,10 @@ export function AgentProfilesPage() {
         return;
       }
       if (latestGovernance.channel_mounts.length > 0) {
-        toast.error('该 Agent 仍有渠道绑定，请先在“渠道绑定”页面解绑或换绑');
+        toast.error('该智能体仍有渠道绑定，请先在“渠道绑定”页面解绑或换绑');
         return;
       }
-      if (!confirm(`确认删除 Agent「${selected.name}」？`)) return;
+      if (!confirm(`确认删除智能体「${selected.name}」？`)) return;
       await deleteSelectedProfile();
     } catch (err) {
       toast.error(getErrorMessage(err, '删除失败'));
@@ -887,10 +887,10 @@ export function AgentProfilesPage() {
         <div className="flex items-center gap-3 px-4 py-4 lg:px-5 lg:pt-6">
           <div className="min-w-0 flex-1">
             <h1 className="text-lg font-semibold text-foreground">
-              自定义 Agent
+              自定义智能体
             </h1>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              {customProfiles.length} 个 Agent
+              {customProfiles.length} 个智能体
             </p>
           </div>
           <Button
@@ -898,8 +898,8 @@ export function AgentProfilesPage() {
             size="icon-sm"
             onClick={handleRefreshProfiles}
             disabled={loading}
-            aria-label="刷新 Agent 列表"
-            title="刷新 Agent 列表"
+            aria-label="刷新智能体列表"
+            title="刷新智能体列表"
           >
             <RefreshCw
               className={loading ? 'h-4 w-4 animate-spin' : 'h-4 w-4'}
@@ -918,7 +918,7 @@ export function AgentProfilesPage() {
         </div>
 
         <nav
-          aria-label="自定义 Agent 列表"
+          aria-label="自定义智能体列表"
           className="flex gap-2 overflow-x-auto px-3 pb-4 lg:block lg:min-h-0 lg:flex-1 lg:space-y-1 lg:overflow-y-auto lg:px-4"
         >
           {draftMode && (
@@ -928,7 +928,7 @@ export function AgentProfilesPage() {
             >
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm font-semibold text-foreground">
-                  {name.trim() || '新 Agent 草稿'}
+                  {name.trim() || '新智能体草稿'}
                 </span>
                 <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
                   尚未保存
@@ -992,7 +992,7 @@ export function AgentProfilesPage() {
                 <div className="max-w-2xl">
                   <div className="mb-3 inline-flex items-center gap-2 text-sm font-medium text-primary">
                     <Wand2 className="h-4 w-4" />
-                    新建自定义 Agent
+                    新建自定义智能体
                   </div>
                   <h1
                     id="create-agent-title"
@@ -1012,7 +1012,7 @@ export function AgentProfilesPage() {
                   onClick={() => setCreatePanelOpen(false)}
                 >
                   <X className="h-4 w-4" />
-                  返回 Agent
+                  返回智能体
                 </Button>
               </header>
 
@@ -1021,7 +1021,7 @@ export function AgentProfilesPage() {
                   htmlFor="new-agent-description"
                   className="text-sm font-semibold text-foreground"
                 >
-                  Agent 角色描述
+                  智能体角色描述
                 </label>
                 <p
                   id="new-agent-description-help"
@@ -1094,13 +1094,13 @@ export function AgentProfilesPage() {
               </div>
               <div className="mt-4 text-sm font-medium text-foreground">
                 {customProfiles.length === 0
-                  ? '还没有自定义 Agent'
-                  : '选择一个 Agent'}
+                  ? '还没有自定义智能体'
+                  : '选择一个智能体'}
               </div>
               <p className="mt-1 max-w-sm text-xs leading-5 text-muted-foreground">
                 {customProfiles.length === 0
-                  ? '创建一个专门处理特定任务的 Agent。'
-                  : '从左侧选择 Agent 查看配置，或创建一个新的 Agent。'}
+                  ? '创建一个专门处理特定任务的智能体。'
+                  : '从左侧选择智能体查看配置，或创建一个新的智能体。'}
               </p>
             </div>
           ) : (
@@ -1109,7 +1109,7 @@ export function AgentProfilesPage() {
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <h1 className="truncate text-2xl font-semibold tracking-tight text-foreground">
-                      {name.trim() || '新 Agent'}
+                      {name.trim() || '新智能体'}
                     </h1>
                     {draftMode && <Badge variant="secondary">草稿</Badge>}
                     {hasUnsavedChanges && (
@@ -1117,14 +1117,14 @@ export function AgentProfilesPage() {
                     )}
                   </div>
                   <p className="mt-1.5 max-w-2xl text-sm leading-6 text-muted-foreground">
-                    管理 Agent 的身份和能力，以及所属工作区和消息渠道。
+                    管理智能体的身份和能力，以及所属工作区和消息渠道。
                   </p>
                 </div>
               </header>
 
               {draftMode && (
                 <nav
-                  aria-label="创建 Agent 步骤"
+                  aria-label="创建智能体步骤"
                   className="overflow-x-auto rounded-xl border bg-card p-2"
                 >
                   <ol className="flex min-w-[680px] gap-1">
@@ -1162,7 +1162,7 @@ export function AgentProfilesPage() {
                         身份
                       </h2>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        定义这个 Agent
+                        定义这个智能体
                         如何称呼自己，以及它处理任务时遵循的角色设定。
                       </p>
                     </div>
@@ -1214,11 +1214,11 @@ export function AgentProfilesPage() {
                           />
                           <div className="min-w-0 flex-1">
                             <div className="text-sm font-medium text-foreground">
-                              Agent 头像
+                              智能体头像
                             </div>
                             <p className="mt-1 text-xs leading-5 text-muted-foreground">
                               {avatarUrl || avatarEmoji || avatarColor
-                                ? '当前使用这个 Agent 的自定义头像。'
+                                ? '当前使用这个智能体的自定义头像。'
                                 : '未单独设置，自动继承主 HappyClaw 头像。'}
                             </p>
                           </div>
@@ -1292,7 +1292,7 @@ export function AgentProfilesPage() {
                         )}
                         {draftMode && (
                           <p className="text-[11px] text-muted-foreground">
-                            创建 Agent 后即可上传图片；Emoji
+                            创建智能体后即可上传图片；Emoji
                             与背景色会随创建一起保存。
                           </p>
                         )}
@@ -1553,7 +1553,7 @@ export function AgentProfilesPage() {
                               setMcpMode(value as RuntimePolicyMode)
                             }
                           >
-                            <SelectTrigger aria-label="Agent MCP">
+                            <SelectTrigger aria-label="智能体 MCP">
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
@@ -1714,7 +1714,7 @@ export function AgentProfilesPage() {
                 <div className="flex flex-wrap items-center gap-2 border-t border-border pt-5">
                   <div className="mr-auto text-xs text-muted-foreground">
                     {draftMode
-                      ? '完成配置后创建 Agent'
+                      ? '完成配置后创建智能体'
                       : dirty
                         ? '有未保存的修改'
                         : '所有更改已保存'}
@@ -1759,7 +1759,7 @@ export function AgentProfilesPage() {
                           ) : (
                             <Plus className="h-4 w-4" />
                           )}
-                          创建 Agent
+                          创建智能体
                         </Button>
                       )}
                     </>
@@ -1806,17 +1806,17 @@ export function AgentProfilesPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>迁移工作区后删除 Agent</DialogTitle>
+            <DialogTitle>迁移工作区后删除智能体</DialogTitle>
           </DialogHeader>
           <div className="space-y-4 text-sm">
             <p className="leading-6 text-muted-foreground">
               「{selected?.name}」仍归属 {governance?.workspaces.length ?? 0}{' '}
               个工作区。删除前必须把它们迁移到同一个目标
-              Agent；渠道绑定会随工作区归属一起更新。
+              智能体；渠道绑定会随工作区归属一起更新。
             </p>
             <div>
               <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
-                目标 Agent
+                目标智能体
               </label>
               <Select
                 value={deleteTargetId}
@@ -1824,14 +1824,14 @@ export function AgentProfilesPage() {
                 disabled={deleting}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="选择目标 Agent" />
+                  <SelectValue placeholder="选择目标智能体" />
                 </SelectTrigger>
                 <SelectContent>
                   {profiles
                     .filter((profile) => profile.id !== selected?.id)
                     .map((profile) => (
                       <SelectItem key={profile.id} value={profile.id}>
-                        {profile.is_default ? '主 Agent' : profile.name}
+                        {profile.is_default ? '主智能体' : profile.name}
                       </SelectItem>
                     ))}
                 </SelectContent>

@@ -310,7 +310,7 @@ export function buildAgentCapabilityPreview(options: {
     );
   if (restrictedSystemIds.size > 0) {
     notes.push(
-      `有 ${restrictedSystemIds.size} 个系统 MCP 仅限管理员，普通成员 Agent 不会继承。`,
+      `有 ${restrictedSystemIds.size} 个系统 MCP 仅限管理员，普通成员智能体不会继承。`,
     );
   }
 

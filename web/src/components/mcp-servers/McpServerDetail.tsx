@@ -186,7 +186,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
           )}
           {server.unavailableReason === 'system_admin_only' && (
             <p className="mt-2 rounded-lg border border-warning/20 bg-warning-bg px-3 py-2 text-xs leading-5 text-warning">
-              此系统 MCP 仅限管理员使用。普通成员的 Agent
+              此系统 MCP 仅限管理员使用。普通成员的智能体
               无法运行它，完整运行配置也不会向普通成员公开。
             </p>
           )}
@@ -218,7 +218,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
         <div className="space-y-5 p-5 sm:p-6">
           {server.readonly && (
             <p className="rounded-lg bg-muted px-3 py-2 text-xs leading-5 text-muted-foreground">
-              系统 MCP 由管理员统一管理，你可以查看并在 Agent
+              系统 MCP 由管理员统一管理，你可以查看并在智能体
               能力中引用，但不能修改。
             </p>
           )}
@@ -235,8 +235,8 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
               <div className="grid grid-cols-2 gap-2">
                 {(
                   [
-                    ['admin_only', '仅管理员', '普通成员的 Agent 不可使用'],
-                    ['shared', '共享给成员', '允许普通成员的 Agent 使用'],
+                    ['admin_only', '仅管理员', '普通成员的智能体不可使用'],
+                    ['shared', '共享给成员', '允许普通成员的智能体使用'],
                   ] as const
                 ).map(([value, title, description]) => (
                   <button
@@ -261,7 +261,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
               {editMemberAccess === 'shared' && (
                 <p className="mt-2 rounded-lg border border-warning/20 bg-warning-bg px-3 py-2 text-xs leading-5 text-warning">
                   共享会把完整 command、args、url、env 和 headers
-                  配置交给普通成员的 Agent
+                  配置交给普通成员的智能体
                   运行。请确认其中所有凭据都允许成员使用。
                 </p>
               )}
@@ -505,7 +505,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
           <p className="rounded-lg bg-muted/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
             {isImported
               ? '这是从宿主机导入的独立副本，后续导入不会覆盖它。'
-              : '修改会影响新启动的 Agent 运行环境。已有密钥不会通过 API 或界面再次显示。'}
+              : '修改会影响新启动的智能体运行环境。已有密钥不会通过 API 或界面再次显示。'}
           </p>
         </div>
       )}

@@ -534,7 +534,7 @@ export function buildAskQuestionText(questions: AskQuestionView[]): string {
           return `<text_tag color='blue'>${label}</text_tag>`;
         })
         .join(' ');
-      return `${head}\n${tags}\n<font color='grey'>请在 Agent 终端回复</font>`;
+      return `${head}\n${tags}\n<font color='grey'>请在智能体终端回复</font>`;
     })
     .join('\n\n');
 }

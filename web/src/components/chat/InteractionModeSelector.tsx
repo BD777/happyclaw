@@ -27,7 +27,7 @@ const OPTIONS: Array<{
     value: 'proactive',
     title: '主动模式',
     description:
-      'Agent 在处理过程中主动发消息；每次发送立即形成一条独立消息，一轮可以发送多条。身份与语气仍由 Agent Profile 决定。',
+      '智能体在处理过程中主动发消息；每次发送立即形成一条独立消息，一轮可以发送多条。身份与语气仍由智能体配置决定。',
     icon: MessagesSquare,
   },
 ];
@@ -37,7 +37,7 @@ export function InteractionModeSelector({
   onChange,
   disabled = false,
   name,
-  description = '选择由框架在任务结束时交付一条主回复，还是由 Agent 在处理过程中主动发出多条消息。身份、Skills、记忆与渠道响应范围不变。',
+  description = '选择由框架在任务结束时交付一条主回复，还是由智能体在处理过程中主动发出多条消息。身份、Skills、记忆与渠道响应范围不变。',
 }: InteractionModeSelectorProps) {
   return (
     <fieldset disabled={disabled}>

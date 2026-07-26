@@ -294,9 +294,7 @@ export default function PlanFormDialog({
                 type="number"
                 step="0.1"
                 value={form.rate_multiplier}
-                onChange={(e) =>
-                  set('rate_multiplier', Number(e.target.value))
-                }
+                onChange={(e) => set('rate_multiplier', Number(e.target.value))}
               />
             </Field>
             <Field label="试用天数">
@@ -438,7 +436,7 @@ export default function PlanFormDialog({
             <Input
               value={form.features}
               onChange={(e) => set('features', e.target.value)}
-              placeholder="逗号分隔，如: 高速响应, 无限对话, 自定义 Agent"
+              placeholder="逗号分隔，如: 高速响应, 无限对话, 自定义智能体"
             />
           </div>
         </div>

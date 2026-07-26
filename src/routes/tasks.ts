@@ -102,7 +102,7 @@ function taskPermissions(task: ScheduledTask, authUser: AuthUser) {
 function revisionConflict(c: Context, task: ScheduledTask) {
   return c.json(
     {
-      error: '任务已被其他页面或 Agent 修改，请刷新后重试。',
+      error: '任务已被其他页面或智能体修改，请刷新后重试。',
       code: 'TASK_REVISION_CONFLICT',
       current_task: task,
     },
@@ -473,7 +473,7 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
       ? patchData.script_command
       : existing.script_command;
   if (finalExecutionType === 'agent' && !finalPrompt.trim()) {
-    return c.json({ error: 'Agent 模式下 prompt 不能为空。' }, 400);
+    return c.json({ error: '智能体模式下 prompt 不能为空。' }, 400);
   }
   if (finalExecutionType === 'script' && !finalScriptCommand?.trim()) {
     return c.json({ error: '脚本模式下 script_command 不能为空。' }, 400);

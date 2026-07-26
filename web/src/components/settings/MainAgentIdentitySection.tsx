@@ -117,7 +117,7 @@ export function MainAgentIdentitySection() {
       <div>
         <h3 className="text-sm font-semibold text-foreground">头像</h3>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          这是全局主 HappyClaw 的头像。未单独设置头像的自定义 Agent
+          这是全局主 HappyClaw 的头像。未单独设置头像的自定义智能体
           会自动继承它。
         </p>
       </div>

@@ -659,7 +659,7 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
       if (referencedByProfiles.length > 0) {
         return c.json(
           {
-            error: 'MCP server is selected by one or more Agents',
+            error: '一个或多个智能体正在使用该 MCP 服务器',
             referencedByProfiles,
           },
           409,
@@ -779,7 +779,7 @@ mcpServersRoutes.delete('/:id', authMiddleware, async (c) => {
   if (referencedByProfiles.length > 0) {
     return c.json(
       {
-        error: 'MCP server is selected by one or more Agents',
+        error: '一个或多个智能体正在使用该 MCP 服务器',
         referencedByProfiles,
       },
       409,

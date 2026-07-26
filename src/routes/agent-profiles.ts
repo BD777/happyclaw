@@ -214,7 +214,7 @@ agentProfileRoutes.post(
     const user = c.get('user') as AuthUser;
     const id = c.req.param('id');
     const existing = getAgentProfileForUser(id, user.id);
-    if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+    if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
     const body = (await c.req.json().catch(() => ({}))) as Record<
       string,
       unknown
@@ -281,10 +281,7 @@ agentProfileRoutes.post(
         group.created_by !== user.id ||
         mappedProfileId !== id
       ) {
-        return c.json(
-          { error: 'Workspace does not belong to this Agent' },
-          400,
-        );
+        return c.json({ error: '该工作区不属于此智能体' }, 400);
       }
       workspace = { jid: workspaceJid, group };
     }
@@ -320,7 +317,7 @@ agentProfileRoutes.post(
     const user = c.get('user') as AuthUser;
     const id = c.req.param('id');
     const profile = getAgentProfileForUser(id, user.id);
-    if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+    if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
     if (profile.is_default) {
       return c.json(
         { error: 'Configure the main HappyClaw avatar in system settings' },
@@ -363,7 +360,7 @@ agentProfileRoutes.delete('/:id/avatar', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
   const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
   if (profile.is_default) {
     return c.json(
       { error: 'Configure the main HappyClaw avatar in system settings' },
@@ -379,7 +376,7 @@ agentProfileRoutes.post('/:id/refine-prompt', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
   const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
   const body = await c.req.json().catch(() => ({}));
   const parsed = AgentProfileRefinePromptSchema.safeParse(body);
@@ -459,7 +456,7 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
         // profile and workspace snapshot here prevents a new A-owned workspace
         // from being published between snapshot and post-commit cleanup.
         const existing = getAgentProfileForUser(id, user.id);
-        if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+        if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
 
         const effectiveRuntimePolicy =
           parsed.data.runtime_policy === undefined
@@ -609,8 +606,8 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
             return c.json(
               {
                 error: err.persisted
-                  ? 'Agent profile was updated, but runtime cleanup failed; retry the same request'
-                  : 'Failed to quiesce active workspaces; profile was not updated',
+                  ? '智能体配置已更新，但运行时清理失败；请重试相同请求'
+                  : '无法停止活动工作区；智能体配置未更新',
                 persisted: err.persisted,
                 retryable: true,
                 profile: persistedProfile,
@@ -621,7 +618,7 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
         } else {
           profile = commit();
         }
-        if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+        if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
         return c.json({
           profile,
@@ -635,7 +632,7 @@ agentProfileRoutes.get('/:id/prompt-versions', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
   const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
   return c.json({ versions: listAgentProfilePromptVersions(id, user.id) });
 });
 
@@ -652,7 +649,7 @@ agentProfileRoutes.post(
 
     return withAgentProfileLocks([id], async () => {
       const existing = getAgentProfileForUser(id, user.id);
-      if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+      if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
       const target = getAgentProfilePromptVersion(id, user.id, version);
       if (!target) return c.json({ error: 'Prompt version not found' }, 404);
 
@@ -743,19 +740,15 @@ agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
     // wins and archive observes the mapping and returns 409.
     const result = archiveAgentProfile(id, user.id);
     if (result === 'not_found') {
-      return c.json({ error: 'Agent profile not found' }, 404);
+      return c.json({ error: '智能体配置不存在' }, 404);
     }
     if (result === 'is_default') {
-      return c.json(
-        { error: 'The built-in HappyClaw Agent cannot be deleted' },
-        400,
-      );
+      return c.json({ error: '不能删除内置的 HappyClaw 智能体' }, 400);
     }
     if (result === 'has_workspaces') {
       return c.json(
         {
-          error:
-            'Agent profile still owns workspaces; move or delete them first',
+          error: '该智能体仍拥有工作区；请先迁移或删除这些工作区',
         },
         409,
       );
@@ -763,8 +756,7 @@ agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
     if (result === 'has_mounts') {
       return c.json(
         {
-          error:
-            'Agent profile still owns IM channel mounts; unbind them first',
+          error: '该智能体仍有消息渠道挂载；请先解绑',
         },
         409,
       );
@@ -777,7 +769,7 @@ agentProfileRoutes.get('/:id/workspaces', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
   const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
   const defaultProfile = getOrCreateDefaultAgentProfile(user.id);
   const groups = getAllRegisteredGroups();

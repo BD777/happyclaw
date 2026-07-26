@@ -360,7 +360,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     ? getAgentProfileDisplayName(group.agent_profile_name)
     : group?.is_home
       ? 'HappyClaw'
-      : 'Agent';
+      : '智能体';
   const workspaceDisplayName = group?.is_my_home
     ? agentProfileLabel
     : group?.name;
@@ -889,7 +889,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 )}
                 title={
                   interactionMode === 'proactive'
-                    ? '主动模式：由 Agent 决定何时发送 0～多条独立消息'
+                    ? '主动模式：由智能体决定何时发送 0～多条独立消息'
                     : 'Assistant 模式：框架在任务完成后交付一条主回复'
                 }
                 aria-label={
@@ -1234,7 +1234,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         message={
           resetAgentId
             ? '将清除该子对话的 Claude 会话上下文，下次发送消息时将开始全新会话。聊天记录不受影响。'
-            : '将清除当前对话的 Claude 上下文并停止运行中的 Agent 进程，下次发送消息时将开始全新会话。聊天记录和其他对话不受影响。'
+            : '将清除当前对话的 Claude 上下文并停止运行中的智能体进程，下次发送消息时将开始全新会话。聊天记录和其他对话不受影响。'
         }
         confirmText="清除"
         confirmVariant="danger"

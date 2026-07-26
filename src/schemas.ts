@@ -151,7 +151,7 @@ export const TaskCreateSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['prompt'],
-        message: 'Agent 模式下 prompt 为必填项',
+        message: '智能体模式下 prompt 为必填项',
       });
     }
     if (execType === 'script' && !data.script_command?.trim()) {

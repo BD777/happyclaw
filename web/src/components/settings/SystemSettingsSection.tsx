@@ -80,7 +80,7 @@ const fieldGroups: FieldGroup[] = [
         key: 'containerMaxOutputSize',
         label: '运行日志保留上限',
         description:
-          '限制单次运行保留的 stdout/stderr 日志，不限制 Agent 回复长度。',
+          '限制单次运行保留的 stdout/stderr 日志，不限制智能体回复长度。',
         unit: 'MB',
         toDisplay: (value) => Math.round(value / 1_048_576),
         toStored: (value) => value * 1_048_576,
@@ -187,7 +187,7 @@ const fieldGroups: FieldGroup[] = [
         key: 'maxRepliesPerTurn',
         label: '单轮消息条数上限',
         description:
-          '一次回合内 Agent 最多送达多少条用户可见消息，用于兜住异常的重复发送循环；正常对话远达不到。0 表示不限制。',
+          '一次回合内智能体最多送达多少条用户可见消息，用于兜住异常的重复发送循环；正常对话远达不到。0 表示不限制。',
         unit: '条',
         toDisplay: (value) => value,
         toStored: (value) => value,
@@ -683,8 +683,8 @@ export function HostIntegrationSettingsSection({
     <div>
       {scope === 'host' && (
         <div className="rounded-lg border border-warning/30 bg-warning-bg px-4 py-3 text-xs leading-5 text-warning">
-          这些设置会读取宿主机文件，只对系统管理员开放。自定义 Agent
-          是否继承宿主机 Claude Code 配置，请在对应 Agent 的设置中管理。
+          这些设置会读取宿主机文件，只对系统管理员开放。自定义智能体
+          是否继承宿主机 Claude Code 配置，请在对应智能体的设置中管理。
         </div>
       )}
 
@@ -955,7 +955,7 @@ export function HostIntegrationSettingsSection({
           {saving && (
             <Loader2 className="size-4 animate-spin" aria-hidden="true" />
           )}
-          {scope === 'main-agent' ? '保存主 Agent 设置' : '保存宿主机设置'}
+          {scope === 'main-agent' ? '保存主智能体设置' : '保存宿主机设置'}
         </Button>
       </div>
     </div>

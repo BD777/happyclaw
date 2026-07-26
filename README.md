@@ -7,7 +7,7 @@
 <h1 align="center">HappyClaw</h1>
 
 <p align="center">
-  <strong>自托管、多用户、Agent-first 的 Claude Code 工作台</strong>
+  <strong>自托管、多用户、智能体优先的 Claude Code 工作台</strong>
   <br />
   让 Claude Code 通过 Web 与 7 种消息渠道长期在线，在宿主机或 Docker 沙箱中安全执行任务。
 </p>
@@ -42,14 +42,14 @@
 
 ## HappyClaw 是什么
 
-HappyClaw 是一个基于 [Claude Agent SDK for TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript) 的自托管 AI Agent 系统。它把完整的 Claude Code 运行时封装成一个可持续运行的多用户服务，让你可以从浏览器、飞书、Telegram、QQ、钉钉、微信、Discord 或 WhatsApp 使用同一套 Agent、工作区、能力和自动化任务。
+HappyClaw 是一个基于 [Claude Agent SDK for TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript) 的自托管 AI 智能体系统。它把完整的 Claude Code 运行时封装成一个可持续运行的多用户服务，让你可以从浏览器、飞书、Telegram、QQ、钉钉、微信、Discord 或 WhatsApp 使用同一套智能体、工作区、能力和自动化任务。
 
-HappyClaw 不是一个简单的聊天 API Wrapper。Agent 运行在真实的 Claude Code 环境中，可以读写项目文件、执行终端命令、使用浏览器、调用 MCP、加载 Skills，并在多个独立工作区和会话之间保持清晰的权限与上下文边界。
+HappyClaw 不是一个简单的聊天 API Wrapper。智能体运行在真实的 Claude Code 环境中，可以读写项目文件、执行终端命令、使用浏览器、调用 MCP、加载 Skills，并在多个独立工作区和会话之间保持清晰的权限与上下文边界。
 
 ### 为什么使用 HappyClaw
 
-- **Claude Code 原生运行时** — 直接使用版本锁定的 Claude Agent SDK 与 Claude Code CLI，不重新实现工具调用和 Agent 循环。
-- **Agent-first 工作台** — Agent 管身份和能力，工作区管文件与执行环境，会话管对话上下文，产品层级清晰。
+- **Claude Code 原生运行时** — 直接使用版本锁定的 Claude Agent SDK 与 Claude Code CLI，不重新实现工具调用和运行循环。
+- **智能体优先工作台** — 智能体管身份和能力，工作区管文件与执行环境，会话管对话上下文，产品层级清晰。
 - **随时可访问** — Web、PWA 和 7 种 IM 渠道统一接入，任务完成后可以主动把结果送回消息渠道。
 - **多用户与多账号** — 用户、渠道凭据、工作区、记忆、Skills、MCP 和运行数据彼此隔离。
 - **宿主机与容器双模式** — 管理员可以使用授权的本机项目目录，普通成员默认在 Docker 沙箱中运行。
@@ -59,33 +59,33 @@ HappyClaw 不是一个简单的聊天 API Wrapper。Agent 运行在真实的 Cla
 
 | 模块           | 主要能力                                                                                |
 | -------------- | --------------------------------------------------------------------------------------- |
-| **Agent**      | 主 HappyClaw 对话式创建/编辑、自定义 Agent、头像、结构化提示词、AI 优化、版本历史与恢复 |
-| **工作区**     | Agent 归属、宿主机/容器执行、独立目录、项目环境变量、项目 Claude 上下文、多会话         |
-| **能力治理**   | 用户 Skills、系统/用户 MCP、Claude Code Plugins 与最终生效预览；Agent 工具权限完整开放  |
+| **智能体**     | 主 HappyClaw 对话式创建/编辑、自定义智能体、头像、结构化提示词、AI 优化、版本历史与恢复 |
+| **工作区**     | 智能体归属、宿主机/容器执行、独立目录、项目环境变量、项目 Claude 上下文、多会话         |
+| **能力治理**   | 用户 Skills、系统/用户 MCP、Claude Code Plugins 与最终生效预览；智能体工具权限完整开放  |
 | **消息渠道**   | 飞书、Telegram、QQ、钉钉、微信、Discord、WhatsApp，多账号、扫码登录、工作区/会话绑定    |
 | **模型提供商** | Anthropic 官方与第三方兼容端点、多 Provider、轮询/加权/故障转移、健康检查、会话粘性     |
-| **定时任务**   | Cron、固定间隔、一次性任务，Agent/Script 执行，隔离上下文，幂等立即运行，通知重试       |
+| **定时任务**   | Cron、固定间隔、一次性任务，智能体/Script 执行，隔离上下文，幂等立即运行，通知重试      |
 | **记忆与文件** | 用户全局记忆、工作区记忆、日期记忆、上下文压缩归档、全文搜索、文件上传下载与终端        |
-| **用量与计费** | Token 分类统计、Agent/工作区/模型筛选、明细与 CSV 导出、订阅、余额、兑换码与配额        |
+| **用量与计费** | Token 分类统计、智能体/工作区/模型筛选、明细与 CSV 导出、订阅、余额、兑换码与配额       |
 | **运维与安全** | RBAC、邀请注册、登录设备、审计日志、运行监控、Docker 镜像管理、备份与安全恢复           |
 | **客户端体验** | 实时流式输出、工具轨迹、Markdown/Mermaid/KaTeX、消息分享图片、响应式布局与 PWA          |
 
-## Agent-first 工作模型
+## 智能体优先工作模型
 
-HappyClaw 使用统一的 `Agent → Workspace → Runtime Session` 层级：
+HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级：
 
 ```text
-Agent（身份、提示词、Skills、MCP）
+智能体（身份、提示词、Skills、MCP）
 └── Workspace（项目目录、执行模式、环境变量、渠道挂载）
     ├── Main Session（工作区主会话）
     ├── Runtime Session（独立对话或渠道原生话题）
     └── Scheduled Run（定时任务的普通或隔离运行）
 ```
 
-- **Agent** 保存长期身份和能力策略。主 HappyClaw Agent 始终存在，也可以创建代码审查、研究、运维等自定义 Agent。
-- **对话式 Agent Builder** 在主 HappyClaw 名下的所有 Workspace 主会话与普通 Runtime Session 中生效，允许用户多轮讨论需求、保存并预览 Agent 草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新 Agent；定时任务与 Sub-Agent 不能代替用户发布。
-- **Workspace** 是私有的文件与执行隔离边界。创建时必须选择 Agent，后续可以迁移归属。
-- **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层 Agent。
+- **智能体** 保存长期身份和能力策略。主 HappyClaw 智能体始终存在，也可以创建代码审查、研究、运维等自定义智能体。
+- **对话式智能体构建器** 在主 HappyClaw 名下的所有 Workspace 主会话与普通 Runtime Session 中生效，允许用户多轮讨论需求、保存并预览智能体草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新智能体；定时任务与 Sub-Agent 不能代替用户发布。
+- **Workspace** 是私有的文件与执行隔离边界。创建时必须选择智能体，后续可以迁移归属。
+- **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层智能体。
 - **Channel Mount** 把 IM 群聊、私聊或原生话题挂载到工作区或具体会话。
 
 ### 执行模式
@@ -97,17 +97,17 @@ Agent（身份、提示词、Skills、MCP）
 
 普通成员不能把容器工作区降级为宿主机执行。Script 定时任务也只允许管理员在有权限的 Host 工作区运行。
 
-## Agent 与能力治理
+## 智能体与能力治理
 
-### Agent Profile
+### 智能体配置（Agent Profile）
 
-每个自定义 Agent 都可以配置：
+每个自定义智能体都可以配置：
 
 - 名称、头像和 Claude 原生 preset。
 - 身份、目标、工作方式和输出要求等结构化提示词。
 - AI 生成提示词、局部优化、版本记录和历史版本恢复。
 - 托管 Claude 上下文或管理员宿主机 Claude 上下文。
-- 用户 Skills、HappyClaw MCP 与 Claude Code Plugins；Agent 始终拥有完整工具权限。
+- 用户 Skills、HappyClaw MCP 与 Claude Code Plugins；智能体始终拥有完整工具权限。
 
 配置页可以针对具体工作区预览最终生效能力，包括项目 `CLAUDE.md`、`.claude/skills`、项目 MCP、用户能力和同名覆盖来源。
 
@@ -117,14 +117,14 @@ HappyClaw 区分不同层级的能力来源：
 
 | 来源                    | 说明                                                              |
 | ----------------------- | ----------------------------------------------------------------- |
-| **内置能力**            | 随 HappyClaw 或 Agent 容器提供的基础工具与 Skills                 |
+| **内置能力**            | 随 HappyClaw 或智能体容器提供的基础工具与 Skills                  |
 | **用户 Skills**         | 从技能市场、HTTPS Git 仓库或 ZIP 导入，按用户隔离并记录来源与版本 |
 | **项目上下文**          | 工作区目录里的 `CLAUDE.md`、`.claude/skills` 和 MCP 配置          |
-| **用户 MCP**            | 当前用户维护的 MCP Server，只进入允许使用它的 Agent               |
+| **用户 MCP**            | 当前用户维护的 MCP Server，只进入允许使用它的智能体               |
 | **系统 MCP**            | 管理员维护，默认仅管理员可用，显式共享后普通成员才能使用          |
 | **Claude Code Plugins** | 系统 catalog 与用户启用状态分离，通过版本化运行快照加载           |
 
-内置 MCP 工具覆盖消息发送、定时任务、渠道查询、Skill 管理和记忆读写；实际开放的工具会根据用户权限、Agent 策略、工作区模式和渠道上下文动态裁剪。
+内置 MCP 工具覆盖消息发送、定时任务、渠道查询、Skill 管理和记忆读写；实际开放的工具会根据用户权限、智能体策略、工作区模式和渠道上下文动态裁剪。
 
 ## 渠道接入
 
@@ -145,7 +145,7 @@ Bot 的凭据。
 
 渠道账号的凭据和扫码会话按用户、账号隔离。当前绑定边界为：
 
-1. 渠道账号的默认 Agent/工作区。
+1. 渠道账号的默认智能体/工作区。
 2. 群聊绑定到工作区；一个工作区可以绑定多个账号下的多个群聊。
 3. 私聊绑定到工作区内的指定 Runtime Session。
 4. 飞书话题群、Telegram Forum 等原生线程自动映射为独立 Runtime Session。
@@ -181,10 +181,10 @@ HappyClaw 可以同时配置多个 Claude Provider，并为新会话按策略选
 
 ## 定时任务
 
-定时任务使用与交互会话相同的 Agent、工作区和执行策略：
+定时任务使用与交互会话相同的智能体、工作区和执行策略：
 
 - **调度方式** — Cron、固定间隔和一次性时间点；间隔任务最短 60 秒。
-- **执行类型** — Agent 任务运行完整 Claude Agent；Script 任务直接执行 Shell。
+- **执行类型** — 智能体任务运行完整 Claude Agent；Script 任务直接执行 Shell。
 - **上下文模式** — `group` 注入工作区主会话；`isolated` 每次创建独立队列、Claude session 和 IPC 命名空间。
 - **立即运行** — Web、REST 和 MCP 共用幂等键与稳定 `runId`，网络重试不会重复执行。
 - **运行控制** — 支持暂停、恢复、编辑、停止当前运行、软删除和恢复任务。
@@ -215,7 +215,7 @@ cd happyclaw
 make start
 ```
 
-首次启动会自动安装三端依赖、编译后端/Web/Agent Runner，并在 Docker 可用时构建 Agent 镜像。启动完成后打开：
+首次启动会自动安装三端依赖、编译后端/Web/Agent Runner，并在 Docker 可用时构建智能体镜像。启动完成后打开：
 
 <http://localhost:3000>
 
@@ -224,7 +224,7 @@ make start
 1. 创建第一个管理员账户。
 2. 配置 Anthropic 官方账号或第三方 Claude 兼容 Provider。
 3. 可选添加飞书、Telegram、QQ、钉钉、微信、Discord 或 WhatsApp 渠道账号。
-4. 进入工作台创建 Agent、工作区和会话。
+4. 进入工作台创建智能体、工作区和会话。
 
 ### 开发模式
 
@@ -260,7 +260,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | ----------------------- | ----------------------------------------------------- |
 | **设置 → 模型与提供商** | 官方/第三方 Provider、密钥、模型、1M 上下文和负载均衡 |
 | **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态、默认工作区和会话绑定    |
-| **设置 → 主 HappyClaw** | 默认 Agent 的 Skills 与 MCP                           |
+| **设置 → 主 HappyClaw** | 默认智能体的 Skills 与 MCP                            |
 | **设置 → 执行与容量**   | 超时、并发、上下文窗口和运行限制                      |
 | **设置 → 任务与自动化** | 定时任务默认值和自动化策略                            |
 | **设置 → 宿主机集成**   | 管理员 Host 目录与 Claude 上下文来源                  |
@@ -273,7 +273,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | --------------------------- | ------------------------ | ---------------------------------- |
 | `WEB_PORT`                  | `3000`                   | Web、REST API 与 WebSocket 端口    |
 | `WEB_SESSION_SECRET`        | 自动生成并持久化         | Web 登录会话签名密钥               |
-| `CONTAINER_IMAGE`           | `happyclaw-agent:latest` | Agent 容器镜像                     |
+| `CONTAINER_IMAGE`           | `happyclaw-agent:latest` | 智能体容器镜像                     |
 | `CONTAINER_TIMEOUT`         | `1800000`                | 容器硬超时，毫秒                   |
 | `IDLE_TIMEOUT`              | `1800000`                | 容器空闲保活时间，毫秒             |
 | `MAX_CONCURRENT_CONTAINERS` | `20`                     | 最大并发容器数                     |
@@ -334,18 +334,18 @@ flowchart LR
     Stream --> IM
 ```
 
-主服务始终使用 Node.js 运行，负责认证、路由、队列、调度、渠道连接、Provider 池、用量和持久化。Docker 只用于隔离 Agent 执行环境，不承载 HappyClaw 主服务。
+主服务始终使用 Node.js 运行，负责认证、路由、队列、调度、渠道连接、Provider 池、用量和持久化。Docker 只用于隔离智能体执行环境，不承载 HappyClaw 主服务。
 
 ### 技术栈
 
-| 层                | 技术                                                                             |
-| ----------------- | -------------------------------------------------------------------------------- |
-| **主服务**        | Node.js、TypeScript、Hono、WebSocket、SQLite                                     |
-| **Agent Runtime** | Claude Agent SDK、Claude Code CLI、MCP、文件 IPC                                 |
-| **Web**           | React 19、Vite、Tailwind CSS、Radix UI、Zustand、Recharts、xterm.js              |
-| **渠道**          | Feishu SDK、grammY、QQ Bot API、DingTalk Stream、Discord.js、Baileys、微信 iLink |
-| **隔离执行**      | Docker、非 root Node.js 容器、Chromium、常用开发与浏览器工具                     |
-| **质量保障**      | TypeScript、Vitest、Prettier、GitHub Actions                                     |
+| 层               | 技术                                                                             |
+| ---------------- | -------------------------------------------------------------------------------- |
+| **主服务**       | Node.js、TypeScript、Hono、WebSocket、SQLite                                     |
+| **智能体运行时** | Claude Agent SDK、Claude Code CLI、MCP、文件 IPC                                 |
+| **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、Recharts、xterm.js              |
+| **渠道**         | Feishu SDK、grammY、QQ Bot API、DingTalk Stream、Discord.js、Baileys、微信 iLink |
+| **隔离执行**     | Docker、非 root Node.js 容器、Chromium、常用开发与浏览器工具                     |
+| **质量保障**     | TypeScript、Vitest、Prettier、GitHub Actions                                     |
 
 ## 安全模型
 
@@ -355,7 +355,7 @@ HappyClaw 会执行代码和访问第三方消息平台，部署前请理解以�
 - Provider 与渠道密钥使用本机 AES-256-GCM 密钥加密，密钥文件权限限制为 `0600`。
 - REST、WebSocket、IM 命令和 MCP 工具分别执行身份、owner、角色与能力策略检查。
 - 普通成员固定使用 Container 模式；管理员 Host 模式只允许访问授权目录。
-- Agent 不提供只读或受限安全模式，工具执行权限完整开放；Skills 与 MCP 是否启用由用户显式选择。
+- 智能体不提供只读或受限安全模式，工具执行权限完整开放；Skills 与 MCP 是否启用由用户显式选择。
 - Script 定时任务只允许管理员在授权的 Host 工作区执行。
 - Skill ZIP、文件上传、备份恢复和 Git 操作包含路径、符号链接、大小与目标校验。
 - 对公网开放时，建议使用 HTTPS 反向代理、强密码、关闭开放注册，并定期备份 `data/`。
@@ -408,12 +408,12 @@ happyclaw/
 
 ## 文档
 
-| 文档                                                                  | 用途                                              |
-| --------------------------------------------------------------------- | ------------------------------------------------- |
-| [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、Agent、用量等接口 |
-| [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求              |
-| [Agent-first 架构记录](docs/agent-first-architecture-plan.md)         | Agent、工作区、运行会话与渠道挂载的迁移背景       |
-| [Plugin 自动化设计记录](docs/claude-code-plugin-automation-design.md) | Claude Code Plugin catalog 与运行快照的历史设计   |
+| 文档                                                                  | 用途                                               |
+| --------------------------------------------------------------------- | -------------------------------------------------- |
+| [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、智能体、用量等接口 |
+| [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求               |
+| [智能体优先架构记录](docs/agent-first-architecture-plan.md)           | 智能体、工作区、运行会话与渠道挂载的迁移背景       |
+| [Plugin 自动化设计记录](docs/claude-code-plugin-automation-design.md) | Claude Code Plugin catalog 与运行快照的历史设计    |
 
 ## 常见问题
 
@@ -472,7 +472,7 @@ docs: update provider setup guide
 
 ## 致谢
 
-- [Anthropic Claude Code](https://github.com/anthropics/claude-code) 与 [Claude Agent SDK for TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript) 提供完整的 Agent 运行时。
+- [Anthropic Claude Code](https://github.com/anthropics/claude-code) 与 [Claude Agent SDK for TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript) 提供完整的智能体运行时。
 - 感谢所有渠道 SDK、开源依赖、Issue 提交者和贡献者。
 
 HappyClaw 是独立开源项目，与 Anthropic 及各消息平台不存在官方隶属、授权或背书关系。相关名称和商标归各自权利人所有。

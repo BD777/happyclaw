@@ -224,7 +224,7 @@ export function MainAgentCapabilitiesSection() {
       <div>
         <h3 className="text-sm font-semibold text-foreground">系统附加能力</h3>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          按来源控制主 Agent 的 Skills，并管理 HappyClaw 附加的 MCP。 宿主机
+          按来源控制主智能体的 Skills，并管理 HappyClaw 附加的 MCP。 宿主机
           Skills 可独立于宿主机 Prompt 与 Rules 启用。
         </p>
       </div>

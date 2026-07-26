@@ -59,7 +59,7 @@ describe('settings information architecture', () => {
       "bindings: '/settings?tab=my-channels&view=bindings'",
     );
     expect(navItems).toContain("label: '能力库'");
-    expect(capabilities).toMatch(/能力库[\s\S]*具体 Agent 的“能力配置”/);
+    expect(capabilities).toMatch(/能力库[\s\S]*具体智能体的“能力配置”/);
   });
 
   test('keeps workspaces private and removes the abandoned collaboration surface', () => {

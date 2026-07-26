@@ -89,7 +89,7 @@ export function SkillsPage() {
         </div>
 
         <div className="mx-6 mt-4 rounded-lg bg-muted px-4 py-3 text-xs leading-5 text-muted-foreground">
-          “我的 Skills”可安装和管理；HappyClaw 内置与宿主机 Skills 只读。 Agent
+          “我的 Skills”可安装和管理；HappyClaw 内置与宿主机 Skills 只读。智能体
           可以独立选择不使用、使用部分或使用全部宿主机
           Skills，不必同时继承宿主机 Prompt 或
           Rules。不同来源的同名项会并列显示。

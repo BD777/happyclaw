@@ -81,7 +81,7 @@ export function WorkspaceInteractionModeDialog({
         />
 
         <p className="rounded-md bg-muted/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          切换会安全重启该工作区的 Agent
+          切换会安全重启该工作区的智能体
           运行时；身份、Skills、记忆与渠道绑定保持不变。正在运行的任务会先停止，后续消息按新模式处理。
         </p>
 

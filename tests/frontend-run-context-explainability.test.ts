@@ -29,7 +29,7 @@ describe('Agent runtime context explainability', () => {
     expect(preview).toContain('snapshot.skills.included');
     expect(preview).toContain('snapshot.skills.manifestHash');
     expect(preview).toContain('usage.mcpTools.length');
-    expect(preview).toContain('来自旧 Agent 配置');
+    expect(preview).toContain('来自旧智能体配置');
     expect(preview).toContain('snapshot.subagentContract');
   });
 });

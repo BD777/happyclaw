@@ -1700,7 +1700,7 @@ async function runGroupModeTask(
   )
     return;
   runningTaskIds.add(task.id);
-  let resultSummary = '已排队到源工作区，等待 Agent 执行';
+  let resultSummary = '已排队到源工作区，等待智能体执行';
 
   try {
     // Resolve task owner for sender attribution

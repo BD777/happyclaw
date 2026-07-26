@@ -148,14 +148,14 @@ export function AgentGovernanceSection({
                           className="h-8 min-w-0 flex-1 text-xs"
                           aria-label={`迁移工作区 ${workspace.name}`}
                         >
-                          <SelectValue placeholder="迁移到其他 Agent" />
+                          <SelectValue placeholder="迁移到其他智能体" />
                         </SelectTrigger>
                         <SelectContent>
                           {profiles
                             .filter((profile) => profile.id !== selected.id)
                             .map((profile) => (
                               <SelectItem key={profile.id} value={profile.id}>
-                                {profile.is_default ? '主 Agent' : profile.name}
+                                {profile.is_default ? '主智能体' : profile.name}
                               </SelectItem>
                             ))}
                         </SelectContent>

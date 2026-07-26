@@ -18,7 +18,7 @@ interface NavItem {
 
 export const baseNavItems: NavItem[] = [
   { path: '/chat', icon: MessageCircle, label: '工作台' },
-  { path: '/agent-profiles', icon: Bot, label: 'Agent' },
+  { path: '/agent-profiles', icon: Bot, label: '智能体' },
   { path: '/capabilities', icon: Puzzle, label: '能力库' },
   { path: '/tasks', icon: Clock4, label: '任务' },
   { path: '/usage', icon: BarChart3, label: '用量', hideOnMobile: true },

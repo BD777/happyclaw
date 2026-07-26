@@ -517,7 +517,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     ? getAgentProfileForUser(validation.data.agent_profile_id, authUser.id)
     : getOrCreateDefaultAgentProfile(authUser.id);
   if (!agentProfile) {
-    return c.json({ error: 'Agent profile not found' }, 404);
+    return c.json({ error: '智能体配置不存在' }, 404);
   }
 
   // Billing: check group limit
@@ -940,10 +940,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
   if (!publishedAgentProfile) {
     fs.rmSync(groupDir, { recursive: true, force: true });
-    return c.json(
-      { error: 'Agent profile is no longer active; choose another Agent' },
-      409,
-    );
+    return c.json({ error: '该智能体配置已失效；请选择其他智能体' }, 409);
   }
 
   // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
@@ -1105,8 +1102,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   ) {
     return c.json(
       {
-        error:
-          'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+        error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
         code: 'WORKSPACE_AGENT_PROFILE_MISSING',
       },
       409,
@@ -1210,8 +1206,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
           deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
           return c.json(
             {
-              error:
-                'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+              error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
               code: 'WORKSPACE_AGENT_PROFILE_MISSING',
             },
             409,
@@ -1242,8 +1237,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         if (!(err instanceof WorkspaceAgentProfileMissingError)) throw err;
         return c.json(
           {
-            error:
-              'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+            error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
             code: 'WORKSPACE_AGENT_PROFILE_MISSING',
           },
           409,
@@ -1294,7 +1288,7 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
     validation.data.agent_profile_id,
     authUser.id,
   );
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
   let invalidatedRuntimeJids = 0;
   let committedProfile = profile;
@@ -1370,7 +1364,7 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
       );
       if (outcome.kind === 'retry') continue;
       if (outcome.kind === 'target_missing') {
-        return c.json({ error: 'Agent profile is no longer active' }, 409);
+        return c.json({ error: '该智能体配置已失效' }, 409);
       }
       if (outcome.kind === 'workspace_missing') {
         return c.json(
@@ -1407,8 +1401,8 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
       return c.json(
         {
           error: err.persisted
-            ? 'Workspace Agent profile was updated, but runtime cleanup failed; retry the same request'
-            : 'Failed to quiesce active runtime; Workspace Agent profile was not updated',
+            ? '工作区智能体配置已更新，但运行时清理失败；请重试相同请求'
+            : '无法停止活动运行时；工作区智能体配置未更新',
           persisted: err.persisted,
           retryable: true,
           agent_profile_id: err.persisted ? profile.id : undefined,

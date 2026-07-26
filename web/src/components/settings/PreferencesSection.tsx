@@ -214,7 +214,7 @@ function FollowUpBehaviorSection() {
     <Section
       icon={ListTodo}
       title="运行中的后续消息"
-      desc="当前设备：选择 Agent 正在运行时发送新消息的默认行为"
+      desc="当前设备：选择智能体正在运行时发送新消息的默认行为"
     >
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <OptionButton
