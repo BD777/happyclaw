@@ -107,6 +107,7 @@ import {
   resolveFeishuCliRuntimeBinding,
   type FeishuCliRuntimeBinding,
 } from './feishu-cli-runtime.js';
+import { assertValidWorkspaceFolderName } from './workspace-folder.js';
 
 /**
  * 宿主机的 ~/.claude.json 路径。
@@ -977,6 +978,10 @@ export function getContainerRuntimeEnvDir(
   taskRunId?: string,
   feishuChannelAccountId?: string | null,
 ): string {
+  const safeGroupFolder = assertValidWorkspaceFolderName(
+    groupFolder,
+    'group folder',
+  );
   const identityPath = feishuChannelAccountId
     ? [
         'channel-accounts',
@@ -994,7 +999,7 @@ export function getContainerRuntimeEnvDir(
   return path.join(
     DATA_DIR,
     'env',
-    groupFolder,
+    safeGroupFolder,
     ...identityPath,
     ...runtimePath,
   );
@@ -1010,7 +1015,7 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   taskRunId: string,
 ): void {
   const safeTaskRunId = assertRuntimeEnvPathSegment(taskRunId, 'task run id');
-  const safeGroupFolder = assertRuntimeEnvPathSegment(
+  const safeGroupFolder = assertValidWorkspaceFolderName(
     groupFolder,
     'group folder',
   );

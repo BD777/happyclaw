@@ -227,6 +227,34 @@ describe('managed MCP runtime secret boundary', () => {
     expect(taskDirs.every((taskDir) => !fs.existsSync(taskDir))).toBe(true);
   });
 
+  test('cleans task env snapshots for a valid dotted workspace folder', () => {
+    const folder = 'workspace.with-dot';
+    const taskRunId = 'task-run-dot';
+    const taskDirs = [
+      getContainerRuntimeEnvDir(folder, undefined, taskRunId, 'account-a'),
+      getContainerRuntimeEnvDir(folder, undefined, taskRunId),
+    ];
+    for (const taskDir of taskDirs) {
+      fs.mkdirSync(taskDir, { recursive: true });
+      fs.writeFileSync(path.join(taskDir, 'env'), 'SECRET=value');
+    }
+
+    cleanupContainerTaskRuntimeEnvDirs(folder, taskRunId);
+
+    expect(taskDirs.every((taskDir) => !fs.existsSync(taskDir))).toBe(true);
+  });
+
+  test('rejects unsafe workspace folders before building env paths', () => {
+    expect(() =>
+      getContainerRuntimeEnvDir(
+        '../workspace',
+        undefined,
+        'task-run-a',
+        'account-a',
+      ),
+    ).toThrow(/Invalid group folder/);
+  });
+
   test('member runtime receives only explicitly shared system MCP, regardless of where tokens are stored', () => {
     const ownerId = 'member-owner';
     ownerRoles.set(ownerId, 'member');

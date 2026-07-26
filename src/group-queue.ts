@@ -36,10 +36,42 @@ export interface IpcPrePublishAdmission {
   rollback?: () => void;
 }
 export interface RunnerMessageRequirements {
-  /** Bot identity whose App credentials must already be present in a Docker
-   * runner. Ignored for host-mode processes. */
+  /**
+   * Bot identity whose App credentials must already be present in a Docker
+   * runner. An explicit null means the request must run without an injected
+   * Bot; omission means this internal caller is not imposing an identity
+   * constraint. Ignored for host-mode processes.
+   */
   feishuCliAccountId?: string | null;
 }
+
+interface FeishuCliIdentityRequirement {
+  specified: boolean;
+  accountId: string | null;
+}
+
+function resolveFeishuCliIdentityRequirement(
+  requirements?: RunnerMessageRequirements,
+  channelContext?: ChannelTurnContext,
+): FeishuCliIdentityRequirement {
+  if (
+    requirements !== undefined &&
+    Object.prototype.hasOwnProperty.call(requirements, 'feishuCliAccountId')
+  ) {
+    return {
+      specified: true,
+      accountId: requirements.feishuCliAccountId ?? null,
+    };
+  }
+  if (channelContext !== undefined) {
+    return {
+      specified: true,
+      accountId: resolveFeishuCliBoundAccountId({ channelContext }),
+    };
+  }
+  return { specified: false, accountId: null };
+}
+
 export interface MutationPauseToken {
   readonly id: number;
 }
@@ -1137,12 +1169,13 @@ export class GroupQueue {
     requirements: RunnerMessageRequirements,
   ): boolean {
     const state = this.resolveActiveState(groupJid);
-    const requiredAccountId = requirements.feishuCliAccountId ?? null;
+    const identityRequirement =
+      resolveFeishuCliIdentityRequirement(requirements);
     return (
       state !== null &&
       state.containerName !== null &&
-      requiredAccountId !== null &&
-      requiredAccountId !== state.feishuCliAccountId
+      identityRequirement.specified &&
+      identityRequirement.accountId !== state.feishuCliAccountId
     );
   }
 
@@ -1387,13 +1420,14 @@ export class GroupQueue {
     // bound Bot): drain it and let the normal cold-start path launch a runner
     // carrying B's credentials. Host mode is intentionally exempt because
     // feishu-cli there is governed entirely by the host's native configuration.
-    const requiredFeishuCliAccountId =
-      requirements?.feishuCliAccountId ??
-      resolveFeishuCliBoundAccountId({ channelContext });
+    const identityRequirement = resolveFeishuCliIdentityRequirement(
+      requirements,
+      channelContext,
+    );
     if (
       state.containerName !== null &&
-      requiredFeishuCliAccountId !== null &&
-      requiredFeishuCliAccountId !== state.feishuCliAccountId
+      identityRequirement.specified &&
+      identityRequirement.accountId !== state.feishuCliAccountId
     ) {
       this.requestDrainForActiveRunner(
         groupJid,
@@ -1403,7 +1437,7 @@ export class GroupQueue {
         {
           groupJid,
           activeFeishuCliAccountId: state.feishuCliAccountId,
-          requiredFeishuCliAccountId,
+          requiredFeishuCliAccountId: identityRequirement.accountId,
         },
         'Rejected warm IPC injection across Feishu Bot identities',
       );

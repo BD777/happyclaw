@@ -161,6 +161,48 @@ describe('GroupQueue IPC delivery receipts', () => {
     expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
   });
 
+  test('restarts a Bot-bound container for an explicitly unbound request', async () => {
+    await startRunner({
+      containerName: 'happyclaw-bot-a',
+      feishuCliAccountId: 'account-a',
+    });
+
+    expect(
+      queue.requiresFeishuCliContainerRestart(JID, {
+        feishuCliAccountId: null,
+      }),
+    ).toBe(true);
+    expect(
+      queue.sendMessage(
+        JID,
+        'use native unbound config',
+        undefined,
+        undefined,
+        JID,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { feishuCliAccountId: null },
+      ),
+    ).toBe('no_active');
+    expect(readPayloads()).toEqual([]);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('keeps compatibility for internal IPC without an identity constraint', async () => {
+    await startRunner({
+      containerName: 'happyclaw-bot-a',
+      feishuCliAccountId: 'account-a',
+    });
+
+    expect(
+      queue.sendMessage(JID, 'internal message without turn identity'),
+    ).toBe('sent');
+    expect(readPayloads()).toHaveLength(1);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+  });
+
   test('does not impose container Bot identity on host-mode runners', async () => {
     await startRunner();
 

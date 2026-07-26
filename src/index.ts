@@ -68,6 +68,7 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
+import { isValidWorkspaceFolderName } from './workspace-folder.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   closeDatabase,
@@ -4782,10 +4783,7 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // folder 会直接拼到 path.join(GROUPS_DIR, ...) 上。任何含 `..`、绝对路径或
   // 路径分隔符的 folder 都会让 mkdir/写入跑出 GROUPS_DIR 之外（agent
   // bypass-permissions 模式下完全可达）。规则与典型 unix 目录命名一致。
-  if (
-    !group.folder ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(group.folder)
-  ) {
+  if (!group.folder || !isValidWorkspaceFolderName(group.folder)) {
     throw new Error(`registerGroup: invalid folder name: ${group.folder}`);
   }
 
