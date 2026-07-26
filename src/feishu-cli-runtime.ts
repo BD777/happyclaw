@@ -1,14 +1,10 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
 import { loadChannelAccountSecret } from './channel-account-secrets.js';
 import { getChannelAccount } from './db.js';
 import type { ChannelAccount, ChannelTurnContext } from './types.js';
 
-const FEISHU_CLI_MANAGED_ENV_KEYS = [
+const FEISHU_CLI_CREDENTIAL_ENV_KEYS = [
   'FEISHU_APP_ID',
   'FEISHU_APP_SECRET',
-  'FEISHU_PROFILE',
 ] as const;
 
 export class FeishuCliCredentialBindingError extends Error {
@@ -23,6 +19,7 @@ export interface FeishuCliRuntimeBinding {
   accountId: string | null;
   appId: string;
   appSecret: string;
+  /** Inherited user preference only; HappyClaw never synthesizes a profile. */
   profileName?: string;
 }
 
@@ -71,23 +68,15 @@ function fallbackBinding(
   };
 }
 
-export function feishuCliProfileName(accountId: string): string {
-  const safeAccountId = accountId.replace(/[^A-Za-z0-9_-]/g, '_');
-  const name = `happyclaw_${safeAccountId}`.slice(0, 64);
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
-    throw new FeishuCliCredentialBindingError(
-      'The bound Feishu account cannot be represented as a CLI profile',
-    );
-  }
-  return name;
-}
-
 /**
  * Resolve the Feishu CLI identity for one Agent run.
  *
  * An exact inbound Feishu turn is authoritative. A workspace-level account is
- * used only when no turn-scoped account exists. The process environment (for
- * example values loaded from ~/.zshrc) is the final compatibility fallback.
+ * used only when no turn-scoped account exists. The inherited process
+ * environment is the next fallback regardless of whether it came from zsh,
+ * bash, fish, launchd, systemd, Docker, or another launcher. With no complete
+ * inherited credentials this returns null and feishu-cli resolves its native
+ * active profile or config.yaml without HappyClaw parsing either one.
  *
  * Once a Feishu account is explicitly bound, failures are closed rather than
  * silently falling back to a different Bot identity.
@@ -164,45 +153,7 @@ export function resolveFeishuCliRuntimeBinding(
     accountId: account.id,
     appId,
     appSecret,
-    profileName: feishuCliProfileName(account.id),
   };
-}
-
-export function ensureFeishuCliProfile(
-  profileRoot: string,
-  profileName: string,
-): string {
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(profileName)) {
-    throw new FeishuCliCredentialBindingError(
-      'Invalid Feishu CLI profile name',
-    );
-  }
-  fs.mkdirSync(profileRoot, { recursive: true, mode: 0o700 });
-  fs.chmodSync(profileRoot, 0o700);
-  const profilesDir = path.join(profileRoot, 'profiles');
-  const profileDir = path.join(profilesDir, profileName);
-  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(profilesDir, 0o700);
-  fs.chmodSync(profileDir, 0o700);
-  return profileDir;
-}
-
-export function prepareFeishuCliRuntimeBinding(
-  input: ResolveFeishuCliRuntimeBindingInput & {
-    profileRoot?: string | null;
-  },
-  dependencies?: FeishuCliBindingDependencies,
-): FeishuCliRuntimeBinding | null {
-  const binding = resolveFeishuCliRuntimeBinding(input, dependencies);
-  if (binding?.source === 'channel_account') {
-    if (!input.profileRoot || !binding.profileName) {
-      throw new FeishuCliCredentialBindingError(
-        'A bound Feishu account requires an isolated CLI profile directory',
-      );
-    }
-    ensureFeishuCliProfile(input.profileRoot, binding.profileName);
-  }
-  return binding;
 }
 
 function bindingEnvironment(
@@ -220,7 +171,8 @@ export function applyFeishuCliBindingToEnvironment(
   binding: FeishuCliRuntimeBinding | null,
 ): void {
   if (!binding) return;
-  for (const key of FEISHU_CLI_MANAGED_ENV_KEYS) delete environment[key];
+  for (const key of FEISHU_CLI_CREDENTIAL_ENV_KEYS) delete environment[key];
+  if (binding.profileName) delete environment.FEISHU_PROFILE;
   Object.assign(environment, bindingEnvironment(binding));
 }
 
@@ -229,12 +181,11 @@ export function applyFeishuCliBindingToEnvLines(
   binding: FeishuCliRuntimeBinding | null,
 ): void {
   if (!binding) return;
+  const managedKeys = binding.profileName
+    ? [...FEISHU_CLI_CREDENTIAL_ENV_KEYS, 'FEISHU_PROFILE']
+    : FEISHU_CLI_CREDENTIAL_ENV_KEYS;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (
-      FEISHU_CLI_MANAGED_ENV_KEYS.some((key) =>
-        lines[index]?.startsWith(`${key}=`),
-      )
-    ) {
+    if (managedKeys.some((key) => lines[index]?.startsWith(`${key}=`))) {
       lines.splice(index, 1);
     }
   }

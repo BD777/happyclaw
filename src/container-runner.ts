@@ -105,7 +105,7 @@ import {
 import {
   applyFeishuCliBindingToEnvironment,
   applyFeishuCliBindingToEnvLines,
-  prepareFeishuCliRuntimeBinding,
+  resolveFeishuCliRuntimeBinding,
   type FeishuCliRuntimeBinding,
 } from './feishu-cli-runtime.js';
 
@@ -1207,9 +1207,11 @@ export function buildVolumeMounts(
     });
   }
 
-  // Per-user feishu-cli OAuth state (token.json + config.yaml).
+  // Per-user native feishu-cli state (profiles, token.json, config.yaml).
   // Without this mount, every container restart loses the user's feishu OAuth
-  // authorization, forcing re-auth every IDLE_TIMEOUT (#477).
+  // authorization, forcing re-auth every IDLE_TIMEOUT (#477). HappyClaw never
+  // creates or switches profiles here: the CLI keeps ownership of its native
+  // config, while a bound Bot's App credentials are overlaid via env below.
   if (ownerId) {
     const userFeishuCliDir = path.join(
       DATA_DIR,
@@ -1224,14 +1226,13 @@ export function buildVolumeMounts(
       containerPath: '/home/node/.feishu-cli',
       readonly: false,
     });
-    feishuCliBinding = prepareFeishuCliRuntimeBinding({
+    feishuCliBinding = resolveFeishuCliRuntimeBinding({
       ownerUserId: ownerId,
       channelContext,
       workspaceChannelAccountId: group.channel_account_id,
-      profileRoot: userFeishuCliDir,
     });
   } else {
-    feishuCliBinding = prepareFeishuCliRuntimeBinding({
+    feishuCliBinding = resolveFeishuCliRuntimeBinding({
       ownerUserId: ownerId,
       channelContext,
       workspaceChannelAccountId: group.channel_account_id,
@@ -2338,11 +2339,10 @@ export async function runHostAgent(
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }
-    const feishuCliBinding = prepareFeishuCliRuntimeBinding({
+    const feishuCliBinding = resolveFeishuCliRuntimeBinding({
       ownerUserId: group.created_by,
       channelContext: input.channelContext,
       workspaceChannelAccountId: group.channel_account_id,
-      profileRoot: path.join(os.homedir(), '.feishu-cli'),
     });
     applyFeishuCliBindingToEnvironment(hostEnv, feishuCliBinding);
     const fallbackModel = getSystemSettings().fallbackModel?.trim();

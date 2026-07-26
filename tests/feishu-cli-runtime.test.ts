@@ -1,19 +1,11 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { afterEach, describe, expect, test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 
 import {
   applyFeishuCliBindingToEnvironment,
   applyFeishuCliBindingToEnvLines,
-  ensureFeishuCliProfile,
-  FeishuCliCredentialBindingError,
-  feishuCliProfileName,
   resolveFeishuCliRuntimeBinding,
 } from '../src/feishu-cli-runtime.js';
 import type { ChannelAccount, ChannelTurnContext } from '../src/types.js';
-
-const temporaryDirectories: string[] = [];
 
 function account(overrides: Partial<ChannelAccount> = {}): ChannelAccount {
   return {
@@ -69,12 +61,6 @@ function dependencies(
   };
 }
 
-afterEach(() => {
-  for (const directory of temporaryDirectories.splice(0)) {
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
 describe('Feishu CLI runtime identity binding', () => {
   test('prefers the exact turn account over global fallback credentials', () => {
     const binding = resolveFeishuCliRuntimeBinding(
@@ -94,7 +80,6 @@ describe('Feishu CLI runtime identity binding', () => {
       accountId: 'account-current',
       appId: 'cli_current',
       appSecret: 'secret-current',
-      profileName: 'happyclaw_account-current',
     });
   });
 
@@ -140,6 +125,53 @@ describe('Feishu CLI runtime identity binding', () => {
         fallbackEnvironment: { FEISHU_APP_ID: 'cli_global' },
       }),
     ).toBeNull();
+  });
+
+  test.each(['zsh', 'bash', 'fish', 'service manager'])(
+    'accepts credentials inherited from any %s environment',
+    () => {
+      expect(
+        resolveFeishuCliRuntimeBinding({
+          fallbackEnvironment: {
+            FEISHU_APP_ID: 'cli_inherited',
+            FEISHU_APP_SECRET: 'secret-inherited',
+          },
+        }),
+      ).toMatchObject({
+        source: 'global_environment',
+        appId: 'cli_inherited',
+        appSecret: 'secret-inherited',
+      });
+    },
+  );
+
+  test('leaves native config and profile resolution untouched without credentials', () => {
+    const binding = resolveFeishuCliRuntimeBinding({
+      fallbackEnvironment: {
+        FEISHU_PROFILE: 'work',
+        FEISHU_OWNER_EMAIL: 'owner@example.com',
+      },
+    });
+    const environment = {
+      FEISHU_PROFILE: 'work',
+      FEISHU_OWNER_EMAIL: 'owner@example.com',
+    };
+    const lines = [
+      'FEISHU_PROFILE=work',
+      'FEISHU_OWNER_EMAIL=owner@example.com',
+    ];
+
+    expect(binding).toBeNull();
+    applyFeishuCliBindingToEnvironment(environment, binding);
+    applyFeishuCliBindingToEnvLines(lines, binding);
+    expect(environment).toEqual({
+      FEISHU_PROFILE: 'work',
+      FEISHU_OWNER_EMAIL: 'owner@example.com',
+    });
+    expect(lines).toEqual([
+      'FEISHU_PROFILE=work',
+      'FEISHU_OWNER_EMAIL=owner@example.com',
+    ]);
   });
 
   test('rejects control characters in fallback credentials', () => {
@@ -202,7 +234,7 @@ describe('Feishu CLI runtime identity binding', () => {
     ).toThrow(error);
   });
 
-  test('replaces lower-priority Feishu values in host and container envs', () => {
+  test('overlays Bot credentials while preserving native profile preferences', () => {
     const binding = resolveFeishuCliRuntimeBinding(
       {
         ownerUserId: 'owner-1',
@@ -229,37 +261,14 @@ describe('Feishu CLI runtime identity binding', () => {
     expect(environment).toEqual({
       FEISHU_APP_ID: 'cli_current',
       FEISHU_APP_SECRET: 'secret-current',
-      FEISHU_PROFILE: 'happyclaw_account-current',
+      FEISHU_PROFILE: 'global',
       KEEP: 'yes',
     });
     expect(lines).toEqual([
+      'FEISHU_PROFILE=workspace',
       'KEEP=yes',
       'FEISHU_APP_ID=cli_current',
       'FEISHU_APP_SECRET=secret-current',
-      'FEISHU_PROFILE=happyclaw_account-current',
     ]);
-  });
-
-  test('creates an account-isolated profile without writing credentials', () => {
-    const root = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'happyclaw-feishu-cli-'),
-    );
-    temporaryDirectories.push(root);
-    const name = feishuCliProfileName('12345678-1234-1234-1234-123456789012');
-    const profile = ensureFeishuCliProfile(root, name);
-
-    expect(profile).toBe(path.join(root, 'profiles', name));
-    expect(fs.statSync(profile).mode & 0o777).toBe(0o700);
-    expect(fs.readdirSync(profile)).toEqual([]);
-  });
-
-  test('rejects unsafe profile names', () => {
-    const root = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'happyclaw-feishu-cli-'),
-    );
-    temporaryDirectories.push(root);
-    expect(() => ensureFeishuCliProfile(root, '../escape')).toThrow(
-      FeishuCliCredentialBindingError,
-    );
   });
 });
