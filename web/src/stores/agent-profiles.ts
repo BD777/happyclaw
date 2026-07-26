@@ -7,6 +7,7 @@ import type {
   AgentProfilePrompts,
   AgentProfilePromptVersion,
   AgentProfileRuntimePolicy,
+  AgentProfileRuntimePolicyPatch,
   GroupInfo,
 } from '../types';
 import { useChatStore } from './chat';
@@ -45,7 +46,9 @@ interface AgentProfilesState {
   profilesError: string | null;
   error: string | null;
   loadProfiles: () => Promise<void>;
+  refreshProfile: (id: string) => Promise<AgentProfile>;
   loadProfileGovernance: (id: string) => Promise<AgentProfileGovernance>;
+  retryRuntimeCleanup: (id: string) => Promise<void>;
   loadPromptVersions: (id: string) => Promise<AgentProfilePromptVersion[]>;
   restorePromptVersion: (id: string, version: number) => Promise<AgentProfile>;
   generateProfileDraft: (description: string) => Promise<AgentProfileDraft>;
@@ -84,7 +87,7 @@ interface AgentProfilesState {
       include_claude_preset?: boolean;
       avatar_emoji?: string | null;
       avatar_color?: string | null;
-      runtime_policy?: AgentProfileRuntimePolicy;
+      runtime_policy?: AgentProfileRuntimePolicyPatch;
     },
   ) => Promise<AgentProfile>;
   uploadProfileAvatar: (id: string, file: File) => Promise<AgentProfile>;
@@ -129,6 +132,27 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
     }
   },
 
+  refreshProfile: async (id) => {
+    const data = await api.get<{ profiles: AgentProfile[] }>(
+      '/api/agent-profiles',
+    );
+    const profile = data.profiles.find((candidate) => candidate.id === id);
+    if (!profile) throw new Error('智能体配置不存在');
+    set((state) => ({
+      profiles: state.profiles.map((candidate) =>
+        candidate.id === id ? profile : candidate,
+      ),
+      governanceByProfile: {
+        ...state.governanceByProfile,
+        [id]: state.governanceByProfile[id]
+          ? { ...state.governanceByProfile[id], profile }
+          : undefined,
+      },
+      error: null,
+    }));
+    return profile;
+  },
+
   loadProfileGovernance: async (id) => {
     set((state) => ({
       governanceLoading: { ...state.governanceLoading, [id]: true },
@@ -152,6 +176,30 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
       }));
       throw err;
     }
+  },
+
+  retryRuntimeCleanup: async (id) => {
+    await api.post<{
+      success: boolean;
+      cleaned_runtime_jids: number;
+      runtime_cleanup_pending: false;
+    }>(
+      `/api/agent-profiles/${encodeURIComponent(id)}/runtime-cleanup`,
+      undefined,
+      120_000,
+    );
+    set((state) => ({
+      governanceByProfile: {
+        ...state.governanceByProfile,
+        [id]: state.governanceByProfile[id]
+          ? {
+              ...state.governanceByProfile[id],
+              runtime_cleanup_pending: false,
+            }
+          : undefined,
+      },
+      error: null,
+    }));
   },
 
   loadPromptVersions: async (id) => {
@@ -240,23 +288,60 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
       const res = await api.patch<{ profile: AgentProfile }>(
         `/api/agent-profiles/${encodeURIComponent(id)}`,
         { ...data, prompt_schema_version: 2 },
+        120_000,
       );
       set((state) => ({
         profiles: state.profiles.map((p) => (p.id === id ? res.profile : p)),
         governanceByProfile: {
           ...state.governanceByProfile,
           [id]: state.governanceByProfile[id]
-            ? { ...state.governanceByProfile[id], profile: res.profile }
+            ? {
+                ...state.governanceByProfile[id],
+                profile: res.profile,
+                runtime_cleanup_pending: false,
+              }
             : undefined,
         },
         error: null,
       }));
-      await Promise.all([
+      // The profile PATCH is already committed at this point. A secondary
+      // navigation-list refresh must not turn a successful capability save
+      // into a false failure that makes the editor roll back its UI.
+      await Promise.allSettled([
         useChatStore.getState().loadGroups(),
         useGroupsStore.getState().loadGroups(),
       ]);
       return res.profile;
     } catch (err) {
+      const persistedProfile =
+        err &&
+        typeof err === 'object' &&
+        'body' in err &&
+        (err as { body?: Record<string, unknown> }).body?.persisted === true
+          ? (err as { body?: { profile?: AgentProfile } }).body?.profile
+          : undefined;
+      if (persistedProfile?.id === id) {
+        set((state) => ({
+          profiles: state.profiles.map((profile) =>
+            profile.id === id ? persistedProfile : profile,
+          ),
+          governanceByProfile: {
+            ...state.governanceByProfile,
+            [id]: state.governanceByProfile[id]
+              ? {
+                  ...state.governanceByProfile[id],
+                  profile: persistedProfile,
+                  runtime_cleanup_pending: true,
+                }
+              : undefined,
+          },
+          error:
+            err && typeof err === 'object' && 'message' in err
+              ? String(err.message)
+              : '配置已保存，但运行时清理失败',
+        }));
+        throw err;
+      }
       set({ error: err instanceof Error ? err.message : String(err) });
       throw err;
     }

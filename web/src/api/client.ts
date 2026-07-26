@@ -8,19 +8,23 @@ export interface ApiError {
   body?: Record<string, unknown>;
 }
 
-export async function apiFetch<T>(path: string, options?: RequestInit & { timeoutMs?: number }): Promise<T> {
+export async function apiFetch<T>(
+  path: string,
+  options?: RequestInit & { timeoutMs?: number },
+): Promise<T> {
   const requestPath = /^https?:\/\//i.test(path)
     ? path
     : withBasePath(path.startsWith('/') ? path : `/${path}`);
   const { timeoutMs: customTimeout, ...fetchOptions } = options ?? {};
   const controller = new AbortController();
   const isFormData = fetchOptions.body instanceof FormData;
-  const timeoutMs = customTimeout ?? (isFormData ? 120_000 : REQUEST_TIMEOUT_MS);
+  const timeoutMs =
+    customTimeout ?? (isFormData ? 120_000 : REQUEST_TIMEOUT_MS);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   // FormData 时不设 Content-Type，让浏览器自动加 multipart boundary
   const headers = isFormData
-    ? fetchOptions.headers ?? {}
+    ? (fetchOptions.headers ?? {})
     : { 'Content-Type': 'application/json', ...fetchOptions.headers };
 
   let res: Response;
@@ -56,7 +60,11 @@ export async function apiFetch<T>(path: string, options?: RequestInit & { timeou
         replaceInApp('/settings');
       }
     }
-    throw { status: res.status, message: body.error || res.statusText, body } as ApiError;
+    throw {
+      status: res.status,
+      message: body.error || res.statusText,
+      body,
+    } as ApiError;
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -67,24 +75,51 @@ export async function apiFetch<T>(path: string, options?: RequestInit & { timeou
  * 以 20KB/s 的保守下限估算，最少 120s，最多 10min（与后端 requestTimeout 对齐）。
  */
 export function computeUploadTimeoutMs(bytes: number): number {
-  return Math.min(10 * 60_000, Math.max(120_000, Math.ceil(bytes / (20 * 1024)) * 1000));
+  return Math.min(
+    10 * 60_000,
+    Math.max(120_000, Math.ceil(bytes / (20 * 1024)) * 1000),
+  );
 }
 
 export const api = {
   get: <T>(path: string) => apiFetch<T>(path),
-  post: <T>(path: string, body?: unknown, timeoutMs?: number) => apiFetch<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined, ...(timeoutMs ? { timeoutMs } : {}) }),
-  put: <T>(path: string, body?: unknown) => apiFetch<T>(path, { method: 'PUT', body: body ? JSON.stringify(body) : undefined }),
-  patch: <T>(path: string, body?: unknown) => apiFetch<T>(path, { method: 'PATCH', body: body ? JSON.stringify(body) : undefined }),
+  post: <T>(path: string, body?: unknown, timeoutMs?: number) =>
+    apiFetch<T>(path, {
+      method: 'POST',
+      body: body ? JSON.stringify(body) : undefined,
+      ...(timeoutMs ? { timeoutMs } : {}),
+    }),
+  put: <T>(path: string, body?: unknown) =>
+    apiFetch<T>(path, {
+      method: 'PUT',
+      body: body ? JSON.stringify(body) : undefined,
+    }),
+  patch: <T>(path: string, body?: unknown, timeoutMs?: number) =>
+    apiFetch<T>(path, {
+      method: 'PATCH',
+      body: body ? JSON.stringify(body) : undefined,
+      ...(timeoutMs ? { timeoutMs } : {}),
+    }),
   delete: <T>(path: string) => apiFetch<T>(path, { method: 'DELETE' }),
-  uploadFiles: async <T>(path: string, files: FileList, extraFields?: Record<string, string>) => {
+  uploadFiles: async <T>(
+    path: string,
+    files: FileList,
+    extraFields?: Record<string, string>,
+  ) => {
     const formData = new FormData();
     let totalBytes = 0;
     for (const file of files) {
       formData.append('files', file);
       totalBytes += file.size;
     }
-    if (extraFields) for (const [k, v] of Object.entries(extraFields)) formData.append(k, v);
+    if (extraFields)
+      for (const [k, v] of Object.entries(extraFields)) formData.append(k, v);
     // 不设 Content-Type，浏览器自动加 boundary
-    return apiFetch<T>(path, { method: 'POST', body: formData, headers: {}, timeoutMs: computeUploadTimeoutMs(totalBytes) });
+    return apiFetch<T>(path, {
+      method: 'POST',
+      body: formData,
+      headers: {},
+      timeoutMs: computeUploadTimeoutMs(totalBytes),
+    });
   },
 };

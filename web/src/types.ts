@@ -118,6 +118,16 @@ export interface AgentProfileRuntimePolicy {
   };
 }
 
+export interface AgentProfileRuntimePolicyPatch {
+  context?: Partial<NonNullable<AgentProfileRuntimePolicy['context']>>;
+  skills?: {
+    mode?: AgentProfileRuntimePolicy['skills']['mode'];
+    ids?: string[];
+    host?: Partial<NonNullable<AgentProfileRuntimePolicy['skills']['host']>>;
+  };
+  mcp?: Partial<AgentProfileRuntimePolicy['mcp']>;
+}
+
 export type AgentContextSource = NonNullable<
   AgentProfileRuntimePolicy['context']
 >['source'];
@@ -181,6 +191,8 @@ export interface AgentProfileGovernance {
   profile: AgentProfile;
   workspaces: AgentProfileWorkspace[];
   channel_mounts: AgentProfileChannelMount[];
+  /** A previous committed profile change still needs workspace teardown. */
+  runtime_cleanup_pending?: boolean;
 }
 
 export type CapabilityLayerSource =

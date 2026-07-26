@@ -44,7 +44,10 @@ import { AgentPromptEditor } from '../components/agents/AgentPromptEditor';
 import { AgentPromptVersionHistory } from '../components/agents/AgentPromptVersionHistory';
 import { EffectiveCapabilitiesPreview } from '../components/agents/EffectiveCapabilitiesPreview';
 import { AgentGovernanceSection } from '../components/agents/AgentGovernanceSection';
-import { AgentSkillsPolicyEditor } from '../components/agents/AgentSkillsPolicyEditor';
+import {
+  AgentSkillsPolicyEditor,
+  type HostSkillSaveStatus,
+} from '../components/agents/AgentSkillsPolicyEditor';
 import { PolicyResourcePicker } from '../components/agents/PolicyResourcePicker';
 import { EmojiAvatar } from '../components/common/EmojiAvatar';
 import { EmojiPicker } from '../components/common/EmojiPicker';
@@ -54,6 +57,7 @@ import { useAgentProfilesStore } from '../stores/agent-profiles';
 import { useAuthStore } from '../stores/auth';
 import { useSkillsStore } from '../stores/skills';
 import { useMcpServersStore } from '../stores/mcp-servers';
+import type { ApiError } from '../api/client';
 import {
   buildMcpPolicyOptions,
   normalizeMcpPolicyReferences,
@@ -73,6 +77,7 @@ import {
 import { createUnsavedNavigationGuard } from '../utils/unsaved-navigation';
 import {
   getHostSkillPolicy,
+  hostSkillPolicyForMode,
   skillPolicySummary,
   skillSelectionError,
   type RuntimePolicyMode,
@@ -138,6 +143,22 @@ function sameRuntimePolicy(
   );
 }
 
+function sameSkillSourcePolicy(
+  a: ReturnType<typeof hostSkillPolicyForMode>,
+  b: ReturnType<typeof hostSkillPolicyForMode>,
+): boolean {
+  return a.mode === b.mode && JSON.stringify(a.ids) === JSON.stringify(b.ids);
+}
+
+function asApiError(error: unknown): ApiError | null {
+  if (!error || typeof error !== 'object' || !('status' in error)) return null;
+  const candidate = error as Partial<ApiError>;
+  return typeof candidate.status === 'number' &&
+    typeof candidate.message === 'string'
+    ? (candidate as ApiError)
+    : null;
+}
+
 export function AgentProfilesPage() {
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -166,7 +187,9 @@ export function AgentProfilesPage() {
     loading,
     profilesError,
     loadProfiles,
+    refreshProfile,
     loadProfileGovernance,
+    retryRuntimeCleanup,
     loadPromptVersions,
     restorePromptVersion,
     governanceByProfile,
@@ -208,6 +231,18 @@ export function AgentProfilesPage() {
   const [hostSkillsMode, setHostSkillsMode] =
     useState<RuntimePolicyMode>('disabled');
   const [hostSkillIds, setHostSkillIds] = useState<string[]>([]);
+  const [hostSkillsSaving, setHostSkillsSaving] = useState(false);
+  const [runtimeCleanupRepairing, setRuntimeCleanupRepairing] = useState(false);
+  const [hostSkillsSaveStatus, setHostSkillsSaveStatus] =
+    useState<HostSkillSaveStatus>('idle');
+  const hostSkillsSavingRef = useRef(false);
+  const selectedIdRef = useRef<string | null>(null);
+  const confirmedHostSkillPolicyRef = useRef(
+    hostSkillPolicyForMode('disabled', []),
+  );
+  const attemptedHostSkillPolicyRef = useRef(
+    hostSkillPolicyForMode('disabled', []),
+  );
   const [mcpMode, setMcpMode] = useState<RuntimePolicyMode>('inherit');
   const [mcpIds, setMcpIds] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
@@ -305,6 +340,7 @@ export function AgentProfilesPage() {
     () => customProfiles.find((profile) => profile.id === selectedId) ?? null,
     [customProfiles, selectedId],
   );
+  selectedIdRef.current = selectedId;
 
   useEffect(() => {
     if (!selected || location.hash !== '#agent-capabilities') return;
@@ -322,8 +358,21 @@ export function AgentProfilesPage() {
     const normalized = normalizeRuntimePolicy(policy);
     setSkillsMode(normalized.skills.mode);
     setSkillIds(normalized.skills.ids);
-    setHostSkillsMode(normalized.skills.host?.mode ?? 'disabled');
-    setHostSkillIds(normalized.skills.host?.ids ?? []);
+    const hostPolicy = normalized.skills.host ?? {
+      mode: 'disabled' as const,
+      ids: [],
+    };
+    setHostSkillsMode(hostPolicy.mode);
+    setHostSkillIds(hostPolicy.ids);
+    confirmedHostSkillPolicyRef.current = {
+      mode: hostPolicy.mode,
+      ids: [...hostPolicy.ids],
+    };
+    attemptedHostSkillPolicyRef.current = {
+      mode: hostPolicy.mode,
+      ids: [...hostPolicy.ids],
+    };
+    setHostSkillsSaveStatus('idle');
     setMcpMode(normalized.mcp.mode);
     setMcpIds(normalizeMcpPolicyReferences(normalized.mcp.ids));
     setContextSource(getAgentContextSource(normalized));
@@ -526,6 +575,27 @@ export function AgentProfilesPage() {
   const governance = selected ? governanceByProfile[selected.id] : undefined;
   const governanceBusy = selected ? !!governanceLoading[selected.id] : false;
   const governanceError = selected ? governanceErrors[selected.id] : undefined;
+  useEffect(() => {
+    if (
+      draftMode ||
+      !selected ||
+      !governance?.runtime_cleanup_pending ||
+      governance.profile.id !== selected.id ||
+      hostSkillsSavingRef.current
+    ) {
+      return;
+    }
+    const persistedPolicy = getHostSkillPolicy(selected.runtime_policy);
+    confirmedHostSkillPolicyRef.current = {
+      mode: persistedPolicy.mode,
+      ids: [...persistedPolicy.ids],
+    };
+    attemptedHostSkillPolicyRef.current = {
+      mode: persistedPolicy.mode,
+      ids: [...persistedPolicy.ids],
+    };
+    setHostSkillsSaveStatus('warning');
+  }, [draftMode, governance, selected]);
   const skillOptions = useMemo(() => {
     const available = skills
       .filter((skill) => skill.source === 'user' && skill.enabled)
@@ -726,9 +796,190 @@ export function AgentProfilesPage() {
       setSelectedId(profile.id);
       toast.success('已保存');
     } catch (err) {
+      if (selected && asApiError(err)?.body?.persisted === true) {
+        void loadProfileGovernance(selected.id).catch(() => undefined);
+      }
       toast.error(getErrorMessage(err, '保存失败'));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const persistHostSkillPolicy = async (
+    nextPolicy: ReturnType<typeof hostSkillPolicyForMode>,
+  ) => {
+    if (!selected || draftMode || hostSkillsSavingRef.current) return;
+    const profileId = selected.id;
+    attemptedHostSkillPolicyRef.current = {
+      mode: nextPolicy.mode,
+      ids: [...nextPolicy.ids],
+    };
+    hostSkillsSavingRef.current = true;
+    setHostSkillsSaving(true);
+    setHostSkillsSaveStatus('idle');
+    try {
+      await updateProfile(profileId, {
+        runtime_policy: {
+          skills: {
+            host: nextPolicy,
+          },
+        },
+      });
+      if (selectedIdRef.current === profileId) {
+        attemptedHostSkillPolicyRef.current = {
+          mode: nextPolicy.mode,
+          ids: [...nextPolicy.ids],
+        };
+        confirmedHostSkillPolicyRef.current = {
+          mode: nextPolicy.mode,
+          ids: [...nextPolicy.ids],
+        };
+        setHostSkillsSaveStatus('saved');
+        toast.success('宿主机 Skills 已保存并生效');
+      }
+    } catch (err) {
+      if (selectedIdRef.current === profileId) {
+        // The user may have visited another profile and returned while this
+        // request was in flight. Restore this request's attempted policy so a
+        // retry cannot accidentally send the other render's stale value.
+        attemptedHostSkillPolicyRef.current = {
+          mode: nextPolicy.mode,
+          ids: [...nextPolicy.ids],
+        };
+        const apiError = asApiError(err);
+        if (apiError?.body?.persisted === true) {
+          confirmedHostSkillPolicyRef.current = {
+            mode: nextPolicy.mode,
+            ids: [...nextPolicy.ids],
+          };
+          setHostSkillsMode(nextPolicy.mode);
+          setHostSkillIds([...nextPolicy.ids]);
+          setHostSkillsSaveStatus('warning');
+          toast.warning('配置已保存，但工作区运行时清理失败，请重试清理');
+        } else if (apiError?.status === 0 || apiError?.status === 408) {
+          try {
+            const [freshProfile, freshGovernance] = await Promise.all([
+              refreshProfile(profileId),
+              loadProfileGovernance(profileId),
+            ]);
+            if (selectedIdRef.current === profileId) {
+              attemptedHostSkillPolicyRef.current = {
+                mode: nextPolicy.mode,
+                ids: [...nextPolicy.ids],
+              };
+              const freshPolicy = getHostSkillPolicy(
+                freshProfile.runtime_policy,
+              );
+              confirmedHostSkillPolicyRef.current = {
+                mode: freshPolicy.mode,
+                ids: [...freshPolicy.ids],
+              };
+              if (sameSkillSourcePolicy(freshPolicy, nextPolicy)) {
+                setHostSkillsMode(freshPolicy.mode);
+                setHostSkillIds([...freshPolicy.ids]);
+                if (freshGovernance.runtime_cleanup_pending) {
+                  setHostSkillsSaveStatus('warning');
+                  toast.warning('配置已保存，但工作区运行时清理仍未完成');
+                } else {
+                  setHostSkillsSaveStatus('saved');
+                  toast.success('宿主机 Skills 已确认保存并生效');
+                }
+              } else {
+                // The timed-out PATCH may still be completing on the server.
+                // Keep the requested selection visible and offer an
+                // idempotent retry instead of claiming either outcome.
+                setHostSkillsMode(nextPolicy.mode);
+                setHostSkillIds([...nextPolicy.ids]);
+                setHostSkillsSaveStatus('uncertain');
+                toast.warning('连接中断，暂时无法确认宿主机 Skills 状态');
+              }
+            }
+          } catch {
+            if (selectedIdRef.current === profileId) {
+              attemptedHostSkillPolicyRef.current = {
+                mode: nextPolicy.mode,
+                ids: [...nextPolicy.ids],
+              };
+              setHostSkillsMode(nextPolicy.mode);
+              setHostSkillIds([...nextPolicy.ids]);
+              setHostSkillsSaveStatus('uncertain');
+              toast.warning('连接中断，暂时无法确认宿主机 Skills 状态');
+            }
+          }
+        } else {
+          const confirmed = confirmedHostSkillPolicyRef.current;
+          setHostSkillsMode(confirmed.mode);
+          setHostSkillIds([...confirmed.ids]);
+          setHostSkillsSaveStatus('error');
+          toast.error(getErrorMessage(err, '宿主机 Skills 保存失败'));
+        }
+      }
+    } finally {
+      hostSkillsSavingRef.current = false;
+      setHostSkillsSaving(false);
+    }
+  };
+
+  const handleRetryProfileRuntimeCleanup = async () => {
+    if (!selected || draftMode || runtimeCleanupRepairing) return;
+    const profileId = selected.id;
+    setRuntimeCleanupRepairing(true);
+    try {
+      await retryRuntimeCleanup(profileId);
+      if (selectedIdRef.current === profileId) {
+        setHostSkillsSaveStatus('saved');
+        toast.success('工作区运行时清理已完成');
+      }
+    } catch (err) {
+      if (selectedIdRef.current === profileId) {
+        setHostSkillsSaveStatus('warning');
+        toast.error(getErrorMessage(err, '工作区运行时清理失败'));
+      }
+    } finally {
+      setRuntimeCleanupRepairing(false);
+    }
+  };
+
+  const handleRetryHostSkillSave = () => {
+    if (hostSkillsSavingRef.current || draftMode || !selected) return;
+    if (hostSkillsSaveStatus === 'warning') {
+      void handleRetryProfileRuntimeCleanup();
+      return;
+    }
+    const attempted = attemptedHostSkillPolicyRef.current;
+    setHostSkillsMode(attempted.mode);
+    setHostSkillIds([...attempted.ids]);
+    void persistHostSkillPolicy(attempted);
+  };
+
+  const handleHostSkillsModeChange = (mode: RuntimePolicyMode) => {
+    if (hostSkillsSavingRef.current || mode === hostSkillsMode) return;
+    const nextPolicy = hostSkillPolicyForMode(mode, hostSkillIds);
+    setHostSkillsMode(nextPolicy.mode);
+    setHostSkillIds(nextPolicy.ids);
+    setHostSkillsSaveStatus('idle');
+    if (
+      !draftMode &&
+      selected &&
+      !(nextPolicy.mode === 'custom' && nextPolicy.ids.length === 0)
+    ) {
+      void persistHostSkillPolicy(nextPolicy);
+    }
+  };
+
+  const handleHostSkillIdsChange = (ids: string[]) => {
+    if (hostSkillsSavingRef.current) return;
+    const nextPolicy = hostSkillPolicyForMode(hostSkillsMode, ids);
+    setHostSkillIds(nextPolicy.ids);
+    setHostSkillsSaveStatus('idle');
+    if (
+      !draftMode &&
+      selected &&
+      nextPolicy.mode === 'custom' &&
+      nextPolicy.ids.length > 0 &&
+      nextPolicy.ids.length <= 100
+    ) {
+      void persistHostSkillPolicy(nextPolicy);
     }
   };
 
@@ -1122,6 +1373,36 @@ export function AgentProfilesPage() {
                   </p>
                 </div>
               </header>
+
+              {!draftMode && governance?.runtime_cleanup_pending && (
+                <div
+                  role="status"
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-foreground"
+                >
+                  <div>
+                    <div className="font-medium">
+                      智能体配置已保存，但工作区运行时清理未完成
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      为避免旧配置继续运行，相关工作区已暂停；清理成功后会自动恢复。
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={runtimeCleanupRepairing}
+                    onClick={() => void handleRetryProfileRuntimeCleanup()}
+                  >
+                    {runtimeCleanupRepairing ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" />
+                    )}
+                    重试清理
+                  </Button>
+                </div>
+              )}
 
               {draftMode && (
                 <nav
@@ -1524,12 +1805,16 @@ export function AgentProfilesPage() {
                           mode: hostSkillsMode,
                           ids: hostSkillIds,
                         }}
-                        onHostModeChange={setHostSkillsMode}
-                        onHostIdsChange={setHostSkillIds}
+                        onHostModeChange={handleHostSkillsModeChange}
+                        onHostIdsChange={handleHostSkillIdsChange}
                         hostOptions={hostSkillOptions}
                         loading={skillsLoading}
                         error={skillsError}
                         hostAvailable={isAdmin}
+                        hostAutoSave={!draftMode}
+                        hostSaving={hostSkillsSaving || runtimeCleanupRepairing}
+                        hostSaveStatus={hostSkillsSaveStatus}
+                        onRetryHostSave={handleRetryHostSkillSave}
                         managedError={managedSkillsError}
                         hostError={hostSkillsError}
                       />
@@ -1773,6 +2058,8 @@ export function AgentProfilesPage() {
                         disabled={
                           !dirty ||
                           saving ||
+                          hostSkillsSaving ||
+                          runtimeCleanupRepairing ||
                           !name.trim() ||
                           !!autoCompactError ||
                           !!capabilityError

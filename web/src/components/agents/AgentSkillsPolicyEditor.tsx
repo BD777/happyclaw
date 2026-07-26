@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { Check, Loader2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import {
   PolicyResourcePicker,
@@ -21,9 +21,20 @@ interface AgentSkillsPolicyEditorProps {
   loading?: boolean;
   error?: string | null;
   hostAvailable: boolean;
+  hostAutoSave?: boolean;
+  hostSaving?: boolean;
+  hostSaveStatus?: HostSkillSaveStatus;
+  onRetryHostSave?: () => void;
   managedError?: string | null;
   hostError?: string | null;
 }
+
+export type HostSkillSaveStatus =
+  | 'idle'
+  | 'saved'
+  | 'error'
+  | 'warning'
+  | 'uncertain';
 
 export function AgentSkillsPolicyEditor({
   managedPolicy,
@@ -37,6 +48,10 @@ export function AgentSkillsPolicyEditor({
   loading,
   error,
   hostAvailable,
+  hostAutoSave = false,
+  hostSaving,
+  hostSaveStatus = 'idle',
+  onRetryHostSave,
   managedError,
   hostError,
 }: AgentSkillsPolicyEditorProps) {
@@ -93,6 +108,7 @@ export function AgentSkillsPolicyEditor({
               label="宿主机 Skills 使用方式"
               value={hostPolicy.mode}
               onChange={onHostModeChange}
+              disabled={hostSaving}
               options={[
                 {
                   value: 'disabled',
@@ -120,10 +136,81 @@ export function AgentSkillsPolicyEditor({
                 onChange={onHostIdsChange}
                 loading={loading}
                 error={error}
+                disabled={hostSaving}
                 emptyText="未在 ~/.claude/skills 检测到有效 Skill"
               />
             )}
             {hostError && <InlineError message={hostError} />}
+            {!hostError && (
+              <p
+                aria-live="polite"
+                className={`flex min-h-5 items-center gap-1.5 text-[11px] ${
+                  hostSaveStatus === 'error'
+                    ? 'text-destructive'
+                    : hostSaveStatus === 'warning' ||
+                        hostSaveStatus === 'uncertain'
+                      ? 'text-warning'
+                      : hostSaveStatus === 'saved'
+                        ? 'text-primary'
+                        : 'text-muted-foreground'
+                }`}
+              >
+                {hostSaving ? (
+                  <>
+                    <Loader2 className="size-3 animate-spin" />
+                    正在保存并应用宿主机 Skills…
+                  </>
+                ) : hostSaveStatus === 'saved' ? (
+                  <>
+                    <Check className="size-3" />
+                    已保存并生效；新会话会使用这项策略。
+                  </>
+                ) : hostSaveStatus === 'error' ? (
+                  <>
+                    保存失败，当前选择尚未生效。
+                    {onRetryHostSave && (
+                      <button
+                        type="button"
+                        className="font-medium underline underline-offset-2"
+                        onClick={onRetryHostSave}
+                      >
+                        重试保存
+                      </button>
+                    )}
+                  </>
+                ) : hostSaveStatus === 'warning' ? (
+                  <>
+                    配置已保存，但工作区运行时清理未完成。
+                    {onRetryHostSave && (
+                      <button
+                        type="button"
+                        className="font-medium underline underline-offset-2"
+                        onClick={onRetryHostSave}
+                      >
+                        重试清理
+                      </button>
+                    )}
+                  </>
+                ) : hostSaveStatus === 'uncertain' ? (
+                  <>
+                    连接中断，暂时无法确认服务端状态。
+                    {onRetryHostSave && (
+                      <button
+                        type="button"
+                        className="font-medium underline underline-offset-2"
+                        onClick={onRetryHostSave}
+                      >
+                        重新确认并应用
+                      </button>
+                    )}
+                  </>
+                ) : hostAutoSave ? (
+                  '修改后会自动保存；“全部使用”也会自动包含以后新增的宿主机 Skills。'
+                ) : (
+                  '修改后需保存或创建智能体才会生效。'
+                )}
+              </p>
+            )}
           </>
         ) : (
           <p className="rounded-lg border border-border bg-muted/30 px-3 py-3 text-xs leading-5 text-muted-foreground">
@@ -168,15 +255,17 @@ function SkillSourceSection({
   );
 }
 
-function PolicyModeCards({
+export function PolicyModeCards({
   label,
   value,
   onChange,
   options,
+  disabled = false,
 }: {
   label: string;
   value: RuntimePolicyMode;
   onChange: (mode: RuntimePolicyMode) => void;
+  disabled?: boolean;
   options: Array<{
     value: RuntimePolicyMode;
     label: string;
@@ -184,45 +273,63 @@ function PolicyModeCards({
     recommended?: boolean;
   }>;
 }) {
-  const groupId = useId();
   return (
-    <fieldset>
-      <legend className="sr-only">{label}</legend>
-      <div className="grid gap-3 md:grid-cols-3">
-        {options.map((option) => {
-          const id = `${groupId}-${option.value}`;
-          return (
-            <div key={option.value}>
-              <input
-                id={id}
-                type="radio"
-                name={groupId}
-                value={option.value}
-                checked={value === option.value}
-                onChange={() => onChange(option.value)}
-                className="peer sr-only"
-              />
-              <label
-                htmlFor={id}
-                className="flex min-h-24 cursor-pointer flex-col rounded-lg border border-border p-3 text-left transition-colors hover:bg-muted/50 peer-checked:border-primary peer-checked:bg-primary/5 peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2"
-              >
-                <span className="flex items-center gap-2 text-sm font-medium text-foreground">
-                  {option.label}
-                  {option.recommended && (
-                    <span className="text-[10px] font-medium text-primary">
-                      推荐
-                    </span>
-                  )}
+    <div
+      className="grid gap-3 md:grid-cols-3"
+      role="radiogroup"
+      aria-label={label}
+      aria-busy={disabled}
+    >
+      {options.map((option, index) => {
+        const checked = value === option.value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="radio"
+            aria-checked={checked}
+            disabled={disabled}
+            tabIndex={checked ? 0 : -1}
+            onClick={() => onChange(option.value)}
+            onKeyDown={(event) => {
+              const direction =
+                event.key === 'ArrowRight' || event.key === 'ArrowDown'
+                  ? 1
+                  : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+                    ? -1
+                    : 0;
+              if (direction === 0) return;
+              event.preventDefault();
+              const nextIndex =
+                (index + direction + options.length) % options.length;
+              const buttons =
+                event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                  '[role="radio"]',
+                );
+              buttons?.[nextIndex]?.focus();
+              onChange(options[nextIndex]!.value);
+            }}
+            className={`flex min-h-24 flex-col rounded-lg border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60 ${
+              checked
+                ? 'border-primary bg-primary/5'
+                : 'border-border hover:bg-muted/50'
+            }`}
+          >
+            <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+              {option.label}
+              {option.recommended && (
+                <span className="text-[10px] font-medium text-primary">
+                  推荐
                 </span>
-                <span className="mt-1 text-[11px] leading-5 text-muted-foreground">
-                  {option.description}
-                </span>
-              </label>
-            </div>
-          );
-        })}
-      </div>
-    </fieldset>
+              )}
+            </span>
+            <span className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              {option.description}
+            </span>
+          </button>
+        );
+      })}
+    </div>
   );
 }
 

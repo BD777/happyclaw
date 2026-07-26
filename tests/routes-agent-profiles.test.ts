@@ -566,6 +566,88 @@ describe('/api/agent-profiles routes', () => {
     });
   });
 
+  test('persists an admin host Skills switch from custom to inherit', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'All Host Skills Agent',
+      runtimePolicy: {
+        context: {
+          source: 'managed',
+          auto_compact_window: 0,
+          auto_compact_percentage: 80,
+        },
+        skills: {
+          mode: 'disabled',
+          ids: [],
+          host: {
+            mode: 'custom',
+            ids: ['legacy-custom-selection'],
+          },
+        },
+        mcp: { mode: 'custom', ids: ['github'] },
+      },
+    });
+
+    const patchRes = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-test-role': 'admin',
+      },
+      body: JSON.stringify({
+        runtime_policy: {
+          skills: {
+            host: { mode: 'inherit', ids: [] },
+          },
+        },
+      }),
+    });
+
+    expect(patchRes.status).toBe(200);
+    const patched = (await patchRes.json()).profile;
+    expect(patched.runtime_policy.skills.host).toEqual({
+      mode: 'inherit',
+      ids: [],
+    });
+    expect(patched.runtime_policy).toMatchObject({
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 80,
+      },
+      skills: { mode: 'disabled', ids: [] },
+      mcp: { mode: 'custom', ids: ['github'] },
+    });
+    expect(patched.version).toBe(profile.version + 1);
+    expect(
+      db.getAgentProfileForUser(profile.id, 'routes-agent-user')?.runtime_policy
+        .skills.host,
+    ).toEqual({ mode: 'inherit', ids: [] });
+  });
+
+  test('rejects member attempts to enable inherited host Skills', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Member Host Skills Agent',
+    });
+    const patchRes = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: {
+          skills: {
+            host: { mode: 'inherit', ids: [] },
+          },
+        },
+      }),
+    });
+
+    expect(patchRes.status).toBe(403);
+    expect(await patchRes.json()).toEqual({
+      error: 'host skills require an admin role',
+    });
+  });
+
   test('allows admins to create host agents and patch the default HappyClaw profile', async () => {
     const createRes = await routes.request('/', {
       method: 'POST',
@@ -861,7 +943,7 @@ describe('/api/agent-profiles routes', () => {
     ).toHaveLength(3);
   });
 
-  test('reports persisted post-stop failure and identical sensitive retry cleans up without another version bump', async () => {
+  test('reports persisted post-stop failure and owner cleanup retry removes the safety block', async () => {
     const profile = db.createAgentProfile({
       ownerUserId: 'routes-agent-user',
       name: 'Post Commit Retry Identity',
@@ -923,18 +1005,114 @@ describe('/api/agent-profiles routes', () => {
       version: profile.version + 1,
     });
     expect(runtimeSafetyBlocked).toBe(true);
+    const pendingGovernance = await routes.request(`/${profile.id}/workspaces`);
+    expect(pendingGovernance.status).toBe(200);
+    expect(await pendingGovernance.json()).toMatchObject({
+      runtime_cleanup_pending: true,
+    });
 
-    const retried = await request();
+    const retried = await routes.request(`/${profile.id}/runtime-cleanup`, {
+      method: 'POST',
+    });
     expect(retried.status).toBe(200);
-    expect((await retried.json()).profile).toMatchObject({
+    expect(await retried.json()).toMatchObject({
+      success: true,
+      runtime_cleanup_pending: false,
+    });
+    expect(
+      db.getAgentProfileForUser(profile.id, 'routes-agent-user'),
+    ).toMatchObject({
       identity_prompt: 'new post-commit identity',
       version: profile.version + 1,
     });
-    // The first post-commit teardown failure installs a persistent fail-closed
-    // gate. Retrying the same already-persisted payload tears the runtime down
-    // again without another version bump, then releases that gate.
+    // Cleanup is owner-scoped and does not need to replay a potentially
+    // privileged or stale configuration payload.
     expect(stopGroup).toHaveBeenCalledTimes(4);
     expect(runtimeSafetyBlocked).toBe(false);
+    const repairedGovernance = await routes.request(
+      `/${profile.id}/workspaces`,
+    );
+    expect(repairedGovernance.status).toBe(200);
+    expect(await repairedGovernance.json()).toMatchObject({
+      runtime_cleanup_pending: false,
+    });
+  });
+
+  test('governance waits for an in-flight profile cleanup before reporting pending state', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Locked Governance Snapshot',
+      identityPrompt: 'old locked identity',
+    });
+    db.setRegisteredGroup('web:locked-governance-snapshot', {
+      name: 'Locked Governance Snapshot',
+      folder: 'locked-governance-snapshot',
+      added_at: '2026-07-10T00:00:00.000Z',
+      created_by: 'routes-agent-user',
+    });
+    db.assignWorkspaceAgentProfile('locked-governance-snapshot', profile.id);
+
+    let stopCalls = 0;
+    let runtimeSafetyBlocked = false;
+    let signalPostStop!: () => void;
+    const postStopEntered = new Promise<void>((resolve) => {
+      signalPostStop = resolve;
+    });
+    let releasePostStop!: () => void;
+    const postStopRelease = new Promise<void>((resolve) => {
+      releasePostStop = resolve;
+    });
+    const stopGroup = vi.fn(async () => {
+      stopCalls += 1;
+      if (stopCalls === 2) {
+        signalPostStop();
+        await postStopRelease;
+        throw new Error('injected delayed post-commit cleanup failure');
+      }
+    });
+    webContext.setWebDeps({
+      queue: {
+        pauseGroupsForMutation: () => ({ keys: ['locked-governance'] }),
+        resumeGroupsAfterMutation: () => {},
+        listDescendantJids: () => [],
+        stopGroup,
+        blockGroupsForRuntimeSafety: () => {
+          runtimeSafetyBlocked = true;
+        },
+        unblockGroupsForRuntimeSafety: () => {
+          runtimeSafetyBlocked = false;
+        },
+        isGroupRuntimeSafetyBlocked: () => runtimeSafetyBlocked,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    const patchPromise = routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ identity_prompt: 'new locked identity' }),
+    });
+    await postStopEntered;
+
+    let governanceSettled = false;
+    const governancePromise = routes
+      .request(`/${profile.id}/workspaces`)
+      .then((response) => {
+        governanceSettled = true;
+        return response;
+      });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(governanceSettled).toBe(false);
+
+    releasePostStop();
+    const failedPatch = await patchPromise;
+    expect(failedPatch.status).toBe(503);
+    const governance = await governancePromise;
+    expect(governance.status).toBe(200);
+    expect(await governance.json()).toMatchObject({
+      runtime_cleanup_pending: true,
+      profile: { identity_prompt: 'new locked identity' },
+    });
   });
 
   test('emoji-only and normalized no-op PATCHes do not quiesce Agent workspaces', async () => {

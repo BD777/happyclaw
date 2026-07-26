@@ -144,6 +144,68 @@ beforeAll(() => {
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 
 describe('buildAgentCapabilityPreview', () => {
+  test('inherit discovers a host Skill added after the profile was configured', () => {
+    const profile = {
+      id: 'future-host-skills-profile',
+      owner_user_id: 'owner',
+      name: 'Future Host Skills',
+      identity_prompt: '',
+      soul_prompt: '',
+      agents_prompt: '',
+      tools_prompt: '',
+      prompt_mode: 'append' as const,
+      include_claude_preset: true,
+      avatar_emoji: null,
+      avatar_color: null,
+      avatar_url: null,
+      identity_hash: 'hash',
+      version: 1,
+      is_default: false,
+      status: 'active' as const,
+      created_at: '',
+      updated_at: '',
+      runtime_policy: {
+        context: {
+          source: 'managed' as const,
+          auto_compact_window: 0,
+          auto_compact_percentage: 0,
+        },
+        skills: {
+          mode: 'disabled' as const,
+          ids: [],
+          host: { mode: 'inherit' as const, ids: [] },
+        },
+        mcp: { mode: 'disabled' as const, ids: [] },
+      },
+    };
+    const before = buildAgentCapabilityPreview({
+      profile,
+      ownerRole: 'admin',
+    });
+    expect(
+      before.skills.entries.some((entry) => entry.id === 'added-later'),
+    ).toBe(false);
+
+    writeSkill(path.join(externalDir, 'skills'), 'added-later');
+    try {
+      const after = buildAgentCapabilityPreview({
+        profile,
+        ownerRole: 'admin',
+      });
+      expect(after.skills.entries).toContainEqual(
+        expect.objectContaining({
+          id: 'added-later',
+          source: 'host',
+        }),
+      );
+    } finally {
+      fs.rmSync(path.join(externalDir, 'skills', 'added-later'), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
   test('returns a complete preview when all host Skills are inherited independently', () => {
     const preview = buildAgentCapabilityPreview({
       profile: {

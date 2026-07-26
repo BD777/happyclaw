@@ -101,9 +101,132 @@ describe('Agent profile frontend write contract', () => {
       soul_prompt: 'updated',
     });
 
-    expect(api.patch).toHaveBeenCalledWith('/api/agent-profiles/profile-1', {
-      soul_prompt: 'updated',
-      prompt_schema_version: 2,
+    expect(api.patch).toHaveBeenCalledWith(
+      '/api/agent-profiles/profile-1',
+      {
+        soul_prompt: 'updated',
+        prompt_schema_version: 2,
+      },
+      120_000,
+    );
+  });
+
+  test('supports a minimal host Skills policy PATCH for immediate apply', async () => {
+    useAgentProfilesStore.setState({ profiles: [profile] });
+    const updated = {
+      ...profile,
+      runtime_policy: {
+        ...profile.runtime_policy,
+        skills: {
+          ...profile.runtime_policy.skills,
+          host: { mode: 'inherit' as const, ids: [] },
+        },
+      },
+      version: 2,
+    };
+    vi.mocked(api.patch).mockResolvedValue({ profile: updated });
+
+    await useAgentProfilesStore.getState().updateProfile(profile.id, {
+      runtime_policy: {
+        skills: {
+          host: { mode: 'inherit', ids: [] },
+        },
+      },
     });
+
+    expect(api.patch).toHaveBeenCalledWith(
+      '/api/agent-profiles/profile-1',
+      {
+        runtime_policy: {
+          skills: {
+            host: { mode: 'inherit', ids: [] },
+          },
+        },
+        prompt_schema_version: 2,
+      },
+      120_000,
+    );
+    expect(
+      useAgentProfilesStore.getState().profiles[0]?.runtime_policy.skills.host,
+    ).toEqual({ mode: 'inherit', ids: [] });
+  });
+
+  test('does not report a committed profile PATCH as failed when list refresh fails', async () => {
+    useAgentProfilesStore.setState({ profiles: [profile] });
+    const updated = { ...profile, name: 'Reviewer 2', version: 2 };
+    vi.mocked(api.patch).mockResolvedValue({ profile: updated });
+    storeDeps.loadGroups.mockRejectedValueOnce(new Error('refresh failed'));
+
+    await expect(
+      useAgentProfilesStore
+        .getState()
+        .updateProfile(profile.id, { name: 'Reviewer 2' }),
+    ).resolves.toEqual(updated);
+    expect(useAgentProfilesStore.getState().profiles[0]?.name).toBe(
+      'Reviewer 2',
+    );
+  });
+
+  test('adopts a persisted profile from a post-commit cleanup error', async () => {
+    useAgentProfilesStore.setState({ profiles: [profile] });
+    const persisted = {
+      ...profile,
+      runtime_policy: {
+        ...profile.runtime_policy,
+        skills: {
+          ...profile.runtime_policy.skills,
+          host: { mode: 'inherit' as const, ids: [] },
+        },
+      },
+      version: 2,
+    };
+    const error = {
+      status: 503,
+      message: '配置已更新，但运行时清理失败',
+      body: { persisted: true, retryable: true, profile: persisted },
+    };
+    vi.mocked(api.patch).mockRejectedValue(error);
+
+    await expect(
+      useAgentProfilesStore.getState().updateProfile(profile.id, {
+        runtime_policy: {
+          skills: { host: { mode: 'inherit', ids: [] } },
+        },
+      }),
+    ).rejects.toBe(error);
+    expect(
+      useAgentProfilesStore.getState().profiles[0]?.runtime_policy.skills.host,
+    ).toEqual({ mode: 'inherit', ids: [] });
+  });
+
+  test('retries runtime cleanup through the owner-scoped endpoint', async () => {
+    useAgentProfilesStore.setState({
+      profiles: [profile],
+      governanceByProfile: {
+        [profile.id]: {
+          profile,
+          workspaces: [],
+          channel_mounts: [],
+          runtime_cleanup_pending: true,
+        },
+      },
+    });
+    vi.mocked(api.post).mockResolvedValue({
+      success: true,
+      cleaned_runtime_jids: 1,
+      runtime_cleanup_pending: false,
+    });
+
+    await useAgentProfilesStore.getState().retryRuntimeCleanup(profile.id);
+
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/agent-profiles/profile-1/runtime-cleanup',
+      undefined,
+      120_000,
+    );
+    expect(
+      useAgentProfilesStore.getState().governanceByProfile[profile.id]
+        ?.runtime_cleanup_pending,
+    ).toBe(false);
   });
 });

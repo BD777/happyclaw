@@ -39,9 +39,22 @@ export function skillSelectionError(
   label: string,
   policy: SkillSourcePolicy,
 ): string | null {
-  return policy.mode === 'custom' && policy.ids.length === 0
-    ? `请至少选择一个${label}。`
-    : null;
+  if (policy.mode !== 'custom') return null;
+  if (policy.ids.length === 0) return `请至少选择一个${label}。`;
+  if (policy.ids.length > 100) return `${label}最多选择 100 个。`;
+  return null;
+}
+
+export function hostSkillPolicyForMode(
+  mode: RuntimePolicyMode,
+  ids: string[],
+): SkillSourcePolicy {
+  return {
+    mode,
+    // Inherit is intentionally symbolic: expanding it would stop future
+    // Skills from taking effect and can exceed the API's custom-id limit.
+    ids: mode === 'custom' ? [...new Set(ids)] : [],
+  };
 }
 
 export function skillPolicySummary(

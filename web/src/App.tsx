@@ -54,6 +54,20 @@ function UsageRouteFallback() {
   );
 }
 
+function AgentProfilesRouteFallback() {
+  return (
+    <div
+      className="min-h-full px-4 py-5 sm:px-6 lg:px-8 lg:py-8"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="mx-auto max-w-6xl rounded-xl border border-border bg-card/40 p-6 text-sm text-muted-foreground motion-safe:animate-pulse">
+        正在加载智能体设置…
+      </div>
+    </div>
+  );
+}
+
 const appRoutes = createRoutesFromElements(
   <>
     {/* Public Routes */}
@@ -97,7 +111,7 @@ const appRoutes = createRoutesFromElements(
       <Route
         path="/agent-profiles"
         element={
-          <Suspense fallback={null}>
+          <Suspense fallback={<AgentProfilesRouteFallback />}>
             <AgentProfilesPage />
           </Suspense>
         }
