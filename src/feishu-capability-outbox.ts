@@ -89,8 +89,16 @@ export async function deliverFeishuCapabilityMutation(
               ? error
               : definitiveFeishuHttpRejection(error);
           if (rejection) {
+            const retryAt =
+              rejection.retryAfterMs === undefined
+                ? undefined
+                : new Date(
+                    new Date(input.now?.() ?? Date.now()).getTime() +
+                      rejection.retryAfterMs,
+                  ).toISOString();
             throw new DefinitiveChannelDeliveryError(rejection.message, {
               cause: rejection,
+              retryAt,
             });
           }
           throw error;

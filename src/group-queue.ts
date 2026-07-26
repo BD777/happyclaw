@@ -8,6 +8,7 @@ import { killProcessTree } from './container-runner.js';
 import { getTaskById } from './db.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
+import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import type { ChannelTurnContext } from './types.js';
 export type SendMessageResult = 'sent' | 'no_active';
 export interface IpcMessageCursor {
@@ -33,6 +34,11 @@ export interface IpcDeliveryTarget {
 export interface IpcPrePublishAdmission {
   /** Undo host-side Turn/Card/Outbox reservations if disk publish fails. */
   rollback?: () => void;
+}
+export interface RunnerMessageRequirements {
+  /** Bot identity whose App credentials must already be present in a Docker
+   * runner. Ignored for host-mode processes. */
+  feishuCliAccountId?: string | null;
 }
 export interface MutationPauseToken {
   readonly id: number;
@@ -115,6 +121,10 @@ interface GroupState {
   restarting: boolean;
   /** Provider profile ID selected for the current active runner (null = default/override). */
   selectedProviderId: string | null;
+  /** Exact Feishu Bot whose credentials were injected at container startup.
+   * Host processes always keep this null because their native feishu-cli
+   * environment/config is authoritative. */
+  feishuCliAccountId: string | null;
   /** True when a _drain sentinel has been written for the current active runner. */
   drainSentinelWritten: boolean;
   /** True when messages have been IPC-injected into the running agent via sendMessage().
@@ -229,6 +239,7 @@ export class GroupQueue {
         retryTask: null,
         restarting: false,
         selectedProviderId: null,
+        feishuCliAccountId: null,
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
         pendingIpcDeliveries: new Map(),
@@ -1121,6 +1132,20 @@ export class GroupQueue {
     return true;
   }
 
+  requiresFeishuCliContainerRestart(
+    groupJid: string,
+    requirements: RunnerMessageRequirements,
+  ): boolean {
+    const state = this.resolveActiveState(groupJid);
+    const requiredAccountId = requirements.feishuCliAccountId ?? null;
+    return (
+      state !== null &&
+      state.containerName !== null &&
+      requiredAccountId !== null &&
+      requiredAccountId !== state.feishuCliAccountId
+    );
+  }
+
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
@@ -1289,6 +1314,7 @@ export class GroupQueue {
       agentId?: string;
       taskRunId?: string;
       selectedProviderId?: string | null;
+      feishuCliAccountId?: string | null;
     },
   ): void {
     const state = this.getGroup(groupJid);
@@ -1299,6 +1325,7 @@ export class GroupQueue {
     state.agentId = opts.agentId || null;
     state.taskRunId = opts.taskRunId || null;
     state.selectedProviderId = opts.selectedProviderId ?? null;
+    state.feishuCliAccountId = opts.feishuCliAccountId ?? null;
   }
 
   /**
@@ -1348,11 +1375,40 @@ export class GroupQueue {
     beforePublish?: (
       receipt?: IpcDeliveryReceipt,
     ) => IpcPrePublishAdmission | false | void,
+    requirements?: RunnerMessageRequirements,
   ): SendMessageResult {
     if (this.isTerminalMutationDiscarded(groupJid)) return 'no_active';
     if (this.isMutationPaused(groupJid)) return 'no_active';
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
+
+    // Container credentials are immutable process environment. Never inject a
+    // turn from Bot B into a warm runner that started with Bot A (or with no
+    // bound Bot): drain it and let the normal cold-start path launch a runner
+    // carrying B's credentials. Host mode is intentionally exempt because
+    // feishu-cli there is governed entirely by the host's native configuration.
+    const requiredFeishuCliAccountId =
+      requirements?.feishuCliAccountId ??
+      resolveFeishuCliBoundAccountId({ channelContext });
+    if (
+      state.containerName !== null &&
+      requiredFeishuCliAccountId !== null &&
+      requiredFeishuCliAccountId !== state.feishuCliAccountId
+    ) {
+      this.requestDrainForActiveRunner(
+        groupJid,
+        'Draining container before switching Feishu CLI Bot identity',
+      );
+      logger.info(
+        {
+          groupJid,
+          activeFeishuCliAccountId: state.feishuCliAccountId,
+          requiredFeishuCliAccountId,
+        },
+        'Rejected warm IPC injection across Feishu Bot identities',
+      );
+      return 'no_active';
+    }
 
     // If the active runner is a scheduled task (not a user-message handler),
     // do NOT pipe user messages into it.  The task container has no knowledge

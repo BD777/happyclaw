@@ -59,6 +59,7 @@ import {
   AvailableGroup,
   ContainerInput,
   ContainerOutput,
+  cleanupContainerTaskRuntimeEnvDirs,
   runContainerAgent,
   runHostAgent,
   runAgentWithModelFallback,
@@ -66,6 +67,7 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   closeDatabase,
@@ -8664,6 +8666,13 @@ async function runAgent(
   ipcWatcherManager?.watchGroup(group.folder);
   try {
     const executionMode = group.executionMode || 'container';
+    const feishuCliAccountId =
+      executionMode === 'container'
+        ? resolveFeishuCliBoundAccountId({
+            channelContext,
+            workspaceChannelAccountId: group.channel_account_id,
+          })
+        : null;
 
     const onProcessCb = (
       proc: ChildProcess,
@@ -8677,6 +8686,7 @@ async function runAgent(
         groupFolder: group.folder,
         displayName: identifier,
         selectedProviderId,
+        feishuCliAccountId,
       });
     };
 
@@ -10297,6 +10307,7 @@ function startIpcWatcher(): void {
                 ),
                 { recursive: true, force: true },
               );
+              cleanupContainerTaskRuntimeEnvDirs(sourceGroup, ipcTaskId);
             })
           ) {
             logger.debug(
@@ -14655,6 +14666,13 @@ async function processAgentConversation(
       );
     }
     const executionMode = effectiveGroup.executionMode || 'container';
+    const feishuCliAccountId =
+      executionMode === 'container'
+        ? resolveFeishuCliBoundAccountId({
+            channelContext: currentAgentChannelContext,
+            workspaceChannelAccountId: effectiveGroup.channel_account_id,
+          })
+        : null;
     const onProcessCb = (
       proc: ChildProcess,
       identifier: string,
@@ -14667,6 +14685,7 @@ async function processAgentConversation(
         displayName: identifier,
         agentId,
         selectedProviderId,
+        feishuCliAccountId,
       });
     };
 
@@ -15466,6 +15485,32 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             messagesToSend,
           );
+          const { effectiveGroup: activeEffectiveGroup } =
+            resolveEffectiveGroup(group);
+          const warmChannelContext = resolveBatchChannelContext(
+            messagesToSend,
+            chatJid,
+          );
+          const requiredFeishuCliAccountId =
+            (activeEffectiveGroup.executionMode || 'container') === 'container'
+              ? resolveFeishuCliBoundAccountId({
+                  channelContext: warmChannelContext,
+                  workspaceChannelAccountId:
+                    activeEffectiveGroup.channel_account_id,
+                })
+              : null;
+
+          // Plugin expansion may execute inline commands inside the active
+          // container. Reject a cross-Bot warm path before expansion so even
+          // those commands cannot observe the previous Bot's credentials.
+          if (
+            queue.requiresFeishuCliContainerRestart(chatJid, {
+              feishuCliAccountId: requiredFeishuCliAccountId,
+            })
+          ) {
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
 
           // Plugin command expander (DMI commands) — same as cold-start path.
           // Active-runner IPC injection: replies advance the cursor without
@@ -15477,8 +15522,6 @@ async function startMessageLoop(): Promise<void> {
           // returns null on the non-home sibling and DMI commands stop working
           // once a runner is up (#18 P2-bug-3).
           {
-            const { effectiveGroup: activeEffectiveGroup } =
-              resolveEffectiveGroup(group);
             const fallbackExpandCtx = buildExpandContext(
               chatJid,
               activeEffectiveGroup,
@@ -15573,10 +15616,6 @@ async function startMessageLoop(): Promise<void> {
           // task's send_message output loses task attribution and the host skips
           // the notify_channels broadcast (riba2534/happyclaw#559).
           const injectionTaskId = extractLastTaskId(messagesToSend);
-          const warmChannelContext = resolveBatchChannelContext(
-            messagesToSend,
-            chatJid,
-          );
 
           const sendResult = queue.sendMessage(
             chatJid,
@@ -15618,6 +15657,7 @@ async function startMessageLoop(): Promise<void> {
                 lastSourceJidForRoute,
                 receipt,
               ),
+            { feishuCliAccountId: requiredFeishuCliAccountId },
           );
           if (sendResult === 'sent' && deliveryTarget) {
             logger.debug(

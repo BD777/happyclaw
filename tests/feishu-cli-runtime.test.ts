@@ -1,8 +1,10 @@
+import fs from 'node:fs';
+
 import { describe, expect, test } from 'vitest';
 
 import {
-  applyFeishuCliBindingToEnvironment,
   applyFeishuCliBindingToEnvLines,
+  resolveFeishuCliBoundAccountId,
   resolveFeishuCliRuntimeBinding,
 } from '../src/feishu-cli-runtime.js';
 import type { ChannelAccount, ChannelTurnContext } from '../src/types.js';
@@ -62,15 +64,28 @@ function dependencies(
 }
 
 describe('Feishu CLI runtime identity binding', () => {
-  test('prefers the exact turn account over global fallback credentials', () => {
+  test('host mode leaves feishu-cli identity entirely to the host', () => {
+    const source = fs.readFileSync(
+      new URL('../src/container-runner.ts', import.meta.url),
+      'utf8',
+    );
+    const hostRunner = source.slice(
+      source.indexOf('export async function runHostAgent'),
+      source.indexOf('export type AgentRunner'),
+    );
+
+    expect(hostRunner).not.toContain('resolveFeishuCliRuntimeBinding');
+    expect(hostRunner).not.toContain('applyFeishuCliBinding');
+    expect(hostRunner).not.toContain('FEISHU_APP_ID');
+    expect(hostRunner).not.toContain('FEISHU_APP_SECRET');
+  });
+
+  test('prefers the exact turn account over the workspace account', () => {
     const binding = resolveFeishuCliRuntimeBinding(
       {
         ownerUserId: 'owner-1',
         channelContext: context(),
-        fallbackEnvironment: {
-          FEISHU_APP_ID: 'cli_global',
-          FEISHU_APP_SECRET: 'secret-global',
-        },
+        workspaceChannelAccountId: 'account-workspace',
       },
       dependencies(),
     );
@@ -88,10 +103,6 @@ describe('Feishu CLI runtime identity binding', () => {
       {
         ownerUserId: 'owner-1',
         workspaceChannelAccountId: 'account-current',
-        fallbackEnvironment: {
-          FEISHU_APP_ID: 'cli_global',
-          FEISHU_APP_SECRET: 'secret-global',
-        },
       },
       dependencies(),
     );
@@ -100,89 +111,37 @@ describe('Feishu CLI runtime identity binding', () => {
     expect(binding?.appId).toBe('cli_current');
   });
 
-  test('falls back to process credentials only without a bound account', () => {
-    const binding = resolveFeishuCliRuntimeBinding({
-      ownerUserId: 'owner-1',
-      fallbackEnvironment: {
-        FEISHU_APP_ID: 'cli_global',
-        FEISHU_APP_SECRET: 'secret-global',
-        FEISHU_PROFILE: 'personal',
-      },
-    });
-
-    expect(binding).toEqual({
-      source: 'global_environment',
-      accountId: null,
-      appId: 'cli_global',
-      appSecret: 'secret-global',
-      profileName: 'personal',
-    });
-  });
-
-  test('does not create a partial fallback identity', () => {
-    expect(
-      resolveFeishuCliRuntimeBinding({
-        fallbackEnvironment: { FEISHU_APP_ID: 'cli_global' },
-      }),
-    ).toBeNull();
-  });
-
-  test.each(['zsh', 'bash', 'fish', 'service manager'])(
-    'accepts credentials inherited from any %s environment',
-    () => {
-      expect(
-        resolveFeishuCliRuntimeBinding({
-          fallbackEnvironment: {
-            FEISHU_APP_ID: 'cli_inherited',
-            FEISHU_APP_SECRET: 'secret-inherited',
-          },
-        }),
-      ).toMatchObject({
-        source: 'global_environment',
-        appId: 'cli_inherited',
-        appSecret: 'secret-inherited',
-      });
-    },
-  );
-
-  test('leaves native config and profile resolution untouched without credentials', () => {
-    const binding = resolveFeishuCliRuntimeBinding({
-      fallbackEnvironment: {
-        FEISHU_PROFILE: 'work',
-        FEISHU_OWNER_EMAIL: 'owner@example.com',
-      },
-    });
-    const environment = {
-      FEISHU_PROFILE: 'work',
-      FEISHU_OWNER_EMAIL: 'owner@example.com',
-    };
+  test('leaves native container config untouched without a bound account', () => {
+    const binding = resolveFeishuCliRuntimeBinding({});
     const lines = [
       'FEISHU_PROFILE=work',
       'FEISHU_OWNER_EMAIL=owner@example.com',
     ];
 
     expect(binding).toBeNull();
-    applyFeishuCliBindingToEnvironment(environment, binding);
     applyFeishuCliBindingToEnvLines(lines, binding);
-    expect(environment).toEqual({
-      FEISHU_PROFILE: 'work',
-      FEISHU_OWNER_EMAIL: 'owner@example.com',
-    });
     expect(lines).toEqual([
       'FEISHU_PROFILE=work',
       'FEISHU_OWNER_EMAIL=owner@example.com',
     ]);
   });
 
-  test('rejects control characters in fallback credentials', () => {
+  test('selects only a Feishu turn account before the workspace fallback', () => {
     expect(
-      resolveFeishuCliRuntimeBinding({
-        fallbackEnvironment: {
-          FEISHU_APP_ID: 'cli_global\nINJECTED=value',
-          FEISHU_APP_SECRET: 'secret-global',
-        },
+      resolveFeishuCliBoundAccountId({
+        channelContext: context(),
+        workspaceChannelAccountId: 'account-workspace',
       }),
-    ).toBeNull();
+    ).toBe('account-current');
+    expect(
+      resolveFeishuCliBoundAccountId({
+        channelContext: context({
+          provider: 'telegram',
+          channelAccountId: 'telegram-account',
+        }),
+        workspaceChannelAccountId: 'account-workspace',
+      }),
+    ).toBe('account-workspace');
   });
 
   test.each([
@@ -224,17 +183,13 @@ describe('Feishu CLI runtime identity binding', () => {
         {
           ownerUserId: 'owner-1',
           channelContext: context(),
-          fallbackEnvironment: {
-            FEISHU_APP_ID: 'cli_global',
-            FEISHU_APP_SECRET: 'secret-global',
-          },
         },
         deps,
       ),
     ).toThrow(error);
   });
 
-  test('overlays Bot credentials while preserving native profile preferences', () => {
+  test('overlays the bound Bot and removes inherited user-token overrides', () => {
     const binding = resolveFeishuCliRuntimeBinding(
       {
         ownerUserId: 'owner-1',
@@ -242,28 +197,16 @@ describe('Feishu CLI runtime identity binding', () => {
       },
       dependencies(),
     );
-    const environment = {
-      FEISHU_APP_ID: 'cli_global',
-      FEISHU_APP_SECRET: 'secret-global',
-      FEISHU_PROFILE: 'global',
-      KEEP: 'yes',
-    };
     const lines = [
       'FEISHU_APP_ID=cli_workspace',
       'FEISHU_APP_SECRET=secret-workspace',
+      'FEISHU_USER_ACCESS_TOKEN=stale-user-token',
       'FEISHU_PROFILE=workspace',
       'KEEP=yes',
     ];
 
-    applyFeishuCliBindingToEnvironment(environment, binding);
     applyFeishuCliBindingToEnvLines(lines, binding);
 
-    expect(environment).toEqual({
-      FEISHU_APP_ID: 'cli_current',
-      FEISHU_APP_SECRET: 'secret-current',
-      FEISHU_PROFILE: 'global',
-      KEEP: 'yes',
-    });
     expect(lines).toEqual([
       'FEISHU_PROFILE=workspace',
       'KEEP=yes',

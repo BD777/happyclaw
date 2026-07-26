@@ -5,6 +5,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'crypto';
 import { TerminalManager } from './terminal-manager.js';
+import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 
 // Web context and shared utilities
 import {
@@ -517,6 +518,15 @@ async function handleWebUserMessage(
     if (!dbGroup) return { ok: false, status: 404, error: 'Group not found' };
     group = dbGroup;
   }
+  const runtimeGroup = deps.resolveEffectiveGroup
+    ? deps.resolveEffectiveGroup(group).effectiveGroup
+    : group;
+  const requiredFeishuCliAccountId =
+    (runtimeGroup.executionMode || 'container') === 'container'
+      ? resolveFeishuCliBoundAccountId({
+          workspaceChannelAccountId: runtimeGroup.channel_account_id,
+        })
+      : null;
 
   ensureChatExists(chatJid);
 
@@ -677,16 +687,16 @@ async function handleWebUserMessage(
   // so cold-start re-expands and inline runs again. Lead-approved tradeoff;
   // log a warn line so we can confirm rarity in production.
   let sendContent = content;
-  const eagerExpandActive = deps.queue.hasActiveMainRunnerForMessage(chatJid);
+  const eagerExpandActive =
+    !deps.queue.requiresFeishuCliContainerRestart(chatJid, {
+      feishuCliAccountId: requiredFeishuCliAccountId,
+    }) && deps.queue.hasActiveMainRunnerForMessage(chatJid);
   if (eagerExpandActive) {
     // Use the effective (sibling-resolved) group so non-home groups bound to a
     // home sibling inherit executionMode / customCwd / created_by — otherwise
     // buildWebExpandContext returns null on sibling JIDs and the active runner
     // ends up receiving the literal `/foo` slash command (#21 round-13 P2-3).
-    const expandGroup = deps.resolveEffectiveGroup
-      ? deps.resolveEffectiveGroup(group).effectiveGroup
-      : group;
-    const expandCtx = buildWebExpandContext(chatJid, expandGroup);
+    const expandCtx = buildWebExpandContext(chatJid, runtimeGroup);
     if (expandCtx) {
       const expansion = await expandPluginSlashCommandIfNeeded(
         expandCtx,
@@ -812,6 +822,7 @@ async function handleWebUserMessage(
     },
     undefined,
     (receipt) => preAdmitRoute?.(group.folder, null, receipt) ?? false,
+    { feishuCliAccountId: requiredFeishuCliAccountId },
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
@@ -903,6 +914,19 @@ async function handleAgentConversationMessage(
     );
     return { ok: false, status: 404, error: 'Agent not found' };
   }
+  const parentGroup =
+    deps.getRegisteredGroups()[chatJid] ?? getRegisteredGroup(chatJid);
+  const runtimeParentGroup =
+    parentGroup && deps.resolveEffectiveGroup
+      ? deps.resolveEffectiveGroup(parentGroup).effectiveGroup
+      : parentGroup;
+  const requiredFeishuCliAccountId =
+    runtimeParentGroup &&
+    (runtimeParentGroup.executionMode || 'container') === 'container'
+      ? resolveFeishuCliBoundAccountId({
+          workspaceChannelAccountId: runtimeParentGroup.channel_account_id,
+        })
+      : null;
 
   const virtualChatJid = `${chatJid}#agent:${agentId}`;
 
@@ -1025,10 +1049,10 @@ async function handleAgentConversationMessage(
   //     → inline double-fire. Cold-start handles all three outcomes.
   let agentSendContent = content;
   const eagerExpandAgentActive =
-    deps.queue.hasActiveMainRunnerForMessage(virtualChatJid);
+    !deps.queue.requiresFeishuCliContainerRestart(virtualChatJid, {
+      feishuCliAccountId: requiredFeishuCliAccountId,
+    }) && deps.queue.hasActiveMainRunnerForMessage(virtualChatJid);
   if (eagerExpandAgentActive) {
-    const parentGroup =
-      deps.getRegisteredGroups()[chatJid] ?? getRegisteredGroup(chatJid);
     if (parentGroup) {
       // Use the effective (sibling-resolved) parent group so a non-home parent
       // bound to a home sibling expands plugins via the home's executionMode /
@@ -1166,6 +1190,7 @@ async function handleAgentConversationMessage(
     undefined,
     (receipt) =>
       preAdmitRoute?.(agent.group_folder, null, receipt, agentId) ?? false,
+    { feishuCliAccountId: requiredFeishuCliAccountId },
   );
   if (agentSendResult === 'sent') {
     deps.advanceNextPullCursorOnly(virtualChatJid, {

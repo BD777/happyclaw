@@ -5,6 +5,10 @@ import type { ChannelAccount, ChannelTurnContext } from './types.js';
 const FEISHU_CLI_CREDENTIAL_ENV_KEYS = [
   'FEISHU_APP_ID',
   'FEISHU_APP_SECRET',
+  // feishu-cli document commands prefer an explicit user token over the App
+  // credentials. A token inherited through provider/custom env must therefore
+  // not survive an exact container Bot binding.
+  'FEISHU_USER_ACCESS_TOKEN',
 ] as const;
 
 export class FeishuCliCredentialBindingError extends Error {
@@ -15,12 +19,10 @@ export class FeishuCliCredentialBindingError extends Error {
 }
 
 export interface FeishuCliRuntimeBinding {
-  source: 'channel_account' | 'global_environment';
-  accountId: string | null;
+  source: 'channel_account';
+  accountId: string;
   appId: string;
   appSecret: string;
-  /** Inherited user preference only; HappyClaw never synthesizes a profile. */
-  profileName?: string;
 }
 
 interface FeishuCliBindingDependencies {
@@ -34,7 +36,6 @@ export interface ResolveFeishuCliRuntimeBindingInput {
   ownerUserId?: string | null;
   channelContext?: ChannelTurnContext;
   workspaceChannelAccountId?: string | null;
-  fallbackEnvironment?: Record<string, string | undefined>;
 }
 
 function optionalTrimmed(value: string | null | undefined): string | null {
@@ -46,37 +47,32 @@ function hasUnsafeCredentialCharacters(value: string): boolean {
   return /[\u0000\r\n]/.test(value);
 }
 
-function fallbackBinding(
-  environment: Record<string, string | undefined>,
-): FeishuCliRuntimeBinding | null {
-  const appId = optionalTrimmed(environment.FEISHU_APP_ID);
-  const appSecret = optionalTrimmed(environment.FEISHU_APP_SECRET);
-  if (!appId || !appSecret) return null;
-  if (
-    hasUnsafeCredentialCharacters(appId) ||
-    hasUnsafeCredentialCharacters(appSecret)
-  ) {
-    return null;
-  }
-  const profileName = optionalTrimmed(environment.FEISHU_PROFILE);
-  return {
-    source: 'global_environment',
-    accountId: null,
-    appId,
-    appSecret,
-    ...(profileName ? { profileName } : {}),
-  };
+/**
+ * Select the Bot identity a container run must use without reading secrets.
+ * Host mode deliberately never calls this helper: feishu-cli on the host owns
+ * its complete native environment/config resolution.
+ */
+export function resolveFeishuCliBoundAccountId(
+  input: Pick<
+    ResolveFeishuCliRuntimeBindingInput,
+    'channelContext' | 'workspaceChannelAccountId'
+  >,
+): string | null {
+  const isFeishuTurn = input.channelContext?.provider === 'feishu';
+  const turnAccountId = isFeishuTurn
+    ? optionalTrimmed(input.channelContext?.channelAccountId)
+    : null;
+  return turnAccountId ?? optionalTrimmed(input.workspaceChannelAccountId);
 }
 
 /**
  * Resolve the Feishu CLI identity for one Agent run.
  *
  * An exact inbound Feishu turn is authoritative. A workspace-level account is
- * used only when no turn-scoped account exists. The inherited process
- * environment is the next fallback regardless of whether it came from zsh,
- * bash, fish, launchd, systemd, Docker, or another launcher. With no complete
- * inherited credentials this returns null and feishu-cli resolves its native
- * active profile or config.yaml without HappyClaw parsing either one.
+ * used only when no turn-scoped account exists. With no bound account this
+ * returns null and feishu-cli resolves any native container profile/config
+ * without HappyClaw parsing it. Host-mode execution must not call this
+ * resolver at all.
  *
  * Once a Feishu account is explicitly bound, failures are closed rather than
  * silently falling back to a different Bot identity.
@@ -88,27 +84,21 @@ export function resolveFeishuCliRuntimeBinding(
     loadChannelAccountSecret,
   },
 ): FeishuCliRuntimeBinding | null {
-  const fallbackEnvironment = input.fallbackEnvironment ?? process.env;
   const isFeishuTurn = input.channelContext?.provider === 'feishu';
   const turnAccountId = isFeishuTurn
     ? optionalTrimmed(input.channelContext?.channelAccountId)
     : null;
-  const workspaceAccountId = optionalTrimmed(input.workspaceChannelAccountId);
-  const candidateAccountId = turnAccountId ?? workspaceAccountId;
+  const candidateAccountId = resolveFeishuCliBoundAccountId(input);
 
-  if (!candidateAccountId) {
-    return fallbackBinding(fallbackEnvironment);
-  }
+  if (!candidateAccountId) return null;
 
   const account = dependencies.getChannelAccount(candidateAccountId);
   if (!account) {
-    if (!turnAccountId) return fallbackBinding(fallbackEnvironment);
     throw new FeishuCliCredentialBindingError(
       'The Feishu account bound to this turn no longer exists',
     );
   }
   if (account.provider !== 'feishu') {
-    if (!turnAccountId) return fallbackBinding(fallbackEnvironment);
     throw new FeishuCliCredentialBindingError(
       'The channel account bound to this Feishu turn has the wrong provider',
     );
@@ -162,18 +152,7 @@ function bindingEnvironment(
   return {
     FEISHU_APP_ID: binding.appId,
     FEISHU_APP_SECRET: binding.appSecret,
-    ...(binding.profileName ? { FEISHU_PROFILE: binding.profileName } : {}),
   };
-}
-
-export function applyFeishuCliBindingToEnvironment(
-  environment: Record<string, string>,
-  binding: FeishuCliRuntimeBinding | null,
-): void {
-  if (!binding) return;
-  for (const key of FEISHU_CLI_CREDENTIAL_ENV_KEYS) delete environment[key];
-  if (binding.profileName) delete environment.FEISHU_PROFILE;
-  Object.assign(environment, bindingEnvironment(binding));
 }
 
 export function applyFeishuCliBindingToEnvLines(
@@ -181,11 +160,12 @@ export function applyFeishuCliBindingToEnvLines(
   binding: FeishuCliRuntimeBinding | null,
 ): void {
   if (!binding) return;
-  const managedKeys = binding.profileName
-    ? [...FEISHU_CLI_CREDENTIAL_ENV_KEYS, 'FEISHU_PROFILE']
-    : FEISHU_CLI_CREDENTIAL_ENV_KEYS;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (managedKeys.some((key) => lines[index]?.startsWith(`${key}=`))) {
+    if (
+      FEISHU_CLI_CREDENTIAL_ENV_KEYS.some((key) =>
+        lines[index]?.startsWith(`${key}=`),
+      )
+    ) {
       lines.splice(index, 1);
     }
   }

@@ -52,8 +52,31 @@ const { runContainerAgentMock, runHostAgentMock, runScriptMock } = vi.hoisted(
         input.taskRunId,
         'input',
       );
+      const runtimeEnvDirs = [
+        path.join(
+          tmpDir,
+          'env',
+          input.groupFolder,
+          'default',
+          'tasks-run',
+          input.taskRunId,
+        ),
+        path.join(
+          tmpDir,
+          'env',
+          input.groupFolder,
+          'channel-accounts',
+          'account-a',
+          'tasks-run',
+          input.taskRunId,
+        ),
+      ];
       fs.mkdirSync(sessionDir, { recursive: true });
       fs.mkdirSync(ipcDir, { recursive: true });
+      for (const runtimeEnvDir of runtimeEnvDirs) {
+        fs.mkdirSync(runtimeEnvDir, { recursive: true });
+        fs.writeFileSync(path.join(runtimeEnvDir, 'env'), 'SECRET=value');
+      }
       fs.writeFileSync(path.join(sessionDir, 'transcript.jsonl'), '{}');
       fs.writeFileSync(path.join(ipcDir, 'request.json'), '{}');
       onProcess?.({} as never, `container-${input.taskRunId}`, null);
@@ -384,6 +407,31 @@ describe('scheduled task workspace/session contract', () => {
     expect(
       fs.existsSync(
         path.join(tmpDir, 'ipc', GROUP_FOLDER, 'tasks-run', input.taskRunId),
+      ),
+    ).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(
+          tmpDir,
+          'env',
+          GROUP_FOLDER,
+          'default',
+          'tasks-run',
+          input.taskRunId,
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(
+          tmpDir,
+          'env',
+          GROUP_FOLDER,
+          'channel-accounts',
+          'account-a',
+          'tasks-run',
+          input.taskRunId,
+        ),
       ),
     ).toBe(false);
     const storedTask = db.getTaskById(taskId)!;

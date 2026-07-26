@@ -51,8 +51,11 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
-const { buildVolumeMounts, getContainerRuntimeEnvDir } =
-  await import('../src/container-runner.js');
+const {
+  buildVolumeMounts,
+  cleanupContainerTaskRuntimeEnvDirs,
+  getContainerRuntimeEnvDir,
+} = await import('../src/container-runner.js');
 
 function writeMcpStore(
   ownerId: string,
@@ -205,6 +208,23 @@ describe('managed MCP runtime secret boundary', () => {
         'account-a',
       ),
     ).toThrow(/Invalid agent id/);
+  });
+
+  test('cleans a task env snapshot under every Bot identity', () => {
+    const taskRunId = 'task-run-a';
+    const taskDirs = [
+      getContainerRuntimeEnvDir('workspace', undefined, taskRunId, 'account-a'),
+      getContainerRuntimeEnvDir('workspace', undefined, taskRunId, 'account-b'),
+      getContainerRuntimeEnvDir('workspace', undefined, taskRunId),
+    ];
+    for (const taskDir of taskDirs) {
+      fs.mkdirSync(taskDir, { recursive: true });
+      fs.writeFileSync(path.join(taskDir, 'env'), 'SECRET=value');
+    }
+
+    cleanupContainerTaskRuntimeEnvDirs('workspace', taskRunId);
+
+    expect(taskDirs.every((taskDir) => !fs.existsSync(taskDir))).toBe(true);
   });
 
   test('member runtime receives only explicitly shared system MCP, regardless of where tokens are stored', () => {

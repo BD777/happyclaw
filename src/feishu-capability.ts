@@ -27,15 +27,22 @@ export interface FeishuCapabilityResult {
 /**
  * The broker or Feishu explicitly rejected a capability request before any
  * visible mutation could be accepted. The durable Outbox may safely record a
- * definitive failure instead of fencing the whole turn as uncertain.
+ * definitive failure or scheduled retry instead of fencing the whole turn as
+ * uncertain.
  */
 export class DefinitiveFeishuCapabilityError extends Error {
-  constructor(message: string, options: { cause?: unknown } = {}) {
+  readonly retryAfterMs?: number;
+
+  constructor(
+    message: string,
+    options: { cause?: unknown; retryAfterMs?: number } = {},
+  ) {
     super(
       message,
       options.cause === undefined ? undefined : { cause: options.cause },
     );
     this.name = 'DefinitiveFeishuCapabilityError';
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -109,6 +116,24 @@ function record(value: unknown): Record<string, unknown> {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function feishuRetryAfterMs(response: Record<string, unknown>): number {
+  const headers = record(response.headers);
+  const raw = headers['retry-after'] ?? headers['Retry-After'];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const text =
+    typeof value === 'number' || typeof value === 'string'
+      ? String(value).trim()
+      : '';
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    return Math.min(300_000, Math.max(1_000, Number(text) * 1_000));
+  }
+  const retryAt = Date.parse(text);
+  if (Number.isFinite(retryAt)) {
+    return Math.min(300_000, Math.max(1_000, retryAt - Date.now()));
+  }
+  return 5_000;
 }
 
 function boundedInt(
@@ -262,7 +287,10 @@ export function definitiveFeishuHttpRejection(
   );
   return new DefinitiveFeishuCapabilityError(
     `Feishu rejected the request (http=${status}, code=${code}, msg=${detail})`,
-    { cause: error },
+    {
+      cause: error,
+      ...(status === 429 ? { retryAfterMs: feishuRetryAfterMs(response) } : {}),
+    },
   );
 }
 

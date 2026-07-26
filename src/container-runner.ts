@@ -103,7 +103,6 @@ import {
   type CloseHandlerContext,
 } from './agent-output-parser.js';
 import {
-  applyFeishuCliBindingToEnvironment,
   applyFeishuCliBindingToEnvLines,
   resolveFeishuCliRuntimeBinding,
   type FeishuCliRuntimeBinding,
@@ -999,6 +998,48 @@ export function getContainerRuntimeEnvDir(
     ...identityPath,
     ...runtimePath,
   );
+}
+
+/**
+ * Remove every identity-specific environment snapshot for one isolated task
+ * run. The scheduler does not need to retain or rediscover which Bot identity
+ * was selected after the container exits.
+ */
+export function cleanupContainerTaskRuntimeEnvDirs(
+  groupFolder: string,
+  taskRunId: string,
+): void {
+  const safeTaskRunId = assertRuntimeEnvPathSegment(taskRunId, 'task run id');
+  const safeGroupFolder = assertRuntimeEnvPathSegment(
+    groupFolder,
+    'group folder',
+  );
+  const workspaceEnvRoot = path.join(DATA_DIR, 'env', safeGroupFolder);
+  const taskRuntimeSuffix = path.join('tasks-run', safeTaskRunId);
+
+  fs.rmSync(path.join(workspaceEnvRoot, 'default', taskRuntimeSuffix), {
+    recursive: true,
+    force: true,
+  });
+
+  const accountRoot = path.join(workspaceEnvRoot, 'channel-accounts');
+  let accountEntries: fs.Dirent[];
+  try {
+    accountEntries = fs.readdirSync(accountRoot, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of accountEntries) {
+    if (!entry.isDirectory()) continue;
+    // Ignore unexpected legacy/manual entries instead of letting them broaden
+    // the deletion target.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(entry.name)) continue;
+    fs.rmSync(path.join(accountRoot, entry.name, taskRuntimeSuffix), {
+      recursive: true,
+      force: true,
+    });
+  }
 }
 
 export function buildVolumeMounts(
@@ -2339,12 +2380,6 @@ export async function runHostAgent(
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }
-    const feishuCliBinding = resolveFeishuCliRuntimeBinding({
-      ownerUserId: group.created_by,
-      channelContext: input.channelContext,
-      workspaceChannelAccountId: group.channel_account_id,
-    });
-    applyFeishuCliBindingToEnvironment(hostEnv, feishuCliBinding);
     const fallbackModel = getSystemSettings().fallbackModel?.trim();
     if (fallbackModel) {
       hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = fallbackModel;

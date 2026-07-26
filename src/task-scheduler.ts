@@ -14,6 +14,7 @@ import { getSystemSettings } from './runtime-config.js';
 import { channelConversationJid } from './channel-address.js';
 import {
   ContainerOutput,
+  cleanupContainerTaskRuntimeEnvDirs,
   runContainerAgent,
   runHostAgent,
   runAgentWithModelFallback,
@@ -378,6 +379,7 @@ function cleanupIsolatedTaskRun(
     deleteSession(workspace.folder, sessionAgentId);
     deleteMessagesForChatJid(virtualChatJid);
     fs.rmSync(sessionPath, { recursive: true, force: true });
+    cleanupContainerTaskRuntimeEnvDirs(workspace.folder, taskRunId);
   };
 
   // send_message writes happen before the runner returns, but the host watcher

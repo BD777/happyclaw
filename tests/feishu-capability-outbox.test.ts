@@ -273,6 +273,44 @@ describe('Feishu capability mutation outbox', () => {
     expect(fallback.status).toBe('delivered');
   });
 
+  test('a Feishu HTTP 429 enters retry wait instead of failing permanently', async () => {
+    const now = '2026-07-26T08:00:00.000Z';
+    const run = store.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'feishu-mutation-http-429',
+      now,
+    }).run;
+    const result = await deliverFeishuCapabilityMutation({
+      ...route,
+      turnRunId: run.id,
+      requestId: 'provider-429',
+      request: {
+        operation: 'send_card',
+        params: { card: { schema: '2.0', body: { elements: [] } } },
+      },
+      owner: 'provider-429-worker',
+      now: () => now,
+      execute: async () => {
+        throw Object.assign(new Error('Request failed with status code 429'), {
+          response: {
+            status: 429,
+            headers: { 'retry-after': '2' },
+            data: { code: 99991400, msg: 'rate limit exceeded' },
+          },
+        });
+      },
+    });
+
+    expect(result.delivery).toMatchObject({
+      status: 'retry_wait',
+      error: expect.stringContaining('http=429'),
+    });
+    expect(
+      store.getChannelOutboxItem(result.delivery.itemId)?.availableAt,
+    ).toBe('2026-07-26T08:00:02.000Z');
+    expect(store.getUncertainChannelOutboxForTurn(run.id)).toBeUndefined();
+  });
+
   test('a Feishu 5xx remains uncertain because acceptance cannot be ruled out', async () => {
     const run = store.createChannelTurnRun({
       ...route,
