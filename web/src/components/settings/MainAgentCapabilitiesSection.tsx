@@ -14,6 +14,7 @@ import {
 import { PolicyResourcePicker } from '../agents/PolicyResourcePicker';
 import { AgentSkillsPolicyEditor } from '../agents/AgentSkillsPolicyEditor';
 import { EffectiveCapabilitiesPreview } from '../agents/EffectiveCapabilitiesPreview';
+import { ErrorBoundary } from '../common/ErrorBoundary';
 import { Button } from '@/components/ui/button';
 import {
   Select,
@@ -278,11 +279,13 @@ export function MainAgentCapabilitiesSection() {
         </Button>
       </div>
       {currentRuntimePolicy && (
-        <EffectiveCapabilitiesPreview
-          profileId={profile.id}
-          runtimePolicy={currentRuntimePolicy}
-          workspaces={governance?.workspaces ?? []}
-        />
+        <ErrorBoundary resetKeys={[profile.id]}>
+          <EffectiveCapabilitiesPreview
+            profileId={profile.id}
+            runtimePolicy={currentRuntimePolicy}
+            workspaces={governance?.workspaces ?? []}
+          />
+        </ErrorBoundary>
       )}
     </section>
   );

@@ -10,6 +10,7 @@ import { useBillingStore } from '../../stores/billing';
 import { useGroupsStore } from '../../stores/groups';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { ErrorBoundary } from '../common/ErrorBoundary';
 
 export function AppLayout() {
   const location = useLocation();
@@ -167,7 +168,9 @@ export function AppLayout() {
               : `overflow-y-auto overflow-x-hidden overscroll-y-none ${hideMobileTabBar ? 'pb-6' : 'pb-nav-safe'}`
           }`}
         >
-          <Outlet />
+          <ErrorBoundary resetKeys={[location.pathname]}>
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </div>
 

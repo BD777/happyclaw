@@ -49,6 +49,7 @@ import { PolicyResourcePicker } from '../components/agents/PolicyResourcePicker'
 import { EmojiAvatar } from '../components/common/EmojiAvatar';
 import { EmojiPicker } from '../components/common/EmojiPicker';
 import { ColorPicker } from '../components/common/ColorPicker';
+import { ErrorBoundary } from '../components/common/ErrorBoundary';
 import { useAgentProfilesStore } from '../stores/agent-profiles';
 import { useAuthStore } from '../stores/auth';
 import { useSkillsStore } from '../stores/skills';
@@ -1683,11 +1684,13 @@ export function AgentProfilesPage() {
                     </div>
                   </section>
                   {!draftMode && selected && (
-                    <EffectiveCapabilitiesPreview
-                      profileId={selected.id}
-                      runtimePolicy={currentRuntimePolicy}
-                      workspaces={governance?.workspaces ?? []}
-                    />
+                    <ErrorBoundary resetKeys={[selected.id]}>
+                      <EffectiveCapabilitiesPreview
+                        profileId={selected.id}
+                        runtimePolicy={currentRuntimePolicy}
+                        workspaces={governance?.workspaces ?? []}
+                      />
+                    </ErrorBoundary>
                   )}
                   {!draftMode && selected && (
                     <AgentGovernanceSection

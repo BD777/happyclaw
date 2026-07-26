@@ -110,6 +110,26 @@ describe('Agent prompt and capability frontend contract', () => {
     expect(system).toContain('宿主机');
   });
 
+  test('isolates capability preview failures instead of blanking the page', () => {
+    const appLayout = read('web/src/components/layout/AppLayout.tsx');
+    const profiles = read('web/src/pages/AgentProfilesPage.tsx');
+    const main = read(
+      'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
+    );
+    const boundary = read('web/src/components/common/ErrorBoundary.tsx');
+
+    expect(appLayout).toMatch(
+      /<ErrorBoundary resetKeys=\{\[location\.pathname\]\}>[\s\S]*<Outlet \/>/,
+    );
+    expect(profiles).toMatch(
+      /<ErrorBoundary resetKeys=\{\[selected\.id\]\}>[\s\S]*<EffectiveCapabilitiesPreview/,
+    );
+    expect(main).toMatch(
+      /<ErrorBoundary resetKeys=\{\[profile\.id\]\}>[\s\S]*<EffectiveCapabilitiesPreview/,
+    );
+    expect(boundary).toMatch(/role="alert"[\s\S]*重试渲染[\s\S]*刷新页面/);
+  });
+
   test('never refills or reveals stored MCP secrets', () => {
     const detail = read('web/src/components/mcp-servers/McpServerDetail.tsx');
     const store = read('web/src/stores/mcp-servers.ts');

@@ -144,6 +144,71 @@ beforeAll(() => {
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 
 describe('buildAgentCapabilityPreview', () => {
+  test('returns a complete preview when all host Skills are inherited independently', () => {
+    const preview = buildAgentCapabilityPreview({
+      profile: {
+        id: 'all-host-skills-profile',
+        owner_user_id: 'owner',
+        name: 'All Host Skills',
+        identity_prompt: '',
+        include_claude_preset: true,
+        avatar_emoji: null,
+        avatar_color: null,
+        avatar_url: null,
+        identity_hash: 'hash',
+        version: 1,
+        is_default: false,
+        status: 'active',
+        created_at: '',
+        updated_at: '',
+        runtime_policy: {
+          context: {
+            source: 'managed',
+            auto_compact_window: 0,
+            auto_compact_percentage: 0,
+          },
+          skills: {
+            mode: 'inherit',
+            ids: [],
+            host: {
+              mode: 'inherit',
+              // A previous custom selection may remain for audit after the
+              // mode changes. Inherit must ignore that list and stay renderable.
+              ids: ['shared'],
+            },
+          },
+          mcp: { mode: 'inherit', ids: [] },
+        },
+      },
+      ownerRole: 'admin',
+    });
+
+    expect(preview.skills.host).toEqual({
+      mode: 'inherit',
+      ids: ['shared'],
+    });
+    expect(preview.skills.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'shared',
+          source: 'managed',
+          overrides: ['host'],
+        }),
+        expect.objectContaining({
+          id: 'disabled-collision',
+          source: 'host',
+          overrides: [],
+        }),
+      ]),
+    );
+    for (const entry of preview.skills.entries) {
+      expect(typeof entry.id).toBe('string');
+      expect(Array.isArray(entry.overrides)).toBe(true);
+    }
+    expect(Array.isArray(preview.skills.conflicts)).toBe(true);
+    expect(Array.isArray(preview.notes)).toBe(true);
+  });
+
   test('shows additive layers, overrides and host context', () => {
     const preview = buildAgentCapabilityPreview({
       profile: {
