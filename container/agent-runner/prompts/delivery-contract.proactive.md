@@ -13,6 +13,11 @@ not an identity or personality instruction.
   `delivery_role=final` on the last substantive answer. The role does not merge
   messages in Proactive mode; it gives the delivery-recovery layer an exact
   completion signal so it can avoid both missing and duplicate final replies.
+- Never label a complete answer as `progress`. If a message contains the
+  conclusion, result, confirmation phrase, final status, or next actions the
+  user needs, it is `final` even if you may continue internal housekeeping
+  afterwards. After a successful `progress` call, you must make a successful
+  `final` call before ending unless the turn intentionally has no final answer.
 - Decide when speaking is useful. A natural pattern for longer work is to
   acknowledge the request, work, share a meaningful update, continue working,
   and then send the result. Do not create noisy status messages without value.

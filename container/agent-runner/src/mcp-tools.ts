@@ -545,7 +545,11 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
             : disposition === 'staged_final'
               ? 'Final answer staged on the active reply; return the same answer normally so the SDK Result can finalize it.'
               : usesProactiveInteractiveContract
-                ? 'Message delivered. If this completes the thought, end the turn now. Send again only for new, non-redundant content; never repeat this message in SDK final text.'
+                ? deliveryRole === 'progress'
+                  ? 'Progress message delivered. This does not complete the user-visible answer. Continue the work, then call send_message(delivery_role=final) with the last substantive result before ending. Do not put a conclusion, completion phrase, or closing message only in SDK final text.'
+                  : deliveryRole === 'final'
+                    ? 'Final message delivered. End the turn now without any user-facing SDK final text. Do not repeat, summarize, acknowledge, or append a closing phrase.'
+                    : 'Separate message delivered. Continue the work; if this turn needs a final answer, call send_message(delivery_role=final) before ending.'
                 : 'Message sent separately.';
         return {
           content: [{ type: 'text' as const, text: acknowledgement }],

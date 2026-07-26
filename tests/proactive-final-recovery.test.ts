@@ -98,6 +98,36 @@ describe('Proactive SDK final recovery orchestration', () => {
     }
   });
 
+  test('does not deliver a redundant SDK courtesy closure after a complete progress answer', async () => {
+    const registry = new ActiveTurnOutputRegistry();
+    registry.bind(SCOPE, TURN, CALLBACKS);
+    registry.recordDeliveredUtterance({
+      scopeKey: SCOPE,
+      inputTurnId: TURN,
+      role: 'progress',
+      text: '草稿已经做好，完整预览、最终结论、确认口令和修改方式都在这条消息中。你可以直接回复确认口令发布，也可以告诉我需要修改的地方。',
+    });
+    const deliver = vi.fn();
+
+    await expect(
+      recoverProactiveFinalCandidate({
+        registry,
+        scopeKey: SCOPE,
+        inputTurnId: TURN,
+        inputTurnCompleted: true,
+        candidate: '草稿就绪，等你确认口令或修改意见。',
+        canDeliver: () => true,
+        deliver,
+      }),
+    ).resolves.toEqual({
+      attempted: false,
+      projected: false,
+      targetDelivered: false,
+      reason: 'redundant_sdk_closure',
+    });
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
   test('does not publish incomplete results or bypass the reply fuse', async () => {
     const registry = new ActiveTurnOutputRegistry();
     registry.bind(SCOPE, TURN, CALLBACKS);

@@ -148,7 +148,7 @@ describe('send_message host acknowledgement', () => {
         {
           type: 'text',
           text: expect.stringContaining(
-            'Send again only for new, non-redundant content',
+            'call send_message(delivery_role=final)',
           ),
         },
       ],
@@ -168,7 +168,19 @@ describe('send_message host acknowledgement', () => {
       expect(request.deliveryRole).toBe(expectedRole);
       expect(request.presentation).toBe('native');
       writeResult(root, request.requestId as string, { success: true });
-      await expect(pending).resolves.toBeDefined();
+      await expect(pending).resolves.toMatchObject({
+        content: [
+          {
+            type: 'text',
+            text:
+              expectedRole === 'progress'
+                ? expect.stringContaining(
+                    'This does not complete the user-visible answer',
+                  )
+                : expect.stringContaining('End the turn now'),
+          },
+        ],
+      });
     }
   });
 

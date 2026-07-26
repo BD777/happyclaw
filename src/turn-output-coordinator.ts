@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
 
+import { isRedundantProactiveSdkClosure } from './proactive-final-classifier.js';
+
 /**
  * User-visible delivery semantics are deliberately owned by the HappyClaw
  * host, not inferred from the fact that an MCP tool happened to run.
@@ -37,7 +39,12 @@ export interface ProactiveFinalRecoveryDecision {
     | 'empty_candidate'
     | 'duplicate_delivery'
     | 'explicit_final_delivered'
+    | 'redundant_sdk_closure'
     | 'untracked_turn';
+}
+
+function normalizeDeliveredText(text: string): string {
+  return text.trim().replace(/\r\n?/g, '\n');
 }
 
 interface PreparedTurnMessage {
@@ -71,6 +78,7 @@ export class TurnOutputCoordinator {
   private finalized = false;
   private deliveredUtteranceCount = 0;
   private deliveredFinalUtterance = false;
+  private readonly deliveredProgressTexts: string[] = [];
   private readonly deliveredTextFingerprints = new Set<string>();
   private readonly stagedFingerprints = new Set<string>();
 
@@ -257,11 +265,19 @@ export class TurnOutputCoordinator {
     if (input?.role === 'final') {
       this.deliveredFinalUtterance = true;
     }
-    const normalizedText = input?.text?.trim().replace(/\r\n?/g, '\n');
+    const normalizedText = input?.text
+      ? normalizeDeliveredText(input.text)
+      : '';
     if (normalizedText) {
       this.deliveredTextFingerprints.add(
         crypto.createHash('sha256').update(normalizedText).digest('hex'),
       );
+      if (input?.role === 'progress') {
+        this.deliveredProgressTexts.push(normalizedText);
+        if (this.deliveredProgressTexts.length > 8) {
+          this.deliveredProgressTexts.shift();
+        }
+      }
     }
     return true;
   }
@@ -271,8 +287,9 @@ export class TurnOutputCoordinator {
    *
    * A physically acknowledged, explicitly-final utterance is authoritative.
    * Exact text matches are also suppressed so older models that repeat the
-   * delivered answer in SDK final text do not create duplicates. Everything
-   * else is a missing-final candidate and should be recovered by the host.
+   * delivered answer in SDK final text do not create duplicates. A narrow
+   * courtesy-closure check also suppresses low-value SDK tails after a complete
+   * progress answer; everything else is recovered by the host.
    */
   resolveProactiveFinalRecovery(
     candidate: string | null | undefined,
@@ -281,7 +298,7 @@ export class TurnOutputCoordinator {
     if (!text) {
       return { deliver: false, text: null, reason: 'empty_candidate' };
     }
-    const normalizedText = text.trim().replace(/\r\n?/g, '\n');
+    const normalizedText = normalizeDeliveredText(text);
     const fingerprint = crypto
       .createHash('sha256')
       .update(normalizedText)
@@ -291,6 +308,9 @@ export class TurnOutputCoordinator {
     }
     if (this.deliveredFinalUtterance) {
       return { deliver: false, text, reason: 'explicit_final_delivered' };
+    }
+    if (isRedundantProactiveSdkClosure(text, this.deliveredProgressTexts)) {
+      return { deliver: false, text, reason: 'redundant_sdk_closure' };
     }
     return { deliver: true, text, reason: 'missing_final_delivery' };
   }

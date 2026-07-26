@@ -468,6 +468,104 @@ describe('Proactive final delivery recovery', () => {
     });
   });
 
+  test('suppresses a short SDK courtesy closure after a complete answer was mislabeled as progress', () => {
+    const coordinator = new TurnOutputCoordinator();
+    coordinator.recordDeliveredUtterance({
+      role: 'progress',
+      text: [
+        '草稿已经做好了，上一条消息里有完整预览，现在卡在等你确认。',
+        '一句话回顾：调研 Agent 会并行调研并汇总成飞书文档，已经精确选择了所需技能。',
+        '两个前置提醒仍然有效，发布时请回复确认口令；要修改哪里也可以直接说。',
+      ].join('\n\n'),
+    });
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery(
+        '草稿就绪，等你确认口令或修改意见。',
+      ),
+    ).toEqual({
+      deliver: false,
+      text: '草稿就绪，等你确认口令或修改意见。',
+      reason: 'redundant_sdk_closure',
+    });
+  });
+
+  test('keeps concise SDK finals that add a root cause, identifier, or structured payload', () => {
+    for (const candidate of [
+      '调查完成，根因是权限不足，需要重新授权。',
+      '发布完成，ID：AGENT-12345',
+      '报告已就绪：https://example.com/report',
+      '下一步：运行 `feishu-cli auth login`。',
+      '文档已就绪，下载地址为 report.internal/doc',
+      '草稿完成，请回复确认口令 AGENT_READY',
+      '报告完成，所有临时文件已删除。',
+    ]) {
+      const coordinator = new TurnOutputCoordinator();
+      coordinator.recordDeliveredUtterance({
+        role: 'progress',
+        text: '排查已经完成，完整过程和现象都整理好了。目前正在确认最终根因和对应处理方式，稍后给出最后结论。',
+      });
+
+      expect(
+        coordinator.resolveProactiveFinalRecovery(candidate),
+      ).toMatchObject({
+        deliver: true,
+        text: candidate,
+        reason: 'missing_final_delivery',
+      });
+    }
+  });
+
+  test('keeps a completion message when earlier progress was only an interim update', () => {
+    const coordinator = new TurnOutputCoordinator();
+    coordinator.recordDeliveredUtterance({
+      role: 'progress',
+      text: '我正在抓取全部资料并逐项核对来源，目前已经处理一半。接下来还要验证关键事实、整理引用并生成最终报告，请稍等。',
+    });
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery('报告已经完成，请查收。'),
+    ).toEqual({
+      deliver: true,
+      text: '报告已经完成，请查收。',
+      reason: 'missing_final_delivery',
+    });
+  });
+
+  test('does not mistake started generation for a completed progress answer', () => {
+    const coordinator = new TurnOutputCoordinator();
+    coordinator.recordDeliveredUtterance({
+      role: 'progress',
+      text: '我已经开始生成最终报告，目前正在整理引用和检查关键数据。完整文档还没有完成，接下来需要继续验证来源并补充结论。',
+    });
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery('报告已经完成，请查收。'),
+    ).toEqual({
+      deliver: true,
+      text: '报告已经完成，请查收。',
+      reason: 'missing_final_delivery',
+    });
+  });
+
+  test('suppresses an English courtesy closure after a complete progress answer', () => {
+    const coordinator = new TurnOutputCoordinator();
+    coordinator.recordDeliveredUtterance({
+      role: 'progress',
+      text: 'The draft is already completed and the full preview is above. The final result, required skills, confirmation phrase, and next actions are all included in that message.',
+    });
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery(
+        'Draft ready. Let me know if you want changes.',
+      ),
+    ).toEqual({
+      deliver: false,
+      text: 'Draft ready. Let me know if you want changes.',
+      reason: 'redundant_sdk_closure',
+    });
+  });
+
   test('recovers direct SDK answers when the model never called send_message', () => {
     const registry = new ActiveTurnOutputRegistry();
     registry.bind('workspace:main', 'turn-1', {
