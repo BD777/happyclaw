@@ -2214,8 +2214,16 @@ async function runQueryAttempt(
     emit({
       status: 'success',
       // Proactive SDK text is control-plane only; user-visible speech must
-      // already have crossed the send_message delivery boundary.
+      // normally have crossed the send_message delivery boundary. Preserve a
+      // completed non-empty candidate for host-side, ACK-aware recovery rather
+      // than silently discarding it when the model violates that contract.
       result: proactiveInteractiveContract ? null : candidate.finalText,
+      ...(proactiveInteractiveContract &&
+      inputTurnCompleted &&
+      !candidate.suspectTruncated &&
+      candidate.finalText?.trim()
+        ? { proactiveFinalCandidate: candidate.finalText }
+        : {}),
       newSessionId,
       sdkMessageUuid: candidate.sdkMessageUuid,
       sourceKind: sourceKindOverride ?? 'sdk_final',

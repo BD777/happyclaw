@@ -305,6 +305,26 @@ describe('attachStdoutHandler — framed output parsing (marker collision)', () 
     expect(out[0].result).toBe('hi');
   });
 
+  test('preserves a hidden proactive final candidate for host recovery', async () => {
+    const out = await runParser([
+      `${S}${JSON.stringify({
+        status: 'success',
+        result: null,
+        proactiveFinalCandidate: '完整但尚未投递的最终回答',
+        inputTurnCompleted: true,
+        inputTurnId: 'turn-proactive-1',
+      })}${E}`,
+    ]);
+
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      result: null,
+      proactiveFinalCandidate: '完整但尚未投递的最终回答',
+      inputTurnCompleted: true,
+      inputTurnId: 'turn-proactive-1',
+    });
+  });
+
   test('preserves an explicit structured provider failure with no banner text', async () => {
     const out = await runParser([
       `${S}${JSON.stringify({

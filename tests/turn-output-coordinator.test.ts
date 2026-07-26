@@ -418,3 +418,88 @@ describe('ActiveTurnOutputRegistry exactly-one staging', () => {
     expect(final).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('Proactive final delivery recovery', () => {
+  test('recovers a non-empty SDK final after only progress was delivered', () => {
+    const coordinator = new TurnOutputCoordinator();
+    coordinator.recordDeliveredUtterance({
+      role: 'progress',
+      text: '我先检查现有技能，稍等。',
+    });
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery('这是完整的 Agent 草稿预览。'),
+    ).toEqual({
+      deliver: true,
+      text: '这是完整的 Agent 草稿预览。',
+      reason: 'missing_final_delivery',
+    });
+  });
+
+  test('does not duplicate an explicitly delivered final utterance', () => {
+    const coordinator = new TurnOutputCoordinator();
+    coordinator.recordDeliveredUtterance({
+      role: 'final',
+      text: '完整报告已经发送。',
+    });
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery('内部 SDK 收尾文本'),
+    ).toEqual({
+      deliver: false,
+      text: '内部 SDK 收尾文本',
+      reason: 'explicit_final_delivered',
+    });
+  });
+
+  test('deduplicates the exact delivered text even when an older caller omitted the final role', () => {
+    const coordinator = new TurnOutputCoordinator();
+    coordinator.recordDeliveredUtterance({
+      role: 'progress',
+      text: '  完整报告\r\n第二行  ',
+    });
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery('完整报告\n第二行'),
+    ).toEqual({
+      deliver: false,
+      text: '完整报告\n第二行',
+      reason: 'duplicate_delivery',
+    });
+  });
+
+  test('recovers direct SDK answers when the model never called send_message', () => {
+    const registry = new ActiveTurnOutputRegistry();
+    registry.bind('workspace:main', 'turn-1', {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+    });
+
+    expect(
+      registry.resolveProactiveFinalRecovery({
+        scopeKey: 'workspace:main',
+        inputTurnId: 'turn-1',
+        text: '直接回答',
+      }),
+    ).toEqual({
+      deliver: true,
+      text: '直接回答',
+      reason: 'missing_final_delivery',
+    });
+  });
+
+  test('fails open to recovery when a healthy result outlives its process-local binding', () => {
+    const registry = new ActiveTurnOutputRegistry();
+    expect(
+      registry.resolveProactiveFinalRecovery({
+        scopeKey: 'workspace:main',
+        inputTurnId: 'recovered-turn',
+        text: '恢复出来的最终答案',
+      }),
+    ).toEqual({
+      deliver: true,
+      text: '恢复出来的最终答案',
+      reason: 'untracked_turn',
+    });
+  });
+});

@@ -56,6 +56,10 @@ describe('Agent Runner reply-mode prompt contract', () => {
     expect(runner).toContain(
       'result: proactiveInteractiveContract ? null : candidate.finalText',
     );
+    expect(runner).toContain('proactiveFinalCandidate: candidate.finalText');
+    expect(proactive).toContain('`delivery_role=progress`');
+    expect(proactive).toContain('`delivery_role=final`');
+    expect(tools).toContain("? (args.delivery_role ?? 'progress')");
     expect(proactiveOutput).not.toContain('最终回复必须自包含');
     expect(proactiveOutput).toContain(
       '[Your previous response had no visible output.',

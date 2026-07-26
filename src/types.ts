@@ -438,6 +438,7 @@ export interface FollowUpActionResult {
 export type MessageSourceKind =
   | 'sdk_final'
   | 'sdk_send_message'
+  | 'proactive_sdk_fallback'
   | 'interrupt_partial'
   | 'overflow_partial'
   | 'compact_partial'

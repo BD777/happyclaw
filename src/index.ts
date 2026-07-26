@@ -33,6 +33,10 @@ import {
   TurnOutputCoordinator,
 } from './turn-output-coordinator.js';
 import {
+  recoverProactiveFinalCandidate,
+  type ProactiveFinalFallbackDelivery,
+} from './proactive-final-recovery.js';
+import {
   resolveHostIpcLogicalChatJid,
   routeHostIpcOutput,
 } from './host-ipc-output-router.js';
@@ -67,6 +71,7 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
@@ -415,6 +420,8 @@ import {
   FollowUpMode,
   QueuedFollowUp,
   FollowUpActionResult,
+  MessageSourceKind,
+  MessageFinalizationReason,
   TaskRunStatus,
 } from './types.js';
 import {
@@ -2671,6 +2678,12 @@ async function deliverIndependentChannelSystemNotice(input: {
   senderName?: string;
   agentId?: string | null;
   presentation?: 'default' | 'native';
+  messageMeta?: {
+    turnId?: string;
+    sessionId?: string;
+    sourceKind?: MessageSourceKind;
+    finalizationReason?: MessageFinalizationReason;
+  };
   route: {
     provider: string;
     accountId: string;
@@ -2754,7 +2767,15 @@ async function deliverIndependentChannelSystemNotice(input: {
       input.text,
       timestamp,
       true,
-      { sourceJid: input.targetJid },
+      {
+        sourceJid: input.targetJid,
+        meta: {
+          turnId: input.messageMeta?.turnId,
+          sessionId: input.messageMeta?.sessionId,
+          sourceKind: input.messageMeta?.sourceKind,
+          finalizationReason: input.messageMeta?.finalizationReason,
+        },
+      },
     );
     broadcastNewMessage(input.logicalChatJid, {
       id: msgId,
@@ -2765,6 +2786,10 @@ async function deliverIndependentChannelSystemNotice(input: {
       timestamp,
       is_from_me: true,
       source_jid: input.targetJid,
+      turn_id: input.messageMeta?.turnId ?? null,
+      session_id: input.messageMeta?.sessionId ?? null,
+      source_kind: input.messageMeta?.sourceKind ?? null,
+      finalization_reason: input.messageMeta?.finalizationReason ?? null,
     });
     return true;
   } finally {
@@ -2820,6 +2845,89 @@ async function deliverProactiveTailInterruptionNotice(input: {
     PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   );
   return true;
+}
+
+/**
+ * Recover non-empty SDK final text that a Proactive model forgot to send.
+ *
+ * Native delivery gets a fresh, durable Outbox turn because the original turn
+ * may already be finalizing. A failed/unavailable native route still projects
+ * the exact answer into the canonical Web session so the result is never
+ * silently lost; it deliberately does not claim a physical provider ACK.
+ */
+async function deliverProactiveFinalFallback(input: {
+  logicalChatJid: string;
+  scopeKey: string;
+  inputTurnId: string;
+  text: string;
+  sessionId?: string;
+  agentId?: string | null;
+  targetJid?: string | null;
+  scope?: ActiveChannelOutboxScope;
+}): Promise<ProactiveFinalFallbackDelivery> {
+  const scopeRoute = input.scope?.chatId
+    ? {
+        provider: input.scope.provider,
+        accountId: input.scope.accountId,
+        sourceJid: input.scope.sourceJid,
+        chatId: input.scope.chatId,
+        rootId: input.scope.rootId,
+        threadId: input.scope.threadId,
+      }
+    : null;
+  const route =
+    scopeRoute ??
+    (input.targetJid ? resolveDurableChannelRoute(input.targetJid) : null);
+  if (input.targetJid && route) {
+    const delivered = await deliverIndependentChannelSystemNotice({
+      logicalChatJid: input.logicalChatJid,
+      scopeKey: input.scopeKey,
+      targetJid: input.targetJid,
+      originalInputTurnId: input.inputTurnId,
+      originalRunId: input.scope?.turnRunId ?? `proactive:${input.inputTurnId}`,
+      noticeKey: 'proactive-final-fallback',
+      text: input.text,
+      sender: 'happyclaw-agent',
+      senderName: ASSISTANT_NAME,
+      agentId: input.agentId,
+      presentation: 'native',
+      messageMeta: {
+        turnId: input.inputTurnId,
+        sessionId: input.sessionId,
+        sourceKind: 'proactive_sdk_fallback',
+        finalizationReason: 'completed',
+      },
+      route,
+    });
+    if (delivered) {
+      return { projected: true, targetDelivered: true, path: 'native' };
+    }
+  }
+
+  const messageId = `proactive_final_${crypto
+    .createHash('sha256')
+    .update(`${input.logicalChatJid}\0${input.inputTurnId}\0${input.text}`)
+    .digest('hex')
+    .slice(0, 32)}`;
+  const webDelivery = await sendMessageWithOutcome(
+    input.logicalChatJid,
+    input.text,
+    {
+      sendToIM: false,
+      messageId,
+      messageMeta: {
+        turnId: input.inputTurnId,
+        sessionId: input.sessionId,
+        sourceKind: 'proactive_sdk_fallback',
+        finalizationReason: 'completed',
+      },
+    },
+  );
+  return {
+    projected: webDelivery.targetDelivered,
+    targetDelivered: !input.targetJid && webDelivery.targetDelivered,
+    path: input.targetJid ? 'web_after_native_failure' : 'web',
+  };
 }
 
 function resolveDurableChannelRoute(targetJid: string): {
@@ -5350,6 +5458,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const runnerIdleCloseMs = resolveRunnerLivenessTimeouts({
+    executionTimeoutMs:
+      effectiveGroup.containerConfig?.timeout ??
+      getSystemSettings().containerTimeout,
+    idleTimeoutMs: getSystemSettings().idleTimeout,
+  }).idleCloseMs;
 
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -5359,7 +5473,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'Idle timeout, closing container stdin',
       );
       queue.closeStdin(chatJid);
-    }, getSystemSettings().idleTimeout);
+    }, runnerIdleCloseMs);
   };
 
   const lastProcessed = missedMessages[missedMessages.length - 1];
@@ -7096,6 +7210,56 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             !publishesFrameworkAnswer(interactionMode) &&
             !result.providerFailure
           ) {
+            const proactiveInputId = resolveContainerOutputInputTurnId(
+              result,
+              lastProcessed.id,
+            );
+            if (result.proactiveFinalCandidate?.trim()) {
+              const outputScope =
+                channelOutboxScopesByInput.get(proactiveInputId);
+              const recovery = await recoverProactiveFinalCandidate({
+                registry: activeTurnOutputs,
+                scopeKey: mainAdmissionKey,
+                inputTurnId: proactiveInputId,
+                inputTurnCompleted: result.inputTurnCompleted,
+                candidate: result.proactiveFinalCandidate,
+                canDeliver: () =>
+                  canDeliverTurnUtterance(
+                    effectiveGroup.folder,
+                    null,
+                    proactiveInputId,
+                  ),
+                deliver: (text) =>
+                  deliverProactiveFinalFallback({
+                    logicalChatJid: chatJid,
+                    scopeKey: mainAdmissionKey,
+                    inputTurnId: proactiveInputId,
+                    text,
+                    sessionId: activeSessionId,
+                    targetJid: outputScope?.sourceJid ?? replySourceImJid,
+                    scope: outputScope,
+                  }),
+              });
+              if (recovery.projected) {
+                sentReplyByInput.set(proactiveInputId, true);
+              }
+              if (recovery.targetDelivered) {
+                channelPhysicalDeliveryAckByInput.set(proactiveInputId, true);
+                genuineReplyDeliveredByInput.set(proactiveInputId, true);
+              }
+              logger[recovery.projected ? 'warn' : 'info'](
+                {
+                  group: effectiveGroup.folder,
+                  inputTurnId: proactiveInputId,
+                  recoveryReason: recovery.reason,
+                  deliveryPath: recovery.path,
+                  targetDelivered: recovery.targetDelivered,
+                },
+                recovery.projected
+                  ? 'Recovered Proactive SDK final that was not sent through send_message'
+                  : 'Proactive SDK final recovery not required',
+              );
+            }
             // In Proactive mode the SDK Result is an internal control-plane
             // terminal, never a user-visible answer. A healthy turn may have
             // emitted several native messages or intentionally stayed silent.
@@ -8479,6 +8643,11 @@ async function runTerminalWarmup(chatJid: string): Promise<void> {
 
   let bootstrapCompleted = false;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const warmupIdleCloseMs = resolveRunnerLivenessTimeouts({
+    executionTimeoutMs:
+      group.containerConfig?.timeout ?? getSystemSettings().containerTimeout,
+    idleTimeoutMs: getSystemSettings().idleTimeout,
+  }).idleCloseMs;
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -8487,7 +8656,7 @@ async function runTerminalWarmup(chatJid: string): Promise<void> {
         'Terminal warmup idle timeout, closing stdin',
       );
       queue.closeStdin(chatJid);
-    }, getSystemSettings().idleTimeout);
+    }, warmupIdleCloseMs);
   };
 
   try {
@@ -9728,6 +9897,8 @@ function startIpcWatcher(): void {
                 activeTurnOutputs.recordDeliveredUtterance({
                   scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
                   inputTurnId: data.inputTurnId,
+                  role: hostOutputRoute.deliveryRole ?? undefined,
+                  text: data.text,
                 });
               }
               if (
@@ -13560,6 +13731,12 @@ async function processAgentConversation(
 
   // Track idle timer
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const agentRunnerIdleCloseMs = resolveRunnerLivenessTimeouts({
+    executionTimeoutMs:
+      effectiveGroup.containerConfig?.timeout ??
+      getSystemSettings().containerTimeout,
+    idleTimeoutMs: getSystemSettings().idleTimeout,
+  }).idleCloseMs;
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -13568,7 +13745,7 @@ async function processAgentConversation(
         'Agent conversation idle timeout, closing stdin',
       );
       queue.closeStdin(virtualJid);
-    }, getSystemSettings().idleTimeout);
+    }, agentRunnerIdleCloseMs);
   };
 
   const cursorCommittedInputTurns = new Set<string>();
@@ -14034,6 +14211,59 @@ async function processAgentConversation(
     }
 
     if (!publishesFrameworkAnswer(interactionMode) && !output.providerFailure) {
+      const proactiveInputId = resolveContainerOutputInputTurnId(
+        output,
+        lastProcessed.id,
+      );
+      if (output.proactiveFinalCandidate?.trim()) {
+        const outputScope =
+          agentChannelOutboxScopesByInput.get(proactiveInputId);
+        const recovery = await recoverProactiveFinalCandidate({
+          registry: activeTurnOutputs,
+          scopeKey: agentAdmissionKey,
+          inputTurnId: proactiveInputId,
+          inputTurnCompleted: output.inputTurnCompleted,
+          candidate: output.proactiveFinalCandidate,
+          canDeliver: () =>
+            canDeliverTurnUtterance(
+              effectiveGroup.folder,
+              agentId,
+              proactiveInputId,
+            ),
+          deliver: (text) =>
+            deliverProactiveFinalFallback({
+              logicalChatJid: virtualChatJid,
+              scopeKey: agentAdmissionKey,
+              inputTurnId: proactiveInputId,
+              text,
+              sessionId: currentAgentSessionId,
+              agentId,
+              targetJid: outputScope?.sourceJid ?? replySourceImJid,
+              scope: outputScope,
+            }),
+        });
+        if (recovery.projected) {
+          agentReplySentByInput.set(proactiveInputId, true);
+          agentAnyReplyProjectedByInput.set(proactiveInputId, true);
+        }
+        if (recovery.targetDelivered) {
+          agentPhysicalDeliveryAckByInput.set(proactiveInputId, true);
+          agentGenuineReplyDeliveredByInput.set(proactiveInputId, true);
+        }
+        logger[recovery.projected ? 'warn' : 'info'](
+          {
+            chatJid,
+            agentId,
+            inputTurnId: proactiveInputId,
+            recoveryReason: recovery.reason,
+            deliveryPath: recovery.path,
+            targetDelivered: recovery.targetDelivered,
+          },
+          recovery.projected
+            ? 'Recovered Proactive agent SDK final that was not sent through send_message'
+            : 'Proactive agent SDK final recovery not required',
+        );
+      }
       output.result = null;
       if (
         isProactiveControlPlaneSuccess({

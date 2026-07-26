@@ -108,6 +108,7 @@ import {
   type FeishuCliRuntimeBinding,
 } from './feishu-cli-runtime.js';
 import { assertValidWorkspaceFolderName } from './workspace-folder.js';
+import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
 
 /**
  * 宿主机的 ~/.claude.json 路径。
@@ -383,6 +384,9 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error' | 'stream' | 'closed';
   result: string | null;
+  /** Hidden SDK final text from an interactive Proactive turn. The host may
+   * publish it only after reconciling acknowledged `send_message` deliveries. */
+  proactiveFinalCandidate?: string;
   newSessionId?: string;
   error?: string;
   providerFailure?: boolean;
@@ -1751,8 +1755,12 @@ export async function runContainerAgent(
       container.stdin.end();
 
       let timedOut = false;
-      const timeoutMs =
-        group.containerConfig?.timeout || getSystemSettings().containerTimeout;
+      const systemSettings = getSystemSettings();
+      const timeoutMs = resolveRunnerLivenessTimeouts({
+        executionTimeoutMs:
+          group.containerConfig?.timeout || systemSettings.containerTimeout,
+        idleTimeoutMs: systemSettings.idleTimeout,
+      }).watchdogMs;
 
       const killOnTimeout = () => {
         timedOut = true;
@@ -1879,6 +1887,10 @@ export async function runContainerAgent(
             // concurrent sessions cannot keep selecting a provider that just
             // returned an account-level failure.
             await onOutput(output);
+            // The foreground projection resets its idle-close timer during
+            // onOutput. Reset the outer watchdog afterwards so graceful idle
+            // reclamation always wins, even when provider delivery was slow.
+            resetTimeout();
             if (output.providerFailure) {
               exec(`docker stop ${containerName}`, (err) => {
                 if (err) {
@@ -2680,8 +2692,12 @@ export async function runHostAgent(
 
       // 9. 超时管理
       let timedOut = false;
-      const timeoutMs =
-        group.containerConfig?.timeout || getSystemSettings().containerTimeout;
+      const systemSettings = getSystemSettings();
+      const timeoutMs = resolveRunnerLivenessTimeouts({
+        executionTimeoutMs:
+          group.containerConfig?.timeout || systemSettings.containerTimeout,
+        idleTimeoutMs: systemSettings.idleTimeout,
+      }).watchdogMs;
 
       let killTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -2793,6 +2809,9 @@ export async function runHostAgent(
             // Keep provider selection safe while the user-facing projection is
             // awaiting a network ACK.
             await onOutput(output);
+            // See the container path above: start the watchdog after the
+            // foreground projection has reset its graceful idle timer.
+            resetTimeout();
             if (output.providerFailure) {
               killProcessTree(proc, 'SIGTERM');
             }
