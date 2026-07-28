@@ -35,6 +35,7 @@ describe('task run status contract', () => {
       'can_stop',
       'can_delete',
       'can_restore',
+      'can_purge',
     ]) {
       expect(card).toContain(`task.permissions?.${permission} !== false`);
     }
@@ -45,6 +46,13 @@ describe('task run status contract', () => {
     expect(page).toContain('需要先修改为未来时间再启用');
     expect(store).toContain('execution_blocked_reason');
     expect(card).toContain('配置已阻止执行');
+    expect(card).toContain('已移到回收站');
+    expect(card).toContain('onPurge');
+    expect(page).toContain('当前任务');
+    expect(page).toContain('回收站');
+    expect(page).toContain('清空回收站');
+    expect(page).toContain('永久删除');
+    expect(store).toContain("'/api/tasks/purge'");
     const createForm = read('web/src/components/tasks/CreateTaskForm.tsx');
     expect(createForm).toContain('Docker 容器脚本不会被执行');
     expect(createForm).toContain("groups[jid]?.execution_mode === 'host'");

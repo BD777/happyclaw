@@ -4412,6 +4412,13 @@ export type TaskSoftDeleteMutationResult =
   | TaskRevisionMutationResult
   | { status: 'active_run'; task: ScheduledTask; run: TaskRun };
 
+export type TaskPermanentDeleteMutationResult =
+  | { status: 'deleted'; task_ids: string[] }
+  | { status: 'conflict'; task: ScheduledTask }
+  | { status: 'not_deleted'; task: ScheduledTask }
+  | { status: 'active_run'; task: ScheduledTask; run: TaskRun }
+  | { status: 'not_found'; task_id: string };
+
 /**
  * Optimistic mutation used by V2 REST/MCP callers. Legacy updateTask remains
  * available while all in-process clients migrate to this contract.
@@ -4558,6 +4565,62 @@ export function restoreTaskWithRevision(
         return { status: 'updated', task: latest };
       if (!latest) return { status: 'not_found' };
       return { status: 'conflict', task: latest };
+    })
+    .immediate();
+}
+
+/**
+ * Permanently remove soft-deleted task definitions and their run history.
+ * The whole batch is atomic: a stale revision, restored task, or active run
+ * aborts the operation so "empty recycle bin" cannot silently skip records.
+ */
+export function permanentlyDeleteTasksWithRevisions(
+  tasks: Array<{ id: string; expectedRevision: number }>,
+): TaskPermanentDeleteMutationResult {
+  return db
+    .transaction((): TaskPermanentDeleteMutationResult => {
+      const currentTasks: ScheduledTask[] = [];
+      for (const requested of tasks) {
+        const current = getTaskById(requested.id);
+        if (!current) {
+          return { status: 'not_found', task_id: requested.id };
+        }
+        if (current.revision !== requested.expectedRevision) {
+          return { status: 'conflict', task: current };
+        }
+        if (!current.deleted_at) {
+          return { status: 'not_deleted', task: current };
+        }
+        const activeRun = getActiveTaskRunForTask(requested.id);
+        if (activeRun) {
+          return { status: 'active_run', task: current, run: activeRun };
+        }
+        currentTasks.push(current);
+      }
+
+      const deleteRunLogs = db.prepare(
+        'DELETE FROM task_run_logs WHERE task_id = ?',
+      );
+      const deleteRuns = db.prepare('DELETE FROM task_runs WHERE task_id = ?');
+      const deleteDefinition = db.prepare(
+        `DELETE FROM scheduled_tasks
+         WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL`,
+      );
+      for (const task of currentTasks) {
+        deleteRunLogs.run(task.id);
+        deleteRuns.run(task.id);
+        const result = deleteDefinition.run(task.id, task.revision);
+        if (result.changes !== 1) {
+          throw new Error(
+            `Failed to permanently delete task ${task.id} after validation`,
+          );
+        }
+      }
+
+      return {
+        status: 'deleted',
+        task_ids: currentTasks.map((task) => task.id),
+      };
     })
     .immediate();
 }

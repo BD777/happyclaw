@@ -121,6 +121,26 @@ async function deleteTask(id: string) {
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 
+async function purgeTasks(
+  tasks: Array<{ id: string; expected_revision?: number }>,
+) {
+  const response = await tasksRoutes.request('/purge', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      tasks: tasks.map((task) => ({
+        id: task.id,
+        expected_revision:
+          task.expected_revision ?? db.getTaskById(task.id)?.revision,
+      })),
+    }),
+  });
+  return {
+    status: response.status,
+    body: await response.json().catch(() => ({})),
+  };
+}
+
 async function patchTask(
   id: string,
   body: Record<string, unknown>,
@@ -165,6 +185,11 @@ beforeEach(() => {
     'cancel-no-scheduler-task',
     'capacity-live-task',
     'capacity-deleted-task',
+    'purge-route-task-a',
+    'purge-route-task-b',
+    'purge-live-route-task',
+    'purge-stale-route-task-a',
+    'purge-stale-route-task-b',
     'route-move-task',
   ]) {
     try {
@@ -631,6 +656,70 @@ describe('tasks route ownership and cleanup contract', () => {
     expect(db.getTaskRunsForTask('restore-route-task')).toHaveLength(1);
   });
 
+  test('permanently deletes selected recycle-bin tasks and their run history', async () => {
+    createTask('purge-route-task-a', OWNER_ID);
+    createTask('purge-route-task-b', OWNER_ID);
+    const run = db.createTaskRun({
+      task: db.getTaskById('purge-route-task-a')!,
+      triggerType: 'manual',
+      idempotencyKey: 'purge-history',
+    });
+    db.cancelTaskRun(run.run.id, 'finished before recycle-bin cleanup');
+    asUser(OWNER_ID);
+
+    expect((await deleteTask('purge-route-task-a')).status).toBe(200);
+    expect((await deleteTask('purge-route-task-b')).status).toBe(200);
+    const response = await purgeTasks([
+      { id: 'purge-route-task-a' },
+      { id: 'purge-route-task-b' },
+    ]);
+
+    expect(response).toMatchObject({
+      status: 200,
+      body: {
+        success: true,
+        deleted_count: 2,
+        task_ids: ['purge-route-task-a', 'purge-route-task-b'],
+      },
+    });
+    expect(db.getTaskById('purge-route-task-a')).toBeUndefined();
+    expect(db.getTaskById('purge-route-task-b')).toBeUndefined();
+    expect(db.getTaskRunsForTask('purge-route-task-a')).toEqual([]);
+  });
+
+  test('recycle-bin purge rejects live tasks and is atomic on revision conflict', async () => {
+    createTask('purge-live-route-task', OWNER_ID);
+    createTask('purge-stale-route-task-a', OWNER_ID);
+    createTask('purge-stale-route-task-b', OWNER_ID);
+    asUser(OWNER_ID);
+
+    const liveResponse = await purgeTasks([{ id: 'purge-live-route-task' }]);
+    expect(liveResponse).toMatchObject({
+      status: 409,
+      body: { code: 'TASK_NOT_DELETED' },
+    });
+    expect(db.getTaskById('purge-live-route-task')).toBeTruthy();
+
+    expect((await deleteTask('purge-stale-route-task-a')).status).toBe(200);
+    expect((await deleteTask('purge-stale-route-task-b')).status).toBe(200);
+    const staleRevision =
+      db.getTaskById('purge-stale-route-task-b')!.revision + 1;
+    const staleResponse = await purgeTasks([
+      { id: 'purge-stale-route-task-a' },
+      {
+        id: 'purge-stale-route-task-b',
+        expected_revision: staleRevision,
+      },
+    ]);
+
+    expect(staleResponse).toMatchObject({
+      status: 409,
+      body: { code: 'TASK_REVISION_CONFLICT' },
+    });
+    expect(db.getTaskById('purge-stale-route-task-a')?.deleted_at).toBeTruthy();
+    expect(db.getTaskById('purge-stale-route-task-b')?.deleted_at).toBeTruthy();
+  });
+
   test('restoring a soft-deleted task is independent of other owned tasks', async () => {
     const capOwner = 'capacity-owner';
     const capJid = 'web:capacity-owner';
@@ -928,6 +1017,7 @@ describe('tasks route ownership and cleanup contract', () => {
       can_stop: false,
       can_delete: false,
       can_restore: false,
+      can_purge: false,
     });
     expect(
       (

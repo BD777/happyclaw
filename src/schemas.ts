@@ -104,6 +104,18 @@ export const TaskPatchSchema = z.object({
     .optional(),
 });
 
+export const TaskPurgeSchema = z.object({
+  tasks: z
+    .array(
+      z.object({
+        id: z.string().trim().min(1).max(128),
+        expected_revision: z.number().int().positive(),
+      }),
+    )
+    .min(1)
+    .max(500),
+});
+
 // Cron 表达式校验：5 段（分 时 日 月 周）或 6 段（秒 分 时 日 月 周）
 // 也允许预定义表达式如 @daily, @hourly 等
 const CRON_REGEX =

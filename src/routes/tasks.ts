@@ -9,6 +9,7 @@ import {
   MAX_TASK_PROMPT_LENGTH,
   TaskCreateSchema,
   TaskPatchSchema,
+  TaskPurgeSchema,
 } from '../schemas.js';
 import { logger } from '../logger.js';
 import {
@@ -20,6 +21,7 @@ import {
   updateTaskWithRevision,
   softDeleteTaskWithRevision,
   restoreTaskWithRevision,
+  permanentlyDeleteTasksWithRevisions,
   getTaskRunById,
   getActiveTaskRunForTask,
   getTaskRunsForTask,
@@ -85,6 +87,7 @@ function taskPermissions(task: ScheduledTask, authUser: AuthUser) {
     can_delete: canOperateExecution && !task.deleted_at,
     can_restore:
       canOperateExecution && !executionBlockedReason && !!task.deleted_at,
+    can_purge: canOperateExecution && !!task.deleted_at,
     execution_scope:
       task.execution_mode === 'host'
         ? ('workspace_host' as const)
@@ -297,6 +300,80 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   notifyTaskSchedulerChanged();
 
   return c.json({ success: true, taskId });
+});
+
+tasksRoutes.post('/purge', authMiddleware, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const validation = TaskPurgeSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  const uniqueTasks = Array.from(
+    new Map(validation.data.tasks.map((task) => [task.id, task])).values(),
+  );
+  for (const requested of uniqueTasks) {
+    const task = getTaskById(requested.id);
+    if (!task || !canViewTask(task, authUser)) {
+      return c.json({ error: 'Task not found' }, 404);
+    }
+    if (!task.deleted_at) {
+      return c.json(
+        {
+          error: '任务仍在当前任务列表中，请先将它移到回收站。',
+          code: 'TASK_NOT_DELETED',
+          current_task: task,
+        },
+        409,
+      );
+    }
+    if (task.execution_type === 'script' && authUser.role !== 'admin') {
+      return c.json({ error: '只有管理员可以永久删除脚本类型任务' }, 403);
+    }
+  }
+
+  const mutation = permanentlyDeleteTasksWithRevisions(
+    uniqueTasks.map((task) => ({
+      id: task.id,
+      expectedRevision: task.expected_revision,
+    })),
+  );
+  if (mutation.status === 'not_found') {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  if (mutation.status === 'conflict') {
+    return revisionConflict(c, mutation.task);
+  }
+  if (mutation.status === 'not_deleted') {
+    return c.json(
+      {
+        error: '任务已被恢复，请刷新后重试。',
+        code: 'TASK_NOT_DELETED',
+        current_task: mutation.task,
+      },
+      409,
+    );
+  }
+  if (mutation.status === 'active_run') {
+    return c.json(
+      {
+        error: '任务仍有运行中的记录，暂时无法永久删除。',
+        code: 'TASK_HAS_ACTIVE_RUN',
+        current_run: mutation.run,
+      },
+      409,
+    );
+  }
+
+  return c.json({
+    success: true,
+    deleted_count: mutation.task_ids.length,
+    task_ids: mutation.task_ids,
+  });
 });
 
 tasksRoutes.patch('/:id', authMiddleware, async (c) => {

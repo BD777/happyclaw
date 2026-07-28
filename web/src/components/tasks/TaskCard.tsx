@@ -29,7 +29,9 @@ interface TaskCardProps {
   onRunNow?: (id: string) => void;
   onStopRun?: (runId: string | number) => void;
   onRestore?: (id: string) => void;
+  onPurge?: (id: string) => void;
   isRunning?: boolean;
+  isMutating?: boolean;
 }
 
 export function TaskCard({
@@ -40,7 +42,9 @@ export function TaskCard({
   onRunNow,
   onStopRun,
   onRestore,
+  onPurge,
   isRunning = false,
+  isMutating = false,
 }: TaskCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
@@ -75,6 +79,9 @@ export function TaskCard({
   };
 
   const getStatusColor = () => {
+    if (task.deleted_at) {
+      return 'bg-muted text-muted-foreground';
+    }
     if (effectiveRunning) {
       return 'bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-300';
     }
@@ -181,10 +188,17 @@ export function TaskCard({
               <span
                 className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor()}`}
               >
-                {currentRun
-                  ? runStatusLabel(currentRun)
-                  : formatTaskStatus(task.status, effectiveRunning)}
+                {task.deleted_at
+                  ? '已移到回收站'
+                  : currentRun
+                    ? runStatusLabel(currentRun)
+                    : formatTaskStatus(task.status, effectiveRunning)}
               </span>
+              {task.deleted_at && (
+                <span className="ml-2 text-xs text-muted-foreground">
+                  {new Date(task.deleted_at).toLocaleString('zh-CN')}
+                </span>
+              )}
               {task.permissions?.execution_blocked_reason && (
                 <span className="ml-2 text-xs text-error">配置已阻止执行</span>
               )}
@@ -287,7 +301,8 @@ export function TaskCard({
                   event.stopPropagation();
                   onRestore(task.id);
                 }}
-                className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-brand-50 hover:text-primary"
+                disabled={isMutating}
+                className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-brand-50 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                 title="恢复为暂停状态"
                 aria-label="恢复任务"
               >
@@ -295,14 +310,34 @@ export function TaskCard({
               </button>
             )}
 
+          {task.deleted_at &&
+            onPurge &&
+            task.permissions?.can_purge !== false && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onPurge(task.id);
+                }}
+                disabled={isMutating}
+                className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-950/40 dark:hover:text-red-400"
+                title="永久删除任务和运行历史"
+                aria-label="永久删除任务"
+              >
+                <Trash2 className="h-5 w-5" />
+              </button>
+            )}
+
           {!task.deleted_at && task.permissions?.can_delete !== false && (
             <button
               type="button"
               onClick={handleDelete}
-              disabled={effectiveRunning}
+              disabled={effectiveRunning || isMutating}
               className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-950/40 dark:hover:text-red-400"
-              title={effectiveRunning ? '请先停止当前运行' : '删除并保留历史'}
-              aria-label="删除任务"
+              title={
+                effectiveRunning ? '请先停止当前运行' : '移到回收站并保留历史'
+              }
+              aria-label="将任务移到回收站"
             >
               <Trash2 className="h-5 w-5" />
             </button>

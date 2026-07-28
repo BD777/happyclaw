@@ -70,6 +70,7 @@ export interface TaskPermissions {
   can_stop: boolean;
   can_delete: boolean;
   can_restore: boolean;
+  can_purge: boolean;
   execution_scope: 'workspace_container' | 'workspace_host';
   risk_level: 'normal' | 'high';
   execution_blocked_reason?: string | null;
@@ -123,6 +124,7 @@ interface TasksState {
   updateTask: (id: string, fields: Record<string, unknown>) => Promise<void>;
   deleteTask: (id: string, revision?: number) => Promise<void>;
   restoreTask: (id: string, revision?: number) => Promise<void>;
+  purgeTasks: (ids: string[]) => Promise<number>;
   loadLogs: (taskId: string) => Promise<void>;
   runTaskNow: (id: string, idempotencyKey?: string) => Promise<TaskRun>;
   stopTaskRun: (runId: string | number) => Promise<void>;
@@ -257,6 +259,7 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       await get().loadTasks();
     } catch (err) {
       set({ error: extractErrorMessage(err) });
+      throw err;
     }
   },
 
@@ -268,6 +271,31 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       });
       set({ error: null });
       await get().loadTasks();
+    } catch (err) {
+      set({ error: extractErrorMessage(err) });
+      throw err;
+    }
+  },
+
+  purgeTasks: async (ids: string[]) => {
+    const uniqueIds = Array.from(new Set(ids));
+    if (uniqueIds.length === 0) return 0;
+    try {
+      const tasksById = new Map(get().tasks.map((task) => [task.id, task]));
+      const requestedTasks = uniqueIds.map((id) => {
+        const task = tasksById.get(id);
+        if (!task?.deleted_at || !task.revision) {
+          throw new Error('任务状态已经变化，请刷新后重试。');
+        }
+        return { id, expected_revision: task.revision };
+      });
+      const data = await api.post<{ deleted_count: number }>(
+        '/api/tasks/purge',
+        { tasks: requestedTasks },
+      );
+      set({ error: null });
+      await get().loadTasks();
+      return data.deleted_count;
     } catch (err) {
       set({ error: extractErrorMessage(err) });
       throw err;
