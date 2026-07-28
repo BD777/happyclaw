@@ -6129,7 +6129,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           chatId: nextAddress.externalChatId,
           rootId: nextAddress.rootMessageId,
           threadId: nextAddress.threadId,
-          externalMessageId: inputTurnId,
+          externalMessageId: inputCursor?.id ?? inputTurnId,
           sessionId: activeSessionId,
         });
         if (nextRuntime.executionDisposition !== 'execute') {
@@ -13480,7 +13480,7 @@ async function processAgentConversation(
   bindAgentTurnOutputCoordinator(lastProcessed.id);
   activeRouteAdmissions.set(
     agentAdmissionKey,
-    (newSourceJid, inputTurnId, _inputCursor, coveredInputs) => {
+    (newSourceJid, inputTurnId, inputCursor, coveredInputs) => {
       if (admittedWarmAgentInputs.has(inputTurnId)) return false;
       const targetSourceJid = resolveStickyChannelOwner(
         replySourceImJid,
@@ -13504,7 +13504,7 @@ async function processAgentConversation(
           chatId: nextAddress.externalChatId,
           rootId: nextAddress.rootMessageId,
           threadId: nextAddress.threadId,
-          externalMessageId: inputTurnId,
+          externalMessageId: inputCursor?.id ?? inputTurnId,
           agentId,
           sessionId: currentAgentSessionId,
         });
