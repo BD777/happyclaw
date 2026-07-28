@@ -37,6 +37,17 @@ describe('conversation-agent exact input cursor fencing', () => {
     main.indexOf('async function startMessageLoop()'),
   );
 
+  test('initializes the batch runtime id before startup recovery registers the batch', () => {
+    const declaration = agentHost.indexOf(
+      'const lastProcessed = missedMessages[missedMessages.length - 1]',
+    );
+    const registration = agentHost.indexOf(
+      'activeAgentBuilderTurns.startBatch(',
+    );
+    expect(declaration).toBeGreaterThanOrEqual(0);
+    expect(registration).toBeGreaterThan(declaration);
+  });
+
   test('does not let late A cursor state become active B cursor state', () => {
     expect(agentHost).toContain(
       'const cursorCommittedInputTurns = new Set<string>()',

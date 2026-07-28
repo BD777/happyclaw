@@ -13324,6 +13324,10 @@ async function processAgentConversation(
     }
   }
 
+  // The batch runtime id is needed before the rest of the conversation setup.
+  // Keep this declaration above startBatch so startup recovery cannot hit the
+  // temporal dead zone while rebuilding an agent turn.
+  const lastProcessed = missedMessages[missedMessages.length - 1];
   activeAgentBuilderTurns.startBatch(
     agentBuilderScope,
     missedMessages.map((message) => ({
@@ -13456,7 +13460,6 @@ async function processAgentConversation(
   const streamingSessionJid = replySourceImJid
     ? `${replySourceImJid}#agent:${agentId}`
     : undefined;
-  const lastProcessed = missedMessages[missedMessages.length - 1];
   const healthyAgentCompletedInputTurns = new Set<string>();
   const agentProcessingIndicatorJidsByInput = new Map<string, string>();
   const agentProcessingIndicatorInputsByCompletion = new Map<string, string[]>([
