@@ -1,6 +1,9 @@
 import { describe, expect, test, vi } from 'vitest';
 
-import { recoverProactiveFinalCandidate } from '../src/proactive-final-recovery.js';
+import {
+  preserveUnacknowledgedProactiveFinal,
+  recoverProactiveFinalCandidate,
+} from '../src/proactive-final-recovery.js';
 import { ActiveTurnOutputRegistry } from '../src/turn-output-coordinator.js';
 
 const SCOPE = 'workspace\0conversation:agent';
@@ -204,5 +207,77 @@ describe('Proactive SDK final recovery orchestration', () => {
       attempted: false,
       reason: 'explicit_final_delivered',
     });
+  });
+
+  test('preserves the exact uncertain final in Web and suppresses the SDK closure without claiming native ACK', async () => {
+    const registry = new ActiveTurnOutputRegistry();
+    const nativeDelivered = vi.fn();
+    registry.bind(SCOPE, TURN, {
+      ...CALLBACKS,
+      onUtteranceDelivered: nativeDelivered,
+    });
+    registry.recordAttemptedFinal({
+      scopeKey: SCOPE,
+      inputTurnId: TURN,
+      text: '# 完整总结\n\n四个 AI-native 工作方式',
+    });
+    const project = vi.fn(async () => true);
+
+    await expect(
+      preserveUnacknowledgedProactiveFinal({
+        registry,
+        scopeKey: SCOPE,
+        inputTurnId: TURN,
+        text: '# 完整总结\n\n四个 AI-native 工作方式',
+        uncertain: true,
+        project,
+      }),
+    ).resolves.toEqual({
+      projected: true,
+      finalizationReason: 'delivery_uncertain',
+    });
+    expect(project).toHaveBeenCalledWith(
+      '# 完整总结\n\n四个 AI-native 工作方式',
+      'delivery_uncertain',
+    );
+    expect(nativeDelivered).not.toHaveBeenCalled();
+
+    const deliverFallback = vi.fn();
+    await expect(
+      recoverProactiveFinalCandidate({
+        registry,
+        scopeKey: SCOPE,
+        inputTurnId: TURN,
+        inputTurnCompleted: true,
+        candidate: '已通过 send_message(final) 投递完整总结。本轮工作已完成。',
+        canDeliver: () => true,
+        deliver: deliverFallback,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      reason: 'explicit_final_delivered',
+    });
+    expect(deliverFallback).not.toHaveBeenCalled();
+  });
+
+  test('marks a definitive native failure as error while preserving the final', async () => {
+    const registry = new ActiveTurnOutputRegistry();
+    registry.bind(SCOPE, TURN, CALLBACKS);
+    const project = vi.fn(async () => true);
+
+    await expect(
+      preserveUnacknowledgedProactiveFinal({
+        registry,
+        scopeKey: SCOPE,
+        inputTurnId: TURN,
+        text: '无法送达但不能丢失的 final',
+        uncertain: false,
+        project,
+      }),
+    ).resolves.toEqual({
+      projected: true,
+      finalizationReason: 'error',
+    });
+    expect(project).toHaveBeenCalledWith('无法送达但不能丢失的 final', 'error');
   });
 });

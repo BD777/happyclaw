@@ -470,6 +470,7 @@ export type MessageSourceKind =
 
 export type MessageFinalizationReason =
   | 'completed'
+  | 'delivery_uncertain'
   | 'interrupted'
   | 'error'
   | 'shutdown'

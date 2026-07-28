@@ -46,6 +46,7 @@ export type HostIpcOutputRoute =
       delivered: false;
       staged: false;
       deliveryRole: TurnMessageDeliveryRole | null;
+      attemptedFinalRecorded: boolean;
     }
   | {
       path: 'rejected';
@@ -84,7 +85,6 @@ export function routeHostIpcOutput(
   }
   if (
     input.scheduledTask ||
-    input.interactionMode === 'proactive' ||
     deliveryRole === null ||
     deliveryRole === 'separate'
   ) {
@@ -93,6 +93,26 @@ export function routeHostIpcOutput(
       delivered: false,
       staged: false,
       deliveryRole,
+      attemptedFinalRecorded: false,
+    };
+  }
+
+  if (input.interactionMode === 'proactive') {
+    const attemptedFinalRecorded =
+      deliveryRole === 'final' &&
+      typeof input.inputTurnId === 'string' &&
+      Boolean(input.inputTurnId) &&
+      activeTurnOutputs.recordAttemptedFinal({
+        scopeKey: channelTurnScope(input.sourceGroup, input.agentId),
+        inputTurnId: input.inputTurnId,
+        text: input.text,
+      });
+    return {
+      path: 'separate_provider',
+      delivered: false,
+      staged: false,
+      deliveryRole,
+      attemptedFinalRecorded,
     };
   }
 

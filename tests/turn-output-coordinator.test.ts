@@ -452,6 +452,33 @@ describe('Proactive final delivery recovery', () => {
     });
   });
 
+  test('an attempted explicit final stays authoritative over a lying SDK closure', () => {
+    const coordinator = new TurnOutputCoordinator();
+    expect(
+      coordinator.recordAttemptedFinal(
+        '# 完整总结\n\n这是用户真正需要看到的正文。',
+      ),
+    ).toBe(true);
+
+    expect(
+      coordinator.resolveProactiveFinalRecovery(
+        '已通过 send_message(final) 投递完整总结。本轮工作已完成。',
+      ),
+    ).toEqual({
+      deliver: false,
+      text: '# 完整总结\n\n这是用户真正需要看到的正文。',
+      reason: 'explicit_final_attempted',
+    });
+    expect(coordinator.deliveredUtterances).toBe(0);
+  });
+
+  test('does not let a later final replace the first uncertain attempt', () => {
+    const coordinator = new TurnOutputCoordinator();
+    expect(coordinator.recordAttemptedFinal('第一份 final')).toBe(true);
+    expect(coordinator.recordAttemptedFinal('第二份 final')).toBe(false);
+    expect(coordinator.attemptedFinalText).toBe('第一份 final');
+  });
+
   test('deduplicates the exact delivered text even when an older caller omitted the final role', () => {
     const coordinator = new TurnOutputCoordinator();
     coordinator.recordDeliveredUtterance({
@@ -599,5 +626,33 @@ describe('Proactive final delivery recovery', () => {
       text: '恢复出来的最终答案',
       reason: 'untracked_turn',
     });
+  });
+
+  test('keeps an explicit final authoritative when IPC arrives before the warm turn binding', () => {
+    const registry = new ActiveTurnOutputRegistry();
+    expect(
+      registry.recordAttemptedFinal({
+        scopeKey: 'workspace:main',
+        inputTurnId: 'restoring-turn',
+        text: 'Outbox 已持久化的准确 final',
+      }),
+    ).toBe(true);
+    expect(
+      registry.resolveProactiveFinalRecovery({
+        scopeKey: 'workspace:main',
+        inputTurnId: 'restoring-turn',
+        text: '已通过 send_message(final) 投递。本轮完成。',
+      }),
+    ).toEqual({
+      deliver: false,
+      text: 'Outbox 已持久化的准确 final',
+      reason: 'explicit_final_attempted',
+    });
+
+    const coordinator = registry.bind('workspace:main', 'restoring-turn', {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+    });
+    expect(coordinator.attemptedFinalText).toBe('Outbox 已持久化的准确 final');
   });
 });

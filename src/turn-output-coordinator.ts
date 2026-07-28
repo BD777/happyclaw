@@ -39,6 +39,7 @@ export interface ProactiveFinalRecoveryDecision {
     | 'empty_candidate'
     | 'duplicate_delivery'
     | 'explicit_final_delivered'
+    | 'explicit_final_attempted'
     | 'redundant_sdk_closure'
     | 'untracked_turn';
 }
@@ -75,6 +76,7 @@ export class TurnOutputCoordinator {
     | undefined;
   private implicitMessageCounter = 0;
   private stagedFinal: string | null = null;
+  private attemptedFinal: string | null = null;
   private finalized = false;
   private deliveredUtteranceCount = 0;
   private deliveredFinalUtterance = false;
@@ -233,6 +235,27 @@ export class TurnOutputCoordinator {
     }
   }
 
+  /**
+   * Capture the exact explicit Proactive final before its durable Outbox enters
+   * physical provider delivery.
+   *
+   * This is intentionally separate from recordDeliveredUtterance(): an
+   * attempted native send is not a provider acknowledgement. The first final
+   * remains authoritative because an uncertain first send fences all later
+   * channel mutations for the turn.
+   */
+  recordAttemptedFinal(text: string): boolean {
+    if (this.finalized || !text.trim()) return false;
+    if (this.attemptedFinal !== null) {
+      return (
+        normalizeDeliveredText(this.attemptedFinal) ===
+        normalizeDeliveredText(text)
+      );
+    }
+    this.attemptedFinal = text;
+    return true;
+  }
+
   /** SDK Result is authoritative when it contains a real final answer. */
   resolvePrimaryAnswer(
     sdkResult: string | null | undefined,
@@ -309,6 +332,13 @@ export class TurnOutputCoordinator {
     if (this.deliveredFinalUtterance) {
       return { deliver: false, text, reason: 'explicit_final_delivered' };
     }
+    if (this.attemptedFinal !== null) {
+      return {
+        deliver: false,
+        text: this.attemptedFinal,
+        reason: 'explicit_final_attempted',
+      };
+    }
     if (isRedundantProactiveSdkClosure(text, this.deliveredProgressTexts)) {
       return { deliver: false, text, reason: 'redundant_sdk_closure' };
     }
@@ -321,6 +351,10 @@ export class TurnOutputCoordinator {
 
   get hasDeliveredUtterance(): boolean {
     return this.deliveredUtteranceCount > 0;
+  }
+
+  get attemptedFinalText(): string | null {
+    return this.attemptedFinal;
   }
 }
 
@@ -355,6 +389,12 @@ export interface RecordDeliveredUtteranceInput {
   text?: string;
 }
 
+export interface RecordAttemptedFinalInput {
+  scopeKey: string;
+  inputTurnId: string;
+  text: string;
+}
+
 export interface ResolveProactiveFinalRecoveryInput {
   scopeKey: string;
   inputTurnId: string;
@@ -369,6 +409,13 @@ export interface ResolveProactiveFinalRecoveryInput {
  */
 export class ActiveTurnOutputRegistry {
   private readonly bindings = new Map<string, ActiveTurnOutputBinding>();
+  /**
+   * Short process-local bridge for IPC files that arrive just before their
+   * warm turn binding is restored. The durable Outbox owns crash recovery;
+   * this bounded ledger only prevents a later SDK terminal in the same host
+   * process from replacing an explicit final with control-plane text.
+   */
+  private readonly attemptedFinals = new Map<string, string>();
 
   constructor(private readonly maxUtterances = 0) {}
 
@@ -382,7 +429,10 @@ export class ActiveTurnOutputRegistry {
     callbacks: ActiveTurnOutputCallbacks,
     coordinator = new TurnOutputCoordinator(this.maxUtterances),
   ): TurnOutputCoordinator {
-    this.bindings.set(this.key(scopeKey, inputTurnId), {
+    const key = this.key(scopeKey, inputTurnId);
+    const attemptedFinal = this.attemptedFinals.get(key);
+    if (attemptedFinal) coordinator.recordAttemptedFinal(attemptedFinal);
+    this.bindings.set(key, {
       coordinator,
       callbacks,
     });
@@ -443,6 +493,33 @@ export class ActiveTurnOutputRegistry {
   }
 
   /**
+   * Record the authoritative explicit final without claiming either a
+   * canonical projection or a native provider acknowledgement.
+   */
+  recordAttemptedFinal(input: RecordAttemptedFinalInput): boolean {
+    if (!input.text.trim()) return false;
+    const key = this.key(input.scopeKey, input.inputTurnId);
+    const existing = this.attemptedFinals.get(key);
+    if (
+      existing &&
+      normalizeDeliveredText(existing) !== normalizeDeliveredText(input.text)
+    ) {
+      return false;
+    }
+    if (!existing) {
+      this.attemptedFinals.set(key, input.text);
+      if (this.attemptedFinals.size > 512) {
+        const oldest = this.attemptedFinals.keys().next().value as
+          | string
+          | undefined;
+        if (oldest) this.attemptedFinals.delete(oldest);
+      }
+    }
+    const binding = this.bindings.get(key);
+    return binding?.coordinator.recordAttemptedFinal(input.text) ?? true;
+  }
+
+  /**
    * Record a durable user-visible projection without claiming that the native
    * provider acknowledged it. Used when recovery persists the final answer to
    * the canonical Web session after a native delivery failure.
@@ -469,6 +546,16 @@ export class ActiveTurnOutputRegistry {
       return binding.coordinator.resolveProactiveFinalRecovery(input.text);
     }
     const text = input.text?.trim() ? input.text : null;
+    const attemptedFinal = this.attemptedFinals.get(
+      this.key(input.scopeKey, input.inputTurnId),
+    );
+    if (text && attemptedFinal) {
+      return {
+        deliver: false,
+        text: attemptedFinal,
+        reason: 'explicit_final_attempted',
+      };
+    }
     return text
       ? { deliver: true, text, reason: 'untracked_turn' }
       : { deliver: false, text: null, reason: 'empty_candidate' };

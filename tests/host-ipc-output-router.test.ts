@@ -170,6 +170,45 @@ describe('host IPC primary output routing', () => {
     expect(projected).not.toHaveBeenCalled();
   });
 
+  test('records the exact Proactive final before entering provider delivery', () => {
+    const activeTurnOutputs = new ActiveTurnOutputRegistry();
+    const scope = channelTurnScope('workspace', 'conversation-agent');
+    const coordinator = activeTurnOutputs.bind(scope, 'turn-1', {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+    });
+
+    const route = routeHostIpcOutput(
+      {
+        sourceGroup: 'workspace',
+        agentId: 'conversation-agent',
+        inputTurnId: 'turn-1',
+        text: '准确的完整总结正文',
+        deliveryRole: 'final',
+        authorized: true,
+        scheduledTask: false,
+        interactionMode: 'proactive',
+      },
+      activeTurnOutputs,
+    );
+
+    expect(route).toMatchObject({
+      path: 'separate_provider',
+      deliveryRole: 'final',
+      attemptedFinalRecorded: true,
+    });
+    expect(coordinator.attemptedFinalText).toBe('准确的完整总结正文');
+    expect(
+      coordinator.resolveProactiveFinalRecovery(
+        '已通过 send_message(final) 投递完整总结。本轮工作已完成。',
+      ),
+    ).toEqual({
+      deliver: false,
+      text: '准确的完整总结正文',
+      reason: 'explicit_final_attempted',
+    });
+  });
+
   test('wires both host execution paths to the live visible answer for interruption persistence', () => {
     const main = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),

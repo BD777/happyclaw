@@ -993,11 +993,120 @@ function getFileType(
  * - Code block / table spacing with <br>
  * - Invalid image cleanup
  */
+// Feishu documents a generous total post limit, but large single `md` elements
+// have produced provider-side 2200 errors in real threads. Keep one physical
+// message/Outbox row while using smaller rich-text nodes inside that message.
+export const FEISHU_POST_MD_NODE_MAX_BYTES = 2_400;
+
+function takeUtf8Prefix(
+  value: string,
+  maxBytes: number,
+): { prefix: string; rest: string } {
+  let bytes = 0;
+  let consumedCodeUnits = 0;
+  for (const character of value) {
+    const nextBytes = Buffer.byteLength(character);
+    if (bytes + nextBytes > maxBytes) break;
+    bytes += nextBytes;
+    consumedCodeUnits += character.length;
+  }
+  return {
+    prefix: value.slice(0, consumedCodeUnits),
+    rest: value.slice(consumedCodeUnits),
+  };
+}
+
+interface MarkdownFence {
+  marker: string;
+  opener: string;
+}
+
+function nextMarkdownFence(
+  line: string,
+  current: MarkdownFence | null,
+): MarkdownFence | null {
+  const trimmed = line.trim();
+  if (!current) {
+    const opener = trimmed.match(/^(`{3,}|~{3,})(.*)$/);
+    if (!opener) return null;
+    return {
+      marker: opener[1],
+      // Language identifiers are short in valid Markdown. Bounding an
+      // adversarial opener keeps continuation overhead below the node budget.
+      opener: Buffer.byteLength(trimmed) <= 128 ? trimmed : opener[1],
+    };
+  }
+  const closingPattern = new RegExp(
+    `^${current.marker[0]}{${current.marker.length},}\\s*$`,
+  );
+  return closingPattern.test(trimmed) ? null : current;
+}
+
+/**
+ * Split optimized Markdown into several `md` elements without creating
+ * additional provider messages. UTF-8 byte accounting avoids breaking CJK or
+ * emoji, and long fenced blocks are closed/reopened at node boundaries so each
+ * element renders independently.
+ */
+export function splitFeishuPostMarkdown(
+  markdown: string,
+  maxBytes = FEISHU_POST_MD_NODE_MAX_BYTES,
+): string[] {
+  if (!Number.isInteger(maxBytes) || maxBytes < 256) {
+    throw new Error(
+      'Feishu post Markdown node budget must be at least 256 bytes',
+    );
+  }
+  if (!markdown) return [''];
+
+  const chunks: string[] = [];
+  let current = '';
+  let fence: MarkdownFence | null = null;
+  const flush = (): void => {
+    if (!current) return;
+    const closing = fence ? `\n${fence.marker}` : '';
+    chunks.push(`${current}${closing}`);
+    current = fence ? `${fence.opener}\n` : '';
+  };
+
+  const lines = markdown.match(/[^\n]*\n|[^\n]+$/g) ?? [markdown];
+  for (const line of lines) {
+    let remaining = line;
+    while (remaining) {
+      const closingReserve = fence ? Buffer.byteLength(`\n${fence.marker}`) : 0;
+      const available = maxBytes - Buffer.byteLength(current) - closingReserve;
+      if (available <= 0) {
+        flush();
+        continue;
+      }
+      if (Buffer.byteLength(remaining) <= available) {
+        current += remaining;
+        remaining = '';
+        fence = nextMarkdownFence(line, fence);
+        continue;
+      }
+      const { prefix, rest } = takeUtf8Prefix(remaining, available);
+      if (!prefix) {
+        flush();
+        continue;
+      }
+      current += prefix;
+      remaining = rest;
+      flush();
+    }
+  }
+  flush();
+  return chunks.length > 0 ? chunks : [''];
+}
+
 /** Build a post+md fallback content string for when interactive card send fails. */
-function buildPostMdFallback(text: string): string {
+export function buildPostMdFallback(text: string): string {
+  const optimized = optimizeMarkdownStyle(text, 1);
   return JSON.stringify({
     zh_cn: {
-      content: [[{ tag: 'md', text: optimizeMarkdownStyle(text, 1) }]],
+      content: splitFeishuPostMarkdown(optimized).map((chunk) => [
+        { tag: 'md', text: chunk },
+      ]),
     },
   });
 }

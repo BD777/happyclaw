@@ -133,6 +133,19 @@ describe('workspace interaction runtime policy', () => {
       text: 'hello',
       presentation: 'native',
     });
+    expect(
+      buildInteractionTextOutboxPayload('完整总结', 'native', {
+        deliveryRole: 'final',
+        inputTurnId: 'turn-1',
+        logicalChatJid: 'web:main#agent:session-1',
+      }),
+    ).toEqual({
+      text: '完整总结',
+      presentation: 'native',
+      deliveryRole: 'final',
+      inputTurnId: 'turn-1',
+      logicalChatJid: 'web:main#agent:session-1',
+    });
   });
 
   test('uses the IPC-file mode frozen before a workspace mode switch', () => {

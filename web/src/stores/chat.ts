@@ -63,7 +63,12 @@ export interface Message {
     | 'interrupt_partial'
     | 'legacy'
     | null;
-  finalization_reason?: 'completed' | 'interrupted' | 'error' | null;
+  finalization_reason?:
+    | 'completed'
+    | 'delivery_uncertain'
+    | 'interrupted'
+    | 'error'
+    | null;
   delivery_mode?: FollowUpMode | null;
   delivery_status?: 'queued' | 'promoting' | 'released' | 'cancelled' | null;
   delivery_run_id?: string | null;

@@ -31,8 +31,10 @@ import {
 import {
   ActiveTurnOutputRegistry,
   TurnOutputCoordinator,
+  type TurnMessageDeliveryRole,
 } from './turn-output-coordinator.js';
 import {
+  preserveUnacknowledgedProactiveFinal,
   recoverProactiveFinalCandidate,
   type ProactiveFinalFallbackDelivery,
 } from './proactive-final-recovery.js';
@@ -2654,6 +2656,11 @@ async function sendImWithRetry(
   localImagePaths: string[],
   outbox?: ChannelOutboxDeliveryRef,
   deliveryOptions?: ChannelMessageDeliveryOptions,
+  outboxMetadata?: {
+    deliveryRole?: TurnMessageDeliveryRole | null;
+    inputTurnId?: string | null;
+    logicalChatJid?: string | null;
+  },
 ): Promise<boolean> {
   let ok: boolean;
   const durableScoped = outbox !== undefined;
@@ -2672,6 +2679,7 @@ async function sendImWithRetry(
           payload: buildInteractionTextOutboxPayload(
             text,
             deliveryOptions?.presentation,
+            outboxMetadata,
           ),
           send: () => imManager.sendMessage(imJid, text, [], deliveryOptions),
         },
@@ -4736,8 +4744,8 @@ interface SendMessageOptions {
     turnId?: string;
     sessionId?: string;
     sdkMessageUuid?: string;
-    sourceKind?: ContainerOutput['sourceKind'];
-    finalizationReason?: ContainerOutput['finalizationReason'];
+    sourceKind?: MessageSourceKind;
+    finalizationReason?: MessageFinalizationReason;
   };
 }
 
@@ -9602,6 +9610,8 @@ function startIpcWatcher(): void {
               let messageDelivered = false;
               let messageStaged = false;
               let messageDeliveryError: string | undefined;
+              let messageDeliveryUncertain = false;
+              let nativeDeliveryAcknowledged = false;
               let stagedDisposition:
                 | 'staged_progress'
                 | 'staged_final'
@@ -9695,6 +9705,7 @@ function startIpcWatcher(): void {
                 // replay hit is itself evidence that the prior attempt reached
                 // the user. Failed attempts are deliberately never recorded.
                 messageDelivered = true;
+                nativeDeliveryAcknowledged = true;
                 logger.info(
                   { sourceGroup, chatJid: data.chatJid },
                   'Duplicate IPC send_message suppressed (retry replay window)',
@@ -9801,7 +9812,13 @@ function startIpcWatcher(): void {
                           usesNativeMessagePresentation(ipcInteractionMode)
                             ? { presentation: 'native' }
                             : undefined,
+                          {
+                            deliveryRole: hostOutputRoute.deliveryRole,
+                            inputTurnId: data.inputTurnId,
+                            logicalChatJid: effectiveChatJid,
+                          },
                         );
+                        nativeDeliveryAcknowledged = messageDelivered;
                         if (
                           !messageDelivered &&
                           messageScope &&
@@ -9809,6 +9826,7 @@ function startIpcWatcher(): void {
                             messageScope.turnRunId,
                           )
                         ) {
+                          messageDeliveryUncertain = true;
                           messageDeliveryError =
                             'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
                         }
@@ -9935,20 +9953,67 @@ function startIpcWatcher(): void {
                         delivery.receipt.status === 'skipped');
                   }
                 }
-                if (messageDelivered) {
-                  const projectionMessageId = `ipc_${crypto
-                    .createHash('sha256')
-                    .update(
-                      [
+                const projectionMessageId = `ipc_${crypto
+                  .createHash('sha256')
+                  .update(
+                    [
+                      effectiveChatJid,
+                      typeof data.inputTurnId === 'string'
+                        ? data.inputTurnId
+                        : '',
+                      data.text,
+                    ].join('\0'),
+                  )
+                  .digest('hex')
+                  .slice(0, 32)}`;
+                const isExplicitProactiveFinal =
+                  !isTaskIpcMessage &&
+                  ipcInteractionMode === 'proactive' &&
+                  hostOutputRoute.deliveryRole === 'final' &&
+                  typeof data.inputTurnId === 'string' &&
+                  Boolean(data.inputTurnId);
+
+                // An unacknowledged native final must keep the exact answer in
+                // the canonical Web session without replaying the provider
+                // mutation. Its provenance remains visibly non-completed.
+                if (!messageDelivered && isExplicitProactiveFinal) {
+                  const preserved = await preserveUnacknowledgedProactiveFinal({
+                    registry: activeTurnOutputs,
+                    scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
+                    inputTurnId: data.inputTurnId,
+                    text: webText,
+                    uncertain: messageDeliveryUncertain,
+                    project: async (text, finalizationReason) => {
+                      const outcome = await sendMessageWithOutcome(
                         effectiveChatJid,
-                        typeof data.inputTurnId === 'string'
-                          ? data.inputTurnId
-                          : '',
-                        data.text,
-                      ].join('\0'),
-                    )
-                    .digest('hex')
-                    .slice(0, 32)}`;
+                        text,
+                        {
+                          sendToIM: false,
+                          messageId: projectionMessageId,
+                          messageMeta: {
+                            turnId: data.inputTurnId,
+                            sourceKind: 'sdk_send_message',
+                            finalizationReason,
+                          },
+                        },
+                      );
+                      return outcome.targetDelivered;
+                    },
+                  });
+                  logger[preserved.projected ? 'warn' : 'error'](
+                    {
+                      chatJid: effectiveChatJid,
+                      sourceGroup,
+                      agentId: ipcAgentId,
+                      inputTurnId: data.inputTurnId,
+                      finalizationReason: preserved.finalizationReason,
+                    },
+                    preserved.projected
+                      ? 'Preserved unacknowledged Proactive final in canonical Web session'
+                      : 'Failed to preserve unacknowledged Proactive final in canonical Web session',
+                  );
+                }
+                if (messageDelivered) {
                   const sendOutcome = await sendMessageWithOutcome(
                     effectiveChatJid,
                     webText,
@@ -9964,10 +10029,30 @@ function startIpcWatcher(): void {
                             ? data.inputTurnId
                             : undefined,
                         sourceKind: 'sdk_send_message',
+                        finalizationReason:
+                          hostOutputRoute.deliveryRole === 'final'
+                            ? 'completed'
+                            : undefined,
                       },
                     },
                   );
                   messageDelivered = sendOutcome.targetDelivered;
+                  if (!messageDelivered && nativeDeliveryAcknowledged) {
+                    // The provider side effect already ACKed. Reporting a tool
+                    // failure would invite a duplicate retry; preserve the ACK
+                    // while leaving the canonical projection failure visible
+                    // in logs for operator repair.
+                    messageDelivered = true;
+                    logger.error(
+                      {
+                        chatJid: effectiveChatJid,
+                        sourceGroup,
+                        agentId: ipcAgentId,
+                        inputTurnId: data.inputTurnId,
+                      },
+                      'Native IPC message ACKed but canonical Web projection failed',
+                    );
+                  }
                 }
                 if (messageDelivered) {
                   recordSuccessfulIpcSend(sourceGroup, data.chatJid, data.text);

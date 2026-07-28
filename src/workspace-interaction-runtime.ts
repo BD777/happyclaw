@@ -81,10 +81,27 @@ export function usesNativeMessagePresentation(mode: InteractionMode): boolean {
 export function buildInteractionTextOutboxPayload(
   text: string,
   presentation?: 'default' | 'native',
-): { text: string; presentation?: 'native' } {
-  return presentation === 'native'
-    ? { text, presentation: 'native' }
-    : { text };
+  metadata?: {
+    deliveryRole?: 'progress' | 'final' | 'separate' | null;
+    inputTurnId?: string | null;
+    logicalChatJid?: string | null;
+  },
+): {
+  text: string;
+  presentation?: 'native';
+  deliveryRole?: 'progress' | 'final' | 'separate';
+  inputTurnId?: string;
+  logicalChatJid?: string;
+} {
+  return {
+    text,
+    ...(presentation === 'native' ? { presentation: 'native' as const } : {}),
+    ...(metadata?.deliveryRole ? { deliveryRole: metadata.deliveryRole } : {}),
+    ...(metadata?.inputTurnId ? { inputTurnId: metadata.inputTurnId } : {}),
+    ...(metadata?.logicalChatJid
+      ? { logicalChatJid: metadata.logicalChatJid }
+      : {}),
+  };
 }
 
 export interface FrozenIpcInteractionMode {
