@@ -53,6 +53,36 @@ describe('channel account registration fallback', () => {
     expect(sessionBound.target_main_jid).toBeUndefined();
   });
 
+  test('returns the identical object for an already-attached group', () => {
+    // Callers use reference equality to skip persistence on the per-message
+    // hot path; a value-equal copy would silently rewrite the row each time.
+    const attached = {
+      ...baseGroup,
+      channel_account_id: 'bot-a',
+      target_main_jid: 'web:user-selected',
+    };
+    expect(
+      applyChannelAccountRegistrationFallback(
+        attached,
+        'bot-a',
+        'web:account-default',
+      ),
+    ).toBe(attached);
+
+    const fallbackBound = {
+      ...baseGroup,
+      channel_account_id: 'bot-a',
+      target_main_jid: 'web:account-default',
+    };
+    expect(
+      applyChannelAccountRegistrationFallback(
+        fallbackBound,
+        'bot-a',
+        'web:account-default',
+      ),
+    ).toBe(fallbackBound);
+  });
+
   test('uses explicit workspace then home, never an Agent first-workspace fallback', () => {
     const account = {
       owner_user_id: 'owner',

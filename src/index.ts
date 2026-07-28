@@ -12,6 +12,7 @@ import {
   GROUPS_DIR,
   STORE_DIR,
   MAIN_GROUP_FOLDER,
+  CONVERSATION_AGENT_ARCHIVE_DAYS,
   POLL_INTERVAL,
   TIMEZONE,
   isDockerAvailable,
@@ -86,6 +87,7 @@ import {
   ensureChatExists,
   ensureUserHomeGroup,
   getAllChats,
+  getAllChatJids,
   getAllRegisteredGroups,
   getAllSessions,
   hasContainerModeGroups,
@@ -119,6 +121,7 @@ import {
   setLastGroupSync,
   setRegisteredGroup,
   setRouterState,
+  setRouterStateBatch,
   setSessionChannelOwnerOnce,
   setSession,
   deleteSession,
@@ -137,6 +140,7 @@ import {
   updateAgentLastImJid,
   updateAgentInfo,
   deleteAgent,
+  archiveInactiveConversationAgents,
   deleteCompletedAgents,
   deleteImGroupRecord,
   getRunningTaskAgentsByChat,
@@ -238,6 +242,7 @@ import {
   type ActiveChannelOutboxScope,
 } from './channel-outbox-runtime-scope.js';
 import {
+  cleanupChannelReliability,
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
   CHANNEL_RELIABILITY_TERMINAL_STATUSES,
@@ -333,6 +338,8 @@ import {
   agentBuilderTurnScope,
   getAgentBuilderRuntimeRejection,
   isAgentBuilderOwnerInput,
+  isOwnerProfileOwnerInput,
+  OWNER_PROFILE_TRUSTED_CLAIM_SOURCES,
   ownerImIdFromDirectConversationJid,
   resolveTrustedDirectOwnerUpgrade,
 } from './agent-builder-turn-auth.js';
@@ -4850,6 +4857,13 @@ function loadState(): void {
   };
   lastAgentTimestamp = loadCursorMap('last_agent_timestamp');
   lastCommittedCursor = loadCursorMap('last_committed_cursor');
+  const prunedCursors = pruneCursorState();
+  if (prunedCursors > 0) {
+    logger.info(
+      { prunedCursors },
+      'Pruned message cursors for chats that no longer exist',
+    );
+  }
 
   // Do not synthesize a missing committed cursor from the next-pull cursor.
   // A crash can persist next-pull immediately after IPC acceptance while the
@@ -4963,11 +4977,49 @@ function loadState(): void {
   );
 }
 
+/**
+ * Cursor persistence. Both cursor maps are serialized whole, so this cost
+ * scales with the number of historical chats; two defenses keep it bounded:
+ * only keys whose value actually changed are written (in one transaction, not
+ * four), and pruneCursorState() drops keys whose chat no longer exists
+ * (73% of production keys were dead web sessions).
+ */
+const lastPersistedRouterState: Record<string, string> = {};
 function saveState(): void {
-  setRouterState('last_timestamp', globalMessageCursor.timestamp);
-  setRouterState('last_timestamp_id', globalMessageCursor.id);
-  setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
-  setRouterState('last_committed_cursor', JSON.stringify(lastCommittedCursor));
+  const entries: Array<[string, string]> = [
+    ['last_timestamp', globalMessageCursor.timestamp],
+    ['last_timestamp_id', globalMessageCursor.id],
+    ['last_agent_timestamp', JSON.stringify(lastAgentTimestamp)],
+    ['last_committed_cursor', JSON.stringify(lastCommittedCursor)],
+  ];
+  const changed = entries.filter(
+    ([key, value]) => lastPersistedRouterState[key] !== value,
+  );
+  if (changed.length === 0) return;
+  setRouterStateBatch(changed);
+  for (const [key, value] of changed) lastPersistedRouterState[key] = value;
+}
+
+/** Drop cursor entries for chats that no longer exist. Safe: a chat row is
+ * the FK parent of its messages, so a missing chat has no messages to skip
+ * and a recreated chat starts empty anyway. Returns pruned key count. */
+function pruneCursorState(): number {
+  const validJids = new Set(getAllChatJids());
+  let pruned = 0;
+  for (const key of Object.keys(lastAgentTimestamp)) {
+    if (!validJids.has(key)) {
+      delete lastAgentTimestamp[key];
+      pruned += 1;
+    }
+  }
+  for (const key of Object.keys(lastCommittedCursor)) {
+    if (!validJids.has(key)) {
+      delete lastCommittedCursor[key];
+      pruned += 1;
+    }
+  }
+  if (pruned > 0) saveState();
+  return pruned;
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -11033,17 +11085,49 @@ async function processTaskIpc(
         : activeAgentBuilderTurns.requireExactActiveOwnerHumanTurn.bind(
             activeAgentBuilderTurns,
           );
-    const activeTurn = resolveOwnerTurn(
-      agentBuilderTurnScope(sourceGroup, ipcAgentId),
-      data.inputTurnId,
-      getAgentBuilderInputMessage,
-      (persistedInput) =>
-        isAgentBuilderOwnerInput(
-          persistedInput,
-          user.id,
-          (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
-        ),
-    );
+    // The owner's IM identity is anchored across Home registrations, not the
+    // single source row: Home chats registered before owner capture (legacy
+    // topic groups with a NULL owner_im_id) must still authorize the owner.
+    const resolveHomeOwnerImIds = (provider: string): string[] => {
+      const ids = new Set<string>();
+      for (const jid of getJidsByFolder(sourceGroup)) {
+        if (getChannelType(jid) !== provider) continue;
+        const row = registeredGroups[jid] ?? getRegisteredGroup(jid);
+        if (
+          row?.created_by === user.id &&
+          row.owner_im_id &&
+          row.owner_claim_source &&
+          OWNER_PROFILE_TRUSTED_CLAIM_SOURCES.includes(row.owner_claim_source)
+        ) {
+          ids.add(row.owner_im_id);
+        }
+      }
+      return [...ids];
+    };
+    let activeTurn: ReturnType<typeof resolveOwnerTurn>;
+    try {
+      activeTurn = resolveOwnerTurn(
+        agentBuilderTurnScope(sourceGroup, ipcAgentId),
+        data.inputTurnId,
+        getAgentBuilderInputMessage,
+        (persistedInput) =>
+          isOwnerProfileOwnerInput(
+            persistedInput,
+            user.id,
+            (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+            resolveHomeOwnerImIds,
+          ),
+      );
+    } catch (error) {
+      // Turn-authorization misses are expected policy outcomes (queued
+      // non-owner turns, stale turn ids), not host faults.
+      throw new OwnerProfileStoreError(
+        'not_owner_turn',
+        error instanceof Error
+          ? error.message
+          : 'Owner Profile requires an owner conversation turn',
+      );
+    }
     const workspaceJid = getJidsByFolder(sourceGroup).find((jid) =>
       jid.startsWith('web:'),
     );
@@ -16725,6 +16809,20 @@ function recoverPendingMessages(): void {
  * Reset their status and re-trigger processing if they have pending messages.
  */
 function recoverConversationAgents(): void {
+  // Archive long-inactive sessions first so restart recovery only walks the
+  // genuinely live set; production grew this monotonically (51 → 73 in three
+  // days) because conversation agents had no inactivity terminal state.
+  const archived = archiveInactiveConversationAgents(
+    new Date(
+      Date.now() - CONVERSATION_AGENT_ARCHIVE_DAYS * 24 * 60 * 60 * 1000,
+    ).toISOString(),
+  );
+  if (archived > 0) {
+    logger.info(
+      { archived, retentionDays: CONVERSATION_AGENT_ARCHIVE_DAYS },
+      'Recovery: archived inactive conversation agents',
+    );
+  }
   const agents = listActiveConversationAgents();
   if (agents.length === 0) return;
 
@@ -18339,6 +18437,9 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
       account.id,
       workspace.jid,
     );
+    // Steady-state inbound messages resolve to an already-attached group;
+    // rewriting an identical row on every message was pure write amplification.
+    if (updated === group) return;
     setRegisteredGroup(jid, updated);
     registeredGroups[jid] = updated;
   };
@@ -19696,10 +19797,16 @@ async function main(): Promise<void> {
         const tenMinutesAgo = new Date(
           Date.now() - 10 * 60 * 1000,
         ).toISOString();
+        const archived = archiveInactiveConversationAgents(
+          new Date(
+            Date.now() - CONVERSATION_AGENT_ARCHIVE_DAYS * 24 * 60 * 60 * 1000,
+          ).toISOString(),
+        );
         const cleaned = deleteCompletedAgents(tenMinutesAgo);
-        if (cleaned > 0) {
+        const prunedCursors = pruneCursorState();
+        if (cleaned > 0 || archived > 0 || prunedCursors > 0) {
           logger.info(
-            { cleaned },
+            { cleaned, archived, prunedCursors },
             'Periodic cleanup: removed completed agents',
           );
         }
@@ -19762,6 +19869,34 @@ async function main(): Promise<void> {
     },
     24 * 60 * 60 * 1000,
   );
+
+  // Channel reliability retention. Every Feishu message writes 8-12 rows
+  // (inbox/turn/outbox/card) that carry full payload and snapshot JSON; the
+  // store ships a two-stage cleanup (dehydrate payloads, then delete terminal
+  // rows) that was never wired to a timer. Payloads clear after 7 days,
+  // terminal rows after 30 (matching task_runs retention; both exceed every
+  // provider replay window). The first pass runs shortly after startup so
+  // frequently-restarted deployments are not exempt from retention.
+  const runChannelReliabilityCleanup = (): void => {
+    try {
+      const result = cleanupChannelReliability({
+        payloadsBefore: new Date(
+          Date.now() - 7 * 24 * 60 * 60 * 1000,
+        ).toISOString(),
+        recordsBefore: new Date(
+          Date.now() - 30 * 24 * 60 * 60 * 1000,
+        ).toISOString(),
+      });
+      const total = Object.values(result).reduce((sum, n) => sum + n, 0);
+      if (total > 0) {
+        logger.info(result, 'Channel reliability retention pass completed');
+      }
+    } catch (err) {
+      logger.error({ err }, 'Failed channel reliability retention pass');
+    }
+  };
+  setTimeout(runChannelReliabilityCleanup, 5 * 60 * 1000);
+  setInterval(runChannelReliabilityCleanup, 24 * 60 * 60 * 1000);
 
   await ensureDockerRunning();
 

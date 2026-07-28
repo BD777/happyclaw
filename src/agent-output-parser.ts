@@ -306,9 +306,20 @@ export function attachStderrHandler(
 ): void {
   stream.on('data', (data) => {
     const chunk = data.toString();
-    const lines = chunk.trim().split('\n');
-    for (const line of lines) {
-      if (line) logger.debug(logContext, line);
+    // Runner-side operational failures are prefixed so they survive the
+    // debug-level default; without this they are invisible in production
+    // (observed: every workspace-memory snapshot failure was dropped).
+    const hasRunnerWarning = chunk.includes('[agent-runner:warn]');
+    if (hasRunnerWarning || logger.isLevelEnabled('debug')) {
+      const lines = chunk.trim().split('\n');
+      for (const line of lines) {
+        if (!line) continue;
+        if (line.includes('[agent-runner:warn]')) {
+          logger.warn(logContext, line);
+        } else {
+          logger.debug(logContext, line);
+        }
+      }
     }
     // Don't reset timeout on stderr — SDK writes debug logs continuously.
     // Timeout only resets on actual output (OUTPUT_MARKER in stdout).

@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { compress } from 'hono/compress';
 import { cors } from 'hono/cors';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
@@ -233,6 +234,12 @@ function isAllowedOrigin(origin: string | undefined): string | null {
   }
   return null;
 }
+
+// Response compression for API JSON and static assets (WebSocket upgrades
+// never reach the response path). The 1.74MB entry bundle previously left the
+// origin uncompressed on every load; gzip brings it to ~30%. Compressible
+// content types and a 1KB threshold are filtered by the middleware itself.
+app.use(compress());
 
 app.use(
   '/api/*',

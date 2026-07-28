@@ -811,6 +811,15 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
+/**
+ * Failures the operator must see. The host consumes runner stderr at debug
+ * level, so plain log() lines vanish from production logs entirely; this
+ * prefix is elevated to warn by the host's stderr handler.
+ */
+function logWarn(message: string): void {
+  console.error(`[agent-runner:warn] ${message}`);
+}
+
 function generateTurnId(): string {
   return `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -1732,7 +1741,7 @@ async function runQueryAttempt(
         { result: null, block: '' },
       ];
   if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
-    log(
+    logWarn(
       'Workspace memory snapshot unavailable; continuing this turn without durable memory context',
     );
   }
@@ -2166,7 +2175,7 @@ async function runQueryAttempt(
             { result: null, block: '' },
           ];
       if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
-        log(
+        logWarn(
           'Workspace memory snapshot unavailable for warm turn; continuing without durable memory context',
         );
       }

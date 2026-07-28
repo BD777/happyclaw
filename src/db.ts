@@ -100,7 +100,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 66;
+export const CURRENT_SCHEMA_VERSION = 67;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -470,21 +470,45 @@ export function initDatabase(): void {
   // Enable WAL mode for better concurrency and performance only after the
   // upgrade backup gate has completed without mutating the source schema.
   db.exec('PRAGMA journal_mode = WAL');
+  // WAL + NORMAL is the documented safe pairing: commits stop fsyncing the
+  // WAL on every transaction (measured 21x on this driver's synchronous
+  // writes) while checkpoints still sync. Worst case on power loss is losing
+  // the last instants of committed work, never corruption.
+  db.exec('PRAGMA synchronous = NORMAL');
+  db.exec('PRAGMA temp_store = MEMORY');
   reportKnownForeignKeyOrphans();
   // Enable foreign-key enforcement. SQLite defaults to OFF for backward
   // compatibility, so all FK declarations on existing schemas are silent
-  // no-ops without this PRAGMA. We log existing orphans (if any) but only
-  // for visibility — enforcement is reset to OFF when violations exist
-  // because turning it on with violations would refuse the next write.
-  // Operators can clean up via PRAGMA foreign_key_check then restart.
+  // no-ops without this PRAGMA. `messages → chats` orphans are the residue of
+  // an interrupted chat-deletion cascade, so completing that cascade here is
+  // safe and keeps enforcement on. Any other violation class (e.g. billing
+  // rows deliberately preserved for operator review) still resets enforcement
+  // to OFF, because turning it on with violations would refuse the next write.
   try {
     db.exec('PRAGMA foreign_keys = ON');
-    const violations = db.prepare('PRAGMA foreign_key_check').all() as Array<{
+    let violations = db.prepare('PRAGMA foreign_key_check').all() as Array<{
       table: string;
       rowid: number;
       parent: string;
       fkid: number;
     }>;
+    const messageOrphans = violations.filter(
+      (v) => v.table === 'messages' && v.parent === 'chats',
+    );
+    if (messageOrphans.length > 0 && tableExists('chats')) {
+      const repaired = db
+        .prepare(
+          'DELETE FROM messages WHERE chat_jid NOT IN (SELECT jid FROM chats)',
+        )
+        .run().changes;
+      logger.info(
+        { repaired },
+        'Removed orphaned messages left behind by an interrupted chat deletion',
+      );
+      violations = db
+        .prepare('PRAGMA foreign_key_check')
+        .all() as typeof violations;
+    }
     if (violations.length > 0) {
       const summary = violations
         .slice(0, 10)
@@ -2400,6 +2424,26 @@ export function initDatabase(): void {
       logger.info(
         { migratedRows },
         'Separated legacy Feishu quoted context from canonical message content',
+      );
+    }
+  }
+
+  // v66 -> v67: drop the legacy pre-v65 memory chunk index. Workspace Memory
+  // v2 (workspace_memory_* tables) replaced it; no code path reads or writes
+  // memory_chunks anymore, yet with its FTS shadow tables it dominated
+  // production database size (65% of the file, zero writes for months).
+  const memoryChunksSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (memoryChunksSchemaVersion < 67) {
+    const hadLegacyChunks = tableExists('memory_chunks');
+    db.exec(`
+      DROP TABLE IF EXISTS memory_chunks_fts;
+      DROP TABLE IF EXISTS memory_chunks;
+    `);
+    if (hadLegacyChunks) {
+      logger.info(
+        'Dropped legacy memory_chunks tables superseded by Workspace Memory v2',
       );
     }
   }
@@ -6669,6 +6713,30 @@ export function setRouterState(key: string, value: string): void {
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run(key, value);
+}
+
+/**
+ * Persist several router_state keys in one transaction. The cursor save path
+ * runs on every processed message batch; four independent auto-committed
+ * writes meant four WAL syncs where one suffices.
+ */
+export function setRouterStateBatch(
+  entries: ReadonlyArray<readonly [key: string, value: string]>,
+): void {
+  if (entries.length === 0) return;
+  const stmt = db.prepare(
+    'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
+  );
+  db.transaction(() => {
+    for (const [key, value] of entries) stmt.run(key, value);
+  })();
+}
+
+/** All chat JIDs currently present, for cursor-map pruning. */
+export function getAllChatJids(): string[] {
+  return (
+    db.prepare('SELECT jid FROM chats').all() as Array<{ jid: string }>
+  ).map((row) => row.jid);
 }
 
 export function deleteRouterState(key: string): void {
@@ -11317,6 +11385,26 @@ export function deleteCompletedAgents(beforeTimestamp: string): number {
       "DELETE FROM agents WHERE kind IN ('task', 'spawn') AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
     )
     .run(beforeTimestamp);
+  return result.changes;
+}
+
+/**
+ * Archive conversation/spawn sessions with no activity since the cutoff.
+ * Rows stay resolvable (thread bindings keep pointing at them), so a new
+ * message in an old topic still revives the same session; archived rows just
+ * stop participating in startup recovery, which otherwise grows unboundedly.
+ */
+export function archiveInactiveConversationAgents(
+  beforeTimestamp: string,
+): number {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE agents SET status = 'completed', completed_at = ?
+       WHERE kind IN ('conversation', 'spawn') AND status IN ('running', 'idle')
+         AND COALESCE(last_active_at, created_at) < ?`,
+    )
+    .run(now, beforeTimestamp);
   return result.changes;
 }
 

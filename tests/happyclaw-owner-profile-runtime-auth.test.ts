@@ -5,6 +5,7 @@ import {
   agentBuilderTurnScope,
   getAgentBuilderRuntimeRejection,
   isAgentBuilderOwnerInput,
+  isOwnerProfileOwnerInput,
   type AgentBuilderPersistedInput,
 } from '../src/agent-builder-turn-auth.js';
 
@@ -271,6 +272,94 @@ describe('HappyClaw Owner Profile actual sender identity', () => {
           owner_im_id: 'ou_owner',
           owner_claim_source: 'explicit',
         }),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('HappyClaw Owner Profile home-anchored sender identity', () => {
+  const registered = (jid: string) =>
+    jid.startsWith('feishu:') ? { created_by: 'owner-1' } : undefined;
+  const homeFeishuOwner = (provider: string) =>
+    provider === 'feishu' ? ['ou_owner'] : [];
+
+  test('accepts the owner in a Home topic group that never captured owner_im_id', () => {
+    // Production regression: legacy topic groups have a NULL owner claim, but
+    // sibling Home registrations anchor the same human via auto_feishu.
+    expect(
+      isOwnerProfileOwnerInput(
+        {
+          sender: 'ou_owner',
+          source_jid: 'feishu:legacy-topic#thread:t1#root:r1',
+        },
+        'owner-1',
+        registered,
+        homeFeishuOwner,
+      ),
+    ).toBe(true);
+  });
+
+  test('rejects a non-owner group member and an unknown source chat', () => {
+    expect(
+      isOwnerProfileOwnerInput(
+        { sender: 'ou_member', source_jid: 'feishu:legacy-topic' },
+        'owner-1',
+        registered,
+        homeFeishuOwner,
+      ),
+    ).toBe(false);
+    expect(
+      isOwnerProfileOwnerInput(
+        { sender: 'ou_owner', source_jid: 'feishu:unregistered' },
+        'owner-1',
+        () => undefined,
+        homeFeishuOwner,
+      ),
+    ).toBe(false);
+    expect(
+      isOwnerProfileOwnerInput(
+        { sender: 'ou_owner', source_jid: 'feishu:legacy-topic' },
+        'owner-1',
+        () => ({ created_by: 'different-owner' }),
+        homeFeishuOwner,
+      ),
+    ).toBe(false);
+  });
+
+  test('anchored identities never cross providers', () => {
+    expect(
+      isOwnerProfileOwnerInput(
+        { sender: 'qq:ou_owner', source_jid: 'qq:c2c:ou_owner' },
+        'owner-1',
+        () => ({ created_by: 'owner-1' }),
+        homeFeishuOwner,
+      ),
+    ).toBe(false);
+  });
+
+  test('an empty anchor set fails closed and web turns stay user-id matched', () => {
+    expect(
+      isOwnerProfileOwnerInput(
+        { sender: 'ou_owner', source_jid: 'feishu:legacy-topic' },
+        'owner-1',
+        registered,
+        () => [],
+      ),
+    ).toBe(false);
+    expect(
+      isOwnerProfileOwnerInput(
+        { sender: 'owner-1', source_jid: 'web:home' },
+        'owner-1',
+        () => undefined,
+        () => [],
+      ),
+    ).toBe(true);
+    expect(
+      isOwnerProfileOwnerInput(
+        { sender: 'someone-else', source_jid: 'web:home' },
+        'owner-1',
+        () => undefined,
+        () => [],
       ),
     ).toBe(false);
   });

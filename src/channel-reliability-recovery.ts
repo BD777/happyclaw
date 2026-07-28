@@ -188,7 +188,17 @@ async function reconcileChannelReliabilityPass(
     fencedTurnIds.size +
     deliveredEffectTurns +
     interruptExpiredChannelTurnRuns();
-  logger.info(
+  // The live timer fires every 15s and almost always reconciles nothing;
+  // logging each no-op pass at info drowned out real events (87% of all
+  // production log records were all-zero lines from this call site).
+  const logLevel =
+    reconciled > 0 ||
+    deferred > 0 ||
+    interruptedTurns > 0 ||
+    options.mode === 'startup'
+      ? ('info' as const)
+      : ('debug' as const);
+  logger[logLevel](
     { reconciled, deferred, interruptedTurns, mode: options.mode },
     'Channel reliability reconciliation completed',
   );

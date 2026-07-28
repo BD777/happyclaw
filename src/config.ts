@@ -7,6 +7,9 @@ import { promisify } from 'node:util';
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'HappyClaw';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
+// Conversation/spawn sessions with no activity for this long are archived to
+// 'completed'; a new message in the bound thread still revives the session.
+export const CONVERSATION_AGENT_ARCHIVE_DAYS = 30;
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();

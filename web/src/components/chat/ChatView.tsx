@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import {
@@ -41,7 +49,11 @@ import { useTheme } from '../../hooks/useTheme';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../../api/ws';
 import { api } from '../../api/client';
-import { TerminalPanel } from './TerminalPanel';
+// xterm.js is ~488KB and most sessions never open the terminal; keep it out
+// of the chat chunk until the panel is actually mounted.
+const TerminalPanel = lazy(() =>
+  import('./TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
+);
 import { ImBindingDialog } from './ImBindingDialog';
 import { SessionSidebar } from './SessionSidebar';
 import { showToast } from '../../utils/toast';
@@ -1151,15 +1163,17 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               }`}
               style={{ height: terminalVisible ? terminalHeight : 0 }}
             >
-              <TerminalPanel
-                groupJid={groupJid}
-                visible={terminalVisible}
-                onHide={() => setTerminalVisible(false)}
-                onDelete={() => {
-                  setTerminalVisible(false);
-                  setTerminalMounted(false);
-                }}
-              />
+              <Suspense fallback={null}>
+                <TerminalPanel
+                  groupJid={groupJid}
+                  visible={terminalVisible}
+                  onHide={() => setTerminalVisible(false)}
+                  onDelete={() => {
+                    setTerminalVisible(false);
+                    setTerminalMounted(false);
+                  }}
+                />
+              </Suspense>
             </div>
           </>
         )}
@@ -1215,12 +1229,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             </SheetDescription>
           </SheetHeader>
           <div className="flex-1 overflow-hidden h-[calc(85dvh-56px)]">
-            <TerminalPanel
-              groupJid={groupJid}
-              visible
-              onHide={() => setMobileTerminal(false)}
-              onDelete={() => setMobileTerminal(false)}
-            />
+            <Suspense fallback={null}>
+              <TerminalPanel
+                groupJid={groupJid}
+                visible
+                onHide={() => setMobileTerminal(false)}
+                onDelete={() => setMobileTerminal(false)}
+              />
+            </Suspense>
           </div>
         </SheetContent>
       </Sheet>

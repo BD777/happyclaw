@@ -12,10 +12,6 @@ import { RegisterPage } from './pages/RegisterPage';
 import { SetupPage } from './pages/SetupPage';
 import { SetupProvidersPage } from './pages/SetupProvidersPage';
 import { SetupChannelsPage } from './pages/SetupChannelsPage';
-import { MemoryPage } from './pages/MemoryPage';
-import { UsersPage } from './pages/UsersPage';
-import { MonitorPage } from './pages/MonitorPage';
-import { CapabilitiesPage } from './pages/CapabilitiesPage';
 import { AuthGuard } from './components/auth/AuthGuard';
 import { AppLayout } from './components/layout/AppLayout';
 import { APP_BASE, shouldUseHashRouter } from './utils/url';
@@ -38,6 +34,24 @@ const AgentProfilesPage = lazy(() =>
 const BillingPage = lazy(() => import('./pages/BillingPage'));
 const UsagePage = lazy(() =>
   import('./pages/UsagePage').then((m) => ({ default: m.UsagePage })),
+);
+// These four were the only synchronous authed routes left. CapabilitiesPage in
+// particular statically pulls SkillsPage → MarkdownRenderer → KaTeX +
+// highlight.js, which hoisted that whole chain into the entry chunk (~1.74MB
+// raw, 517KB gzip) and made even /login download it.
+const MemoryPage = lazy(() =>
+  import('./pages/MemoryPage').then((m) => ({ default: m.MemoryPage })),
+);
+const UsersPage = lazy(() =>
+  import('./pages/UsersPage').then((m) => ({ default: m.UsersPage })),
+);
+const MonitorPage = lazy(() =>
+  import('./pages/MonitorPage').then((m) => ({ default: m.MonitorPage })),
+);
+const CapabilitiesPage = lazy(() =>
+  import('./pages/CapabilitiesPage').then((m) => ({
+    default: m.CapabilitiesPage,
+  })),
 );
 
 function UsageRouteFallback() {
@@ -128,7 +142,9 @@ const appRoutes = createRoutesFromElements(
         path="/monitor"
         element={
           <AuthGuard requiredPermission="manage_system_config">
-            <MonitorPage />
+            <Suspense fallback={null}>
+              <MonitorPage />
+            </Suspense>
           </AuthGuard>
         }
       />
@@ -148,8 +164,22 @@ const appRoutes = createRoutesFromElements(
           </Suspense>
         }
       />
-      <Route path="/memory" element={<MemoryPage />} />
-      <Route path="/capabilities/:section?" element={<CapabilitiesPage />} />
+      <Route
+        path="/memory"
+        element={
+          <Suspense fallback={null}>
+            <MemoryPage />
+          </Suspense>
+        }
+      />
+      <Route
+        path="/capabilities/:section?"
+        element={
+          <Suspense fallback={null}>
+            <CapabilitiesPage />
+          </Suspense>
+        }
+      />
       <Route
         path="/skills"
         element={<Navigate to="/capabilities/skills" replace />}
@@ -180,7 +210,9 @@ const appRoutes = createRoutesFromElements(
               'view_audit_log',
             ]}
           >
-            <UsersPage />
+            <Suspense fallback={null}>
+              <UsersPage />
+            </Suspense>
           </AuthGuard>
         }
       />

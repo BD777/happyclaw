@@ -89,6 +89,7 @@ export class OwnerProfileStoreError extends Error {
   constructor(
     public readonly code:
       | 'not_home_workspace'
+      | 'not_owner_turn'
       | 'invalid_address'
       | 'revision_conflict'
       | 'idempotency_conflict'

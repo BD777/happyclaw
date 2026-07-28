@@ -583,7 +583,7 @@ describe('HappyClaw owner introduction onboarding state', () => {
       legacy
         .prepare(`SELECT value FROM router_state WHERE key = 'schema_version'`)
         .get(),
-    ).toEqual({ value: '66' });
+    ).toEqual({ value: String(db.CURRENT_SCHEMA_VERSION) });
     legacy
       .prepare(
         `UPDATE workspace_onboarding_states

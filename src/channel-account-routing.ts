@@ -30,6 +30,9 @@ export function resolveChannelAccountFallbackWorkspace(
  * Attach an inbound chat to its channel account without changing a binding the
  * user already selected. Account defaults are only a registration fallback;
  * they must never turn every subsequent IM message into a binding update.
+ * Returns the input object unchanged when nothing needs to move, so callers
+ * can skip persistence — every inbound message funnels through this path, and
+ * an unconditional setRegisteredGroup costs ~10 statements per message.
  */
 export function applyChannelAccountRegistrationFallback(
   group: RegisteredGroup,
@@ -39,9 +42,14 @@ export function applyChannelAccountRegistrationFallback(
   const hasExplicitBinding = Boolean(
     group.target_main_jid || group.target_agent_id,
   );
+  const nextAccountId = group.channel_account_id ?? accountId;
+  const changed =
+    nextAccountId !== group.channel_account_id ||
+    (!hasExplicitBinding && group.target_main_jid !== fallbackWorkspaceJid);
+  if (!changed) return group;
   return {
     ...group,
-    channel_account_id: group.channel_account_id ?? accountId,
+    channel_account_id: nextAccountId,
     ...(hasExplicitBinding ? {} : { target_main_jid: fallbackWorkspaceJid }),
   };
 }
