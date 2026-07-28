@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import {
   createWorkspaceMemoryItem,
   forgetWorkspaceMemoryItem,
+  getMutableWorkspaceMemoryItem,
   getWorkspaceMemoryItem,
   listRecallableWorkspaceMemoryItems,
   listWorkspaceMemoryItems,
@@ -82,7 +83,8 @@ export class WorkspaceMemoryServiceError extends Error {
       | 'not_found'
       | 'invalid_request'
       | 'revision_conflict'
-      | 'idempotency_conflict',
+      | 'idempotency_conflict'
+      | 'reserved_canonical_key',
     message: string,
     public readonly details?: {
       currentRevision?: number;
@@ -225,6 +227,13 @@ function translateStoreError(error: unknown): never {
   if (error.code === 'idempotency_conflict') {
     throw new WorkspaceMemoryServiceError(
       'idempotency_conflict',
+      error.message,
+      error.details,
+    );
+  }
+  if (error.code === 'reserved_canonical_key') {
+    throw new WorkspaceMemoryServiceError(
+      'reserved_canonical_key',
       error.message,
       error.details,
     );
@@ -450,7 +459,7 @@ export function updateWorkspaceMemory(
   if (Object.keys(patch).length === 0) invalid('No memory fields to update');
   validateValue(patch, false);
   try {
-    const current = getWorkspaceMemoryItem(
+    const current = getMutableWorkspaceMemoryItem(
       input.workspaceJid,
       input.itemId,
     ).item;

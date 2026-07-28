@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { WebDeps } from './web-context.js';
 import {
   computeAgentProfileIdentityHash,
@@ -10,6 +12,24 @@ import {
 import { getSystemSettings } from './runtime-config.js';
 import type { AgentProfile, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+
+/**
+ * The built-in HappyClaw identity is code-owned rather than persisted in an
+ * editable AgentProfile field. Bump this version whenever the protected
+ * identity contract changes so existing SDK sessions restart under it.
+ */
+export const HAPPYCLAW_PLATFORM_IDENTITY_VERSION = 1;
+
+export function bindHappyClawPlatformIdentityHash(
+  identityHash: string,
+): string {
+  return createHash('sha256')
+    .update(
+      `happyclaw-platform-identity:v${HAPPYCLAW_PLATFORM_IDENTITY_VERSION}\0${identityHash}`,
+      'utf8',
+    )
+    .digest('hex');
+}
 
 export interface AgentProfileWorkspace {
   jid: string;
@@ -67,13 +87,16 @@ export function resolveEffectiveAgentProfile(
     },
     skills: effectiveSkills,
   };
+  const effectiveIdentityHash = computeAgentProfileIdentityHash(
+    profile,
+    effectiveRuntimePolicy,
+    profile.name,
+  );
   return {
     ...profile,
-    identity_hash: computeAgentProfileIdentityHash(
-      profile,
-      effectiveRuntimePolicy,
-      profile.name,
-    ),
+    identity_hash: profile.is_default
+      ? bindHappyClawPlatformIdentityHash(effectiveIdentityHash)
+      : effectiveIdentityHash,
     runtime_policy: effectiveRuntimePolicy,
   };
 }

@@ -5,21 +5,48 @@ Session 仍可复用的内容，并以 Workspace 作为唯一产品入口和权�
 
 ## 产品边界
 
-HappyClaw 的相关数据分成两个彼此独立的层次：
+HappyClaw 的相关数据分成三个彼此独立的层次：
 
-| 层次             | 用途                                     | 删除/忘记语义                    |
-| ---------------- | ---------------------------------------- | -------------------------------- |
-| Session 历史     | 一段对话的消息、工具轨迹与即时上下文     | 由 Session/消息管理功能单独处理  |
-| Workspace Memory | 同一 Workspace 跨 Session 复用的提炼知识 | 忘记后不再检索，但保留修订审计线 |
+| 层次                   | 用途                                     | 生命周期                         |
+| ---------------------- | ---------------------------------------- | -------------------------------- |
+| 平台/AgentProfile 身份 | Agent 是谁、平台规则和能力策略           | 配置或代码版本管理，不可被忘记   |
+| Home Owner Profile     | 内置 HappyClaw 如何称呼实际 owner        | Home 跨 Session，专用 API 管理   |
+| Session 历史           | 一段对话的消息、工具轨迹与即时上下文     | 由 Session/消息管理功能单独处理  |
+| Workspace Memory       | 同一 Workspace 跨 Session 复用的提炼知识 | 忘记后不再检索，但保留修订审计线 |
 
 因此：
 
 - Memory 页面先选择 Workspace，只查询该 Workspace 的数据。
+- 内置 HappyClaw 的平台身份和安全约束不是 Memory；自定义 Agent 的身份由各自
+  AgentProfile 管理，也不会继承 HappyClaw 的内置身份。
 - Workspace Memory 不是用户全局 Profile，也不会在不同 Workspace 之间共享。
 - Session、日期和任意文件路径不是 Memory 页面中的可浏览“记忆源”。
 - 来源 Session 只用于回溯 provenance；忘记一条 Memory 不会删除 Session 或聊天
   历史。
 - Workspace 文件仍通过文件功能管理，不能通过 Memory API 任意读取或改写。
+
+### Home、Agent 与首次唤醒
+
+- 每个用户的 Home Workspace 永久绑定内置 HappyClaw，不能删除或迁移给自定义
+  Agent。
+- `POST /api/agent-profiles` 只创建自定义 AgentProfile，不自动创建 Workspace、
+  Session 或 Memory，也不继承 Home 的任何内容。
+- 非 Home Workspace 可以由用户显式迁移到另一个 Agent。文件、Session、渠道挂载和
+  Workspace Memory 均跟随 Workspace 保留；迁移不是复制。
+- HappyClaw 只在 Home、内置默认 AgentProfile、实际 owner 的人类交互轮次中运行
+  首次唤醒。宿主用 `workspace_onboarding_states` 原子 claim 一次 lease；只有新 claim
+  的 turn 可以说一次“刚醒来”。同一 lease 的后续消息可以完成设置，但不能重复
+  first-wake。
+- 称呼通过专用 `happyclaw_owner_profile` 工具或
+  `/api/workspaces/:jid/owner-profile` 管理。owner 明确拒绝时记录 `skipped`；
+  清空称呼保持 onboarding 已完成，不会重新触发。
+- 物理唯一真相仍是 Workspace Memory item
+  `happyclaw.owner.preferred_address`，因此沿用 revision、provenance、audit、outbox
+  和 CAS；但它是平台保留项，通用 Memory 的 create/update/forget、列表、详情、
+  versions、搜索、FTS 和 Runtime snapshot 均不暴露它。旧库重复项先确定性收敛，
+  再建立数据库唯一索引。
+- Scheduled Run、Task/Spawn Sub-Agent、自定义 AgentProfile、终端预热和 Home
+  中的非 owner 群成员 turn 都没有 Owner Profile 投影或修改权限。
 
 ## 知识类型
 
@@ -70,6 +97,12 @@ Workspace 有独立的 store revision，每个 item 有单独的 revision：
 Agent Runtime 还按执行上下文收紧写权限：顶层交互式 Main/Runtime Session 可按
 Workspace ACL 读写；Scheduled Run（group/isolated）和 SDK Task Sub-Agent
 只能读取，不能创建、更新或忘记 Memory。
+
+Owner Profile 的边界更严格：只允许 Home 内置 HappyClaw 的 Main/普通 Runtime
+Session，并且宿主必须把本次持久化消息 sender 验证为实际 owner。每个 cold/warm
+turn 都单独读取最新投影；排队 turn 只能用自己的 host-issued turn ID 读取，
+set/clear/skip 还必须是当前 active turn。SDK Sub-Agent 对整个专用工具（包括
+`get`）均被 hook 拒绝。
 
 ## Web 交互
 

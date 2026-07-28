@@ -395,4 +395,110 @@ export class AgentBuilderTurnRegistry {
     }
     return { ...current.turn, content: current.input.content };
   }
+
+  /**
+   * Authorize only the host-owned batch executing right now. Unlike Agent
+   * Builder confirmation, Owner Profile IPC must never let a future queued
+   * owner turn lend authority to the current runner call.
+   */
+  requireExactActiveOwnerHumanTurn(
+    folder: string,
+    runtimeTurnId: string | null | undefined,
+    loadPersistedInput: (
+      chatJid: string,
+      messageId: string,
+    ) => AgentBuilderPersistedInput | null,
+    isOwnerInput: (input: AgentBuilderPersistedInput) => boolean,
+  ): AgentBuilderTurnContext & { content: string } {
+    const active = this.active.get(folder);
+    if (
+      !active?.length ||
+      !runtimeTurnId ||
+      active.some((turn) => turn.runtimeTurnId !== runtimeTurnId)
+    ) {
+      throw new Error(
+        'Owner Profile requires the exact active conversation turn',
+      );
+    }
+    const observed = active.map((turn) => ({
+      turn,
+      input: loadPersistedInput(turn.chatJid, turn.messageId),
+    }));
+    for (const { turn, input } of observed) {
+      if (
+        !input ||
+        input.is_from_me !== 0 ||
+        turn.scheduledTaskId !== null ||
+        input.task_id !== null ||
+        input.source_kind === 'scheduled_task_prompt'
+      ) {
+        throw new Error(
+          'Owner Profile is unavailable for scheduled or non-human turns',
+        );
+      }
+      if (!isOwnerInput(input)) {
+        throw new Error(
+          'Only the actual workspace owner may use Owner Profile',
+        );
+      }
+    }
+    const current = observed[observed.length - 1];
+    if (!current?.input) {
+      throw new Error(
+        'Owner Profile requires the exact active conversation turn',
+      );
+    }
+    return { ...current.turn, content: current.input.content };
+  }
+
+  /**
+   * Read-only per-turn projection resolver. It may address an already
+   * host-admitted queued batch, but only by that batch's exact runtimeTurnId;
+   * its owner identity can never authorize a mutation for another turn.
+   */
+  requireExactOwnerHumanTurn(
+    folder: string,
+    runtimeTurnId: string | null | undefined,
+    loadPersistedInput: (
+      chatJid: string,
+      messageId: string,
+    ) => AgentBuilderPersistedInput | null,
+    isOwnerInput: (input: AgentBuilderPersistedInput) => boolean,
+  ): AgentBuilderTurnContext & { content: string } {
+    if (!runtimeTurnId) {
+      throw new Error('Owner Profile requires an admitted conversation turn');
+    }
+    const batches = [
+      ...(this.active.has(folder) ? [this.active.get(folder)!] : []),
+      ...(this.queued.get(folder) ?? []),
+    ];
+    const exact = batches.find(
+      (batch) =>
+        batch.length > 0 &&
+        batch.every((turn) => turn.runtimeTurnId === runtimeTurnId),
+    );
+    if (!exact) {
+      throw new Error('Owner Profile requires an admitted conversation turn');
+    }
+    const observed = exact.map((turn) => ({
+      turn,
+      input: loadPersistedInput(turn.chatJid, turn.messageId),
+    }));
+    for (const { turn, input } of observed) {
+      if (
+        !input ||
+        input.is_from_me !== 0 ||
+        turn.scheduledTaskId !== null ||
+        input.task_id !== null ||
+        input.source_kind === 'scheduled_task_prompt' ||
+        !isOwnerInput(input)
+      ) {
+        throw new Error(
+          'Owner Profile projection is unavailable for this turn',
+        );
+      }
+    }
+    const current = observed[observed.length - 1];
+    return { ...current.turn, content: current.input!.content };
+  }
 }

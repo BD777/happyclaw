@@ -83,10 +83,22 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
     └── Scheduled Run（定时任务的普通或隔离运行）
 ```
 
+- **内置 HappyClaw** 是不可删除的平台主 Agent，拥有代码级固定身份，理解
+  Workspace、Session、Agent Builder、渠道、任务、Skills/MCP、Provider 和权限
+  模型；这些规则不存放在可遗忘的 Memory 中。
+- **首次唤醒** 只面向 Home Workspace 中经过宿主验证的实际 owner。HappyClaw
+  用简短的“刚醒来”话语询问称呼，并通过专用 Owner Profile 保存；并发会话使用
+  onboarding lease，后续新 Session 或服务重启不会重复表演。清空称呼也不会重置
+  onboarding。
 - **智能体** 保存长期身份和能力策略。主 HappyClaw 智能体始终存在，也可以创建代码审查、研究、运维等自定义智能体。
 - **对话式智能体构建器** 在主 HappyClaw 名下的所有 Workspace 主会话与普通 Runtime Session 中生效，允许用户多轮讨论需求、保存并预览智能体草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新智能体；定时任务与 Sub-Agent 不能代替用户发布。
-- **Workspace** 是私有的文件与执行隔离边界。创建时必须选择智能体，后续可以迁移归属。
-- **Workspace Memory** 是该工作区跨 Session 复用的结构化知识，不是用户全局记忆，也不是任意文件或日期归档。
+- **Home Workspace** 是不可删除的系统工作区，并永久归属内置 HappyClaw。
+- **自定义 Agent** 创建后没有隐式 Workspace、Session 或 Memory；用户需要显式
+  新建 Workspace 或迁移一个非 Home Workspace，避免继承 HappyClaw 上下文。
+- **Workspace** 是私有的文件与执行隔离边界。创建时必须选择智能体，非 Home
+  Workspace 后续可以迁移归属；文件、Session、渠道绑定和 Memory 会随 Workspace
+  保留。
+- **Workspace Memory** 是该工作区跨 Session 复用的结构化知识，不是用户全局记忆，也不是任意文件或日期归档。主人称呼由 Home 专用 Owner Profile facade 管理，不出现在通用 Memory 搜索、快照或修改接口中。
 - **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层智能体；Session 历史与 Workspace Memory 分开保存，忘记一条 Memory 不会删除聊天历史。
 - **Channel Mount** 把 IM 群聊、私聊或原生话题挂载到工作区或具体会话。
 

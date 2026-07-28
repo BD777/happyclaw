@@ -8,6 +8,8 @@ import {
 describe('HappyClaw PromptPlan', () => {
   test('keeps identity first and includes only capabilities that are active', () => {
     const plan = buildHappyClawPromptPlan({
+      platformIdentity: 'built-in HappyClaw identity',
+      platformBootstrap: 'first wake',
       agentIdentity: '<agent-identity>MAIN_MARKER</agent-identity>',
       interaction: 'interaction',
       security: 'security',
@@ -19,6 +21,8 @@ describe('HappyClaw PromptPlan', () => {
     });
 
     expect(plan.blocks.map((block) => block.id)).toEqual([
+      'identity.happyclaw',
+      'bootstrap.happyclaw',
       'agent-profile',
       'interaction',
       'security-rules',
@@ -35,6 +39,16 @@ describe('HappyClaw PromptPlan', () => {
       false,
     );
     expect(plan.blocks[0]).toMatchObject({
+      owner: 'platform',
+      scope: 'main',
+      required: true,
+    });
+    expect(plan.blocks[1]).toMatchObject({
+      owner: 'platform',
+      scope: 'main',
+      required: false,
+    });
+    expect(plan.blocks[2]).toMatchObject({
       owner: 'agent_profile',
       scope: 'main',
       required: false,
@@ -42,6 +56,22 @@ describe('HappyClaw PromptPlan', () => {
     expect(plan.blocks.find((block) => block.id === 'web-fetch')).toMatchObject(
       { condition: 'WebSearch or WebFetch is available' },
     );
+  });
+
+  test('does not inject built-in identity or bootstrap into a custom Agent', () => {
+    const plan = buildHappyClawPromptPlan({
+      agentIdentity: 'custom identity',
+      interaction: 'interaction',
+      security: 'security',
+      output: 'output',
+    });
+
+    expect(plan.blocks.map((block) => block.id)).toEqual([
+      'agent-profile',
+      'interaction',
+      'security-rules',
+      'output',
+    ]);
   });
 
   test('hashes are deterministic and content-sensitive', () => {

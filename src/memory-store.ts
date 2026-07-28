@@ -36,6 +36,11 @@ export type WorkspaceMemorySourceType =
   | 'scheduled_task'
   | 'migration';
 
+/** One durable Home Workspace fact completes HappyClaw's first-wake ritual. */
+export const HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY =
+  'happyclaw.owner.preferred_address';
+const HAPPYCLAW_OWNER_PROFILE_MEMORY_NAMESPACE = 'happyclaw.owner-profile';
+
 export interface WorkspaceMemoryProvenance {
   sourceType: WorkspaceMemorySourceType;
   sourceId: string | null;
@@ -140,7 +145,8 @@ export class WorkspaceMemoryStoreError extends Error {
       | 'store_not_found'
       | 'item_not_found'
       | 'revision_conflict'
-      | 'idempotency_conflict',
+      | 'idempotency_conflict'
+      | 'reserved_canonical_key',
     message: string,
     public readonly details?: {
       currentRevision?: number;
@@ -170,6 +176,20 @@ function nowIso(): string {
 function normalizeNullable(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+function isReservedCanonicalKey(value: string | null | undefined): boolean {
+  return (
+    normalizeNullable(value) === HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY
+  );
+}
+
+function rejectReservedCanonicalKey(value: string | null | undefined): void {
+  if (!isReservedCanonicalKey(value)) return;
+  throw new WorkspaceMemoryStoreError(
+    'reserved_canonical_key',
+    'This canonical key is owned by the HappyClaw Owner Profile service',
+  );
 }
 
 function mapItem(row: MemoryItemRow): WorkspaceMemoryItem {
@@ -295,6 +315,48 @@ function requireItem(
   return mapItem(row);
 }
 
+/**
+ * Duplicate reconciliation clears the losing row's current canonical key so a
+ * cross-status unique index can be installed. Its immutable versions still
+ * mark the row as platform-owned; generic APIs must continue treating it as a
+ * reserved item rather than exposing the retired preferred address.
+ */
+function isReservedMemoryItem(item: WorkspaceMemoryItem): boolean {
+  if (isReservedCanonicalKey(item.canonicalKey)) return true;
+  return Boolean(
+    requireDatabase()
+      .prepare(
+        `SELECT 1
+         FROM workspace_memory_platform_items
+         WHERE item_id = ?
+         UNION ALL
+         SELECT 1
+         FROM workspace_memory_versions
+         WHERE item_id = ? AND canonical_key = ?
+         LIMIT 1`,
+      )
+      .get(item.id, item.id, HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY),
+  );
+}
+
+function markPlatformMemoryItem(itemId: string, at: string): void {
+  requireDatabase()
+    .prepare(
+      `INSERT OR IGNORE INTO workspace_memory_platform_items (
+        item_id, namespace, created_at
+      ) VALUES (?, ?, ?)`,
+    )
+    .run(itemId, HAPPYCLAW_OWNER_PROFILE_MEMORY_NAMESPACE, at);
+}
+
+function rejectReservedMemoryItem(item: WorkspaceMemoryItem): void {
+  if (!isReservedMemoryItem(item)) return;
+  throw new WorkspaceMemoryStoreError(
+    'reserved_canonical_key',
+    'This memory item is owned by the HappyClaw Owner Profile service',
+  );
+}
+
 function appendVersion(
   item: WorkspaceMemoryItem,
   changeType: WorkspaceMemoryChangeType,
@@ -397,7 +459,9 @@ function appendAuditAndOutbox(
 function replaceFts(item: WorkspaceMemoryItem): void {
   const db = requireDatabase();
   db.prepare('DELETE FROM workspace_memory_fts WHERE item_id = ?').run(item.id);
-  if (item.status !== 'active') return;
+  if (item.status !== 'active' || isReservedMemoryItem(item)) {
+    return;
+  }
   db.prepare(
     `INSERT INTO workspace_memory_fts (
       item_id, workspace_jid, title, content, canonical_key
@@ -492,6 +556,15 @@ export function createWorkspaceMemorySchema(db: SqliteDatabase): void {
     );
     CREATE INDEX IF NOT EXISTS idx_workspace_memory_versions_workspace_created
       ON workspace_memory_versions(workspace_jid, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS workspace_memory_platform_items (
+      item_id TEXT PRIMARY KEY,
+      namespace TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (item_id) REFERENCES workspace_memory_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_memory_platform_namespace
+      ON workspace_memory_platform_items(namespace, item_id);
 
     CREATE TABLE IF NOT EXISTS workspace_memory_provenance (
       item_id TEXT NOT NULL,
@@ -599,11 +672,150 @@ export function createWorkspaceMemorySchema(db: SqliteDatabase): void {
       created_at,
       updated_at
     FROM workspaces;
+
+    INSERT OR IGNORE INTO workspace_memory_platform_items (
+      item_id, namespace, created_at
+    )
+    SELECT
+      id, 'happyclaw.owner-profile', created_at
+    FROM workspace_memory_items
+    WHERE canonical_key = 'happyclaw.owner.preferred_address';
+
+    INSERT OR IGNORE INTO workspace_memory_platform_items (
+      item_id, namespace, created_at
+    )
+    SELECT
+      item_id, 'happyclaw.owner-profile', MIN(created_at)
+    FROM workspace_memory_versions
+    WHERE canonical_key = 'happyclaw.owner.preferred_address'
+    GROUP BY item_id;
   `);
 }
 
 export function bindWorkspaceMemoryDatabase(db: SqliteDatabase | null): void {
   database = db;
+}
+
+/**
+ * Reconcile old generic-memory writes before installing the reserved-key
+ * uniqueness invariant. The most recently updated row wins deterministically;
+ * status is deliberately not preferred because a newer clear/forget must not
+ * be undone by an older active duplicate. Every duplicate is detached from
+ * the reserved key with full version/audit/outbox history.
+ */
+export function reconcileHappyClawOwnerAddressCanonicalKey(): {
+  workspaces: number;
+  retiredItems: number;
+} {
+  const db = requireDatabase();
+  return db.transaction(() => {
+    const duplicateStores = db
+      .prepare(
+        `SELECT store_id
+         FROM workspace_memory_items
+         WHERE canonical_key = ?
+         GROUP BY store_id
+         HAVING COUNT(*) > 1`,
+      )
+      .all(HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY) as Array<{
+      store_id: string;
+    }>;
+    let retiredItems = 0;
+    for (const duplicate of duplicateStores) {
+      const rows = db
+        .prepare(
+          `${ITEM_SELECT}
+           WHERE i.store_id = ? AND i.canonical_key = ?
+           ORDER BY i.updated_at DESC, i.revision DESC, i.id DESC`,
+        )
+        .all(
+          duplicate.store_id,
+          HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+        ) as MemoryItemRow[];
+      const storeRowValue = db
+        .prepare(
+          `SELECT id, workspace_jid, revision, created_at, updated_at
+           FROM workspace_memory_stores WHERE id = ?`,
+        )
+        .get(duplicate.store_id) as
+        | NonNullable<ReturnType<typeof storeRow>>
+        | undefined;
+      if (!storeRowValue) continue;
+      let store = mapStore(storeRowValue);
+      for (const loser of rows.slice(1)) {
+        const at = nowIso();
+        markPlatformMemoryItem(loser.id, loser.created_at || at);
+        const result = db
+          .prepare(
+            `UPDATE workspace_memory_items
+             SET canonical_key = NULL,
+                 status = CASE
+                   WHEN status = 'deleted' THEN 'deleted'
+                   ELSE 'superseded'
+                 END,
+                 revision = revision + 1,
+                 updated_at = ?
+             WHERE store_id = ? AND id = ? AND revision = ?
+               AND canonical_key = ?`,
+          )
+          .run(
+            at,
+            store.id,
+            loser.id,
+            loser.revision,
+            HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+          );
+        if (result.changes !== 1) continue;
+        store = bumpStore(store.id, at);
+        const versionItem = requireItem(store, loser.id);
+        const context: WorkspaceMemoryMutationContext = {
+          actorId: 'schema-v66-owner-profile-reconciliation',
+          sourceType: 'migration',
+          sourceId: 'happyclaw.owner.preferred_address',
+          observedAt: at,
+        };
+        appendVersion(versionItem, 'update', context, at);
+        const item = requireItem(store, loser.id);
+        if (item.status === 'deleted') {
+          db.prepare(
+            `UPDATE workspace_memory_tombstones
+             SET deleted_revision = ? WHERE item_id = ?`,
+          ).run(item.revision, item.id);
+        }
+        replaceFts(item);
+        appendAuditAndOutbox(store, item, 'update', context, at);
+        retiredItems++;
+      }
+    }
+    return { workspaces: duplicateStores.length, retiredItems };
+  })();
+}
+
+/**
+ * Must be called only after reconciliation. Keeping this outside
+ * createWorkspaceMemorySchema is essential: an old database may contain
+ * duplicates and would otherwise fail before the migration can repair them.
+ */
+export function enforceHappyClawOwnerAddressCanonicalInvariant(): void {
+  requireDatabase()
+    .prepare(
+      `DELETE FROM workspace_memory_fts
+       WHERE item_id IN (
+         SELECT id FROM workspace_memory_items WHERE canonical_key = ?
+         UNION
+         SELECT item_id FROM workspace_memory_platform_items
+         WHERE namespace = ?
+       )`,
+    )
+    .run(
+      HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+      HAPPYCLAW_OWNER_PROFILE_MEMORY_NAMESPACE,
+    );
+  requireDatabase().exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_memory_owner_address_unique
+      ON workspace_memory_items(store_id, canonical_key)
+      WHERE canonical_key = 'happyclaw.owner.preferred_address';
+  `);
 }
 
 /**
@@ -645,6 +857,12 @@ export function deleteWorkspaceMemoryData(workspaceJid: string): void {
        SELECT id FROM workspace_memory_items WHERE store_id = ?
      )`,
   ).run(store.id);
+  db.prepare(
+    `DELETE FROM workspace_memory_platform_items
+     WHERE item_id IN (
+       SELECT id FROM workspace_memory_items WHERE store_id = ?
+     )`,
+  ).run(store.id);
   db.prepare('DELETE FROM workspace_memory_items WHERE store_id = ?').run(
     store.id,
   );
@@ -658,12 +876,388 @@ export function getWorkspaceMemoryStore(
   return row ? mapStore(row) : null;
 }
 
+export function hasRecallableWorkspaceMemoryCanonicalKey(
+  workspaceJid: string,
+  canonicalKey: string,
+  now: string = nowIso(),
+): boolean {
+  const store = storeRow(workspaceJid);
+  if (!store) return false;
+  const row = requireDatabase()
+    .prepare(
+      `SELECT 1
+       FROM workspace_memory_items
+       WHERE store_id = ?
+         AND canonical_key = ?
+         AND status = 'active'
+         AND (valid_from IS NULL OR julianday(valid_from) <= julianday(?))
+         AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
+         AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
+       LIMIT 1`,
+    )
+    .get(store.id, canonicalKey, now, now, now);
+  return Boolean(row);
+}
+
 export function getWorkspaceMemoryItem(
   workspaceJid: string,
   itemId: string,
 ): { store: WorkspaceMemoryStore; item: WorkspaceMemoryItem } {
   const store = requireStore(workspaceJid);
-  return { store, item: requireItem(store, itemId) };
+  const item = requireItem(store, itemId);
+  if (isReservedMemoryItem(item)) {
+    throw new WorkspaceMemoryStoreError(
+      'item_not_found',
+      'Workspace memory item not found',
+    );
+  }
+  return { store, item };
+}
+
+/** Mutation preflight that preserves the explicit reserved-key rejection code. */
+export function getMutableWorkspaceMemoryItem(
+  workspaceJid: string,
+  itemId: string,
+): { store: WorkspaceMemoryStore; item: WorkspaceMemoryItem } {
+  const store = requireStore(workspaceJid);
+  const item = requireItem(store, itemId);
+  rejectReservedMemoryItem(item);
+  return { store, item };
+}
+
+export interface ReservedWorkspaceMemoryMutationResult {
+  store: WorkspaceMemoryStore;
+  item: WorkspaceMemoryItem;
+  replayed: boolean;
+  changed: boolean;
+}
+
+/**
+ * Read the platform-owned Owner Profile item without exposing it through the
+ * generic Workspace Memory service.
+ */
+export function getHappyClawOwnerAddressMemoryItem(workspaceJid: string): {
+  store: WorkspaceMemoryStore;
+  item: WorkspaceMemoryItem | null;
+} {
+  const store = requireStore(workspaceJid);
+  const row = requireDatabase()
+    .prepare(
+      `${ITEM_SELECT}
+       WHERE i.store_id = ?
+         AND i.canonical_key = ?
+       ORDER BY
+         CASE WHEN i.status = 'active' THEN 0 ELSE 1 END,
+         i.updated_at DESC,
+         i.id DESC
+       LIMIT 1`,
+    )
+    .get(store.id, HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY) as
+    | MemoryItemRow
+    | undefined;
+  return { store, item: row ? mapItem(row) : null };
+}
+
+function reservedRequestReplay(
+  store: WorkspaceMemoryStore,
+  input: {
+    itemId: string;
+    idempotencyKey?: string | null;
+    requestHash?: string | null;
+  },
+): ReservedWorkspaceMemoryMutationResult | null {
+  const idempotencyKey = normalizeNullable(input.idempotencyKey);
+  if (!idempotencyKey) return null;
+  const replay = requireDatabase()
+    .prepare(
+      `SELECT operation, item_id, request_hash, response_json
+       FROM workspace_memory_mutation_requests
+       WHERE store_id = ? AND idempotency_key = ?`,
+    )
+    .get(store.id, idempotencyKey) as
+    | {
+        operation: string;
+        item_id: string;
+        request_hash: string;
+        response_json: string;
+      }
+    | undefined;
+  if (!replay) return null;
+  if (
+    replay.operation !== 'update' ||
+    replay.item_id !== input.itemId ||
+    !input.requestHash ||
+    replay.request_hash !== input.requestHash
+  ) {
+    throw new WorkspaceMemoryStoreError(
+      'idempotency_conflict',
+      'Idempotency key was already used for a different request',
+      { storeRevision: store.revision },
+    );
+  }
+  const response = JSON.parse(replay.response_json) as {
+    store: WorkspaceMemoryStore;
+    item: WorkspaceMemoryItem;
+    changed?: boolean;
+  };
+  return {
+    store: response.store,
+    item: response.item,
+    replayed: true,
+    changed: response.changed ?? true,
+  };
+}
+
+/**
+ * The sole mutation primitive for the reserved preferred-address item.
+ *
+ * Clearing keeps the same item and monotonic revision by changing its status
+ * to `superseded`; restoring changes it back to `active`. This lets callers
+ * use one CAS lineage across set → update → clear → restore.
+ */
+export function mutateHappyClawOwnerAddressMemory(input: {
+  workspaceJid: string;
+  preferredAddress?: string;
+  clear?: boolean;
+  expectedRevision?: number;
+  context: WorkspaceMemoryMutationContext;
+  idempotencyKey?: string | null;
+  requestHash?: string | null;
+}): ReservedWorkspaceMemoryMutationResult {
+  const db = requireDatabase();
+  return db.transaction(() => {
+    const { store: initialStore, item: current } =
+      getHappyClawOwnerAddressMemoryItem(input.workspaceJid);
+    const idempotencyKey = normalizeNullable(input.idempotencyKey);
+    const preferredAddress = normalizeNullable(input.preferredAddress);
+    if (!input.clear && !preferredAddress) {
+      throw new Error('Preferred address must not be empty');
+    }
+
+    if (!current) {
+      if (input.clear) {
+        throw new WorkspaceMemoryStoreError(
+          'revision_conflict',
+          'HappyClaw Owner Profile revision conflict',
+          { currentRevision: 0, storeRevision: initialStore.revision },
+        );
+      }
+      if (
+        input.expectedRevision !== undefined &&
+        input.expectedRevision !== 0
+      ) {
+        throw new WorkspaceMemoryStoreError(
+          'revision_conflict',
+          'HappyClaw Owner Profile revision conflict',
+          { currentRevision: 0, storeRevision: initialStore.revision },
+        );
+      }
+      if (idempotencyKey) {
+        const existing = db
+          .prepare(
+            `SELECT id, create_request_hash
+             FROM workspace_memory_items
+             WHERE store_id = ? AND create_idempotency_key = ?`,
+          )
+          .get(initialStore.id, idempotencyKey) as
+          | { id: string; create_request_hash: string | null }
+          | undefined;
+        if (existing) {
+          if (
+            existing.create_request_hash &&
+            input.requestHash &&
+            existing.create_request_hash !== input.requestHash
+          ) {
+            throw new WorkspaceMemoryStoreError(
+              'idempotency_conflict',
+              'Idempotency key was already used for a different request',
+              { storeRevision: initialStore.revision },
+            );
+          }
+          return {
+            store: requireStore(input.workspaceJid),
+            item: requireItem(initialStore, existing.id),
+            replayed: true,
+            changed: true,
+          };
+        }
+      }
+
+      const at = nowIso();
+      const store = bumpStore(initialStore.id, at);
+      const itemId = newId('wmi');
+      db.prepare(
+        `INSERT INTO workspace_memory_items (
+          id, store_id, workspace_jid, kind, title, content, canonical_key,
+          status, importance, confidence, valid_from, valid_until, expires_at,
+          revision, create_idempotency_key, create_request_hash,
+          created_at, updated_at, deleted_at
+        ) VALUES (?, ?, ?, 'fact', ?, ?, ?, 'active', 1, 1,
+          NULL, NULL, NULL, 1, ?, ?, ?, ?, NULL)`,
+      ).run(
+        itemId,
+        store.id,
+        store.workspaceJid,
+        '主人称呼',
+        preferredAddress,
+        HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+        idempotencyKey,
+        normalizeNullable(input.requestHash),
+        at,
+        at,
+      );
+      markPlatformMemoryItem(itemId, at);
+      const versionItem = requireItem(store, itemId);
+      appendVersion(versionItem, 'create', input.context, at);
+      const item = requireItem(store, itemId);
+      replaceFts(item);
+      appendAuditAndOutbox(store, item, 'create', input.context, at);
+      return { store, item, replayed: false, changed: true };
+    }
+
+    if (idempotencyKey) {
+      const createReplay = db
+        .prepare(
+          `SELECT create_request_hash
+           FROM workspace_memory_items
+           WHERE store_id = ? AND id = ? AND create_idempotency_key = ?`,
+        )
+        .get(initialStore.id, current.id, idempotencyKey) as
+        | { create_request_hash: string | null }
+        | undefined;
+      if (createReplay) {
+        if (
+          createReplay.create_request_hash &&
+          input.requestHash &&
+          createReplay.create_request_hash !== input.requestHash
+        ) {
+          throw new WorkspaceMemoryStoreError(
+            'idempotency_conflict',
+            'Idempotency key was already used for a different request',
+            { storeRevision: initialStore.revision },
+          );
+        }
+        return {
+          store: initialStore,
+          item: current,
+          replayed: true,
+          changed: true,
+        };
+      }
+    }
+
+    const replay = reservedRequestReplay(initialStore, {
+      itemId: current.id,
+      idempotencyKey,
+      requestHash: input.requestHash,
+    });
+    if (replay) return replay;
+
+    if (
+      input.expectedRevision === undefined ||
+      input.expectedRevision !== current.revision
+    ) {
+      throw new WorkspaceMemoryStoreError(
+        'revision_conflict',
+        'HappyClaw Owner Profile revision conflict',
+        {
+          currentRevision: current.revision,
+          storeRevision: initialStore.revision,
+        },
+      );
+    }
+
+    const nextStatus: WorkspaceMemoryStatus = input.clear
+      ? 'superseded'
+      : 'active';
+    const nextContent = input.clear ? current.content : preferredAddress!;
+    if (current.status === nextStatus && current.content === nextContent) {
+      if (idempotencyKey && input.requestHash) {
+        db.prepare(
+          `INSERT INTO workspace_memory_mutation_requests (
+            store_id, idempotency_key, operation, item_id, request_hash,
+            response_json, created_at
+          ) VALUES (?, ?, 'update', ?, ?, ?, ?)`,
+        ).run(
+          initialStore.id,
+          idempotencyKey,
+          current.id,
+          input.requestHash,
+          JSON.stringify({
+            store: initialStore,
+            item: current,
+            changed: false,
+          }),
+          nowIso(),
+        );
+      }
+      return {
+        store: initialStore,
+        item: current,
+        replayed: false,
+        changed: false,
+      };
+    }
+
+    const at = nowIso();
+    const nextRevision = current.revision + 1;
+    const result = db
+      .prepare(
+        `UPDATE workspace_memory_items
+         SET content = ?, status = ?, revision = ?, updated_at = ?,
+             deleted_at = NULL
+         WHERE store_id = ? AND id = ? AND revision = ?
+           AND canonical_key = ?`,
+      )
+      .run(
+        nextContent,
+        nextStatus,
+        nextRevision,
+        at,
+        initialStore.id,
+        current.id,
+        input.expectedRevision,
+        HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+      );
+    if (result.changes !== 1) {
+      const latest = requireItem(initialStore, current.id);
+      throw new WorkspaceMemoryStoreError(
+        'revision_conflict',
+        'HappyClaw Owner Profile revision conflict',
+        {
+          currentRevision: latest.revision,
+          storeRevision: requireStore(input.workspaceJid).revision,
+        },
+      );
+    }
+    const store = bumpStore(initialStore.id, at);
+    if (current.status === 'deleted') {
+      db.prepare(
+        'DELETE FROM workspace_memory_tombstones WHERE item_id = ?',
+      ).run(current.id);
+    }
+    const versionItem = requireItem(store, current.id);
+    appendVersion(versionItem, 'update', input.context, at);
+    const item = requireItem(store, current.id);
+    replaceFts(item);
+    appendAuditAndOutbox(store, item, 'update', input.context, at);
+    if (idempotencyKey && input.requestHash) {
+      db.prepare(
+        `INSERT INTO workspace_memory_mutation_requests (
+          store_id, idempotency_key, operation, item_id, request_hash,
+          response_json, created_at
+        ) VALUES (?, ?, 'update', ?, ?, ?, ?)`,
+      ).run(
+        store.id,
+        idempotencyKey,
+        item.id,
+        input.requestHash,
+        JSON.stringify({ store, item, changed: true }),
+        at,
+      );
+    }
+    return { store, item, replayed: false, changed: true };
+  })();
 }
 
 export function createWorkspaceMemoryItem(input: {
@@ -677,6 +1271,7 @@ export function createWorkspaceMemoryItem(input: {
   item: WorkspaceMemoryItem;
   replayed: boolean;
 } {
+  rejectReservedCanonicalKey(input.value.canonicalKey);
   const db = requireDatabase();
   return db.transaction(() => {
     const initialStore = requireStore(input.workspaceJid);
@@ -692,6 +1287,8 @@ export function createWorkspaceMemoryItem(input: {
         | { id: string; create_request_hash: string | null }
         | undefined;
       if (existing) {
+        const existingItem = requireItem(initialStore, existing.id);
+        rejectReservedMemoryItem(existingItem);
         if (
           existing.create_request_hash &&
           input.requestHash &&
@@ -705,7 +1302,7 @@ export function createWorkspaceMemoryItem(input: {
         }
         return {
           store: requireStore(input.workspaceJid),
-          item: requireItem(initialStore, existing.id),
+          item: existingItem,
           replayed: true,
         };
       }
@@ -765,6 +1362,9 @@ export function updateWorkspaceMemoryItem(input: {
   const db = requireDatabase();
   return db.transaction(() => {
     const initialStore = requireStore(input.workspaceJid);
+    const current = requireItem(initialStore, input.itemId);
+    rejectReservedMemoryItem(current);
+    rejectReservedCanonicalKey(input.patch.canonicalKey);
     const idempotencyKey = normalizeNullable(input.idempotencyKey);
     if (idempotencyKey) {
       const replay = db
@@ -801,7 +1401,6 @@ export function updateWorkspaceMemoryItem(input: {
         return { ...response, replayed: true };
       }
     }
-    const current = requireItem(initialStore, input.itemId);
     if (
       current.revision !== input.expectedRevision ||
       current.status === 'deleted'
@@ -920,6 +1519,8 @@ export function forgetWorkspaceMemoryItem(input: {
   const db = requireDatabase();
   return db.transaction(() => {
     const initialStore = requireStore(input.workspaceJid);
+    const current = requireItem(initialStore, input.itemId);
+    rejectReservedMemoryItem(current);
     const idempotencyKey = normalizeNullable(input.idempotencyKey);
     if (idempotencyKey) {
       const replay = db
@@ -956,7 +1557,6 @@ export function forgetWorkspaceMemoryItem(input: {
         return { ...response, replayed: true };
       }
     }
-    const current = requireItem(initialStore, input.itemId);
     if (
       current.revision !== input.expectedRevision ||
       current.status === 'deleted'
@@ -1044,8 +1644,20 @@ export function listWorkspaceMemoryItems(input: {
   before?: { updatedAt: string; id: string } | null;
 }): { store: WorkspaceMemoryStore; items: WorkspaceMemoryItem[] } {
   const store = requireStore(input.workspaceJid);
-  const clauses = ['i.store_id = ?', 'i.status = ?'];
-  const params: unknown[] = [store.id, input.status ?? 'active'];
+  const clauses = [
+    'i.store_id = ?',
+    'i.status = ?',
+    '(i.canonical_key IS NULL OR i.canonical_key <> ?)',
+    `NOT EXISTS (
+      SELECT 1 FROM workspace_memory_platform_items mpi
+      WHERE mpi.item_id = i.id
+    )`,
+  ];
+  const params: unknown[] = [
+    store.id,
+    input.status ?? 'active',
+    HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+  ];
   if (input.kind) {
     clauses.push('i.kind = ?');
     params.push(input.kind);
@@ -1081,6 +1693,7 @@ export function listRecallableWorkspaceMemoryItems(input: {
   const kindClause = input.kind ? 'AND i.kind = ?' : '';
   const params: unknown[] = [
     store.id,
+    HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
     now,
     now,
     now,
@@ -1092,6 +1705,11 @@ export function listRecallableWorkspaceMemoryItems(input: {
       `${ITEM_SELECT}
        WHERE i.store_id = ?
          AND i.status = 'active'
+         AND (i.canonical_key IS NULL OR i.canonical_key <> ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM workspace_memory_platform_items mpi
+           WHERE mpi.item_id = i.id
+         )
          AND (i.valid_from IS NULL OR julianday(i.valid_from) <= julianday(?))
          AND (i.valid_until IS NULL OR julianday(i.valid_until) > julianday(?))
          AND (i.expires_at IS NULL OR julianday(i.expires_at) > julianday(?))
@@ -1124,6 +1742,7 @@ export function searchWorkspaceMemoryItems(input: {
   const kindClause = input.kind ? 'AND i.kind = ?' : '';
   const params: unknown[] = [
     store.id,
+    HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
     now,
     now,
     now,
@@ -1146,6 +1765,11 @@ export function searchWorkspaceMemoryItems(input: {
            ON p.item_id = i.id AND p.revision = i.revision
          WHERE i.store_id = ?
            AND i.status = 'active'
+           AND (i.canonical_key IS NULL OR i.canonical_key <> ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM workspace_memory_platform_items mpi
+             WHERE mpi.item_id = i.id
+           )
            AND (i.valid_from IS NULL OR julianday(i.valid_from) <= julianday(?))
            AND (i.valid_until IS NULL OR julianday(i.valid_until) > julianday(?))
            AND (i.expires_at IS NULL OR julianday(i.expires_at) > julianday(?))
@@ -1169,6 +1793,11 @@ export function searchWorkspaceMemoryItems(input: {
            ON p.item_id = i.id AND p.revision = i.revision
          WHERE i.store_id = ?
            AND i.status = 'active'
+           AND (i.canonical_key IS NULL OR i.canonical_key <> ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM workspace_memory_platform_items mpi
+             WHERE mpi.item_id = i.id
+           )
            AND (i.valid_from IS NULL OR julianday(i.valid_from) <= julianday(?))
            AND (i.valid_until IS NULL OR julianday(i.valid_until) > julianday(?))
            AND (i.expires_at IS NULL OR julianday(i.expires_at) > julianday(?))
@@ -1206,7 +1835,13 @@ export function listWorkspaceMemoryVersions(input: {
   versions: WorkspaceMemoryVersion[];
 } {
   const store = requireStore(input.workspaceJid);
-  requireItem(store, input.itemId);
+  const item = requireItem(store, input.itemId);
+  if (isReservedMemoryItem(item)) {
+    throw new WorkspaceMemoryStoreError(
+      'item_not_found',
+      'Workspace memory item not found',
+    );
+  }
   const clauses = ['v.item_id = ?'];
   const params: unknown[] = [input.itemId];
   if (input.beforeRevision) {

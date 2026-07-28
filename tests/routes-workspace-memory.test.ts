@@ -44,6 +44,7 @@ vi.mock('../src/middleware/auth.ts', () => ({
 const db = await import('../src/db.js');
 const memoryRoutes = (await import('../src/routes/memory.js')).default;
 const memoryService = await import('../src/memory-service.js');
+const memoryStore = await import('../src/memory-store.js');
 
 const WORKSPACE_A = 'web:memory-a';
 const WORKSPACE_B = 'web:memory-b';
@@ -116,6 +117,29 @@ afterAll(() => {
 });
 
 describe('Workspace Memory v2 routes', () => {
+  test('generic memory route cannot write the reserved Owner Profile key', async () => {
+    expect(
+      memoryStore.hasRecallableWorkspaceMemoryCanonicalKey(
+        WORKSPACE_A,
+        memoryStore.HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+      ),
+    ).toBe(false);
+    const created = await create(WORKSPACE_A, '主人希望被称为小何', {
+      title: '主人称呼',
+      canonicalKey: memoryStore.HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+    });
+    expect(created).toMatchObject({
+      status: 400,
+      body: { error: 'reserved_canonical_key' },
+    });
+    expect(
+      memoryStore.hasRecallableWorkspaceMemoryCanonicalKey(
+        WORKSPACE_A,
+        memoryStore.HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+      ),
+    ).toBe(false);
+  });
+
   test('owner can create, list, get, search and inspect immutable versions', async () => {
     const created = await create(
       WORKSPACE_A,

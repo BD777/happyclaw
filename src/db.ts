@@ -85,7 +85,13 @@ import {
   bindWorkspaceMemoryDatabase,
   createWorkspaceMemorySchema,
   deleteWorkspaceMemoryData,
+  enforceHappyClawOwnerAddressCanonicalInvariant,
 } from './memory-store.js';
+import {
+  bindOwnerProfileDatabase,
+  createOwnerProfileSchema,
+  reconcileLegacyOwnerProfileMemory,
+} from './owner-profile-store.js';
 import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
 
 let db: InstanceType<typeof Database>;
@@ -94,7 +100,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 65;
+export const CURRENT_SCHEMA_VERSION = 66;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -452,6 +458,8 @@ export function initDatabase(): void {
   db = new Database(dbPath);
 
   db.exec('PRAGMA busy_timeout = 5000');
+  const rawSchemaVersionBeforeInit =
+    getRouterStateInternal('schema_version') ?? null;
   try {
     enforcePreMigrationBackup(dbPath);
   } catch (error) {
@@ -822,6 +830,23 @@ export function initDatabase(): void {
       PRIMARY KEY (user_id, jid)
     );
   `);
+
+  // v65 -> v66: HappyClaw Owner Profile remains a reserved Workspace Memory
+  // item; this table tracks only its one-shot onboarding lifecycle. Duplicate
+  // legacy items must be reconciled before the reserved-key unique index is
+  // installed.
+  createOwnerProfileSchema(db);
+  bindOwnerProfileDatabase(db);
+  if (
+    rawSchemaVersionBeforeInit !== null &&
+    Number(rawSchemaVersionBeforeInit) < 66
+  ) {
+    reconcileLegacyOwnerProfileMemory();
+  } else {
+    // Fresh and already-v66 databases need the structural invariant, but must
+    // not re-run legacy sentinel inference on every normal restart.
+    enforceHappyClawOwnerAddressCanonicalInvariant();
+  }
 
   // Sub-agents table for multi-agent parallel execution
   db.exec(`
@@ -7815,6 +7840,23 @@ export function assignWorkspaceAgentProfile(
 ): void {
   const now = new Date().toISOString();
   db.transaction(() => {
+    const home = db
+      .prepare(
+        `SELECT created_by
+         FROM registered_groups
+         WHERE folder = ? AND jid LIKE 'web:%' AND is_home = 1
+         ORDER BY added_at ASC
+         LIMIT 1`,
+      )
+      .get(groupFolder) as { created_by: string | null } | undefined;
+    if (home?.created_by) {
+      const defaultProfile = getOrCreateDefaultAgentProfile(home.created_by);
+      if (profileId !== defaultProfile.id) {
+        throw new Error(
+          'Home Workspace must remain bound to the built-in HappyClaw Agent',
+        );
+      }
+    }
     db.prepare(
       `INSERT INTO workspace_agent_profiles (
         group_folder, agent_profile_id, interaction_mode, created_at, updated_at
@@ -7934,6 +7976,22 @@ export function getAgentProfileForWorkspace(
   groupFolder: string,
   ownerUserId?: string | null,
 ): AgentProfile | undefined {
+  const home = db
+    .prepare(
+      `SELECT created_by
+       FROM registered_groups
+       WHERE folder = ? AND jid LIKE 'web:%' AND is_home = 1
+       ORDER BY added_at ASC
+       LIMIT 1`,
+    )
+    .get(groupFolder) as { created_by: string | null } | undefined;
+  if (home?.created_by) {
+    const defaultProfile = getOrCreateDefaultAgentProfile(home.created_by);
+    if (getWorkspaceAgentProfileId(groupFolder) !== defaultProfile.id) {
+      assignWorkspaceAgentProfile(groupFolder, defaultProfile.id);
+    }
+    return defaultProfile;
+  }
   const mappedId = getWorkspaceAgentProfileId(groupFolder);
   if (mappedId) {
     const mapped = getAgentProfile(mappedId);
@@ -7962,12 +8020,23 @@ export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
 
     const webWorkspaces = db
       .prepare(
-        "SELECT DISTINCT folder, created_by FROM registered_groups WHERE jid LIKE 'web:%' AND created_by IS NOT NULL",
+        `SELECT folder, created_by, MAX(is_home) AS is_home
+         FROM registered_groups
+         WHERE jid LIKE 'web:%' AND created_by IS NOT NULL
+         GROUP BY folder, created_by`,
       )
-      .all() as Array<{ folder: string; created_by: string }>;
+      .all() as Array<{
+      folder: string;
+      created_by: string;
+      is_home: number;
+    }>;
     for (const ws of webWorkspaces) {
-      if (getWorkspaceAgentProfileId(ws.folder)) continue;
       const profile = getOrCreateDefaultAgentProfile(ws.created_by);
+      if (ws.is_home) {
+        assignWorkspaceAgentProfile(ws.folder, profile.id);
+        continue;
+      }
+      if (getWorkspaceAgentProfileId(ws.folder)) continue;
       assignWorkspaceAgentProfile(ws.folder, profile.id);
     }
   });
@@ -9693,7 +9762,13 @@ export function ensureUserHomeGroup(
   username?: string,
 ): string {
   const existing = getUserHomeGroup(userId);
-  if (existing) return existing.jid;
+  if (existing) {
+    assignWorkspaceAgentProfile(
+      existing.folder,
+      getOrCreateDefaultAgentProfile(userId).id,
+    );
+    return existing.jid;
+  }
 
   const now = new Date().toISOString();
   const isAdmin = role === 'admin';
@@ -9714,6 +9789,10 @@ export function ensureUserHomeGroup(
   };
 
   setRegisteredGroup(jid, group);
+  assignWorkspaceAgentProfile(
+    folder,
+    getOrCreateDefaultAgentProfile(userId).id,
+  );
 
   // Ensure chat row exists
   ensureChatExists(jid);
@@ -12785,6 +12864,7 @@ export function closeDatabase(): void {
   _newMsgStmtCache.clear();
   bindChannelReliabilityDatabase(null);
   bindWorkspaceMemoryDatabase(null);
+  bindOwnerProfileDatabase(null);
   if (db) {
     db.close();
   }

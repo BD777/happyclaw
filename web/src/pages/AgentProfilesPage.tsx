@@ -759,7 +759,9 @@ export function AgentProfilesPage() {
       setCreatePanelOpen(false);
       setSelectedId(profile.id);
       setAllowedSearchParams({ agent: profile.id }, { replace: true });
-      toast.success('已创建智能体');
+      toast.success(
+        '已创建智能体；当前未绑定工作区，Session 与 Memory 均和 HappyClaw 隔离',
+      );
     } catch (err) {
       toast.error(getErrorMessage(err, '创建失败'));
     } finally {
@@ -1045,10 +1047,24 @@ export function AgentProfilesPage() {
     targetProfileId: string,
   ) => {
     if (!selected || targetProfileId === selected.id) return;
+    const workspace = governance?.workspaces.find(
+      (candidate) => candidate.jid === workspaceJid,
+    );
+    if (workspace?.is_home) {
+      toast.error('Home Workspace 固定归属内置 HappyClaw，不能迁移');
+      return;
+    }
+    const target = profiles.find((profile) => profile.id === targetProfileId);
+    if (
+      !confirm(
+        `确认将工作区「${workspace?.name ?? workspaceJid}」迁移到「${target?.name ?? '目标智能体'}」？工作区文件、Session、渠道绑定和 Workspace Memory 都会随工作区保留，并对目标智能体可用。`,
+      )
+    ) {
+      return;
+    }
     setMovingWorkspaceJid(workspaceJid);
     try {
       await setWorkspaceAgentProfile(workspaceJid, targetProfileId);
-      const target = profiles.find((profile) => profile.id === targetProfileId);
       toast.success(`工作区已迁移到「${target?.name ?? '目标智能体'}」`);
       await Promise.allSettled([
         loadProfileGovernance(selected.id),

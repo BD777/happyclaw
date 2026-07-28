@@ -35,6 +35,8 @@ export interface PromptPlan {
 }
 
 export interface HappyClawPromptSources {
+  platformIdentity?: string;
+  platformBootstrap?: string;
   agentIdentity?: string;
   interaction: string;
   security: string;
@@ -147,6 +149,31 @@ export function buildHappyClawPromptPlan(
   sources: HappyClawPromptSources,
 ): PromptPlan {
   const inputs: PromptBlockInput[] = [];
+
+  if (sources.platformIdentity) {
+    inputs.push({
+      id: 'identity.happyclaw',
+      version: 1,
+      scope: 'main',
+      owner: 'platform',
+      required: true,
+      condition: 'built-in default HappyClaw AgentProfile',
+      text: wrap('platform-identity', sources.platformIdentity),
+    });
+  }
+
+  if (sources.platformBootstrap) {
+    inputs.push({
+      id: 'bootstrap.happyclaw',
+      version: 1,
+      scope: 'main',
+      owner: 'platform',
+      required: false,
+      condition:
+        'built-in HappyClaw Home runtime; each turn follows the host-authoritative owner-profile block',
+      text: wrap('platform-bootstrap', sources.platformBootstrap),
+    });
+  }
 
   if (sources.agentIdentity) {
     inputs.push({

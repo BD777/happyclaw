@@ -300,7 +300,7 @@ agentProfileRoutes.post(
         agentProfile: {
           id: existing.id,
           version: existing.version,
-          identityHash: existing.identity_hash,
+          identityHash: previewProfile.identity_hash,
           runtimePolicyHash: hashRuntimePolicy(previewProfile.runtime_policy),
         },
         skillManifestHash: preview.skills.manifestHash,

@@ -87,6 +87,18 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 它与 `execution_mode` 共享同一道 quiesce 边界，暖 Runner 只能观察到旧契约或新
 契约；停机失败返回 503 并带 `persisted` 标记。
 
+Home Workspace 固定归属当前用户的内置 HappyClaw。尝试通过
+`PATCH /api/groups/:jid/agent-profile` 将 Home 迁移到自定义 Agent 时返回：
+
+```json
+{
+  "error": "Home Workspace 始终属于内置 HappyClaw，不能迁移到自定义智能体",
+  "code": "HOME_WORKSPACE_AGENT_IMMUTABLE"
+}
+```
+
+HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
+
 创建 Docker 工作区时，当前有效的管理员可以在 `POST /api/groups` 中提交
 `additional_mounts`（最多 8 项）：
 
@@ -171,6 +183,11 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 `effective-capabilities` 返回 PromptPlan、Skill/MCP Manifest、上下文预算和最近一次
 脱敏运行快照，用于对比“配置预期”与“SDK 实际加载”。
 
+`POST /api/agent-profiles` 只创建隔离的 AgentProfile。它不会隐式创建 Workspace、
+Session 或 Memory，也不会绑定/复制 Home Workspace。用户必须在创建 Workspace 时
+显式选择它，或通过上面的非 Home Workspace 迁移接口建立归属。内置 HappyClaw 的
+代码级平台身份不存放在这些可编辑的 Prompt 字段中，自定义 Agent 不会继承。
+
 ## Agent-first 工作区投影
 
 - `GET /api/workspaces`
@@ -180,6 +197,44 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 - `GET /api/workspaces/:jid/channel-mounts`
 
 这些接口是 `registered_groups` 兼容存储之上的只读产品投影。
+
+### HappyClaw Owner Profile
+
+- `GET /api/workspaces/:jid/owner-profile`
+- `PATCH /api/workspaces/:jid/owner-profile`
+
+只允许该用户不可删除的 Home Workspace、内置默认 HappyClaw AgentProfile 和实际
+owner。无权访问、自定义 Agent 或非 Home 目标统一返回 404。
+
+PATCH 使用 action 联合类型：
+
+```json
+{
+  "action": "set",
+  "preferredAddress": "小何",
+  "expectedRevision": 0,
+  "idempotencyKey": "owner-address-first-set"
+}
+```
+
+首次设置的 `expectedRevision` 可省略或为 `0`；已有/已清空值必须先 GET，并携带返回
+的当前 `revision`。修改成功会在同一事务中完成 onboarding。清空不会重置冷启动：
+
+```json
+{
+  "action": "clear",
+  "expectedRevision": 3,
+  "idempotencyKey": "owner-address-clear-3"
+}
+```
+
+owner 明确拒绝首次设置时可提交
+`{"action":"skip","expectedOnboardingRevision":1}`。CAS 过期或从未设置却执行 clear
+返回 409 `revision_conflict`；重复 idempotency key 对应不同请求返回 409。
+
+称呼底层复用保留的 Workspace Memory revision/provenance/audit/outbox，但不属于
+通用 Memory API：`happyclaw.owner.preferred_address` 不能通过通用接口创建、更新或
+忘记，也不会出现在通用读取、搜索、versions 或 Runtime snapshot 中。
 
 ## 工作区项目能力
 

@@ -57,6 +57,49 @@ describe('AgentProfile runtime invalidation', () => {
     expect(effective?.runtime_policy.context.source).toBe('managed');
     expect(effective?.runtime_policy.context.auto_compact_window).toBe(0);
     expect(effective?.runtime_policy.context.auto_compact_percentage).toBe(80);
+    expect(effective?.identity_hash).toBe(
+      runtime.bindHappyClawPlatformIdentityHash(
+        db.computeAgentProfileIdentityHash(
+          profile,
+          effective!.runtime_policy,
+          profile.name,
+        ),
+      ),
+    );
+    expect(effective?.identity_hash).not.toBe(profile.identity_hash);
+  });
+
+  test('custom Agents do not inherit the protected HappyClaw identity hash', () => {
+    const userId = 'agent-profile-runtime-custom-identity';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: userId,
+      username: userId,
+      password_hash: 'hash',
+      display_name: userId,
+      role: 'member',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+    const profile = db.createAgentProfile({
+      ownerUserId: userId,
+      name: 'Isolated Custom Agent',
+      identityPrompt: 'Custom only.',
+    });
+    const effective = runtime.resolveEffectiveAgentProfile(profile)!;
+
+    expect(effective.identity_hash).toBe(
+      db.computeAgentProfileIdentityHash(
+        profile,
+        effective.runtime_policy,
+        profile.name,
+      ),
+    );
+    expect(effective.identity_hash).not.toBe(
+      runtime.bindHappyClawPlatformIdentityHash(effective.identity_hash),
+    );
   });
 
   test('role downgrade forces persisted host context back to managed', () => {

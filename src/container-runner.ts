@@ -375,11 +375,38 @@ export interface ContainerInput {
     id: string;
     name: string;
     version: number;
+    /** Host-authoritative marker for the built-in HappyClaw AgentProfile. */
+    isDefault: boolean;
     identityHash: string;
     identityPrompt: string;
     includeClaudePreset: boolean;
     runtimePolicy?: AgentProfileRuntimePolicy;
   };
+  /**
+   * True only for an interactive turn in the built-in HappyClaw Home
+   * Workspace before the owner-preferred-address memory has been established.
+   */
+  happyClawBootstrapPending?: boolean;
+  /**
+   * Host-authoritative initial Owner Profile projection. Present only for an
+   * actual-owner interactive turn of built-in HappyClaw in Home. The runner
+   * refreshes it over dedicated IPC before every cold/warm model turn.
+   */
+  happyClawOwnerProfile?: {
+    workspaceJid: string;
+    preferredAddress: string | null;
+    revision: number | null;
+    onboarding: {
+      state: 'pending' | 'claimed' | 'completed' | 'skipped';
+      revision: number;
+      leaseOwner: string | null;
+      leaseToken: number | null;
+      leaseExpiresAt: string | null;
+    };
+  };
+  /** Structural capability only; exact owner authorization is re-evaluated by
+   * the host for every dedicated IPC request, including warm turns. */
+  happyClawOwnerProfileEnabled?: boolean;
   /** Host-derived capability flag for main-HappyClaw interactive sessions. */
   agentBuilderEnabled?: boolean;
   agentId?: string;

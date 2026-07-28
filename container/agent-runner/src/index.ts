@@ -66,6 +66,7 @@ import {
 import { StreamEventProcessor } from './stream-processor.js';
 import {
   createMcpTools,
+  fetchHappyClawOwnerProfileTurn,
   fetchWorkspaceMemorySnapshot,
   type McpContext,
   type WorkspaceMemorySnapshot,
@@ -74,6 +75,7 @@ import {
   createSerializedAsyncTrigger,
   loadWorkspaceMemoryTurnContext,
 } from './workspace-memory-context.js';
+import { loadHappyClawOwnerProfileTurnContext } from './owner-profile-context.js';
 import { createWorkspaceMemoryWriteGuard } from './workspace-memory-runtime.js';
 import {
   parseAgentMcpPolicyMode,
@@ -253,6 +255,8 @@ const PROACTIVE_DELIVERY_CONTRACT = loadPrompt(
 );
 const AGENT_BUILDER_GUIDELINES = loadPrompt('agent-builder.md');
 const MEMORY_SYSTEM_WORKSPACE = loadPrompt('memory-system.workspace.md');
+const HAPPYCLAW_PLATFORM_IDENTITY = loadPrompt('identity.happyclaw.md');
+const HAPPYCLAW_PLATFORM_BOOTSTRAP = loadPrompt('bootstrap.happyclaw.md');
 
 // 各渠道共用的格式说明：Web 端始终可看完整渲染，不因来源降级输出。
 // Mermaid 渲染说明已在模式专属 output prompt 中讲过，此处不重复，
@@ -1714,11 +1718,19 @@ async function runQueryAttempt(
     }
   };
   activateCurrentInputTurn(coldInputTurnId);
-  const workspaceMemoryTurn = mcpToolsContext
-    ? await loadWorkspaceMemoryTurnContext(prompt, (query) =>
-        fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
-      )
-    : { snapshot: null, block: '' };
+  const [workspaceMemoryTurn, ownerProfileTurn] = mcpToolsContext
+    ? await Promise.all([
+        loadWorkspaceMemoryTurnContext(prompt, (query) =>
+          fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
+        ),
+        loadHappyClawOwnerProfileTurnContext(() =>
+          fetchHappyClawOwnerProfileTurn(mcpToolsContext),
+        ),
+      ])
+    : [
+        { snapshot: null, block: '' },
+        { result: null, block: '' },
+      ];
   if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
     log(
       'Workspace memory snapshot unavailable; continuing this turn without durable memory context',
@@ -1788,9 +1800,12 @@ async function runQueryAttempt(
     const withWorkspaceMemory = workspaceMemoryTurn.block
       ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
       : withChannelContext;
-    return shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
-      ? anchorUserTurn(withWorkspaceMemory)
+    const withOwnerProfile = ownerProfileTurn.block
+      ? `${ownerProfileTurn.block}\n\n${withWorkspaceMemory}`
       : withWorkspaceMemory;
+    return shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
+      ? anchorUserTurn(withOwnerProfile)
+      : withOwnerProfile;
   };
   const initialRejected = stream.push(prompt, images, decorateInitialUserTurn);
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
@@ -2133,11 +2148,23 @@ async function runQueryAttempt(
           containerInput.currentSourceJid ||
           containerInput.chatJid,
       );
-      const workspaceMemoryTurn = mcpToolsContext
-        ? await loadWorkspaceMemoryTurnContext(msg.text, (query) =>
-            fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
-          )
-        : { snapshot: null, block: '' };
+      const [workspaceMemoryTurn, ownerProfileTurn] = mcpToolsContext
+        ? await Promise.all([
+            loadWorkspaceMemoryTurnContext(msg.text, (query) =>
+              fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
+            ),
+            loadHappyClawOwnerProfileTurnContext(() =>
+              fetchHappyClawOwnerProfileTurn(
+                mcpToolsContext,
+                5_000,
+                msg.receipt?.deliveryId,
+              ),
+            ),
+          ])
+        : [
+            { snapshot: null, block: '' },
+            { result: null, block: '' },
+          ];
       if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
         log(
           'Workspace memory snapshot unavailable for warm turn; continuing without durable memory context',
@@ -2166,7 +2193,10 @@ async function runQueryAttempt(
         const withWorkspaceMemory = workspaceMemoryTurn.block
           ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
           : withChannelContext;
-        return anchorUserTurn(withWorkspaceMemory);
+        const withOwnerProfile = ownerProfileTurn.block
+          ? `${ownerProfileTurn.block}\n\n${withWorkspaceMemory}`
+          : withWorkspaceMemory;
+        return anchorUserTurn(withOwnerProfile);
       });
       for (const reason of rejected) {
         emit({
@@ -2329,6 +2359,14 @@ async function runQueryAttempt(
     !proactiveInteractiveContract &&
     (containerInput.agentProfile?.includeClaudePreset ?? true);
   const promptPlan = buildHappyClawPromptPlan({
+    platformIdentity: containerInput.agentProfile?.isDefault
+      ? HAPPYCLAW_PLATFORM_IDENTITY
+      : undefined,
+    platformBootstrap:
+      containerInput.agentProfile?.isDefault &&
+      containerInput.happyClawOwnerProfileEnabled
+        ? HAPPYCLAW_PLATFORM_BOOTSTRAP
+        : undefined,
     // Agent identity leads platform workspace/context material per the
     // documented Agent-first composition order.
     agentIdentity: buildAgentIdentityPrompt(
@@ -3777,6 +3815,7 @@ async function main(): Promise<void> {
     isHome,
     isAdminHome,
     agentBuilderEnabled,
+    ownerProfileEnabled: containerInput.happyClawOwnerProfileEnabled === true,
     interactionMode: containerInput.interactionMode ?? 'assistant',
     isScheduledTask: containerInput.isScheduledTask || false,
     currentTaskId: containerInput.messageTaskId ?? null,

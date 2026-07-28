@@ -186,6 +186,17 @@ import {
   updateWorkspaceMemory,
   WorkspaceMemoryServiceError,
 } from './memory-service.js';
+import { type WorkspaceMemoryMutationContext } from './memory-store.js';
+import { isHappyClawBootstrapTurn } from './happyclaw-bootstrap.js';
+import {
+  claimHappyClawOwnerIntroduction,
+  clearHappyClawOwnerPreferredAddress,
+  getHappyClawOwnerProfileProjection,
+  OwnerProfileStoreError,
+  setHappyClawOwnerPreferredAddress,
+  skipHappyClawOwnerIntroduction,
+  type HappyClawOwnerProfileProjection,
+} from './owner-profile-store.js';
 import {
   buildWorkspaceMemoryUpdateInput,
   workspaceMemoryWriteRejection,
@@ -193,6 +204,7 @@ import {
 import {
   grantWorkspaceMemoryTurnToCurrentRunner,
   verifyAndConsumeWorkspaceMemoryMutation,
+  verifyWorkspaceMemoryCapability,
 } from './workspace-memory-capability.js';
 import {
   buildSessionMountUpdate,
@@ -2141,11 +2153,81 @@ function toContainerAgentProfile(
     id: profile.id,
     name: profile.name,
     version: profile.version,
+    isDefault: profile.is_default,
     identityHash: profile.identity_hash,
     identityPrompt: buildAgentProfilePrompt(profile),
     includeClaudePreset: profile.prompt_mode === 'append',
     runtimePolicy: profile.runtime_policy,
   };
+}
+
+function resolveHappyClawOwnerProfileForTurn(input: {
+  group: RegisteredGroup;
+  profile: AgentProfile | undefined;
+  turnId?: string;
+  isScheduledTask?: boolean;
+  runtimeAgentId?: string | null;
+  runtimeAgentKind?: 'task' | 'conversation' | 'spawn' | null;
+}): HappyClawOwnerProfileProjection | undefined {
+  if (
+    !isHappyClawBootstrapTurn({
+      turnId: input.turnId,
+      isHome: input.group.is_home === true,
+      isDefaultProfile: input.profile?.is_default === true,
+      isScheduledTask: input.isScheduledTask,
+    }) ||
+    (input.runtimeAgentId && input.runtimeAgentKind !== 'conversation')
+  ) {
+    return undefined;
+  }
+  const ownerId = input.group.created_by;
+  const owner = ownerId ? getUserById(ownerId) : undefined;
+  if (!ownerId || owner?.status !== 'active') return undefined;
+  try {
+    activeAgentBuilderTurns.requireExactActiveOwnerHumanTurn(
+      agentBuilderTurnScope(input.group.folder, input.runtimeAgentId),
+      input.turnId,
+      getAgentBuilderInputMessage,
+      (persistedInput) =>
+        isAgentBuilderOwnerInput(
+          persistedInput,
+          ownerId,
+          (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+        ),
+    );
+  } catch {
+    // A Home group can admit non-owner audience turns. Owner Profile data and
+    // first-wake onboarding are intentionally absent from those turns.
+    return undefined;
+  }
+  const workspaceJid = getJidsByFolder(input.group.folder).find((jid) =>
+    jid.startsWith('web:'),
+  );
+  if (!workspaceJid) return undefined;
+  try {
+    return getHappyClawOwnerProfileProjection(workspaceJid);
+  } catch {
+    return undefined;
+  }
+}
+
+function isHappyClawOwnerProfileRuntimeEligible(input: {
+  group: RegisteredGroup;
+  profile: AgentProfile | undefined;
+  turnId?: string;
+  isScheduledTask?: boolean;
+  runtimeAgentId?: string | null;
+  runtimeAgentKind?: 'task' | 'conversation' | 'spawn' | null;
+}): boolean {
+  return (
+    isHappyClawBootstrapTurn({
+      turnId: input.turnId,
+      isHome: input.group.is_home === true,
+      isDefaultProfile: input.profile?.is_default === true,
+      isScheduledTask: input.isScheduledTask,
+    }) &&
+    (!input.runtimeAgentId || input.runtimeAgentKind === 'conversation')
+  );
 }
 
 function hasSessionAgentProfileMismatch(
@@ -8769,6 +8851,21 @@ async function runAgent(
   }
   const sessionId = sessions[group.folder];
   const containerAgentProfile = toContainerAgentProfile(resolvedAgentProfile);
+  const happyClawOwnerProfile = resolveHappyClawOwnerProfileForTurn({
+    group,
+    profile: resolvedAgentProfile,
+    turnId,
+    isScheduledTask: Boolean(messageTaskId),
+  });
+  const happyClawBootstrapPending =
+    happyClawOwnerProfile?.onboarding.state === 'pending' ||
+    happyClawOwnerProfile?.onboarding.state === 'claimed';
+  const happyClawOwnerProfileEnabled = isHappyClawOwnerProfileRuntimeEligible({
+    group,
+    profile: resolvedAgentProfile,
+    turnId,
+    isScheduledTask: Boolean(messageTaskId),
+  });
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -8896,6 +8993,9 @@ async function runAgent(
           isMain: isAdminHome,
           isHome,
           isAdminHome,
+          happyClawBootstrapPending,
+          happyClawOwnerProfile,
+          happyClawOwnerProfileEnabled,
           agentBuilderEnabled: resolvedAgentProfile?.is_default === true,
           images,
           messageTaskId,
@@ -8922,6 +9022,9 @@ async function runAgent(
           isMain: isAdminHome,
           isHome,
           isAdminHome,
+          happyClawBootstrapPending,
+          happyClawOwnerProfile,
+          happyClawOwnerProfileEnabled,
           agentBuilderEnabled: resolvedAgentProfile?.is_default === true,
           images,
           messageTaskId,
@@ -10348,6 +10451,7 @@ function startIpcWatcher(): void {
           'agent_profile_publish_result_',
           'agent_profile_discard_result_',
           'workspace_memory_result_',
+          'happyclaw_owner_profile_result_',
         ];
         const isResultFile = (name: string) =>
           RESULT_FILE_PREFIXES.some((p) => name.startsWith(p));
@@ -10725,6 +10829,9 @@ async function processTaskIpc(
     timestamp?: string;
     runnerInstanceId?: string;
     mutationSignature?: string;
+    // Dedicated built-in HappyClaw Owner Profile facade.
+    preferredAddress?: string;
+    expectedOnboardingRevision?: number;
     // For the main HappyClaw's conversational Agent Builder
     profileId?: string;
     draftId?: string;
@@ -10810,7 +10917,203 @@ async function processTaskIpc(
     };
   };
 
+  const requireOwnerProfileActor = () => {
+    const ownerId = sourceGroupEntry?.created_by;
+    const user = ownerId ? getUserById(ownerId) : undefined;
+    const runtimeAgent = ipcAgentId ? getAgent(ipcAgentId) : undefined;
+    const sourceProfile = ownerId
+      ? getAgentProfileForWorkspace(sourceGroup, ownerId)
+      : undefined;
+    if (
+      isHome !== true ||
+      !sourceGroupEntry?.is_home ||
+      !user ||
+      user.status !== 'active' ||
+      sourceProfile?.is_default !== true ||
+      ipcTaskId ||
+      (ipcAgentId &&
+        (runtimeAgent?.kind !== 'conversation' ||
+          runtimeAgent.group_folder !== sourceGroup))
+    ) {
+      throw new OwnerProfileStoreError(
+        'not_home_workspace',
+        'Owner Profile is unavailable in this runtime',
+      );
+    }
+    const resolveOwnerTurn =
+      data.operation === 'get'
+        ? activeAgentBuilderTurns.requireExactOwnerHumanTurn.bind(
+            activeAgentBuilderTurns,
+          )
+        : activeAgentBuilderTurns.requireExactActiveOwnerHumanTurn.bind(
+            activeAgentBuilderTurns,
+          );
+    const activeTurn = resolveOwnerTurn(
+      agentBuilderTurnScope(sourceGroup, ipcAgentId),
+      data.inputTurnId,
+      getAgentBuilderInputMessage,
+      (persistedInput) =>
+        isAgentBuilderOwnerInput(
+          persistedInput,
+          user.id,
+          (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+        ),
+    );
+    const workspaceJid = getJidsByFolder(sourceGroup).find((jid) =>
+      jid.startsWith('web:'),
+    );
+    if (!workspaceJid) {
+      throw new OwnerProfileStoreError(
+        'not_home_workspace',
+        'Owner Home Workspace is unavailable',
+      );
+    }
+    const scope = {
+      groupFolder: sourceGroup,
+      agentId: ipcAgentId,
+      taskRunId: ipcTaskId,
+    };
+    const isMutation = data.operation !== 'get';
+    if (
+      !verifyWorkspaceMemoryCapability(
+        scope,
+        data as Record<string, unknown>,
+        data.mutationSignature,
+        isMutation,
+      )
+    ) {
+      throw new OwnerProfileStoreError(
+        'lease_conflict',
+        'Owner Profile runner capability is missing or invalid',
+      );
+    }
+    const context: WorkspaceMemoryMutationContext = {
+      actorId: user.id,
+      sourceType: 'agent_runtime',
+      sourceId: activeTurn.messageId,
+      sessionId: getSession(sourceGroup, ipcAgentId ?? undefined) ?? null,
+      observedAt: new Date().toISOString(),
+    };
+    return { user, workspaceJid, activeTurn, context };
+  };
+
   switch (data.type) {
+    case 'happyclaw_owner_profile': {
+      const finish = (payload: Record<string, unknown>): void =>
+        writeTaskResult(
+          tasksDir,
+          'happyclaw_owner_profile',
+          data.requestId,
+          payload,
+        );
+      try {
+        if (!data.requestId || !SAFE_REQUEST_ID_RE.test(data.requestId)) {
+          throw new Error('Invalid Owner Profile request ID');
+        }
+        const principal = requireOwnerProfileActor();
+        if (
+          (data.operation === 'get' || data.operation === 'skip') &&
+          data.idempotencyKey !== undefined
+        ) {
+          throw new OwnerProfileStoreError(
+            'idempotency_conflict',
+            'Owner Profile get and skip do not accept idempotency keys',
+          );
+        }
+        let result: Record<string, unknown>;
+        switch (data.operation) {
+          case 'get': {
+            if (!data.runnerInstanceId) {
+              throw new OwnerProfileStoreError(
+                'lease_conflict',
+                'Owner Profile runner identity is required',
+              );
+            }
+            const claim = claimHappyClawOwnerIntroduction({
+              workspaceJid: principal.workspaceJid,
+              leaseOwner: data.runnerInstanceId,
+            });
+            const projection = claim.projection;
+            const onboardingStatus = projection.preferredAddress
+              ? 'known'
+              : projection.onboarding.state === 'skipped'
+                ? 'skipped'
+                : projection.onboarding.state === 'completed'
+                  ? 'cleared'
+                  : claim.claimed
+                    ? 'awaiting'
+                    : 'unavailable';
+            result = {
+              projection,
+              onboardingStatus,
+              firstWake: claim.firstWake,
+              leaseAcquired: claim.leaseAcquired,
+            };
+            break;
+          }
+          case 'set':
+            result = setHappyClawOwnerPreferredAddress({
+              workspaceJid: principal.workspaceJid,
+              preferredAddress: data.preferredAddress ?? '',
+              expectedRevision: data.expectedRevision,
+              idempotencyKey: data.idempotencyKey,
+              context: principal.context,
+            });
+            break;
+          case 'clear':
+            if (!Number.isInteger(data.expectedRevision)) {
+              throw new OwnerProfileStoreError(
+                'revision_conflict',
+                'expectedRevision is required to clear the Owner Profile',
+              );
+            }
+            result = clearHappyClawOwnerPreferredAddress({
+              workspaceJid: principal.workspaceJid,
+              expectedRevision: data.expectedRevision!,
+              idempotencyKey: data.idempotencyKey,
+              context: principal.context,
+            });
+            break;
+          case 'skip':
+            result = skipHappyClawOwnerIntroduction({
+              workspaceJid: principal.workspaceJid,
+              expectedOnboardingRevision: data.expectedOnboardingRevision,
+              context: principal.context,
+            });
+            break;
+          default:
+            throw new Error('Unknown Owner Profile operation');
+        }
+        finish({ success: true, ...result });
+      } catch (error) {
+        const code =
+          error instanceof OwnerProfileStoreError
+            ? error.code
+            : 'internal_error';
+        finish({
+          success: false,
+          code,
+          error:
+            error instanceof OwnerProfileStoreError
+              ? error.message
+              : 'Internal error while processing Owner Profile request.',
+          ...(error instanceof OwnerProfileStoreError && error.details
+            ? { details: error.details }
+            : {}),
+        });
+        logger.warn(
+          {
+            sourceGroup,
+            operation: data.operation,
+            code,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'HappyClaw Owner Profile IPC request failed',
+        );
+      }
+      break;
+    }
+
     case 'workspace_memory': {
       const finish = (payload: Record<string, unknown>): void =>
         writeTaskResult(tasksDir, 'workspace_memory', data.requestId, payload);
@@ -15148,6 +15451,24 @@ async function processAgentConversation(
       });
     };
 
+    const happyClawOwnerProfile = resolveHappyClawOwnerProfileForTurn({
+      group: effectiveGroup,
+      profile: agentProfile,
+      turnId: lastProcessed.id,
+      isScheduledTask: Boolean(lastProcessed.task_id),
+      runtimeAgentId: agentId,
+      runtimeAgentKind: agent.kind,
+    });
+    const happyClawOwnerProfileEnabled = isHappyClawOwnerProfileRuntimeEligible(
+      {
+        group: effectiveGroup,
+        profile: agentProfile,
+        turnId: lastProcessed.id,
+        isScheduledTask: Boolean(lastProcessed.task_id),
+        runtimeAgentId: agentId,
+        runtimeAgentKind: agent.kind,
+      },
+    );
     const containerInput: ContainerInput = {
       prompt,
       sessionId,
@@ -15163,6 +15484,11 @@ async function processAgentConversation(
       isAdminHome,
       agentBuilderEnabled:
         agent.kind === 'conversation' && agentProfile?.is_default === true,
+      happyClawBootstrapPending:
+        happyClawOwnerProfile?.onboarding.state === 'pending' ||
+        happyClawOwnerProfile?.onboarding.state === 'claimed',
+      happyClawOwnerProfile,
+      happyClawOwnerProfileEnabled,
       agentId,
       agentName: agent.name,
       images: imagesForAgent,

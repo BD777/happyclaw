@@ -34,6 +34,9 @@ const {
   migrateAgentProfileAutoCompactWindow,
   getAgentChannelMount,
   listAgentProfilePromptVersions,
+  ensureUserHomeGroup,
+  getOrCreateDefaultAgentProfile,
+  getRegisteredGroup,
 } = await import('../src/db.js');
 
 beforeAll(() => {
@@ -216,6 +219,39 @@ describe('AgentProfile DB model', () => {
         'Research Agent',
       ),
     );
+  });
+
+  test('permanently binds Home Workspace to the built-in HappyClaw', () => {
+    const userId = 'agent-profile-home-owner';
+    seedUser(userId);
+    const homeJid = ensureUserHomeGroup(userId, 'member', userId);
+    const home = getRegisteredGroup(homeJid)!;
+    const builtIn = getOrCreateDefaultAgentProfile(userId);
+    const custom = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Must Stay Isolated',
+    });
+
+    expect(getWorkspaceAgentProfileId(home.folder)).toBe(builtIn.id);
+    expect(() => assignWorkspaceAgentProfile(home.folder, custom.id)).toThrow(
+      'Home Workspace must remain bound to the built-in HappyClaw Agent',
+    );
+
+    // Simulate a legacy database written before the invariant existed.
+    const rawDb = new Database(path.join(tmpStoreDir, 'messages.db'));
+    rawDb
+      .prepare(
+        `UPDATE workspace_agent_profiles
+         SET agent_profile_id = ?
+         WHERE group_folder = ?`,
+      )
+      .run(custom.id, home.folder);
+    rawDb.close();
+    expect(getWorkspaceAgentProfileId(home.folder)).toBe(custom.id);
+    expect(getAgentProfileForWorkspace(home.folder, userId)?.id).toBe(
+      builtIn.id,
+    );
+    expect(getWorkspaceAgentProfileId(home.folder)).toBe(builtIn.id);
   });
 
   test('updates identity hash and version when name, prompt, or preset mode changes', () => {

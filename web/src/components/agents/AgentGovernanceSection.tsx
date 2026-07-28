@@ -103,7 +103,9 @@ export function AgentGovernanceSection({
             <div className="max-h-64 overflow-auto rounded-md border">
               {(governance?.workspaces.length ?? 0) === 0 ? (
                 <div className="px-3 py-4 text-sm text-muted-foreground">
-                  暂无工作区
+                  {selected.is_default
+                    ? '暂无工作区'
+                    : '尚未绑定工作区。该智能体当前没有 Session 或 Memory；请显式为它新建工作区，或迁移一个非 Home 工作区。'}
                 </div>
               ) : (
                 governance?.workspaces.map((workspace) => (
@@ -137,52 +139,62 @@ export function AgentGovernanceSection({
                         ))}
                       </div>
                     )}
-                    <div className="mt-2 flex items-center gap-2">
-                      <Select
-                        value={workspaceMoveTargets[workspace.jid] || ''}
-                        onValueChange={(value) =>
-                          onMoveTargetChange(workspace.jid, value)
-                        }
-                      >
-                        <SelectTrigger
-                          className="h-8 min-w-0 flex-1 text-xs"
-                          aria-label={`迁移工作区 ${workspace.name}`}
+                    {workspace.is_home ? (
+                      <div className="mt-2">
+                        <Badge variant="outline">
+                          Home · 固定归属 HappyClaw
+                        </Badge>
+                      </div>
+                    ) : (
+                      <div className="mt-2 flex items-center gap-2">
+                        <Select
+                          value={workspaceMoveTargets[workspace.jid] || ''}
+                          onValueChange={(value) =>
+                            onMoveTargetChange(workspace.jid, value)
+                          }
                         >
-                          <SelectValue placeholder="迁移到其他智能体" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {profiles
-                            .filter((profile) => profile.id !== selected.id)
-                            .map((profile) => (
-                              <SelectItem key={profile.id} value={profile.id}>
-                                {profile.is_default ? '主智能体' : profile.name}
-                              </SelectItem>
-                            ))}
-                        </SelectContent>
-                      </Select>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-8"
-                        disabled={
-                          movingWorkspaceJid === workspace.jid ||
-                          !workspaceMoveTargets[workspace.jid]
-                        }
-                        onClick={() =>
-                          onMoveWorkspace(
-                            workspace.jid,
-                            workspaceMoveTargets[workspace.jid],
-                          )
-                        }
-                      >
-                        {movingWorkspaceJid === workspace.jid ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <ArrowRight className="h-3.5 w-3.5" />
-                        )}
-                        迁移
-                      </Button>
-                    </div>
+                          <SelectTrigger
+                            className="h-8 min-w-0 flex-1 text-xs"
+                            aria-label={`迁移工作区 ${workspace.name}`}
+                          >
+                            <SelectValue placeholder="迁移到其他智能体" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {profiles
+                              .filter((profile) => profile.id !== selected.id)
+                              .map((profile) => (
+                                <SelectItem key={profile.id} value={profile.id}>
+                                  {profile.is_default
+                                    ? '主智能体'
+                                    : profile.name}
+                                </SelectItem>
+                              ))}
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8"
+                          disabled={
+                            movingWorkspaceJid === workspace.jid ||
+                            !workspaceMoveTargets[workspace.jid]
+                          }
+                          onClick={() =>
+                            onMoveWorkspace(
+                              workspace.jid,
+                              workspaceMoveTargets[workspace.jid],
+                            )
+                          }
+                        >
+                          {movingWorkspaceJid === workspace.jid ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <ArrowRight className="h-3.5 w-3.5" />
+                          )}
+                          迁移
+                        </Button>
+                      </div>
+                    )}
                   </div>
                 ))
               )}

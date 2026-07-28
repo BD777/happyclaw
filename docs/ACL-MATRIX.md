@@ -61,6 +61,7 @@
 | `/api/skills/*`                                     | Login，仅本人用户 Skills                      |
 | 用户级 `/api/mcp-servers/*`                         | Login，仅本人配置                             |
 | Workspace Memory v2                                 | Login + Workspace owner ACL，见 4.5           |
+| HappyClaw Owner Profile                             | Home actual owner + runtime exact-turn gate   |
 | `/api/usage/*`                                      | Login；普通用户只见本人，管理视图再按角色过滤 |
 | `/api/billing/my/*`                                 | Login，仅本人                                 |
 
@@ -86,6 +87,10 @@
 - 查看 Runtime Session、绑定和项目能力
 - 打开 Web 终端前的资源检查
 
+Home 的 AgentProfile 归属也是系统不变量：只能绑定同一 owner 的 `is_default`
+HappyClaw。路由在进入 Runtime quiesce 前拒绝迁移，数据库绑定函数再次校验；启动
+backfill 会修复旧数据中的错误 Home 绑定。
+
 Host Workspace 在 Access 之外还要求 admin。
 
 ### 4.2 Modify
@@ -109,6 +114,10 @@ Home Workspace 永远不可删除。其他工作区必须通过 Modify，删除�
 2. 停止工作区、Runtime Session 和虚拟任务 Runner。
 3. 删除数据库、文件和绑定状态。
 4. 仅在提交成功后丢弃被暂停的旧工作；失败则恢复。
+
+自定义 AgentProfile 创建后默认不拥有 Workspace，因此也没有可访问的 Session 或
+Workspace Memory。只有 owner 显式新建/迁移非 Home Workspace 才建立归属；迁移时
+Memory 随 Workspace 保留，不跨 Workspace 复制。
 
 ### 4.4 环境变量
 
@@ -143,6 +152,26 @@ Agent Runtime 的 Workspace Memory MCP 还叠加执行上下文策略：
 
 定时任务和 Sub-Agent 即使继承 Workspace owner 身份，也不能写入 Workspace Memory；
 只读限制由 MCP 暴露面与主进程 IPC broker 共同执行，不能由模型参数扩大权限。
+
+### 4.6 HappyClaw Owner Profile
+
+`GET|PATCH /api/workspaces/:jid/owner-profile` 只接受当前登录用户自己的 Home
+Workspace，且目标必须绑定内置默认 HappyClaw。admin 不具有跨 owner bypass。
+
+Runtime 的权限更严格：
+
+| 上下文                                       | 投影                | 修改                  |
+| -------------------------------------------- | ------------------- | --------------------- |
+| Home 内置 HappyClaw + actual owner turn      | 允许                | 当前 active turn 允许 |
+| Home 内置 HappyClaw + 非 owner 群成员 turn   | 拒绝                | 拒绝                  |
+| Home 内置 HappyClaw 普通 Runtime Session     | actual owner 时允许 | 当前 active turn 允许 |
+| 自定义 AgentProfile / Scheduled / Task/Spawn | 拒绝                | 拒绝                  |
+| SDK Sub-Agent                                | 拒绝                | 拒绝                  |
+
+read-only 投影按 host-issued turn ID 精确匹配当前或已接纳的 queued batch；queued owner
+身份不能为其他 turn 授权。set/clear/skip 必须匹配当前 active batch。Web sender 必须
+等于内部 owner user ID；IM sender 还必须通过强 owner claim 与 provider 原生 ID
+规范化比对。称呼和 onboarding 状态不会注入非 owner turn。
 
 旧 `/api/memory/sources`、`/api/memory/search`、`/api/memory/file` 和
 `/api/memory/global` 只要求有效登录，但无论角色均返回 410；它们不提供旧文件读取

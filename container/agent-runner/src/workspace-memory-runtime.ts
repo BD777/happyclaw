@@ -8,6 +8,9 @@ const WRITE_TOOLS = new Set([
   'mcp__happyclaw__workspace_memory_update',
   'mcp__happyclaw__workspace_memory_forget',
 ]);
+const OWNER_PROFILE_TOOLS = new Set([
+  'mcp__happyclaw__happyclaw_owner_profile',
+]);
 
 /** Sub-agents inherit the MCP server, so enforce read-only access in a hook. */
 export function createWorkspaceMemoryWriteGuard(): HookCallback {
@@ -16,14 +19,17 @@ export function createWorkspaceMemoryWriteGuard(): HookCallback {
     if (
       preTool.hook_event_name === 'PreToolUse' &&
       preTool.agent_id &&
-      WRITE_TOOLS.has(preTool.tool_name)
+      (WRITE_TOOLS.has(preTool.tool_name) ||
+        OWNER_PROFILE_TOOLS.has(preTool.tool_name))
     ) {
+      const ownerProfile = OWNER_PROFILE_TOOLS.has(preTool.tool_name);
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
-          permissionDecisionReason:
-            'Sub-agents have read-only Workspace Memory access. Return proposed learnings to the top-level session.',
+          permissionDecisionReason: ownerProfile
+            ? 'Owner Profile is private to the actual owner’s top-level HappyClaw turn and is unavailable to sub-agents.'
+            : 'Sub-agents have read-only Workspace Memory access. Return proposed learnings to the top-level session.',
         },
       };
     }

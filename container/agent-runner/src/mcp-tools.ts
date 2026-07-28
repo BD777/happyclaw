@@ -31,6 +31,8 @@ export interface McpContext {
   isAdminHome: boolean;
   /** Whether this runtime is an interactive session of the main HappyClaw. */
   agentBuilderEnabled: boolean;
+  /** Host admitted Owner Profile capability for built-in HappyClaw in Home. */
+  ownerProfileEnabled: boolean;
   /** Public reply contract selected by the workspace. */
   interactionMode?: 'assistant' | 'proactive';
   isScheduledTask?: boolean;
@@ -132,6 +134,34 @@ export interface WorkspaceMemorySnapshot {
   };
 }
 
+export interface HappyClawOwnerProfileProjection {
+  workspaceJid: string;
+  preferredAddress: string | null;
+  revision: number | null;
+  onboarding: {
+    state: 'pending' | 'claimed' | 'completed' | 'skipped';
+    revision: number;
+    leaseOwner: string | null;
+    leaseToken: number | null;
+    leaseExpiresAt: string | null;
+    firstWakeAt?: string | null;
+  };
+}
+
+export interface HappyClawOwnerProfileTurnResult {
+  projection: HappyClawOwnerProfileProjection;
+  onboardingStatus:
+    | 'awaiting'
+    | 'known'
+    | 'cleared'
+    | 'skipped'
+    | 'unavailable';
+  firstWake?: boolean;
+  leaseAcquired?: boolean;
+  /** @deprecated Compatibility with pre-v66 test fixtures/results. */
+  newlyClaimed?: boolean;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -182,6 +212,7 @@ export function parseWorkspaceMemorySnapshot(
 }
 
 const WORKSPACE_MEMORY_RESULT_PREFIX = 'workspace_memory_result';
+const OWNER_PROFILE_RESULT_PREFIX = 'happyclaw_owner_profile_result';
 
 async function callWorkspaceMemory(
   ctx: McpContext,
@@ -233,6 +264,94 @@ async function callWorkspaceMemory(
     );
   }
   return result;
+}
+
+async function callHappyClawOwnerProfile(
+  ctx: McpContext,
+  operation: 'get' | 'set' | 'clear' | 'skip',
+  payload: Record<string, unknown>,
+  timeoutMs = 30_000,
+  inputTurnId: string | null | undefined = ctx.currentInputTurnId,
+): Promise<Record<string, unknown>> {
+  const tasksDir = path.join(ctx.workspaceIpc, 'tasks');
+  const requestId = newRequestId();
+  const request: Record<string, unknown> & { requestId: string } = {
+    ...payload,
+    type: 'happyclaw_owner_profile',
+    operation,
+    requestId,
+    inputTurnId: inputTurnId || undefined,
+    sessionId: ctx.currentSessionId || undefined,
+    timestamp: new Date().toISOString(),
+  };
+  const auth = ctx.workspaceMemoryMutationAuth;
+  if (auth) {
+    request.runnerInstanceId = auth.runnerInstanceId;
+    request.mutationSignature = signWorkspaceMemoryMutation(
+      auth.secret,
+      {
+        groupFolder: ctx.groupFolder,
+        agentId: auth.agentId ?? null,
+        taskRunId: auth.taskRunId ?? null,
+      },
+      request,
+    );
+  }
+  const result = await pollIpcResult(
+    tasksDir,
+    request,
+    OWNER_PROFILE_RESULT_PREFIX,
+    timeoutMs,
+  );
+  if (!result.success) {
+    const code = typeof result.code === 'string' ? ` (${result.code})` : '';
+    throw new Error(
+      `${typeof result.error === 'string' ? result.error : 'Owner Profile request failed'}${code}`,
+    );
+  }
+  return result;
+}
+
+export async function fetchHappyClawOwnerProfileTurn(
+  ctx: McpContext,
+  timeoutMs: number = 5_000,
+  inputTurnId: string | null | undefined = ctx.currentInputTurnId,
+): Promise<HappyClawOwnerProfileTurnResult | null> {
+  if (!ctx.ownerProfileEnabled || !inputTurnId) return null;
+  try {
+    const result = await callHappyClawOwnerProfile(
+      ctx,
+      'get',
+      {},
+      timeoutMs,
+      inputTurnId,
+    );
+    if (!isRecord(result.projection)) return null;
+    const projection =
+      result.projection as unknown as HappyClawOwnerProfileProjection;
+    const onboardingStatus = result.onboardingStatus;
+    if (
+      typeof projection.workspaceJid !== 'string' ||
+      !isRecord(projection.onboarding) ||
+      !['awaiting', 'known', 'cleared', 'skipped', 'unavailable'].includes(
+        String(onboardingStatus),
+      )
+    ) {
+      return null;
+    }
+    return {
+      projection,
+      onboardingStatus:
+        onboardingStatus as HappyClawOwnerProfileTurnResult['onboardingStatus'],
+      firstWake:
+        result.firstWake === true ||
+        (result.firstWake === undefined && result.newlyClaimed === true),
+      leaseAcquired: result.leaseAcquired === true,
+    };
+  } catch {
+    // Fail closed: no profile projection is safer than stale/private data.
+    return null;
+  }
 }
 
 /**
@@ -2426,10 +2545,76 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
+  if (ctx.ownerProfileEnabled && !ctx.isScheduledTask && !ctx.currentTaskId) {
+    tools.push(
+      tool(
+        'happyclaw_owner_profile',
+        'Read or update the actual owner’s preferred form of address in the built-in HappyClaw Home Workspace. This is a dedicated profile field, not generic Workspace Memory. Call get before changing an existing value; set and clear use optimistic concurrency and host-managed idempotency. Use skip only when the owner explicitly declines first-wake onboarding.',
+        {
+          action: z.enum(['get', 'set', 'clear', 'skip']),
+          preferred_address: z.string().min(1).max(200).optional(),
+          expected_revision: z.number().int().min(0).optional(),
+          expected_onboarding_revision: z.number().int().min(0).optional(),
+        },
+        async (args) => {
+          try {
+            if (args.action === 'set' && !args.preferred_address?.trim()) {
+              throw new Error('preferred_address is required for set');
+            }
+            if (
+              args.action === 'clear' &&
+              (!Number.isInteger(args.expected_revision) ||
+                (args.expected_revision ?? 0) < 1)
+            ) {
+              throw new Error(
+                'expected_revision from a preceding get is required for clear',
+              );
+            }
+            const payload: Record<string, unknown> = {
+              preferredAddress: args.preferred_address?.trim(),
+              expectedRevision: args.expected_revision,
+              expectedOnboardingRevision: args.expected_onboarding_revision,
+            };
+            if (args.action === 'set' || args.action === 'clear') {
+              payload.idempotencyKey = memoryIdempotencyKey(
+                undefined,
+                `${ctx.currentInputTurnId ?? 'turn'}:owner-profile:${args.action}:${args.expected_revision ?? 0}`,
+              );
+            }
+            const result = await callHappyClawOwnerProfile(
+              ctx,
+              args.action,
+              payload,
+            );
+            return workspaceMemoryToolResult(result);
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: err instanceof Error ? err.message : String(err),
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
+  }
+
   // Workspace is the only durable continuity boundary. The model never
   // supplies a workspace, owner, actor, or filesystem path: the host derives
   // all authorization and provenance from this IPC namespace.
   const memoryKindSchema = z.enum(['fact', 'decision', 'lesson', 'open_loop']);
+  const genericMemoryCanonicalKeySchema = z
+    .string()
+    .min(1)
+    .max(300)
+    .refine(
+      (value) => value.trim() !== 'happyclaw.owner.preferred_address',
+      'Use happyclaw_owner_profile for the reserved owner address field',
+    );
   const callMemoryTool = async (
     operation: 'search' | 'get' | 'create' | 'update' | 'delete',
     payload: Record<string, unknown>,
@@ -2496,7 +2681,7 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
           kind: memoryKindSchema,
           title: z.string().min(1).max(200),
           content: z.string().min(1).max(20_000),
-          canonical_key: z.string().min(1).max(300).optional(),
+          canonical_key: genericMemoryCanonicalKeySchema.optional(),
           importance: z.number().min(0).max(1).optional(),
           confidence: z.number().min(0).max(1).optional(),
           valid_from: z.string().datetime().optional(),
@@ -2530,7 +2715,7 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
           kind: memoryKindSchema.optional(),
           title: z.string().min(1).max(200).optional(),
           content: z.string().min(1).max(20_000).optional(),
-          canonical_key: z.string().min(1).max(300).nullable().optional(),
+          canonical_key: genericMemoryCanonicalKeySchema.nullable().optional(),
           importance: z.number().min(0).max(1).optional(),
           confidence: z.number().min(0).max(1).optional(),
           valid_from: z.string().datetime().nullable().optional(),

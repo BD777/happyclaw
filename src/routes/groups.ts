@@ -1289,6 +1289,28 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
     authUser.id,
   );
   if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
+  if (existing.is_home) {
+    const defaultProfile = getOrCreateDefaultAgentProfile(authUser.id);
+    if (profile.id !== defaultProfile.id) {
+      return c.json(
+        {
+          error:
+            'Home Workspace 始终属于内置 HappyClaw，不能迁移到自定义智能体',
+          code: 'HOME_WORKSPACE_AGENT_IMMUTABLE',
+        },
+        409,
+      );
+    }
+    assignWorkspaceAgentProfile(existing.folder, defaultProfile.id);
+    return c.json({
+      success: true,
+      agent_profile_id: defaultProfile.id,
+      agent_profile_name: defaultProfile.name,
+      agent_profile_version: defaultProfile.version,
+      interaction_mode: getWorkspaceInteractionMode(existing.folder),
+      invalidated_runtime_jids: 0,
+    });
+  }
 
   let invalidatedRuntimeJids = 0;
   let committedProfile = profile;

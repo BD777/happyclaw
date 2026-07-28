@@ -632,6 +632,41 @@ describe('DELETE /:jid mutation pause', () => {
 });
 
 describe('PATCH /:jid/agent-profile two-phase runtime quiesce', () => {
+  test('rejects moving Home Workspace to a custom Agent before runtime teardown', async () => {
+    const jid = 'web:agent-migration-home';
+    const folder = 'agent-migration-home';
+    const builtIn = db.getOrCreateDefaultAgentProfile(OWNER_ID);
+    const custom = db.createAgentProfile({
+      ownerUserId: OWNER_ID,
+      name: 'Isolated Home Target',
+    });
+    db.setRegisteredGroup(jid, {
+      name: 'Protected Home',
+      folder,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      is_home: true,
+    });
+    db.assignWorkspaceAgentProfile(folder, builtIn.id);
+
+    asUser(OWNER_ID);
+    const response = await groupRoutes.request(
+      `/${encodeURIComponent(jid)}/agent-profile`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ agent_profile_id: custom.id }),
+      },
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: 'HOME_WORKSPACE_AGENT_IMMUTABLE',
+    });
+    expect(db.getWorkspaceAgentProfileId(folder)).toBe(builtIn.id);
+    db.deleteRegisteredGroup(jid);
+  });
+
   test('pre-commit stop failure leaves the workspace AgentProfile unchanged', async () => {
     const jid = 'web:agent-migration-pre-failure';
     const folder = 'agent-migration-pre-failure';

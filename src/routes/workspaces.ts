@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Variables } from '../web-context.js';
 import {
   canAccessGroup,
@@ -19,6 +19,14 @@ import {
   type AgentChannelMountRecord,
   type WorkspaceRecord,
 } from '../db.js';
+import { HappyClawOwnerProfileMutationSchema } from '../schemas.js';
+import {
+  clearHappyClawOwnerPreferredAddress,
+  getHappyClawOwnerProfileProjection,
+  OwnerProfileStoreError,
+  setHappyClawOwnerPreferredAddress,
+  skipHappyClawOwnerIntroduction,
+} from '../owner-profile-store.js';
 
 const workspaceRoutes = new Hono<{ Variables: Variables }>();
 
@@ -134,6 +142,44 @@ function listVisibleWorkspaces(user: AuthUser): ResolvedWorkspaceAccess[] {
     .filter((access): access is ResolvedWorkspaceAccess => access !== null);
 }
 
+function resolveOwnerProfileAccess(
+  user: AuthUser,
+  jid: string,
+): ResolvedWorkspaceAccess | null {
+  const workspace = listWorkspaceRecords().find((record) => record.jid === jid);
+  if (!workspace || !workspace.is_home || workspace.owner_user_id !== user.id) {
+    return null;
+  }
+  const access = resolveWorkspaceAccess(user, workspace);
+  if (!access || access.group.created_by !== user.id) return null;
+  const profile = getAgentProfileSnapshot(workspace, true);
+  return profile?.is_default === true ? access : null;
+}
+
+function ownerProfileError(c: Context, error: unknown): Response {
+  if (error instanceof OwnerProfileStoreError) {
+    if (error.code === 'revision_conflict') {
+      return c.json(
+        {
+          error: error.code,
+          message: error.message,
+          currentRevision: error.details?.currentRevision,
+          storeRevision: error.details?.storeRevision,
+        },
+        409,
+      );
+    }
+    if (error.code === 'idempotency_conflict') {
+      return c.json({ error: error.code, message: error.message }, 409);
+    }
+    if (error.code === 'not_home_workspace') {
+      return c.json({ error: 'Owner Profile not found' }, 404);
+    }
+    return c.json({ error: error.code, message: error.message }, 400);
+  }
+  return c.json({ error: 'Owner Profile request failed' }, 500);
+}
+
 workspaceRoutes.get('/', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const workspaces = listVisibleWorkspaces(user).map((access) =>
@@ -152,6 +198,72 @@ workspaceRoutes.get('/mounts', authMiddleware, (c) => {
       ),
     );
   return c.json({ channel_mounts: channelMounts });
+});
+
+workspaceRoutes.get('/:jid/owner-profile', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  const access = resolveOwnerProfileAccess(user, c.req.param('jid'));
+  if (!access) return c.json({ error: 'Owner Profile not found' }, 404);
+  try {
+    return c.json({
+      profile: getHappyClawOwnerProfileProjection(access.workspace.jid),
+    });
+  } catch (error) {
+    return ownerProfileError(c, error);
+  }
+});
+
+workspaceRoutes.patch('/:jid/owner-profile', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const access = resolveOwnerProfileAccess(user, c.req.param('jid'));
+  if (!access) return c.json({ error: 'Owner Profile not found' }, 404);
+  const body = await c.req.json().catch(() => null);
+  const parsed = HappyClawOwnerProfileMutationSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: 'Invalid request', details: parsed.error.format() },
+      400,
+    );
+  }
+  const context = {
+    actorId: user.id,
+    sourceType: 'web_user' as const,
+    sourceId: `api:${access.workspace.jid}:owner-profile`,
+    observedAt: new Date().toISOString(),
+  };
+  try {
+    switch (parsed.data.action) {
+      case 'set':
+        return c.json(
+          setHappyClawOwnerPreferredAddress({
+            workspaceJid: access.workspace.jid,
+            preferredAddress: parsed.data.preferredAddress,
+            expectedRevision: parsed.data.expectedRevision,
+            idempotencyKey: parsed.data.idempotencyKey,
+            context,
+          }),
+        );
+      case 'clear':
+        return c.json(
+          clearHappyClawOwnerPreferredAddress({
+            workspaceJid: access.workspace.jid,
+            expectedRevision: parsed.data.expectedRevision,
+            idempotencyKey: parsed.data.idempotencyKey,
+            context,
+          }),
+        );
+      case 'skip':
+        return c.json(
+          skipHappyClawOwnerIntroduction({
+            workspaceJid: access.workspace.jid,
+            expectedOnboardingRevision: parsed.data.expectedOnboardingRevision,
+            context,
+          }),
+        );
+    }
+  } catch (error) {
+    return ownerProfileError(c, error);
+  }
 });
 
 workspaceRoutes.get('/:jid', authMiddleware, (c) => {

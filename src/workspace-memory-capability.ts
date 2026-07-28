@@ -124,6 +124,25 @@ export function verifyAndConsumeWorkspaceMemoryMutation(
   request: Record<string, unknown>,
   candidateSignature: unknown,
 ): boolean {
+  return verifyWorkspaceMemoryCapability(
+    scope,
+    request,
+    candidateSignature,
+    true,
+  );
+}
+
+/**
+ * Verify a request from the current admitted runner. Owner Profile uses the
+ * non-consuming form for its per-turn read/claim refresh and the consuming
+ * form for mutations.
+ */
+export function verifyWorkspaceMemoryCapability(
+  scope: WorkspaceMemoryCapabilityScope,
+  request: Record<string, unknown>,
+  candidateSignature: unknown,
+  consume: boolean = false,
+): boolean {
   if (
     typeof candidateSignature !== 'string' ||
     !TOKEN_PATTERN.test(candidateSignature)
@@ -159,8 +178,10 @@ export function verifyAndConsumeWorkspaceMemoryMutation(
     expected.length === candidate.length &&
     timingSafeEqual(expected, candidate)
   ) {
-    if (entry.usedSignatures.has(candidateSignature)) return false;
-    entry.usedSignatures.add(candidateSignature);
+    if (consume) {
+      if (entry.usedSignatures.has(candidateSignature)) return false;
+      entry.usedSignatures.add(candidateSignature);
+    }
     return true;
   }
   return false;

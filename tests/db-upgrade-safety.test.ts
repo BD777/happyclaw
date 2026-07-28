@@ -170,6 +170,6 @@ describe('schema version head', () => {
     // one assertion that fails when the head moves, forcing whoever bumps it
     // to confirm the matching migration block — and a test covering it —
     // actually landed. Update the literal in the same commit as the migration.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(65);
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(66);
   });
 });

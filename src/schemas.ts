@@ -581,6 +581,33 @@ export const WorkspaceMemoryVersionsQuerySchema = z
   })
   .strict();
 
+export const HappyClawOwnerProfileMutationSchema = z.discriminatedUnion(
+  'action',
+  [
+    z
+      .object({
+        action: z.literal('set'),
+        preferredAddress: z.string().trim().min(1).max(200),
+        expectedRevision: z.number().int().min(0).optional(),
+        idempotencyKey: z.string().trim().min(1).max(128).optional(),
+      })
+      .strict(),
+    z
+      .object({
+        action: z.literal('clear'),
+        expectedRevision: z.number().int().positive(),
+        idempotencyKey: z.string().trim().min(1).max(128).optional(),
+      })
+      .strict(),
+    z
+      .object({
+        action: z.literal('skip'),
+        expectedOnboardingRevision: z.number().int().min(0).optional(),
+      })
+      .strict(),
+  ],
+);
+
 export const ClaudeConfigSchema = z.object({
   anthropicBaseUrl: z.string(),
   anthropicModel: z.string().max(128).optional(),

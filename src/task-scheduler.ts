@@ -201,6 +201,7 @@ function toRunnerAgentProfile(profile: AgentProfile | undefined) {
     id: profile.id,
     name: profile.name,
     version: profile.version,
+    isDefault: profile.is_default,
     identityHash: profile.identity_hash,
     identityPrompt: buildAgentProfilePrompt(profile),
     includeClaudePreset: profile.prompt_mode === 'append',
