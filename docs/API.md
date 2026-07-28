@@ -261,10 +261,9 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 写入使用 revision 或 idempotency key 防止并发覆盖和重复运行。运行状态与通知状态
 分开持久化；通知失败不会重新执行任务主体。
 
-所有创建入口（手工 REST、AI 创建和 MCP `schedule_task`）以及软删恢复都会在同一
-原子边界检查 `maxTasksPerUser`；达到上限时返回 409 `TASK_LIMIT_REACHED`
-（已软删的不计入）。`prompt` 与 `script_command` 有长度上限，AI 输入和解析结果、
-REST 与 MCP `schedule_task` / `update_task` 使用同一组上限，超出即拒绝。
+任务定义不设置每用户数量配额。`prompt` 与 `script_command` 有长度上限，AI 输入
+和解析结果、REST 与 MCP `schedule_task` / `update_task` 使用同一组上限，超出即
+拒绝。
 
 PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`。已经物化的 Run
 在 `definition_snapshot` 中冻结原投递路由，不会因后续任务编辑而切换目标。

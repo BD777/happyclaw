@@ -262,7 +262,6 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态、默认工作区和会话绑定    |
 | **设置 → 主 HappyClaw** | 默认智能体的 Skills 与 MCP                            |
 | **设置 → 执行与容量**   | 超时、并发、上下文窗口和运行限制                      |
-| **设置 → 任务与自动化** | 定时任务默认值和自动化策略                            |
 | **设置 → 宿主机集成**   | 管理员 Host 目录与 Claude 上下文来源                  |
 | **设置 → 注册策略**     | 开放注册、邀请码注册或关闭注册                        |
 | **设置 → 用户与访问**   | 用户、权限、邀请码与审计日志                          |
@@ -277,8 +276,6 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `CONTAINER_TIMEOUT`         | `1800000`                | 容器硬超时，毫秒                   |
 | `IDLE_TIMEOUT`              | `1800000`                | 容器空闲保活时间，毫秒             |
 | `MAX_CONCURRENT_CONTAINERS` | `20`                     | 最大并发容器数                     |
-| `MAX_CONCURRENT_SCRIPTS`    | `10`                     | 最大并发 Script 任务数             |
-| `SCRIPT_TIMEOUT`            | `60000`                  | Script 任务超时，毫秒              |
 | `MAX_FILE_SIZE_MB`          | `50`                     | Web 和 IM 入站文件大小上限         |
 | `CORS_ALLOWED_ORIGINS`      | 仅 localhost             | 公网部署的 WebSocket Origin 白名单 |
 | `TRUST_PROXY`               | `false`                  | 位于可信反向代理后时设为 `true`    |

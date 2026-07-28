@@ -39,7 +39,7 @@ describe('per-turn reply fuse', () => {
 
 describe('ActiveTurnOutputRegistry reply fuse', () => {
   test('applies the configured limit to turns it tracks', () => {
-    const registry = new ActiveTurnOutputRegistry(() => 2);
+    const registry = new ActiveTurnOutputRegistry(2);
     registry.bind('scope', 'turn-1', CALLBACKS);
 
     const input = { scopeKey: 'scope', inputTurnId: 'turn-1' };
@@ -50,28 +50,10 @@ describe('ActiveTurnOutputRegistry reply fuse', () => {
     expect(registry.canDeliverUtterance(input)).toBe(false);
   });
 
-  test('reads the limit per turn so a settings change applies to new turns', () => {
-    let limit = 1;
-    const registry = new ActiveTurnOutputRegistry(() => limit);
-
-    registry.bind('scope', 'turn-old', CALLBACKS);
-    const oldTurn = { scopeKey: 'scope', inputTurnId: 'turn-old' };
-    registry.recordDeliveredUtterance(oldTurn);
-    expect(registry.canDeliverUtterance(oldTurn)).toBe(false);
-
-    limit = 5;
-    registry.bind('scope', 'turn-new', CALLBACKS);
-    const newTurn = { scopeKey: 'scope', inputTurnId: 'turn-new' };
-    registry.recordDeliveredUtterance(newTurn);
-    expect(registry.canDeliverUtterance(newTurn)).toBe(true);
-    // The in-flight turn keeps the bound it started with.
-    expect(registry.canDeliverUtterance(oldTurn)).toBe(false);
-  });
-
   test('does not suppress turns it is not tracking', () => {
     // Scheduled tasks and other untracked paths have their own accounting; the
     // fuse must never be the reason one of them silently stops delivering.
-    const registry = new ActiveTurnOutputRegistry(() => 1);
+    const registry = new ActiveTurnOutputRegistry(1);
     expect(
       registry.canDeliverUtterance({
         scopeKey: 'scope',
@@ -81,7 +63,7 @@ describe('ActiveTurnOutputRegistry reply fuse', () => {
   });
 
   test('an unbound turn stops counting delivered output', () => {
-    const registry = new ActiveTurnOutputRegistry(() => 5);
+    const registry = new ActiveTurnOutputRegistry(5);
     const coordinator = registry.bind('scope', 'turn-1', CALLBACKS);
     const input = { scopeKey: 'scope', inputTurnId: 'turn-1' };
     expect(registry.recordDeliveredUtterance(input)).toBe(true);

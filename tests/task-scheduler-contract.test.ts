@@ -118,7 +118,6 @@ vi.mock('../src/container-runner.js', async (importOriginal) => {
 });
 
 vi.mock('../src/script-runner.js', () => ({
-  hasScriptCapacity: () => true,
   runScript: runScriptMock,
 }));
 

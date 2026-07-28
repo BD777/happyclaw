@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 // Isolate DB to a temp dir — same pattern as task-meta.test.ts.
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-backfill-grace-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-restart-recovery-'));
 const tmpStoreDir = path.join(tmpDir, 'db');
 const tmpGroupsDir = path.join(tmpDir, 'groups');
 fs.mkdirSync(tmpStoreDir, { recursive: true });
@@ -70,7 +70,7 @@ function makeTask(overrides: Partial<Parameters<typeof createTask>[0]> = {}) {
   return id;
 }
 
-describe('task backfill grace — db helpers', () => {
+describe('task restart recovery — db helpers', () => {
   test('cron minimum interval is deterministic from the complete seconds field', () => {
     for (const value of ['* * * * * *', '0,30 0 * * * *', '@secondly']) {
       expect(() => validateCronMinimumInterval(value)).toThrow(
@@ -186,38 +186,37 @@ describe('task backfill grace — db helpers', () => {
   });
 });
 
-describe('task backfill grace — decision predicate', () => {
+describe('task restart recovery — decision predicate', () => {
   // Imported directly from production code so a future inline-only change
   // breaks the test rather than silently drifting from a local mirror.
 
-  test('graceMs=0 disables skipping (legacy behavior preserved)', () => {
+  test('does not skip before the scheduler has started', () => {
     const tenDaysAgo = new Date(
       Date.now() - 10 * 24 * 60 * 60 * 1000,
     ).toISOString();
-    expect(shouldSkipBackfill(tenDaysAgo, Date.now(), 0)).toBe(false);
+    expect(shouldSkipBackfill(tenDaysAgo, 0)).toBe(false);
   });
 
-  test('within grace window: do not skip', () => {
-    const now = Date.now();
-    const oneMinuteAgo = new Date(now - 60_000).toISOString();
-    // grace = 5 min; 1 min overdue is within window
-    expect(shouldSkipBackfill(oneMinuteAgo, now, 300_000)).toBe(false);
+  test('work scheduled after process startup is not backfill', () => {
+    const startedAt = Date.now();
+    const scheduledAfterStart = new Date(startedAt + 1).toISOString();
+    expect(shouldSkipBackfill(scheduledAfterStart, startedAt)).toBe(false);
   });
 
-  test('beyond grace window: skip', () => {
-    const now = Date.now();
-    const tenMinutesAgo = new Date(now - 10 * 60_000).toISOString();
-    // grace = 5 min; 10 min overdue exceeds window
-    expect(shouldSkipBackfill(tenMinutesAgo, now, 300_000)).toBe(true);
+  test('work that became due while the process was offline is skipped', () => {
+    const startedAt = Date.now();
+    const scheduledBeforeStart = new Date(startedAt - 1).toISOString();
+    expect(shouldSkipBackfill(scheduledBeforeStart, startedAt)).toBe(true);
   });
 
   test('null next_run never triggers skip', () => {
-    expect(shouldSkipBackfill(null, Date.now(), 300_000)).toBe(false);
+    expect(shouldSkipBackfill(null, Date.now())).toBe(false);
   });
 
-  test('exactly at boundary: do not skip (overdue must be strictly greater)', () => {
-    const now = Date.now();
-    const exactlyFiveMinutesAgo = new Date(now - 300_000).toISOString();
-    expect(shouldSkipBackfill(exactlyFiveMinutesAgo, now, 300_000)).toBe(false);
+  test('exactly at process startup is not considered downtime', () => {
+    const startedAt = Date.now();
+    expect(
+      shouldSkipBackfill(new Date(startedAt).toISOString(), startedAt),
+    ).toBe(false);
   });
 });

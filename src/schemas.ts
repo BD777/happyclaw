@@ -534,20 +534,16 @@ export const SystemSettingsSchema = z
     // Deprecated compatibility input. Host execution is serialized only by
     // Session; the route accepts and discards this key for stale clients.
     maxConcurrentHostProcesses: z.number().int().min(1).max(50).optional(),
+    // Retired automation controls. Accept arbitrary legacy values so a stale
+    // browser tab cannot make an otherwise valid save fail after deployment;
+    // the route strips every key before normalization and persistence.
+    maxConcurrentScripts: z.unknown().optional(),
+    scriptTimeout: z.unknown().optional(),
+    taskBackfillGraceMs: z.unknown().optional(),
+    maxRepliesPerTurn: z.unknown().optional(),
+    maxTasksPerUser: z.unknown().optional(),
     maxLoginAttempts: z.number().int().min(1).max(100).optional(),
     loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
-    maxConcurrentScripts: z.number().int().min(1).max(50).optional(),
-    scriptTimeout: z.number().int().min(5000).max(600000).optional(),
-    taskBackfillGraceMs: z
-      .number()
-      .int()
-      .refine(
-        (v) => v === 0 || (v >= 1000 && v <= 86400000),
-        'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
-      )
-      .optional(),
-    maxRepliesPerTurn: z.number().int().min(0).max(500).optional(),
-    maxTasksPerUser: z.number().int().min(0).max(10000).optional(),
     fallbackModel: z.string().max(64).optional(),
   })
   .strict();

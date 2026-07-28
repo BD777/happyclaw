@@ -52,6 +52,14 @@ describe('message-level ChannelTurnContext', () => {
         parentId: 'om_parent',
         threadId: 'omt_thread',
         type: 'text',
+        referencedMessages: [
+          {
+            id: 'om_parent',
+            sender: 'Bob',
+            text: 'quoted body',
+            attachmentIndexes: [1],
+          },
+        ],
       },
       sender: {
         openId: 'ou_sender',
@@ -99,6 +107,14 @@ describe('message-level ChannelTurnContext', () => {
         rootId: 'om_root',
         parentId: 'om_parent',
         threadId: 'omt_thread',
+        referencedMessages: [
+          {
+            id: 'om_parent',
+            sender: 'Bob',
+            text: 'quoted body',
+            attachmentIndexes: [1],
+          },
+        ],
       },
       sender: {
         openId: 'ou_sender',

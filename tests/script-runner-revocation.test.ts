@@ -10,8 +10,7 @@ fs.mkdirSync(path.join(groupsDir, 'workspace'), { recursive: true });
 vi.mock('../src/config.js', () => ({ GROUPS_DIR: groupsDir }));
 vi.mock('../src/runtime-config.js', () => ({
   getSystemSettings: () => ({
-    maxConcurrentScripts: 4,
-    scriptTimeout: 60_000,
+    containerTimeout: 60_000,
   }),
 }));
 vi.mock('../src/logger.js', () => ({

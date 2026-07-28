@@ -94,11 +94,6 @@ export interface SystemSettings {
   maxConcurrentContainers: number;
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
-  maxConcurrentScripts: number;
-  scriptTimeout: number;
-  taskBackfillGraceMs: number;
-  maxRepliesPerTurn: number;
-  maxTasksPerUser: number;
   fallbackModel: string;
 }
 
@@ -135,7 +130,6 @@ export type SettingsTab =
   | 'registration'
   | 'appearance'
   | 'system'
-  | 'automation'
   | 'main-agent'
   | 'host-integration'
   | 'billing'

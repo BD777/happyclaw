@@ -30,7 +30,6 @@ const VALID_TABS: SettingsTab[] = [
   'registration',
   'appearance',
   'system',
-  'automation',
   'main-agent',
   'host-integration',
   'billing',
@@ -55,7 +54,6 @@ const SYSTEM_TABS: SettingsTab[] = [
   'registration',
   'appearance',
   'system',
-  'automation',
   'main-agent',
   'host-integration',
 ];
@@ -94,7 +92,12 @@ export function SettingsPage() {
     !!currentUser?.permissions.includes('view_audit_log');
 
   const defaultTab: SettingsTab = canManageSystemConfig ? 'claude' : 'profile';
-  const rawTab = searchParams.get('tab') as SettingsTab | null;
+  const rawTabValue = searchParams.get('tab');
+  // Keep bookmarks and already-open tabs from the retired automation page on
+  // the closest remaining settings surface instead of falling back to models.
+  const rawTab = (
+    rawTabValue === 'automation' ? 'system' : rawTabValue
+  ) as SettingsTab | null;
 
   const activeTab = useMemo((): SettingsTab => {
     if (mustChangePassword) return 'security';
@@ -137,7 +140,6 @@ export function SettingsPage() {
     registration: '注册策略',
     appearance: '常规与品牌',
     system: '运行与容量',
-    automation: '任务与自动化',
     'main-agent': '主 HappyClaw',
     'host-integration': '宿主机集成',
     billing: '计费管理',
@@ -231,10 +233,8 @@ export function SettingsPage() {
                 </div>
               )}
 
-              {activeTab === 'system' || activeTab === 'automation' ? (
-                <SystemSettingsSection
-                  scope={activeTab === 'automation' ? 'automation' : 'runtime'}
-                />
+              {activeTab === 'system' ? (
+                <SystemSettingsSection scope="runtime" />
               ) : activeTab === 'main-agent' ||
                 activeTab === 'host-integration' ? (
                 <div>

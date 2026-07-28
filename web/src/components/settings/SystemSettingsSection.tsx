@@ -18,12 +18,7 @@ type NumericSettingKey =
   | 'containerMaxOutputSize'
   | 'maxConcurrentContainers'
   | 'maxLoginAttempts'
-  | 'loginLockoutMinutes'
-  | 'maxConcurrentScripts'
-  | 'scriptTimeout'
-  | 'taskBackfillGraceMs'
-  | 'maxRepliesPerTurn'
-  | 'maxTasksPerUser';
+  | 'loginLockoutMinutes';
 
 interface FieldConfig {
   key: NumericSettingKey;
@@ -39,7 +34,7 @@ interface FieldConfig {
 }
 
 interface FieldGroup {
-  scope: 'runtime' | 'security' | 'automation';
+  scope: 'runtime' | 'security';
   title: string;
   description: string;
   fields: FieldConfig[];
@@ -128,71 +123,6 @@ const fieldGroups: FieldGroup[] = [
         toStored: (value) => value,
         min: 1,
         max: 1440,
-        step: 1,
-      },
-    ],
-  },
-  {
-    scope: 'automation',
-    title: '任务调度',
-    description: '保存后用于新启动和新调度的任务；正在执行的脚本不会被中断。',
-    fields: [
-      {
-        key: 'maxConcurrentScripts',
-        label: '脚本任务并发上限',
-        description: '系统同时运行的脚本任务数量上限。',
-        unit: '个',
-        toDisplay: (value) => value,
-        toStored: (value) => value,
-        min: 1,
-        max: 50,
-        step: 1,
-      },
-      {
-        key: 'scriptTimeout',
-        label: '脚本执行超时',
-        description: '单个脚本任务允许持续运行的最长时间。',
-        unit: '秒',
-        toDisplay: (value) => Math.round(value / 1000),
-        toStored: (value) => value * 1000,
-        min: 5,
-        max: 600,
-        step: 5,
-      },
-      {
-        key: 'taskBackfillGraceMs',
-        label: '定时任务逾期容忍窗口',
-        description:
-          '服务恢复后，仅补偿该时间窗口内错过的任务；0 表示补偿所有逾期任务。',
-        unit: '分钟',
-        toDisplay: (value) => Math.round(value / 60_000),
-        toStored: (value) => value * 60_000,
-        min: 0,
-        max: 1440,
-        step: 1,
-      },
-      {
-        key: 'maxTasksPerUser',
-        label: '每用户定时任务上限',
-        description:
-          '单个用户可持有的定时任务总数，防止大量任务持续占满执行容量。0 表示不限制。',
-        unit: '个',
-        toDisplay: (value) => value,
-        toStored: (value) => value,
-        min: 0,
-        max: 10000,
-        step: 10,
-      },
-      {
-        key: 'maxRepliesPerTurn',
-        label: '单轮消息条数上限',
-        description:
-          '一次回合内智能体最多送达多少条用户可见消息，用于兜住异常的重复发送循环；正常对话远达不到。0 表示不限制。',
-        unit: '条',
-        toDisplay: (value) => value,
-        toStored: (value) => value,
-        min: 0,
-        max: 500,
         step: 1,
       },
     ],
@@ -468,7 +398,6 @@ export function SystemSettingsSection({
       <p className="text-sm leading-6 text-muted-foreground">
         {scope === 'runtime' && '管理工作区运行边界、日志和执行容量。'}
         {scope === 'security' && '管理登录与注册请求的认证限流策略。'}
-        {scope === 'automation' && '管理脚本执行限制和定时任务恢复策略。'}
       </p>
 
       <div className="mt-6 divide-y divide-border">

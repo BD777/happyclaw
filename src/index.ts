@@ -77,7 +77,7 @@ import { isValidWorkspaceFolderName } from './workspace-folder.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   closeDatabase,
-  createTaskWithinOwnerLimit,
+  createTask,
   deleteExpiredSessions,
   getExpiredSessionIds,
   deleteTask,
@@ -94,6 +94,7 @@ import {
   getRegisteredGroup,
   getAgentBuilderInputMessage,
   getMessageChannelTurnContext,
+  getMessage,
   getUserById,
   getMessagesSince,
   getNewMessages,
@@ -458,7 +459,7 @@ import {
   stripAgentInternalTags,
   stripVirtualJidSuffix,
 } from './utils.js';
-import { normalizeImageAttachments } from './message-attachments.js';
+import { normalizeImageAttachment } from './message-attachments.js';
 import {
   startWebServer,
   broadcastToWebClients,
@@ -491,6 +492,12 @@ import {
   persistGroupUpdate,
 } from './group-owner.js';
 import { buildRecentConversationHistoryContext } from './conversation-history.js';
+import {
+  collectKnownReferenceAttachmentIndexes,
+  collectReferencedMessageIds,
+  formatMessages,
+} from './message-prompt.js';
+export { escapeXml, formatMessages } from './message-prompt.js';
 import { scanHostMarketplaces } from './plugin-importer.js';
 import { expandMessagesIfNeeded } from './plugin-expander-core.js';
 import { makeExpandContext } from './plugin-expander-context.js';
@@ -1240,9 +1247,10 @@ const activeIpcReplyTurnTrackers = new Map<string, IpcReplyTurnTracker>();
 // Foreground send_message(progress/final) joins the one host-owned primary
 // reply instead of creating an independent provider message. Bindings are
 // exact to (workspace/agent scope, immutable input turn).
-const activeTurnOutputs = new ActiveTurnOutputRegistry(
-  () => getSystemSettings().maxRepliesPerTurn,
-);
+// Internal runaway-loop fuse, deliberately not configurable. It is a process
+// safety invariant rather than a product policy or quota for the model to spend.
+const MAX_REPLIES_PER_TURN = 20;
+const activeTurnOutputs = new ActiveTurnOutputRegistry(MAX_REPLIES_PER_TURN);
 
 /**
  * Per-turn reply fuse shared by every user-visible IPC delivery path.
@@ -1457,11 +1465,19 @@ function injectPreparedFollowUp(
   if (!getQueuedFollowUp(item.chat_jid, item.id)) return 'cancelled';
   const sourceJid = item.source_jid || item.chat_jid;
   const deliveryTarget = createIpcDeliveryTarget(item.chat_jid, [item]);
-  const images = collectMessageImages(item.chat_jid, prepared.messages);
+  const knownReferencedMessageIds = collectPersistedReferencedMessageIds(
+    item.chat_jid,
+    prepared.messages,
+  );
+  const images = collectMessageImages(item.chat_jid, prepared.messages, {
+    knownMessageIds: knownReferencedMessageIds,
+  });
   const runtime = resolveFollowUpRuntime(item.chat_jid);
   const result = queue.sendMessage(
     item.chat_jid,
-    formatMessages(prepared.messages),
+    formatMessages(prepared.messages, {
+      knownMessageIds: knownReferencedMessageIds,
+    }),
     images.length > 0 ? images : undefined,
     (receipt) => {
       if (runtime && receipt) {
@@ -5018,14 +5034,6 @@ function getAvailableGroups(): AvailableGroup[] {
     }));
 }
 
-export function escapeXml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
 /**
  * Build an ExpandContext for plugin slash-command expansion. Resolves the
  * runtime owner / cwd / executionMode / active container name.
@@ -5063,18 +5071,15 @@ function buildExpandContext(
   });
 }
 
-export function formatMessages(messages: NewMessage[]): string {
-  const lines = messages.map((m) => {
-    const sourceJid = m.source_jid || m.chat_jid;
-    const channelType = getChannelType(sourceJid);
-    let sourceAttr = '';
-    if (channelType) {
-      const chatId = extractChatId(sourceJid);
-      sourceAttr = ` source="${escapeXml(channelType)}:${escapeXml(chatId)}"`;
-    }
-    return `<message sender="${escapeXml(m.sender_name)}"${sourceAttr} time="${m.timestamp}">${escapeXml(m.content)}</message>`;
-  });
-  return `<messages>\n${lines.join('\n')}\n</messages>`;
+function collectPersistedReferencedMessageIds(
+  chatJid: string,
+  messages: NewMessage[],
+): Set<string> {
+  return new Set(
+    [...collectReferencedMessageIds(messages)].filter((messageId) =>
+      Boolean(getMessage(chatJid, messageId)),
+    ),
+  );
 }
 
 function resolveBatchChannelContext(
@@ -5126,21 +5131,30 @@ function bindActiveChannelTurn(
 export function collectMessageImages(
   chatJid: string,
   messages: NewMessage[],
+  options: { knownMessageIds?: ReadonlySet<string> } = {},
 ): Array<{ data: string; mimeType: string }> {
   const images: Array<{ data: string; mimeType: string }> = [];
+  const knownMessageIds = options.knownMessageIds ?? new Set<string>();
   for (const msg of messages) {
     if (!msg.attachments) continue;
     try {
       const parsed = JSON.parse(msg.attachments);
-      const normalized = normalizeImageAttachments(parsed, {
-        onMimeMismatch: ({ declaredMime, detectedMime }) => {
-          logger.warn(
-            { chatJid, messageId: msg.id, declaredMime, detectedMime },
-            'Attachment MIME mismatch detected, using detected MIME',
-          );
-        },
-      });
-      for (const item of normalized) {
+      if (!Array.isArray(parsed)) continue;
+      const excludedIndexes = collectKnownReferenceAttachmentIndexes(
+        msg,
+        knownMessageIds,
+      );
+      for (let index = 0; index < parsed.length; index++) {
+        if (excludedIndexes.has(index)) continue;
+        const item = normalizeImageAttachment(parsed[index], {
+          onMimeMismatch: ({ declaredMime, detectedMime }) => {
+            logger.warn(
+              { chatJid, messageId: msg.id, declaredMime, detectedMime },
+              'Attachment MIME mismatch detected, using detected MIME',
+            );
+          },
+        });
+        if (!item) continue;
         images.push({ data: item.data, mimeType: item.mimeType });
       }
     } catch (err) {
@@ -5366,13 +5380,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     agentProfile,
   );
 
-  let prompt = formatMessages(missedMessages);
-
   // Recovery mode: session was cleared to prevent session ghost, so inject
   // recent conversation history to give the fresh session context.
   const isRecovery = recoveryGroups.delete(chatJid);
+  let historyContext: ReturnType<typeof buildRecentConversationHistoryContext> =
+    null;
   if (isRecovery) {
-    const historyContext = buildRecentConversationHistoryContext(
+    historyContext = buildRecentConversationHistoryContext(
       chatJid,
       new Set(missedMessages.map((m) => m.id)),
       {
@@ -5383,14 +5397,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       },
     );
     if (historyContext) {
-      prompt = historyContext.context + prompt;
       logger.info(
         { group: group.name, historyCount: historyContext.count },
         'Recovery: injected recent conversation history into prompt',
       );
     }
   } else if (resetForAgentProfile) {
-    const historyContext = buildRecentConversationHistoryContext(
+    historyContext = buildRecentConversationHistoryContext(
       chatJid,
       new Set(missedMessages.map((m) => m.id)),
       {
@@ -5401,7 +5414,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       },
     );
     if (historyContext) {
-      prompt = historyContext.context + prompt;
       logger.info(
         {
           group: group.name,
@@ -5417,7 +5429,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Proactive provider switch (sticky binding unhealthy/disabled) will clear
     // the SDK session inside the runner. Inject history so the new provider's
     // first turn keeps context, matching the recovery + reactive-failure paths.
-    const historyContext = buildRecentConversationHistoryContext(
+    historyContext = buildRecentConversationHistoryContext(
       chatJid,
       new Set(missedMessages.map((m) => m.id)),
       {
@@ -5428,7 +5440,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       },
     );
     if (historyContext) {
-      prompt = historyContext.context + prompt;
       logger.info(
         { group: group.name, historyCount: historyContext.count },
         'Provider switch: injected recent conversation history into prompt',
@@ -5436,7 +5447,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  const images = collectMessageImages(chatJid, missedMessages);
+  const activeSessionReferencedMessageIds =
+    !historyContext && sessions[effectiveGroup.folder]
+      ? collectPersistedReferencedMessageIds(chatJid, missedMessages)
+      : new Set<string>();
+  const knownReferencedMessageIds = historyContext
+    ? new Set(historyContext.messageIds)
+    : activeSessionReferencedMessageIds;
+  let prompt =
+    (historyContext?.context ?? '') +
+    formatMessages(missedMessages, {
+      knownMessageIds: knownReferencedMessageIds,
+    });
+
+  const images = collectMessageImages(chatJid, missedMessages, {
+    knownMessageIds: activeSessionReferencedMessageIds,
+  });
   const imagesForAgent = images.length > 0 ? images : undefined;
 
   // Extract task_id from the most recent task-prompt message (if any).
@@ -11062,8 +11088,6 @@ async function processTaskIpc(
           break;
         }
 
-        const ipcTaskCap = getSystemSettings().maxTasksPerUser;
-
         const taskId = crypto.randomUUID();
 
         // Capture the concrete route this task was scheduled from, so a task
@@ -11077,33 +11101,24 @@ async function processTaskIpc(
               targetJid)
             : targetJid;
 
-        const creation = createTaskWithinOwnerLimit(
-          {
-            id: taskId,
-            group_folder: targetFolder,
-            chat_jid: targetJid,
-            delivery_route_jid: scheduleDeliveryRouteJid,
-            prompt: data.prompt || '',
-            schedule_type: scheduleType,
-            schedule_value: data.schedule_value,
-            context_mode: contextMode,
-            execution_type: execType,
-            execution_mode: executionMode,
-            script_command: data.script_command ?? null,
-            next_run: nextRun,
-            status: 'active',
-            created_at: new Date().toISOString(),
-            created_by: taskCreatedBy,
-            notify_channels: null,
-          },
-          ipcTaskCap,
-        );
-        if (creation.status === 'limit_reached') {
-          failSchedule(
-            `Scheduled-task limit reached (${creation.limit}). Delete an existing task first.`,
-          );
-          break;
-        }
+        createTask({
+          id: taskId,
+          group_folder: targetFolder,
+          chat_jid: targetJid,
+          delivery_route_jid: scheduleDeliveryRouteJid,
+          prompt: data.prompt || '',
+          schedule_type: scheduleType,
+          schedule_value: data.schedule_value,
+          context_mode: contextMode,
+          execution_type: execType,
+          execution_mode: executionMode,
+          script_command: data.script_command ?? null,
+          next_run: nextRun,
+          status: 'active',
+          created_at: new Date().toISOString(),
+          created_by: taskCreatedBy,
+          notify_channels: null,
+        });
         notifyTaskSchedulerChanged();
         logger.info(
           { taskId, sourceGroup, targetFolder, contextMode, execType },
@@ -11693,11 +11708,7 @@ async function processTaskIpc(
         });
         break;
       }
-      const mutation = restoreTaskWithRevision(
-        task.id,
-        data.expectedRevision!,
-        getSystemSettings().maxTasksPerUser,
-      );
+      const mutation = restoreTaskWithRevision(task.id, data.expectedRevision!);
       if (mutation.status === 'conflict') {
         writeTaskResult(tasksDir, 'restore_task', data.requestId, {
           success: false,
@@ -11711,12 +11722,6 @@ async function processTaskIpc(
           success: true,
           taskId: task.id,
           revision: mutation.task.revision,
-        });
-      } else if (mutation.status === 'limit_reached') {
-        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
-          success: false,
-          code: 'TASK_LIMIT_REACHED',
-          error: `Scheduled-task limit reached (${mutation.limit}). Delete an existing task first.`,
         });
       } else {
         writeTaskResult(tasksDir, 'restore_task', data.requestId, {
@@ -12839,16 +12844,17 @@ async function processAgentConversation(
   // an empty conversation.
   const sessionId = getSession(effectiveGroup.folder, agentId) || undefined;
   let currentAgentSessionId = sessionId;
-  let prompt = formatMessages(missedMessages);
   // Inject history when the SDK session is fresh, or when a proactive provider
   // switch (sticky binding unhealthy/disabled) will clear the existing session
   // inside the runner — otherwise the new provider's first turn loses context.
-  if (
+  const startsFreshSession =
     !sessionId ||
     resetForAgentProfile ||
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)
-  ) {
-    const historyContext = buildRecentConversationHistoryContext(
+    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId);
+  let historyContext: ReturnType<typeof buildRecentConversationHistoryContext> =
+    null;
+  if (startsFreshSession) {
+    historyContext = buildRecentConversationHistoryContext(
       virtualChatJid,
       new Set(missedMessages.map((m) => m.id)),
       {
@@ -12860,14 +12866,26 @@ async function processAgentConversation(
       },
     );
     if (historyContext) {
-      prompt = historyContext.context + prompt;
       logger.info(
         { chatJid, agentId, historyCount: historyContext.count },
         'Agent fresh session: injected recent conversation history into prompt',
       );
     }
   }
-  const images = collectMessageImages(virtualChatJid, missedMessages);
+  const activeSessionReferencedMessageIds = startsFreshSession
+    ? new Set<string>()
+    : collectPersistedReferencedMessageIds(virtualChatJid, missedMessages);
+  const knownReferencedMessageIds = historyContext
+    ? new Set(historyContext.messageIds)
+    : activeSessionReferencedMessageIds;
+  let prompt =
+    (historyContext?.context ?? '') +
+    formatMessages(missedMessages, {
+      knownMessageIds: knownReferencedMessageIds,
+    });
+  const images = collectMessageImages(virtualChatJid, missedMessages, {
+    knownMessageIds: activeSessionReferencedMessageIds,
+  });
   const imagesForAgent = images.length > 0 ? images : undefined;
   // For agent conversations, route reply to IM based on the most recent
   // message's source.  Unlike the main conversation (#99), agent conversations
@@ -15824,9 +15842,15 @@ async function startMessageLoop(): Promise<void> {
           // the message is successfully injected, so we no longer need to kill
           // the process for home groups.
 
-          const formatted = formatMessages(messagesToSend);
+          const knownReferencedMessageIds =
+            collectPersistedReferencedMessageIds(chatJid, messagesToSend);
+          const formatted = formatMessages(messagesToSend, {
+            knownMessageIds: knownReferencedMessageIds,
+          });
 
-          const images = collectMessageImages(chatJid, messagesToSend);
+          const images = collectMessageImages(chatJid, messagesToSend, {
+            knownMessageIds: knownReferencedMessageIds,
+          });
           const imagesForAgent = images.length > 0 ? images : undefined;
 
           if (group.created_by) {
@@ -17329,9 +17353,19 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
         },
         'Web-origin missed messages: attempting to pipe into running agent',
       );
+      const knownReferencedMessageIds = collectPersistedReferencedMessageIds(
+        virtualChatJid,
+        missedMessages,
+      );
       const formatted =
-        missedMessages.length > 0 ? formatMessages(missedMessages) : '';
-      const images = collectMessageImages(virtualChatJid, missedMessages);
+        missedMessages.length > 0
+          ? formatMessages(missedMessages, {
+              knownMessageIds: knownReferencedMessageIds,
+            })
+          : '';
+      const images = collectMessageImages(virtualChatJid, missedMessages, {
+        knownMessageIds: knownReferencedMessageIds,
+      });
       const imagesForAgent = images.length > 0 ? images : undefined;
 
       const lastAgentSourceJid =

@@ -370,12 +370,7 @@ export interface ResolveProactiveFinalRecoveryInput {
 export class ActiveTurnOutputRegistry {
   private readonly bindings = new Map<string, ActiveTurnOutputBinding>();
 
-  /**
-   * Read lazily per turn so a settings change applies to newly started turns
-   * without a restart, while a turn already in flight keeps the bound it began
-   * with.
-   */
-  constructor(private readonly maxUtterancesProvider: () => number = () => 0) {}
+  constructor(private readonly maxUtterances = 0) {}
 
   private key(scopeKey: string, inputTurnId: string): string {
     return `${scopeKey}\0${inputTurnId}`;
@@ -385,7 +380,7 @@ export class ActiveTurnOutputRegistry {
     scopeKey: string,
     inputTurnId: string,
     callbacks: ActiveTurnOutputCallbacks,
-    coordinator = new TurnOutputCoordinator(this.maxUtterancesProvider()),
+    coordinator = new TurnOutputCoordinator(this.maxUtterances),
   ): TurnOutputCoordinator {
     this.bindings.set(this.key(scopeKey, inputTurnId), {
       coordinator,

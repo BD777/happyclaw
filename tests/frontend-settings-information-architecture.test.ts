@@ -96,7 +96,7 @@ describe('settings information architecture', () => {
     expect(security).toMatch(/修改密码|登录设备|shortId|撤销这台设备/);
   });
 
-  test('keeps admin-only host policy separate from runtime and automation', () => {
+  test('keeps admin-only host policy separate from runtime settings', () => {
     const system = read(
       'web/src/components/settings/SystemSettingsSection.tsx',
     );
@@ -104,7 +104,13 @@ describe('settings information architecture', () => {
 
     expect(system).toMatch(/scope: 'runtime'/);
     expect(system).toMatch(/scope: 'security'/);
-    expect(system).toMatch(/scope: 'automation'/);
+    expect(system).not.toMatch(/scope: 'automation'/);
+    const validTabs = page.match(
+      /const VALID_TABS:[\s\S]*?=\s*\[([\s\S]*?)\];/,
+    )?.[1];
+    expect(validTabs).toBeDefined();
+    expect(validTabs).not.toContain("'automation'");
+    expect(page).toContain("rawTabValue === 'automation' ? 'system'");
     expect(system).toMatch(/普通模型通常为 200K\s+上下文/);
     expect(system).toMatch(/\[1m\] 时按 1M 处理/);
     expect(system).toMatch(

@@ -93,6 +93,7 @@ export interface EnrichFeishuInboundContentInput {
 }
 
 export interface EnrichedFeishuInboundContent {
+  /** Current user-visible message only; quoted ancestors are kept separately. */
   text: string;
   imageKeys?: string[];
   /** Message ownership is required by Feishu's message-resource API. */
@@ -102,8 +103,15 @@ export interface EnrichedFeishuInboundContent {
   }>;
   referencedImageRefs?: Array<{
     messageId: string;
+    referenceMessageId: string;
     imageKey: string;
     marker: string;
+  }>;
+  references?: Array<{
+    id: string;
+    sender?: string;
+    text: string;
+    attachmentHints?: string[];
   }>;
   richMessageResolved: boolean;
   referencedMessages: number;
@@ -318,9 +326,13 @@ function normalizeFetchedMessage(
     items.find((item) => item.message_id === requestedId) ?? items[0];
   if (!exact) return undefined;
   if (exact.msg_type !== 'merge_forward') {
+    const normalized = normalizeItem(exact, parseContent, limits);
+    if (normalized && !normalized.messageId) {
+      normalized.messageId = requestedId;
+    }
     return {
       item: exact,
-      normalized: normalizeItem(exact, parseContent, limits),
+      normalized,
     };
   }
 
@@ -526,44 +538,61 @@ export async function enrichFeishuInboundContent(
           0,
           limits.maxImageKeys - currentImageRefs.length,
         );
-        const referenceText = references
-          .map((item) => {
-            const sender = item.senderLabel ? `${item.senderLabel}: ` : '';
-            const markers: string[] = [];
-            for (const imageRef of item.imageRefs) {
-              if (remainingImageBudget <= 0) break;
-              remainingImageBudget--;
-              const marker = `[引用图片 ${referencedImageRefs.length + 1}]`;
-              referencedImageRefs.push({
-                messageId: imageRef.messageId || item.messageId,
-                imageKey: imageRef.imageKey,
-                marker,
-              });
-              markers.push(marker);
-            }
-            const markerText =
-              markers.length > 0 ? `${markers.join(' ')} ` : '';
-            return `- ${sender}${markerText}${item.text || '[仅包含附件]'}`;
-          })
-          .join('\n');
-        const boundedReferences = referenceText.slice(
-          0,
-          Math.floor(limits.maxTextChars / 2),
-        );
-        const prefix = boundedReferences
-          ? `[引用消息链（最早到最近）]\n${boundedReferences}\n[当前消息]\n`
-          : '';
-        // A pathological quote chain must never push the actual triggering
-        // request out of the normalized input.
-        const text = `${prefix}${currentText.slice(
-          0,
-          Math.max(0, limits.maxTextChars - prefix.length),
-        )}`;
+        const normalizedReferences: NonNullable<
+          EnrichedFeishuInboundContent['references']
+        > = [];
+        let remainingReferenceText = Math.floor(limits.maxTextChars / 2);
+        for (const item of references) {
+          const senderBudget = item.senderLabel
+            ? item.senderLabel.length + 2
+            : 0;
+          const textBudget = Math.max(0, remainingReferenceText - senderBudget);
+          if (textBudget <= 0) break;
+
+          const candidateImageRefs: NonNullable<
+            EnrichedFeishuInboundContent['referencedImageRefs']
+          > = [];
+          const markers: string[] = [];
+          for (const imageRef of item.imageRefs) {
+            if (candidateImageRefs.length >= remainingImageBudget) break;
+            const marker = `[引用图片 ${referencedImageRefs.length + candidateImageRefs.length + 1}]`;
+            const markerSequence = [...markers, marker].join(' ');
+            if (markerSequence.length > textBudget) break;
+            candidateImageRefs.push({
+              messageId: imageRef.messageId || item.messageId,
+              referenceMessageId: item.messageId,
+              imageKey: imageRef.imageKey,
+              marker,
+            });
+            markers.push(marker);
+          }
+          const markerText = markers.length > 0 ? `${markers.join(' ')} ` : '';
+          const rawText = `${markerText}${item.text || '[仅包含附件]'}`;
+          const boundedText = rawText.slice(0, textBudget);
+          normalizedReferences.push({
+            id: item.messageId,
+            ...(item.senderLabel ? { sender: item.senderLabel } : {}),
+            text: boundedText,
+          });
+          referencedImageRefs.push(...candidateImageRefs);
+          remainingImageBudget -= candidateImageRefs.length;
+          remainingReferenceText -=
+            senderBudget +
+            boundedText.length +
+            (normalizedReferences.length > 1 ? 1 : 0);
+        }
+
+        // The canonical message remains exactly the current user-visible turn.
+        // Quoted ancestors are prompt-only metadata and cannot displace it.
+        const text = currentText.slice(0, limits.maxTextChars);
         return {
-          text: text.slice(0, limits.maxTextChars),
+          text,
           imageKeys: currentImages.length > 0 ? currentImages : undefined,
           ...(currentImageRefs.length > 0 ? { currentImageRefs } : {}),
           ...(referencedImageRefs.length > 0 ? { referencedImageRefs } : {}),
+          ...(normalizedReferences.length > 0
+            ? { references: normalizedReferences }
+            : {}),
           richMessageResolved: !!rich,
           referencedMessages: references.length,
         };

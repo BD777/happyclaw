@@ -128,7 +128,7 @@ describe('Feishu rich inbound normalization', () => {
     );
   });
 
-  test('reconstructs an ordinary reply chain before a freshly mentioned message', async () => {
+  test('keeps an ordinary reply chain separate from the current message', async () => {
     // Mirrors im.message.receive_v1: the new @ lives in an ordinary reply
     // chain (root_id is present) but has no native thread_id yet.
     const event = {
@@ -183,13 +183,11 @@ describe('Feishu rich inbound normalization', () => {
     });
 
     expect(result.referencedMessages).toBe(2);
-    expect(result.text).toBe(
-      '[引用消息链（最早到最近）]\n' +
-        '- Alice: 第一条\n' +
-        '- Bob: 第二条\n' +
-        '[当前消息]\n' +
-        '请总结上面的讨论',
-    );
+    expect(result.text).toBe('请总结上面的讨论');
+    expect(result.references).toEqual([
+      { id: 'om_root', sender: 'Alice', text: '第一条' },
+      { id: 'om_parent', sender: 'Bob', text: '第二条' },
+    ]);
     expect(
       client.get.mock.calls.map((call) => call[0].path.message_id),
     ).toEqual(['om_parent', 'om_root']);
@@ -242,8 +240,8 @@ describe('Feishu rich inbound normalization', () => {
       parseContent,
       limits: { maxTextChars: 120 },
     });
-    expect(result.text).toContain('必须保留的当前请求');
-    expect(result.text.length).toBeLessThanOrEqual(120);
+    expect(result.text).toBe('必须保留的当前请求');
+    expect(result.references?.[0].text.length).toBeLessThanOrEqual(60);
   });
 
   test('keeps referenced image ownership so callers download from the quoted message', async () => {
@@ -269,12 +267,40 @@ describe('Feishu rich inbound normalization', () => {
     expect(result.referencedImageRefs).toEqual([
       {
         messageId: 'om_image_parent',
+        referenceMessageId: 'om_image_parent',
         imageKey: 'img_v3_parent',
         marker: '[引用图片 1]',
       },
     ]);
-    expect(result.text).toContain('[引用图片 1]');
+    expect(result.text).toBe('这张图是什么？');
+    expect(result.references?.[0].text).toContain('[引用图片 1]');
     expect(result.imageKeys).toBeUndefined();
+  });
+
+  test('does not fetch referenced image bytes when their marker cannot fit', async () => {
+    const client = clientWith(() => ({
+      data: {
+        items: [
+          {
+            message_id: 'om_image_parent',
+            msg_type: 'image',
+            body: { content: JSON.stringify({ image_key: 'img_v3_parent' }) },
+          },
+        ],
+      },
+    }));
+    const result = await enrichFeishuInboundContent({
+      client,
+      messageId: 'om_current',
+      messageType: 'text',
+      fallbackText: '当前消息',
+      parentId: 'om_image_parent',
+      parseContent,
+      limits: { maxTextChars: 10 },
+    });
+
+    expect(result.referencedImageRefs).toBeUndefined();
+    expect(result.references?.[0].text).not.toContain('[引用图');
   });
 
   test('keeps child ownership for images inside a referenced merged forward', async () => {
@@ -309,6 +335,7 @@ describe('Feishu rich inbound normalization', () => {
     expect(result.referencedImageRefs).toEqual([
       {
         messageId: 'om_forward_child_image',
+        referenceMessageId: 'om_forward_parent',
         imageKey: 'img_v3_child_owned',
         marker: '[引用图片 1]',
       },

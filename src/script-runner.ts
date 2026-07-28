@@ -31,11 +31,6 @@ export function getActiveScriptCount(): number {
   return activeScriptCount;
 }
 
-export function hasScriptCapacity(): boolean {
-  const { maxConcurrentScripts } = getSystemSettings();
-  return activeScriptCount < maxConcurrentScripts;
-}
-
 function killScriptProcessTree(child: ChildProcess): void {
   const pid = child.pid;
   if (!pid) return;
@@ -87,7 +82,7 @@ export async function runScript(
   groupFolder: string,
   options?: { ownerId?: string; signal?: AbortSignal },
 ): Promise<ScriptRunResult> {
-  const { scriptTimeout } = getSystemSettings();
+  const { containerTimeout: taskTimeout } = getSystemSettings();
   const cwd = path.join(GROUPS_DIR, groupFolder);
   const startTime = Date.now();
 
@@ -121,7 +116,7 @@ export async function runScript(
       const timeout = setTimeout(() => {
         timedOut = true;
         killScriptProcessTree(child);
-      }, scriptTimeout);
+      }, taskTimeout);
       timeout.unref?.();
       const onAbort = () => {
         aborted = true;

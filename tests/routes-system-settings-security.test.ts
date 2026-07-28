@@ -97,6 +97,28 @@ describe('system settings capability boundaries', () => {
     expect(response.status).toBe(400);
   });
 
+  test('stale clients may submit retired automation fields, which are ignored', async () => {
+    asUser('member', ['manage_system_config']);
+    const response = await app.request('/api/config/system', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        maxConcurrentScripts: 100,
+        scriptTimeout: -1,
+        taskBackfillGraceMs: 'legacy',
+        maxRepliesPerTurn: null,
+        maxTasksPerUser: 999_999,
+      }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).not.toHaveProperty('maxConcurrentScripts');
+    expect(body).not.toHaveProperty('scriptTimeout');
+    expect(body).not.toHaveProperty('taskBackfillGraceMs');
+    expect(body).not.toHaveProperty('maxRepliesPerTurn');
+    expect(body).not.toHaveProperty('maxTasksPerUser');
+  });
+
   test('member with system permission cannot read or write host integration', async () => {
     asUser('member', ['manage_system_config']);
     expect((await app.request('/api/config/host-integration')).status).toBe(

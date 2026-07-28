@@ -75,7 +75,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
 import { removeFlowArtifacts } from './file-manager.js';
-import { hasScriptCapacity, runScript } from './script-runner.js';
+import { runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
 import {
   AgentProfile,
@@ -524,19 +524,17 @@ export function getRunningTaskIds(): string[] {
 }
 
 /**
- * Decide whether a due task is so overdue that we should skip this missed run
- * and advance to the next scheduled trigger instead. Prevents the
- * "restart-storm" failure mode where many tasks fire concurrently after a
- * long downtime. Exported for direct test coverage of the policy.
+ * Recurring work that became due before this scheduler process started is
+ * recorded as missed instead of replayed. One-time work is handled separately
+ * and still runs after a restart. Exported for direct policy coverage.
  */
 export function shouldSkipBackfill(
   nextRunIso: string | null | undefined,
-  nowMs: number,
-  graceMs: number,
+  schedulerStartedAtMs: number,
 ): boolean {
-  if (graceMs <= 0 || !nextRunIso) return false;
-  const overdueMs = nowMs - new Date(nextRunIso).getTime();
-  return overdueMs > graceMs;
+  if (schedulerStartedAtMs <= 0 || !nextRunIso) return false;
+  const scheduledAtMs = new Date(nextRunIso).getTime();
+  return Number.isFinite(scheduledAtMs) && scheduledAtMs < schedulerStartedAtMs;
 }
 
 /**
@@ -1768,6 +1766,7 @@ async function runGroupModeTask(
 }
 
 let schedulerRunning = false;
+let schedulerStartedAtMs = 0;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 let lastCleanupTime = 0;
 const TASK_RUN_LEASE_MS = 60_000;
@@ -2277,10 +2276,6 @@ function executeClaimedTaskRun(
       });
       return;
     }
-    if (!hasScriptCapacity()) {
-      scheduleSafePrestartRetry(claim, 'Script capacity is currently full');
-      return;
-    }
     let leaseLost = false;
     const abortController = new AbortController();
     const heartbeat = startTaskRunHeartbeat(claim, () => {
@@ -2483,7 +2478,6 @@ function executeClaimedTaskRun(
 }
 
 function materializeDueOccurrences(): void {
-  const graceMs = getSystemSettings().taskBackfillGraceMs;
   for (const task of getDueTaskDefinitionsV2(100)) {
     if (!task.next_run) continue;
     const scheduledFor = task.next_run;
@@ -2504,17 +2498,18 @@ function materializeDueOccurrences(): void {
       continue;
     }
     const recurringMisfire =
-      task.schedule_type !== 'once' && graceMs > 0 && overdueMs > graceMs;
+      task.schedule_type !== 'once' &&
+      shouldSkipBackfill(scheduledFor, schedulerStartedAtMs);
     materializeTaskOccurrence({
       taskId: task.id,
       scheduledFor,
       nextRun,
       triggerType:
-        task.schedule_type === 'once' && overdueMs > 0
+        recurringMisfire || (task.schedule_type === 'once' && overdueMs > 0)
           ? 'backfill'
           : 'scheduled',
       missedReason: recurringMisfire
-        ? `Missed by ${Math.round(overdueMs / 1000)}s; grace is ${Math.round(graceMs / 1000)}s`
+        ? `Missed while scheduler was offline by ${Math.round(overdueMs / 1000)}s`
         : undefined,
     });
   }
@@ -2809,6 +2804,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
     return;
   }
   schedulerRunning = true;
+  schedulerStartedAtMs = Date.now();
   schedulerDepsRef = deps;
 
   // Process-local reservations are never authoritative after restart. Durable

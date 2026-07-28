@@ -44,6 +44,25 @@ export type ChannelRoutingMode = 'single_session' | 'thread_map';
 export type AudienceMode = 'everyone' | 'owner_only';
 
 /**
+ * Provider-fetched context for a message referenced by the current inbound
+ * turn. The text is prompt-only metadata: `NewMessage.content` remains scoped
+ * to the current turn and its own attachment markers.
+ */
+export interface ChannelReferencedMessage {
+  id: string;
+  sender?: string;
+  text: string;
+  /** Prompt hints for referenced files/images that were materialized locally. */
+  attachmentHints?: string[];
+  /**
+   * Raw `messages.attachments` indexes owned by this reference. The host uses
+   * them to avoid resending quoted image bytes when the referenced turn is
+   * already present in the active session.
+   */
+  attachmentIndexes?: number[];
+}
+
+/**
  * Sanitized provider context for one inbound turn.
  *
  * This object is safe to persist and expose to the Agent. It intentionally
@@ -78,6 +97,7 @@ export interface ChannelTurnContext {
     parentId?: string;
     threadId?: string;
     type?: string;
+    referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
     openId?: string;

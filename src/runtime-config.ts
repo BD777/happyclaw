@@ -3813,8 +3813,6 @@ export interface SystemSettings {
   maxConcurrentContainers: number;
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
-  maxConcurrentScripts: number;
-  scriptTimeout: number;
   // Billing
   billingEnabled: boolean;
   billingMode: 'wallet_first';
@@ -3838,22 +3836,6 @@ export interface SystemSettings {
   // false = 关闭定时扫描，admin 仍可手点 POST /api/plugins/catalog/scan。
   // 适用于不希望本机私有 plugin 自动入共享 catalog 的环境。
   pluginAutoScan: boolean;
-  // 定时任务逾期容忍窗口（毫秒）。任何 next_run 落在过去且距今超过该窗口的任务
-  // 在 scheduler 轮询时直接跳过本次（next_run 推到下一次），避免停机/重启后多个
-  // 跨天积压任务集体在重启那一秒并发 fire 刷屏。
-  // 0 = 关闭（保留旧行为：无视逾期时长全部 backfill）。默认 300000 (5 分钟)。
-  taskBackfillGraceMs: number;
-  // 单个 Agent turn 内允许送达的用户可见消息条数上限（send_message / send_image /
-  // send_file / feishu_send_card 共用）。这是防止模型进入重复发送循环的保险丝，
-  // 不是 UX 限制：正常轮次（确认 → 执行 → 进展 → 结果）远达不到。达到上限后
-  // 后续投递被拒绝并向模型返回 reply_limit_reached，已送达内容不受影响。
-  // 该数字刻意不写进 Prompt，避免模型把它当成可以用满的配额。
-  // 0 = 关闭。默认 20。
-  maxRepliesPerTurn: number;
-  // 每个用户可持有的定时任务数上限（不含已软删）。频率下限和「每 task 至多一条
-  // 非终态 run」只约束单个任务，挡不住「N 个任务 × 每分钟」持续占满执行容量。
-  // 0 = 关闭。默认 200。
-  maxTasksPerUser: number;
 }
 
 // Upper bound for the login lockout window. auth.ts reclaims login-attempt
@@ -3871,8 +3853,6 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   maxConcurrentContainers: 20,
   maxLoginAttempts: 5,
   loginLockoutMinutes: 15,
-  maxConcurrentScripts: 10,
-  scriptTimeout: 60000,
   billingEnabled: false,
   billingMode: 'wallet_first',
   billingMinStartBalanceUsd: 0.01,
@@ -3884,9 +3864,6 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   mainAgentAutoCompactPercentage: 0,
   fallbackModel: '',
   pluginAutoScan: true,
-  taskBackfillGraceMs: 300000,
-  maxRepliesPerTurn: 20,
-  maxTasksPerUser: 200,
 };
 
 type SystemSettingsSource = 'file' | 'env' | 'api';
@@ -3935,32 +3912,6 @@ function normalizeSystemSettings(
     invalidFields.add(String(key));
     return fallback;
   };
-
-  const taskBackfillRaw = numberField(
-    'taskBackfillGraceMs',
-    DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
-    0,
-    86_400_000,
-  );
-  const taskBackfillGraceMs =
-    taskBackfillRaw === 0 ? 0 : Math.max(1_000, taskBackfillRaw);
-  if (taskBackfillGraceMs !== taskBackfillRaw) {
-    invalidFields.add('taskBackfillGraceMs');
-  }
-
-  const maxRepliesPerTurn = numberField(
-    'maxRepliesPerTurn',
-    DEFAULT_SYSTEM_SETTINGS.maxRepliesPerTurn,
-    0,
-    500,
-  );
-
-  const maxTasksPerUser = numberField(
-    'maxTasksPerUser',
-    DEFAULT_SYSTEM_SETTINGS.maxTasksPerUser,
-    0,
-    10_000,
-  );
 
   // Accept the former system-wide key as the main Agent default during upgrade.
   if (
@@ -4092,18 +4043,6 @@ function normalizeSystemSettings(
       1,
       MAX_LOGIN_LOCKOUT_MINUTES,
     ),
-    maxConcurrentScripts: numberField(
-      'maxConcurrentScripts',
-      DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts,
-      1,
-      50,
-    ),
-    scriptTimeout: numberField(
-      'scriptTimeout',
-      DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
-      5_000,
-      600_000,
-    ),
     billingEnabled: booleanField(
       'billingEnabled',
       DEFAULT_SYSTEM_SETTINGS.billingEnabled,
@@ -4134,9 +4073,6 @@ function normalizeSystemSettings(
       'pluginAutoScan',
       DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
     ),
-    taskBackfillGraceMs,
-    maxRepliesPerTurn,
-    maxTasksPerUser,
   };
 
   if (invalidFields.size > 0) {
@@ -4169,8 +4105,6 @@ function buildEnvFallbackSettings(): SystemSettings {
       maxConcurrentContainers: process.env.MAX_CONCURRENT_CONTAINERS,
       maxLoginAttempts: process.env.MAX_LOGIN_ATTEMPTS,
       loginLockoutMinutes: process.env.LOGIN_LOCKOUT_MINUTES,
-      maxConcurrentScripts: process.env.MAX_CONCURRENT_SCRIPTS,
-      scriptTimeout: process.env.SCRIPT_TIMEOUT,
       billingEnabled: process.env.BILLING_ENABLED,
       billingMinStartBalanceUsd: process.env.BILLING_MIN_START_BALANCE_USD,
       billingCurrency: process.env.BILLING_CURRENCY,
@@ -4185,7 +4119,6 @@ function buildEnvFallbackSettings(): SystemSettings {
         process.env.AUTO_COMPACT_PERCENTAGE,
       fallbackModel: process.env.FALLBACK_MODEL,
       pluginAutoScan: process.env.PLUGIN_AUTO_SCAN,
-      taskBackfillGraceMs: process.env.TASK_BACKFILL_GRACE_MS,
     },
     'env',
   );

@@ -67,6 +67,7 @@ import {
   processingIndicatorKey,
 } from './processing-indicator.js';
 import type {
+  ChannelReferencedMessage,
   ChannelTurnContext,
   FeishuMessageMeta,
   FollowUpAction,
@@ -435,6 +436,7 @@ export function buildFeishuChannelTurnContext(input: {
     parentId?: string;
     threadId?: string;
     type?: string;
+    referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
     openId?: string;
@@ -492,6 +494,9 @@ export function buildFeishuChannelTurnContext(input: {
       ...(input.message.parentId ? { parentId: input.message.parentId } : {}),
       ...(input.message.threadId ? { threadId: input.message.threadId } : {}),
       ...(input.message.type ? { type: input.message.type } : {}),
+      ...(input.message.referencedMessages?.length
+        ? { referencedMessages: input.message.referencedMessages }
+        : {}),
     },
     sender: input.sender
       ? {
@@ -2274,9 +2279,9 @@ export function createFeishuConnection(
         parentId,
         nativeRootId: rootId,
         threadId,
-        // A native thread already has durable SDK session history; only its
-        // explicitly-replied parent needs reinjection. Ordinary reply chains
-        // need bounded reconstruction when a fresh @ starts a new topic.
+        // A native thread already has durable SDK history, so one explicit
+        // parent is enough to preserve reply semantics. Ordinary reply chains
+        // may start a new logical session and need bounded ancestor metadata.
         limits: threadId ? { maxReferenceDepth: 1 } : undefined,
         parseContent: (type, content) => extractMessageContent(type, content),
       });
@@ -2316,6 +2321,32 @@ export function createFeishuConnection(
         enriched.currentImageRefs ??
         currentImageKeys.map((imageKey) => ({ messageId, imageKey }));
       const referencedImageRefs = enriched.referencedImageRefs ?? [];
+      const referencedMessages: ChannelReferencedMessage[] = (
+        enriched.references ?? []
+      ).map((reference) => ({ ...reference }));
+      const replaceReferenceMarker = (
+        referenceMessageId: string,
+        marker: string,
+        replacement: string,
+        attachmentIndex?: number,
+      ): void => {
+        const reference = referencedMessages.find(
+          (item) =>
+            item.id === referenceMessageId && item.text.includes(marker),
+        );
+        if (!reference) return;
+        reference.text = reference.text.replace(marker, replacement);
+        reference.attachmentHints = [
+          ...(reference.attachmentHints ?? []),
+          replacement,
+        ];
+        if (attachmentIndex !== undefined) {
+          reference.attachmentIndexes = [
+            ...(reference.attachmentIndexes ?? []),
+            attachmentIndex,
+          ];
+        }
+      };
       if (currentImageRefs.length > 0 || referencedImageRefs.length > 0) {
         // 图片消息：下载后双轨处理
         // 1. Vision 通道：base64 附件供模型看图
@@ -2380,9 +2411,14 @@ export function createFeishuConnection(
             ref.imageKey,
           );
           if (!imageData) {
-            text = text.replace(ref.marker, '[引用图片下载失败]');
+            replaceReferenceMarker(
+              ref.referenceMessageId,
+              ref.marker,
+              '[引用图片下载失败]',
+            );
             continue;
           }
+          const attachmentIndex = attachments.length;
           attachments.push({
             type: 'image',
             data: imageData.base64,
@@ -2415,7 +2451,12 @@ export function createFeishuConnection(
               );
             }
           }
-          text = text.replace(ref.marker, replacement);
+          replaceReferenceMarker(
+            ref.referenceMessageId,
+            ref.marker,
+            replacement,
+            attachmentIndex,
+          );
         }
 
         // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
@@ -2424,6 +2465,8 @@ export function createFeishuConnection(
         const markers: string[] = [];
         if (attachments.length > 0) {
           attachmentsJson = JSON.stringify(attachments);
+        }
+        if (downloadedCurrentImages > 0) {
           if (savedPaths.length > 0) {
             markers.push(...savedPaths.map((p) => `[图片: ${p}]`));
           } else {
@@ -2539,6 +2582,7 @@ export function createFeishuConnection(
           parentId,
           threadId,
           type: messageType,
+          referencedMessages,
         },
         sender: {
           openId: senderOpenId,

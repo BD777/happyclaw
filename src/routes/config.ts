@@ -2110,11 +2110,6 @@ function toSystemSettingsResponse(
     maxConcurrentContainers: settings.maxConcurrentContainers,
     maxLoginAttempts: settings.maxLoginAttempts,
     loginLockoutMinutes: settings.loginLockoutMinutes,
-    maxConcurrentScripts: settings.maxConcurrentScripts,
-    scriptTimeout: settings.scriptTimeout,
-    taskBackfillGraceMs: settings.taskBackfillGraceMs,
-    maxRepliesPerTurn: settings.maxRepliesPerTurn,
-    maxTasksPerUser: settings.maxTasksPerUser,
     fallbackModel: settings.fallbackModel,
   };
 }
@@ -2154,11 +2149,19 @@ configRoutes.put(
 
     try {
       const before = toSystemSettingsResponse(getSystemSettings());
-      // Deprecated compatibility input. Host mode no longer has an
-      // application-level concurrency pool; accept the old key so stale Web
-      // clients do not fail the whole request, but never persist/apply it.
+      // Deprecated compatibility inputs. Accept them so stale Web clients do
+      // not fail the whole request, but never persist or apply them.
       const effectiveSettings = { ...validation.data };
-      delete effectiveSettings.maxConcurrentHostProcesses;
+      for (const key of [
+        'maxConcurrentHostProcesses',
+        'maxConcurrentScripts',
+        'scriptTimeout',
+        'taskBackfillGraceMs',
+        'maxRepliesPerTurn',
+        'maxTasksPerUser',
+      ] as const) {
+        delete effectiveSettings[key];
+      }
       const saved = saveSystemSettings(effectiveSettings);
       const response = toSystemSettingsResponse(saved);
       const changedFields = changedSettingFields(

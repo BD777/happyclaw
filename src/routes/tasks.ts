@@ -3,7 +3,6 @@
 import { Hono, type Context } from 'hono';
 import * as crypto from 'node:crypto';
 import { sdkQuery } from '../sdk-query.js';
-import { getSystemSettings } from '../runtime-config.js';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
@@ -16,7 +15,7 @@ import {
   getAllTasks,
   getDeletedTasks,
   getTaskById,
-  createTaskWithinOwnerLimit,
+  createTask,
   getTaskRunLogs,
   updateTaskWithRevision,
   softDeleteTaskWithRevision,
@@ -266,8 +265,6 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   const taskId = crypto.randomUUID();
   const now = new Date().toISOString();
 
-  const taskCap = getSystemSettings().maxTasksPerUser;
-
   let nextRun: string;
   try {
     nextRun = computeNextRunForSchedule(schedule_type, schedule_value);
@@ -280,35 +277,23 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
     );
   }
 
-  const creation = createTaskWithinOwnerLimit(
-    {
-      id: taskId,
-      group_folder: groupFolder,
-      chat_jid: chatJid,
-      prompt: prompt || '',
-      schedule_type,
-      schedule_value,
-      context_mode: validation.data.context_mode || 'isolated',
-      execution_type: execType,
-      execution_mode: taskExecutionMode,
-      script_command: script_command ?? null,
-      next_run: nextRun,
-      status: 'active',
-      created_at: now,
-      created_by: authUser.id,
-      notify_channels: notify_channels ?? null,
-    },
-    taskCap,
-  );
-  if (creation.status === 'limit_reached') {
-    return c.json(
-      {
-        error: `定时任务数量已达上限（${creation.limit}）。请先删除不再需要的任务。`,
-        code: 'TASK_LIMIT_REACHED',
-      },
-      409,
-    );
-  }
+  createTask({
+    id: taskId,
+    group_folder: groupFolder,
+    chat_jid: chatJid,
+    prompt: prompt || '',
+    schedule_type,
+    schedule_value,
+    context_mode: validation.data.context_mode || 'isolated',
+    execution_type: execType,
+    execution_mode: taskExecutionMode,
+    script_command: script_command ?? null,
+    next_run: nextRun,
+    status: 'active',
+    created_at: now,
+    created_by: authUser.id,
+    notify_channels: notify_channels ?? null,
+  });
   notifyTaskSchedulerChanged();
 
   return c.json({ success: true, taskId });
@@ -672,25 +657,12 @@ tasksRoutes.post('/:id/restore', authMiddleware, async (c) => {
       428,
     );
   }
-  const mutation = restoreTaskWithRevision(
-    id,
-    expectedRevision,
-    getSystemSettings().maxTasksPerUser,
-  );
+  const mutation = restoreTaskWithRevision(id, expectedRevision);
   if (mutation.status === 'not_found') {
     return c.json({ error: 'Task not found' }, 404);
   }
   if (mutation.status === 'conflict') {
     return revisionConflict(c, mutation.task);
-  }
-  if (mutation.status === 'limit_reached') {
-    return c.json(
-      {
-        error: `定时任务数量已达上限（${mutation.limit}）。请先删除不再需要的任务。`,
-        code: 'TASK_LIMIT_REACHED',
-      },
-      409,
-    );
   }
   notifyTaskSchedulerChanged();
   return c.json({ success: true, task: mutation.task });
@@ -1014,38 +986,25 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
     ? 'host'
     : 'container';
 
-  // Create task immediately with 'parsing' status and description as prompt.
-  // AI creation is the default UI path, so it must share the same atomic
-  // capacity boundary as manual REST and Agent/MCP creation.
-  const creation = createTaskWithinOwnerLimit(
-    {
-      id: taskId,
-      group_folder: groupFolder,
-      chat_jid: chatJid,
-      prompt: description,
-      schedule_type: 'cron',
-      schedule_value: '0 0 * * *', // placeholder, will be updated after parsing
-      context_mode: requestedContextMode ?? 'isolated',
-      execution_type: 'agent',
-      execution_mode: taskExecutionMode,
-      script_command: null,
-      next_run: null,
-      status: 'parsing',
-      created_at: now,
-      created_by: authUser.id,
-      notify_channels: notifyChannels,
-    },
-    getSystemSettings().maxTasksPerUser,
-  );
-  if (creation.status === 'limit_reached') {
-    return c.json(
-      {
-        error: `定时任务数量已达上限（${creation.limit}）。请先删除不再需要的任务。`,
-        code: 'TASK_LIMIT_REACHED',
-      },
-      409,
-    );
-  }
+  // Create immediately with a parsing status so the asynchronous model result
+  // can be committed with the same revision contract as manual edits.
+  createTask({
+    id: taskId,
+    group_folder: groupFolder,
+    chat_jid: chatJid,
+    prompt: description,
+    schedule_type: 'cron',
+    schedule_value: '0 0 * * *', // placeholder, will be updated after parsing
+    context_mode: requestedContextMode ?? 'isolated',
+    execution_type: 'agent',
+    execution_mode: taskExecutionMode,
+    script_command: null,
+    next_run: null,
+    status: 'parsing',
+    created_at: now,
+    created_by: authUser.id,
+    notify_channels: notifyChannels,
+  });
   const parsingRevision = getTaskById(taskId)?.revision ?? 1;
 
   const updateParsedTask = (

@@ -35,12 +35,8 @@ describe('system settings normalization', () => {
     expect(fromEnv.maxConcurrentContainers).toBe(100);
 
     const saved = runtime.saveSystemSettings({
-      scriptTimeout: 1,
-      taskBackfillGraceMs: 12,
       mainAgentAutoCompactPercentage: 95,
     } as any);
-    expect(saved.scriptTimeout).toBe(5_000);
-    expect(saved.taskBackfillGraceMs).toBe(1_000);
     expect(saved.mainAgentAutoCompactPercentage).toBe(90);
 
     const settingsFile = path.join(tmpDir, 'config', 'system-settings.json');

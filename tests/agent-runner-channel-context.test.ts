@@ -99,6 +99,12 @@ describe('Agent Runner channel turn context', () => {
         ...feishuContext().bot,
         tenantAccessToken: 'must-not-cross-boundary',
       },
+      message: {
+        ...feishuContext().message,
+        referencedMessages: [
+          { id: 'om-parent', text: 'prompt-only quoted body' },
+        ],
+      },
     });
 
     expect(normalized).toMatchObject({
@@ -109,6 +115,7 @@ describe('Agent Runner channel turn context', () => {
       sender: { openId: 'ou_sender', userId: 'u_sender' },
     });
     expect(JSON.stringify(normalized)).not.toContain('must-not-cross-boundary');
+    expect(JSON.stringify(normalized)).not.toContain('prompt-only quoted body');
   });
 
   test('creates a compact host-verified per-turn prompt block', () => {

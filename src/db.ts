@@ -81,6 +81,7 @@ import {
   bindChannelReliabilityDatabase,
   createChannelReliabilitySchema,
 } from './channel-reliability-store.js';
+import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
 
 let db: InstanceType<typeof Database>;
 /**
@@ -88,7 +89,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 63;
+export const CURRENT_SCHEMA_VERSION = 64;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -2283,6 +2284,89 @@ export function initDatabase(): void {
   createChannelReliabilitySchema(db);
   bindChannelReliabilityDatabase(db);
 
+  // v63 -> v64: early Feishu reply enrichment embedded quoted ancestors in
+  // messages.content, leaking prompt scaffolding into Web history and then
+  // duplicating it again during fresh-session recovery. Clean only rows whose
+  // direct parent is safely present in the same logical conversation; rows
+  // whose quoted context is the sole surviving copy remain untouched.
+  const embeddedReferenceSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (embeddedReferenceSchemaVersion < 64) {
+    const candidates = db
+      .prepare(
+        `SELECT id, chat_jid, content, channel_context
+         FROM messages
+         WHERE content LIKE ?`,
+      )
+      .all('[引用消息链（最早到最近）]\n%') as Array<{
+      id: string;
+      chat_jid: string;
+      content: string;
+      channel_context: unknown;
+    }>;
+    const findParent = db.prepare(
+      `SELECT sender_name, content
+       FROM messages
+       WHERE id = ? AND chat_jid = ?
+       LIMIT 1`,
+    );
+    const updateMessage = db.prepare(
+      `UPDATE messages
+       SET content = ?, channel_context = ?
+       WHERE id = ? AND chat_jid = ? AND content = ?`,
+    );
+    let migratedRows = 0;
+    db.transaction(() => {
+      for (const candidate of candidates) {
+        const split = splitLegacyEmbeddedReferenceContent(candidate.content);
+        const context = parseChannelTurnContext(candidate.channel_context);
+        const parentId = context?.message?.parentId;
+        if (!split || !context?.message || !parentId) continue;
+        const parent = findParent.get(parentId, candidate.chat_jid) as
+          | { sender_name: string | null; content: string }
+          | undefined;
+        if (!parent) continue;
+
+        const parentText =
+          splitLegacyEmbeddedReferenceContent(String(parent.content))
+            ?.currentContent ?? String(parent.content);
+        const referencedMessages = context.message.referencedMessages?.length
+          ? context.message.referencedMessages
+          : [
+              {
+                id: parentId,
+                ...(parent.sender_name
+                  ? { sender: String(parent.sender_name) }
+                  : {}),
+                text: parentText,
+              },
+            ];
+        const migratedContext: ChannelTurnContext = {
+          ...context,
+          message: {
+            ...context.message,
+            referencedMessages,
+          },
+        };
+        const result = updateMessage.run(
+          split.currentContent,
+          JSON.stringify(migratedContext),
+          candidate.id,
+          candidate.chat_jid,
+          candidate.content,
+        );
+        migratedRows += Number(result.changes ?? 0);
+      }
+    })();
+    if (migratedRows > 0) {
+      logger.info(
+        { migratedRows },
+        'Separated legacy Feishu quoted context from canonical message content',
+      );
+    }
+  }
+
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
@@ -4119,39 +4203,6 @@ export function createTask(task: CreateTaskInput): void {
   );
 }
 
-export type TaskCapacityCreateResult =
-  | { status: 'created' }
-  | { status: 'limit_reached'; limit: number; count: number };
-
-/**
- * Atomically enforce the per-owner live-task fuse and insert a definition.
- *
- * Every production writer must use this boundary. Keeping the COUNT and INSERT
- * in one IMMEDIATE transaction prevents concurrent REST/IPC processes from
- * observing the same remaining slot.
- */
-export function createTaskWithinOwnerLimit(
-  task: CreateTaskInput,
-  maxTasksPerUser: number,
-): TaskCapacityCreateResult {
-  return db
-    .transaction((): TaskCapacityCreateResult => {
-      if (maxTasksPerUser > 0 && task.created_by) {
-        const count = countTasksByOwner(task.created_by);
-        if (count >= maxTasksPerUser) {
-          return {
-            status: 'limit_reached',
-            limit: maxTasksPerUser,
-            count,
-          };
-        }
-      }
-      createTask(task);
-      return { status: 'created' };
-    })
-    .immediate();
-}
-
 /** Parse notify_channels from JSON string stored in DB and normalize new fields */
 function mapTaskRow(row: unknown): ScheduledTask {
   const r = row as any;
@@ -4195,23 +4246,6 @@ export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
     )
     .all(groupFolder)
     .map(mapTaskRow);
-}
-
-/**
- * Live (non-deleted) schedule count for one owner, used as a capacity fuse.
- *
- * Per-task frequency floors and the one-nonterminal-run index bound a single
- * task, but nothing bounded the number of tasks: N schedules firing every
- * minute can keep the queue saturated and crowd out interactive sessions.
- */
-export function countTasksByOwner(ownerId: string): number {
-  const row = db
-    .prepare(
-      `SELECT COUNT(*) AS count FROM scheduled_tasks
-       WHERE deleted_at IS NULL AND created_by = ?`,
-    )
-    .get(ownerId) as { count: number } | undefined;
-  return row?.count ?? 0;
 }
 
 export function getAllTasks(): ScheduledTask[] {
@@ -4341,15 +4375,6 @@ export type TaskSoftDeleteMutationResult =
   | TaskRevisionMutationResult
   | { status: 'active_run'; task: ScheduledTask; run: TaskRun };
 
-export type TaskRestoreMutationResult =
-  | TaskRevisionMutationResult
-  | {
-      status: 'limit_reached';
-      task: ScheduledTask;
-      limit: number;
-      count: number;
-    };
-
 /**
  * Optimistic mutation used by V2 REST/MCP callers. Legacy updateTask remains
  * available while all in-process clients migrate to this contract.
@@ -4473,27 +4498,15 @@ export function softDeleteTaskWithRevision(
 export function restoreTaskWithRevision(
   id: string,
   expectedRevision: number,
-  maxTasksPerUser = 0,
-): TaskRestoreMutationResult {
+): TaskRevisionMutationResult {
   return db
-    .transaction((): TaskRestoreMutationResult => {
+    .transaction((): TaskRevisionMutationResult => {
       const current = getTaskById(id);
       if (!current) return { status: 'not_found' };
       if (current.revision !== expectedRevision) {
         return { status: 'conflict', task: current };
       }
       if (!current.deleted_at) return { status: 'updated', task: current };
-      if (maxTasksPerUser > 0 && current.created_by) {
-        const count = countTasksByOwner(current.created_by);
-        if (count >= maxTasksPerUser) {
-          return {
-            status: 'limit_reached',
-            task: current,
-            limit: maxTasksPerUser,
-            count,
-          };
-        }
-      }
       const now = new Date().toISOString();
       const result = db
         .prepare(
@@ -4903,7 +4916,7 @@ export interface MaterializeTaskOccurrenceInput {
   scheduledFor: string;
   nextRun: string | null;
   triggerType: 'scheduled' | 'backfill';
-  /** Recurring occurrences beyond grace are persisted as terminal missed rows. */
+  /** Intentionally skipped occurrences are persisted as terminal missed rows. */
   missedReason?: string;
 }
 

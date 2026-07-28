@@ -1,4 +1,5 @@
 import { getMessagesPage } from './db.js';
+import { escapeXml } from './message-prompt.js';
 
 /**
  * Build a `<system_context>` block of recent persisted HappyClaw chat history
@@ -21,7 +22,7 @@ export function buildRecentConversationHistoryContext(
     maxMessageLength?: number;
     intro: string;
   },
-): { context: string; count: number } | null {
+): { context: string; count: number; messageIds: string[] } | null {
   const recentHistory = getMessagesPage(chatJid, undefined, opts.limit ?? 30);
   const historyMsgs = recentHistory
     .reverse()
@@ -32,7 +33,8 @@ export function buildRecentConversationHistoryContext(
 
   const maxLen = opts.maxMessageLength ?? 700;
   const historyLines = historyMsgs.map((m) => {
-    const role = m.is_from_me ? 'assistant' : m.sender_name;
+    const role = m.is_from_me ? 'assistant' : 'user';
+    const sender = m.is_from_me ? 'HappyClaw' : m.sender_name;
     const truncated =
       m.content.length > maxLen ? m.content.slice(0, maxLen) + '…' : m.content;
     // Strip lone (unpaired) surrogates while preserving valid surrogate pairs
@@ -46,11 +48,15 @@ export function buildRecentConversationHistoryContext(
     // Defense in depth: strip the closing tag we use to fence this block so a
     // user message containing "</system_context>" can't escape early.
     cleaned = cleaned.replace(/<\/system_context>/gi, '</system_context_>');
-    return `[${role}] ${cleaned}`;
+    return (
+      `<history_message id="${escapeXml(m.id)}" role="${role}"` +
+      ` sender="${escapeXml(sender)}">${escapeXml(cleaned)}</history_message>`
+    );
   });
 
   return {
     count: historyMsgs.length,
+    messageIds: historyMsgs.map((message) => message.id),
     context:
       '<system_context>\n' +
       opts.intro +
