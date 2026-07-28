@@ -183,7 +183,10 @@ const DANGEROUS_ENV_VARS = new Set([
   'TMP',
   // HappyClaw 内部路径映射
   'HAPPYCLAW_WORKSPACE_GROUP',
+  // Legacy internal names remain blocked for rollback/old-runner safety even
+  // though the current runtime no longer reads or mounts these paths.
   'HAPPYCLAW_WORKSPACE_GLOBAL',
+  'HAPPYCLAW_WORKSPACE_MEMORY',
   'HAPPYCLAW_WORKSPACE_IPC',
   'CLAUDE_CONFIG_DIR',
 ]);

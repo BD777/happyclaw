@@ -12,7 +12,7 @@ umask 0000
 # Running as root here so chown works regardless of host uid.
 chown -R node:node /home/node/.claude 2>/dev/null || true
 chown -R node:node /home/node/.feishu-cli 2>/dev/null || true
-chown -R node:node /workspace/group /workspace/global /workspace/memory /workspace/ipc 2>/dev/null || true
+chown -R node:node /workspace/group /workspace/ipc 2>/dev/null || true
 
 # Mark mounted directories as safe for git (CVE-2022-24765 ownership check).
 # Host uid may differ from container node user, causing git to refuse operations.

@@ -262,38 +262,6 @@ describe('ClaudeContextResolver', () => {
     );
   });
 
-  test('plan warns when native CLAUDE.md and HappyClaw memory layer are both active', () => {
-    const external = path.join(tmp, 'external-claude');
-    writeFile(path.join(external, 'CLAUDE.md'), '# admin playbook');
-
-    const base = {
-      executionMode: 'host' as const,
-      group: fakeGroup('main', 'admin', true) as any,
-      ownerHomeFolder: 'main',
-      externalClaudeDir: external,
-      projectRoot: path.join(tmp, 'project'),
-      dataDir: path.join(tmp, 'data'),
-      groupSessionsDir: path.join(tmp, 'sessions', 'main', '.claude'),
-      includeHostClaudeContext: true,
-    };
-
-    const active = buildClaudeContextPlan({
-      ...base,
-      happyclawMemoryActive: true,
-    });
-    expect(active.audit.warnings.some((w) => w.includes('两套全局记忆'))).toBe(
-      true,
-    );
-
-    const disabled = buildClaudeContextPlan({
-      ...base,
-      happyclawMemoryActive: false,
-    });
-    expect(
-      disabled.audit.warnings.some((w) => w.includes('两套全局记忆')),
-    ).toBe(false);
-  });
-
   test('managed admin Agent does not inherit host context without explicit opt-in', () => {
     const external = path.join(tmp, 'external-claude');
     const dataDir = path.join(tmp, 'data');

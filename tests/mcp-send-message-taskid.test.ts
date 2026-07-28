@@ -16,7 +16,6 @@ function baseCtx(overrides: Partial<McpContext> = {}): McpContext {
     currentTaskId: null,
     workspaceIpc: '/tmp/ipc',
     workspaceGroup: '/tmp/group',
-    workspaceGlobal: '/tmp/global',
     ...overrides,
   } as McpContext;
 }

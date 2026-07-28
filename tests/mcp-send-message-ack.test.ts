@@ -32,8 +32,6 @@ function setupSendTool(
     currentInputTurnId: 'delivery-turn-1',
     workspaceIpc: root,
     workspaceGroup: root,
-    workspaceGlobal: root,
-    workspaceMemory: root,
     ...contextPatch,
   };
   const sendTool = createMcpTools(context).find(

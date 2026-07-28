@@ -49,8 +49,6 @@ function toolNames(
     currentInputTurnId: 'turn-1',
     workspaceIpc: '/tmp/tool-init-ipc',
     workspaceGroup: '/tmp/tool-init-group',
-    workspaceGlobal: '/tmp/tool-init-global',
-    workspaceMemory: '/tmp/tool-init-memory',
   }).map((tool) => tool.name);
 }
 
@@ -123,7 +121,11 @@ describe('HappyClaw tool initialization', () => {
       expect.arrayContaining([
         'schedule_task',
         'install_skill',
-        'memory_append',
+        'workspace_memory_search',
+        'workspace_memory_get',
+        'workspace_memory_remember',
+        'workspace_memory_update',
+        'workspace_memory_forget',
         'agent_profile_list',
         'agent_profile_get',
         'agent_profile_draft_get',
@@ -144,6 +146,15 @@ describe('HappyClaw tool initialization', () => {
   test('custom Agent runtime keeps ordinary tools but does not advertise Agent Builder', () => {
     const names = toolNames(false, { agentBuilderEnabled: false });
     expect(names).toContain('schedule_task');
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'workspace_memory_search',
+        'workspace_memory_get',
+        'workspace_memory_remember',
+        'workspace_memory_update',
+        'workspace_memory_forget',
+      ]),
+    );
     expect(names).not.toContain('install_skill');
     expect(names).not.toContain('agent_profile_prepare');
   });
@@ -155,6 +166,19 @@ describe('HappyClaw tool initialization', () => {
     expect(
       toolNames(true, { currentTaskId: 'scheduled-group-task' }),
     ).toContain('agent_profile_publish');
+  });
+
+  test('scheduled and task-triggered turns expose Workspace Memory read-only', () => {
+    for (const names of [
+      toolNames(false, { isScheduledTask: true }),
+      toolNames(false, { currentTaskId: 'scheduled-group-task' }),
+    ]) {
+      expect(names).toContain('workspace_memory_search');
+      expect(names).toContain('workspace_memory_get');
+      expect(names).not.toContain('workspace_memory_remember');
+      expect(names).not.toContain('workspace_memory_update');
+      expect(names).not.toContain('workspace_memory_forget');
+    }
   });
 
   test('real Claude CLI initializes unrestricted builtins and Agent Builder tools', async () => {
@@ -169,8 +193,6 @@ describe('HappyClaw tool initialization', () => {
       currentInputTurnId: 'turn-real',
       workspaceIpc: path.join(cwd, 'ipc'),
       workspaceGroup: cwd,
-      workspaceGlobal: path.join(cwd, 'global'),
-      workspaceMemory: path.join(cwd, 'memory'),
     });
     const server = runnerSdk.createSdkMcpServer({
       name: 'happyclaw',

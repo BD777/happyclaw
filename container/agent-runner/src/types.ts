@@ -216,6 +216,15 @@ export interface ContainerInput {
   /** Whether this is the admin's home container (full privileges). */
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
+  /**
+   * Internal HMAC secret delivered only in the stdin bootstrap. It must remain
+   * runner-private and must never be written to IPC, files, env, or prompts.
+   */
+  workspaceMemoryMutationSigningSecret?: string;
+  /** Public identity paired with the runner-private signing secret. */
+  workspaceMemoryRunnerInstanceId?: string;
+  /** Isolated task-run namespace selected by the host. */
+  taskRunId?: string;
   /** Claude session/provider namespace selected by the host runner. */
   sessionAgentId?: string;
   /** If the last unprocessed message was emitted by a scheduled task prompt,

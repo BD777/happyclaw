@@ -29,8 +29,6 @@ function setup() {
     agentBuilderEnabled: true,
     workspaceIpc: root,
     workspaceGroup: root,
-    workspaceGlobal: path.join(root, 'global'),
-    workspaceMemory: path.join(root, 'memory'),
   };
   return { root, tools: createMcpTools(context) };
 }

@@ -64,7 +64,17 @@ import {
   parseTranscript,
 } from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
-import { createMcpTools, type McpContext } from './mcp-tools.js';
+import {
+  createMcpTools,
+  fetchWorkspaceMemorySnapshot,
+  type McpContext,
+  type WorkspaceMemorySnapshot,
+} from './mcp-tools.js';
+import {
+  createSerializedAsyncTrigger,
+  loadWorkspaceMemoryTurnContext,
+} from './workspace-memory-context.js';
+import { createWorkspaceMemoryWriteGuard } from './workspace-memory-runtime.js';
 import {
   parseAgentMcpPolicyMode,
   resolveAgentMcpPolicy,
@@ -133,10 +143,6 @@ import {
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
   process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';
-const WORKSPACE_GLOBAL =
-  process.env.HAPPYCLAW_WORKSPACE_GLOBAL || '/workspace/global';
-const WORKSPACE_MEMORY =
-  process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/memory';
 const WORKSPACE_IPC = process.env.HAPPYCLAW_WORKSPACE_IPC || '/workspace/ipc';
 
 // 第三方端点必须显式配置模型，官方 Claude 则允许 SDK/CLI 选择默认模型。
@@ -151,7 +157,6 @@ const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
 
-let needsMemoryFlush = false;
 let hadCompaction = false;
 // Module-level session ID so SIGTERM handler can emit it before exit.
 // Updated in main() whenever a query returns a new session.
@@ -184,46 +189,6 @@ const DEFAULT_ALLOWED_TOOLS = [
   'NotebookEdit',
   'mcp__happyclaw__*',
 ];
-
-const MEMORY_FLUSH_ALLOWED_TOOLS = [
-  'mcp__happyclaw__memory_search',
-  'mcp__happyclaw__memory_get',
-  'mcp__happyclaw__memory_append',
-  'Read', // 读取全局 CLAUDE.md 当前内容
-  'Edit', // 编辑全局 CLAUDE.md（永久记忆）
-];
-
-// Memory flush 期间禁用的工具（disallowedTools 会从模型上下文中完全移除这些工具）
-// 注意：allowedTools 仅控制自动审批，不限制工具可见性；
-//       bypassPermissions 模式下所有工具都自动通过，所以必须用 disallowedTools 来限制。
-// mcp__happyclaw__* 部分不在这里硬编码，而是在 main() 里按 createMcpTools() 的注册全集
-// 动态派生（见 memoryFlushDisallowedTools），只保留 memory_append/get/search，
-// 避免后续新增 MCP 工具后再次遗漏屏蔽（如曾漏掉的 send_image/send_file/discord_*/*_skill）。
-const MEMORY_FLUSH_DISALLOWED_BUILTINS = [
-  'Bash',
-  'Write',
-  'WebSearch',
-  'WebFetch',
-  'Glob',
-  'Grep',
-  'Task',
-  'TaskOutput',
-  'TaskStop',
-  'Agent',
-  'TeamCreate',
-  'TeamDelete',
-  'SendMessage',
-  'TodoWrite',
-  'ToolSearch',
-  'Skill',
-  'NotebookEdit',
-];
-// 记忆刷新期间仍需保留可用的 MCP 工具（读写记忆正是 flush 的目的）。
-const MEMORY_FLUSH_KEEP_MCP = new Set([
-  'mcp__happyclaw__memory_append',
-  'mcp__happyclaw__memory_get',
-  'mcp__happyclaw__memory_search',
-]);
 
 let activeAgentMcpPolicy = resolveAgentMcpPolicy('inherit');
 
@@ -287,8 +252,7 @@ const PROACTIVE_DELIVERY_CONTRACT = loadPrompt(
   'delivery-contract.proactive.md',
 );
 const AGENT_BUILDER_GUIDELINES = loadPrompt('agent-builder.md');
-const MEMORY_SYSTEM_HOME = loadPrompt('memory-system.home.md');
-const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
+const MEMORY_SYSTEM_WORKSPACE = loadPrompt('memory-system.workspace.md');
 
 // 各渠道共用的格式说明：Web 端始终可看完整渲染，不因来源降级输出。
 // Mermaid 渲染说明已在模式专属 output prompt 中讲过，此处不重复，
@@ -1043,22 +1007,18 @@ function trimSessionJsonl(jsonlPath: string): void {
  * so users don't lose the response that was being generated.
  * Finally, trim the JSONL file to remove already-compacted history.
  */
-function createPreCompactHook(
-  isHome: boolean,
-  _isAdminHome: boolean,
-  deps: {
-    emit: (output: ContainerOutput) => void;
-    getFullText: () => string;
-    resetFullText: () => void;
-  },
-): HookCallback {
+function createPreCompactHook(deps: {
+  emit: (output: ContainerOutput) => void;
+  getFullText: () => string;
+  resetFullText: () => void;
+}): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
     const transcriptPath = preCompact.transcript_path;
     const sessionId = preCompact.session_id;
 
     // Skip sub-agent compactions — they'd archive the unchanged main transcript
-    // and set hadCompaction, triggering spurious auto-continue + memory flush (#321)
+    // and set hadCompaction, triggering a spurious main-session auto-continue.
     if (preCompact.agent_id) {
       log(
         `PreCompact: skipping sub-agent compact (agent_id=${preCompact.agent_id})`,
@@ -1125,12 +1085,6 @@ function createPreCompactHook(
     // waiting for user input (non-blocking compaction #229).
     hadCompaction = true;
 
-    // Flag memory flush for home containers (full memory write access)
-    if (isHome) {
-      needsMemoryFlush = true;
-      log('PreCompact: flagged memory flush for home container');
-    }
-
     return {};
   };
 }
@@ -1157,7 +1111,7 @@ function extractSessionHistory(oldSessionId: string): string | null {
 }
 
 // Resume 重放防御的 uuid 增量缓存：transcript 是 append-only JSONL，同一
-// sessionId 的多次 runQuery（每条 warm 消息、memory flush、auto-continue）
+// sessionId 的多次 runQuery（每条 warm 消息、auto-continue）
 // 只需读上次之后新增的字节，避免每条消息全量重扫（长会话 O(M²) 阻塞 I/O）。
 // 文件被截断重写（trimSessionFile）时按文件粒度重建。
 let transcriptUuidCache: {
@@ -1597,14 +1551,10 @@ function waitForIpcMessage(): Promise<
   });
 }
 
-function buildMemoryRecallPrompt(isHome: boolean): string {
-  return isHome ? MEMORY_SYSTEM_HOME : MEMORY_SYSTEM_GUEST;
-}
-
 /** 读取用户配置的 MCP servers（stdio/http/sse 类型） */
 function loadUserMcpServers(): Record<string, unknown> {
-  // 禁用记忆层模式下 CLAUDE_CONFIG_DIR 指向 ~/.claude/，HappyClaw 管理的 per-user MCP
-  // 不在那份 settings.json 里，container-runner 通过 env 透传。优先读 env。
+  // CLAUDE_CONFIG_DIR may point at an isolated session directory. HappyClaw
+  // therefore passes the effective per-user MCP set through env first.
   const envJson = process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
   if (envJson) {
     try {
@@ -1687,7 +1637,7 @@ async function runQueryAttempt(
   sessionId: string | undefined,
   mcpServerConfig: ReturnType<typeof createSdkMcpServer>,
   containerInput: ContainerInput,
-  memoryRecall: string,
+  workspaceMemoryInstructions: string,
   resumeAt?: string,
   emitOutput = true,
   allowedTools: string[] = DEFAULT_ALLOWED_TOOLS,
@@ -1764,6 +1714,53 @@ async function runQueryAttempt(
     }
   };
   activateCurrentInputTurn(coldInputTurnId);
+  const workspaceMemoryTurn = mcpToolsContext
+    ? await loadWorkspaceMemoryTurnContext(prompt, (query) =>
+        fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
+      )
+    : { snapshot: null, block: '' };
+  if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
+    log(
+      'Workspace memory snapshot unavailable; continuing this turn without durable memory context',
+    );
+  }
+  const emitWorkspaceMemoryRecall = (
+    workspaceMemorySnapshot: WorkspaceMemorySnapshot,
+    inputTurnId: string,
+    queryRunId: string | undefined = containerInput.queryRunId,
+  ): void => {
+    if (!emitOutput) return;
+    const trace = workspaceMemorySnapshot.retrievalTrace;
+    writeOutput({
+      status: 'stream',
+      result: null,
+      inputTurnId,
+      streamEvent: {
+        eventType: 'memory_recall',
+        agentScope: 'system',
+        isSynthetic: true,
+        displayLevel: 'detail',
+        title: 'Workspace memory snapshot',
+        summary: `revision ${workspaceMemorySnapshot.storeRevision}; ${trace.itemRevisions.length} item(s)`,
+        detail: trace.itemRevisions
+          .map((item) => `${item.id}@${item.revision}`)
+          .slice(0, 10)
+          .join(', '),
+        queryRunId,
+        turnId: containerInput.turnId,
+        sessionId,
+      },
+    });
+    log(
+      `Workspace memory snapshot revision=${workspaceMemorySnapshot.storeRevision} items=${trace.itemRevisions.length} generatedAt=${trace.generatedAt}`,
+    );
+  };
+  if (workspaceMemoryTurn.snapshot) {
+    emitWorkspaceMemoryRecall(
+      workspaceMemoryTurn.snapshot,
+      activeOutputInputTurnId || coldInputTurnId,
+    );
+  }
   const pipedMessagesDuringQuery = ipcDeliveryTracker.unacknowledgedMessages;
   const providerFallbackTurns = new ProviderFallbackTurnLedger({
     prompt,
@@ -1788,9 +1785,12 @@ async function runQueryAttempt(
       message,
       containerInput.channelContext,
     );
-    return shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
-      ? anchorUserTurn(withChannelContext)
+    const withWorkspaceMemory = workspaceMemoryTurn.block
+      ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
       : withChannelContext;
+    return shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
+      ? anchorUserTurn(withWorkspaceMemory)
+      : withWorkspaceMemory;
   };
   const initialRejected = stream.push(prompt, images, decorateInitialUserTurn);
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
@@ -2003,7 +2003,7 @@ async function runQueryAttempt(
       .catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
   };
 
-  const pollIpcDuringQuery = () => {
+  const pollIpcDuringQuery = async (): Promise<void> => {
     if (!ipcPolling) return;
 
     if (shouldClose()) {
@@ -2079,8 +2079,8 @@ async function runQueryAttempt(
       ipcQueryWatcher.close();
       return;
     }
-    // Side-queries (emitOutput=false, e.g. memory flush / CLAUDE.md update) must NOT
-    // consume user IPC messages — those belong to the main query loop. Only sentinels
+    // Maintenance side-queries (emitOutput=false) must NOT consume user IPC
+    // messages — those belong to the main query loop. Only sentinels
     // are checked above. Without this guard, a user message arriving during a side-query
     // gets silently consumed, leaving queryInFlight=true on the host forever (bug #259).
     if (!emitOutput) {
@@ -2133,9 +2133,41 @@ async function runQueryAttempt(
           containerInput.currentSourceJid ||
           containerInput.chatJid,
       );
-      const rejected = stream.push(msg.text, msg.images, (message) =>
-        anchorUserTurn(decorateChannelUserTurn(message, queuedChannelContext)),
-      );
+      const workspaceMemoryTurn = mcpToolsContext
+        ? await loadWorkspaceMemoryTurnContext(msg.text, (query) =>
+            fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
+          )
+        : { snapshot: null, block: '' };
+      if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
+        log(
+          'Workspace memory snapshot unavailable for warm turn; continuing without durable memory context',
+        );
+      }
+      // The query may have completed while the host snapshot request was in
+      // flight. The accepted input remains in the delivery tracker and will be
+      // requeued by the caller; never emit a recall trace or push it into an
+      // ended SDK stream.
+      if (!ipcPolling || stream.ended) return;
+      if (workspaceMemoryTurn.snapshot) {
+        emitWorkspaceMemoryRecall(
+          workspaceMemoryTurn.snapshot,
+          msg.receipt?.deliveryId ||
+            outputCorrelation.currentInputTurnId ||
+            containerInput.turnId ||
+            generateTurnId(),
+          msg.queryRunId || containerInput.queryRunId,
+        );
+      }
+      const rejected = stream.push(msg.text, msg.images, (message) => {
+        const withChannelContext = decorateChannelUserTurn(
+          message,
+          queuedChannelContext,
+        );
+        const withWorkspaceMemory = workspaceMemoryTurn.block
+          ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
+          : withChannelContext;
+        return anchorUserTurn(withWorkspaceMemory);
+      });
       for (const reason of rejected) {
         emit({
           status: 'success',
@@ -2147,12 +2179,18 @@ async function runQueryAttempt(
     // No setTimeout needed — watcher will trigger next check on file change
   };
 
+  const scheduleIpcPoll = createSerializedAsyncTrigger(
+    pollIpcDuringQuery,
+    (err: unknown) => {
+      log(`IPC polling failed: ${err instanceof Error ? err.message : err}`);
+    },
+  );
   const ipcQueryWatcher = createIpcWatcher(() => {
     if (!ipcPolling) return;
-    pollIpcDuringQuery();
+    scheduleIpcPoll();
   });
   // Initial drain to process any pre-existing files
-  pollIpcDuringQuery();
+  scheduleIpcPoll();
 
   const processor = new StreamEventProcessor(emit, log);
 
@@ -2167,15 +2205,15 @@ async function runQueryAttempt(
       containerInput.currentSourceJid || containerInput.chatJid,
     );
   const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
-  const memoryPromptName = isHome
-    ? 'memory-system.home'
-    : 'memory-system.guest';
+  const memoryPromptName = 'memory-system.workspace' as const;
   const hasMemoryTools = allowedTools.some(
     (tool) =>
       tool === 'mcp__happyclaw__*' ||
-      tool === 'mcp__happyclaw__memory_search' ||
-      tool === 'mcp__happyclaw__memory_get' ||
-      tool === 'mcp__happyclaw__memory_append',
+      tool === 'mcp__happyclaw__workspace_memory_search' ||
+      tool === 'mcp__happyclaw__workspace_memory_get' ||
+      tool === 'mcp__happyclaw__workspace_memory_remember' ||
+      tool === 'mcp__happyclaw__workspace_memory_update' ||
+      tool === 'mcp__happyclaw__workspace_memory_forget',
   );
   const hasWebTools = allowedTools.some(
     (tool) => tool === 'WebSearch' || tool === 'WebFetch',
@@ -2299,11 +2337,11 @@ async function runQueryAttempt(
     ),
     interaction: INTERACTION_GUIDELINES,
     security: buildSecurityRulesPrompt(),
-    ...(memoryRecall && hasMemoryTools
+    ...(workspaceMemoryInstructions && hasMemoryTools
       ? {
           memory: {
             id: memoryPromptName,
-            text: memoryRecall,
+            text: workspaceMemoryInstructions,
           },
         }
       : {}),
@@ -2361,13 +2399,6 @@ async function runQueryAttempt(
       `PROMPT DUMP (${systemPromptAppend.length} chars):\n${systemPromptAppend}\n--- END PROMPT DUMP ---`,
     );
   }
-
-  // Home containers (admin & member) can access global and memory directories.
-  // Non-home containers only access memory directory; global CLAUDE.md is NOT
-  // injected into systemPrompt but remains accessible via filesystem (readonly mount).
-  const extraDirs = isHome
-    ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
-    : [WORKSPACE_MEMORY];
 
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
@@ -2508,7 +2539,6 @@ async function runQueryAttempt(
       ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
       ...queryModelRuntime.queryModelOptions,
       cwd: WORKSPACE_GROUP,
-      additionalDirectories: extraDirs,
       resume: sessionId,
       ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
       systemPrompt,
@@ -2542,10 +2572,15 @@ async function runQueryAttempt(
         happyclaw: mcpServerConfig,
       },
       hooks: {
+        PreToolUse: [
+          {
+            hooks: [createWorkspaceMemoryWriteGuard()],
+          },
+        ],
         PreCompact: [
           {
             hooks: [
-              createPreCompactHook(isHome, isAdminHome, {
+              createPreCompactHook({
                 emit,
                 getFullText: () => processor.getFullText(),
                 resetFullText: () => processor.resetFullTextAccumulator(),
@@ -2975,7 +3010,7 @@ async function runQueryAttempt(
         log(`Session initialized: ${newSessionId}`);
         // Mark transport ready and drain any IPC messages that arrived before init.
         sdkTransportReady = true;
-        pollIpcDuringQuery();
+        scheduleIpcPoll();
 
         // Log skills and context usage for observability.
         // getContextUsage() is a newer SDK API; feature-detect to avoid spamming
@@ -3587,7 +3622,7 @@ async function runQuery(
   sessionId: string | undefined,
   mcpServerConfig: ReturnType<typeof createSdkMcpServer>,
   containerInput: ContainerInput,
-  memoryRecall: string,
+  workspaceMemoryInstructions: string,
   resumeAt?: string,
   emitOutput = true,
   allowedTools: string[] = DEFAULT_ALLOWED_TOOLS,
@@ -3602,7 +3637,7 @@ async function runQuery(
     sessionId,
     mcpServerConfig,
     containerInput,
-    memoryRecall,
+    workspaceMemoryInstructions,
     resumeAt,
     emitOutput,
     allowedTools,
@@ -3636,7 +3671,7 @@ async function runQuery(
     failed.sessionIdBeforeTurn,
     mcpServerConfig,
     containerInput,
-    memoryRecall,
+    workspaceMemoryInstructions,
     failed.resumeAt,
     emitOutput,
     allowedTools,
@@ -3746,10 +3781,24 @@ async function main(): Promise<void> {
     isScheduledTask: containerInput.isScheduledTask || false,
     currentTaskId: containerInput.messageTaskId ?? null,
     currentInputTurnId: containerInput.turnId,
+    workspaceMemoryMutationAuth:
+      containerInput.workspaceMemoryMutationSigningSecret &&
+      containerInput.workspaceMemoryRunnerInstanceId
+        ? {
+            runnerInstanceId: containerInput.workspaceMemoryRunnerInstanceId,
+            secret: containerInput.workspaceMemoryMutationSigningSecret,
+            agentId: containerInput.agentId ?? null,
+            taskRunId: containerInput.taskRunId ?? null,
+          }
+        : undefined,
+    get currentSessionId() {
+      return sessionId;
+    },
+    set currentSessionId(value: string | null | undefined) {
+      sessionId = value ?? undefined;
+    },
     workspaceIpc: WORKSPACE_IPC,
     workspaceGroup: WORKSPACE_GROUP,
-    workspaceGlobal: WORKSPACE_GLOBAL,
-    workspaceMemory: WORKSPACE_MEMORY,
   };
   activeAgentMcpPolicy = resolveAgentMcpPolicy(
     parseAgentMcpPolicyMode(process.env.HAPPYCLAW_AGENT_MCP_POLICY),
@@ -3761,18 +3810,7 @@ async function main(): Promise<void> {
       tools: createMcpTools(mcpToolsConfig),
     });
   let mcpServerConfig = buildMcpServerConfig();
-
-  // 记忆刷新阶段的 disallowedTools：内置危险工具 + 除记忆工具外的全部已注册 MCP 工具。
-  // 从 createMcpTools() 的注册全集动态派生，确保新增工具自动纳入屏蔽，避免再次遗漏
-  // （send_image/send_file/install_skill/uninstall_skill/discord_* 等）。
-  const memoryFlushDisallowedTools = [
-    ...MEMORY_FLUSH_DISALLOWED_BUILTINS,
-    ...createMcpTools(mcpToolsConfig)
-      .map((t) => `mcp__happyclaw__${t.name}`)
-      .filter((n) => !MEMORY_FLUSH_KEEP_MCP.has(n)),
-  ];
-
-  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome);
+  const workspaceMemoryInstructions = MEMORY_SYSTEM_WORKSPACE;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
@@ -3896,7 +3934,7 @@ async function main(): Promise<void> {
         sessionId,
         mcpServerConfig,
         containerInput,
-        memoryRecallPrompt,
+        workspaceMemoryInstructions,
         resumeAt,
         true,
         DEFAULT_ALLOWED_TOOLS,
@@ -4023,7 +4061,7 @@ async function main(): Promise<void> {
         break;
       }
 
-      // 中断后：跳过 memory flush 和 session update
+      // 中断后跳过 session update
       if (queryResult.interruptedDuringQuery) {
         // 中断后清除 resumeAt：被中断的 assistant 消息可能未完整提交到 session 历史。
         // 使用 undefined 让 SDK 自行选择恢复点，避免因指向不完整消息的 UUID 导致 resume 失败。
@@ -4104,58 +4142,6 @@ async function main(): Promise<void> {
         continue;
       }
 
-      // Memory Flush: run an extra query to let agent save durable memories (home containers only)
-      // Skip flush when already in a compaction loop — context is too full for productive work.
-      if (
-        needsMemoryFlush &&
-        isHome &&
-        consecutiveCompactions === 0 &&
-        queryResult.durableInputTurnCompleted === true
-      ) {
-        needsMemoryFlush = false;
-        log('Running memory flush query after compaction...');
-
-        const today = new Date().toISOString().split('T')[0];
-        const flushPrompt = [
-          '上下文压缩前记忆刷新。',
-          '**优先检查全局记忆**：先 Read /workspace/global/CLAUDE.md，如果有「待记录」字段且你已获知对应信息（用户身份、偏好、常用项目等），用 Edit 工具立即填写。',
-          '用户明确要求记住的内容，以及下次对话仍可能用到的信息，也写入全局记忆。',
-          `然后使用 memory_append 将时效性记忆保存到 memory/${today}.md（今日进展、临时决策、待办等）。`,
-          '如需确认上下文，可先用 memory_search/memory_get 查阅。',
-          '如果没有值得保存的内容，回复一个字：OK。',
-        ].join(' ');
-
-        const flushResult = await runQuery(
-          flushPrompt,
-          sessionId,
-          mcpServerConfig,
-          containerInput,
-          memoryRecallPrompt,
-          resumeAt,
-          false,
-          MEMORY_FLUSH_ALLOWED_TOOLS,
-          memoryFlushDisallowedTools,
-        );
-        if (flushResult.newSessionId) {
-          sessionId = flushResult.newSessionId;
-          latestSessionId = sessionId;
-        }
-        if (flushResult.lastAssistantUuid)
-          resumeAt = flushResult.lastAssistantUuid;
-        if (flushResult.providerAccountFailure) {
-          log('Account provider failure during memory flush; exiting runner');
-          forceExitWithSafetyNet(0);
-          return;
-        }
-        log('Memory flush completed');
-
-        if (flushResult.closedDuringQuery) {
-          log('Close sentinel during memory flush, exiting');
-          writeOutput({ status: 'closed', result: null });
-          break;
-        }
-      }
-
       // Emit session update so host can track it
       writeOutput({ status: 'success', result: null, newSessionId: sessionId });
 
@@ -4163,9 +4149,8 @@ async function main(): Promise<void> {
       // Instead of waiting for user to send "继续", automatically start a
       // new query so the agent resumes seamlessly where it left off.
       // The query is tagged with sourceKind='auto_continue' so the host
-      // process can suppress system-maintenance noise (memory flush "OK",
-      // CLAUDE.md update acks, etc.) that leaked into the agent's session
-      // transcript — the host will only forward substantive user-facing
+      // process can suppress context-maintenance noise that leaked into the
+      // agent's session transcript — the host only forwards substantive user-facing
       // content to IM, preventing the bug described in issue #275.
       //
       // Guard: if compaction keeps firing repeatedly (e.g. system prompt alone
@@ -4182,12 +4167,11 @@ async function main(): Promise<void> {
           );
           const autoContinuePrompt = [
             '继续。',
-            '注意：刚刚发生了上下文压缩，系统已自动执行了记忆刷新和 CLAUDE.md 更新（这些是内部维护操作）。',
+            '注意：刚刚发生了当前会话的上下文压缩。',
             '请**只关注与用户的实际对话**，从压缩前的最后一个对话话题自然衔接。',
             '如果压缩前你正在进行方案设计、讨论或等待用户确认，请简要回顾当前状态和待确认事项。',
             '如果压缩前已经在执行中，则继续执行。',
-            '**重要**：不要提及、确认或重复任何系统维护相关的内容（如 "OK"、"已更新 CLAUDE.md"、"记忆已刷新" 等），',
-            '这些内部状态对用户不可见。如果你的回复中确实包含此类内容，请用 <internal>...</internal> 标签包裹。',
+            '不要把压缩摘要当作其他会话或工作区的长期记忆，也不要向用户播报内部压缩状态。',
           ].join('');
           containerInput.turnId = generateTurnId();
           const autoContResult = await runQuery(
@@ -4195,7 +4179,7 @@ async function main(): Promise<void> {
             sessionId,
             mcpServerConfig,
             containerInput,
-            memoryRecallPrompt,
+            workspaceMemoryInstructions,
             resumeAt,
             true,
             DEFAULT_ALLOWED_TOOLS,
@@ -4330,7 +4314,7 @@ async function main(): Promise<void> {
           sessionId,
           mcpServerConfig,
           containerInput,
-          memoryRecallPrompt,
+          workspaceMemoryInstructions,
           resumeAt,
           true,
           DEFAULT_ALLOWED_TOOLS,

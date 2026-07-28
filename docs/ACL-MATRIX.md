@@ -60,7 +60,7 @@
 | `/api/channel-accounts/*`                           | Login，仅本人渠道账号                         |
 | `/api/skills/*`                                     | Login，仅本人用户 Skills                      |
 | 用户级 `/api/mcp-servers/*`                         | Login，仅本人配置                             |
-| `/api/memory/*`                                     | Login，仅本人可访问记忆                       |
+| Workspace Memory v2                                 | Login + Workspace owner ACL，见 4.5           |
 | `/api/usage/*`                                      | Login；普通用户只见本人，管理视图再按角色过滤 |
 | `/api/billing/my/*`                                 | Login，仅本人                                 |
 
@@ -118,6 +118,35 @@ Home Workspace 永远不可删除。其他工作区必须通过 Modify，删除�
 - Host Workspace 必须 admin。
 - 非 admin 必须同时是 owner 且拥有 `manage_group_env`。
 - admin 仍需先通过工作区 Access，不能借 admin 角色读取其他用户工作区。
+
+### 4.5 Workspace Memory v2
+
+`/api/memory/workspaces/:workspaceJid/items*` 先要求 Login，再按 URL 中的
+Workspace JID 执行资源级授权：
+
+| 操作                           | 权限                                               |
+| ------------------------------ | -------------------------------------------------- |
+| GET 列表、搜索、详情、versions | `canAccessGroup()`，当前用户必须是 Workspace owner |
+| POST、PATCH、DELETE            | `canModifyGroup()`，当前用户必须是 Workspace owner |
+
+admin 没有跨 owner bypass。目标 Workspace/item 不存在或授权失败均返回 404，不能据此
+枚举其他用户的 Workspace 或 Memory。客户端必须使用 `/api/workspaces` 返回的 JID，
+不能用 `folder` 绕过资源解析。
+
+Agent Runtime 的 Workspace Memory MCP 还叠加执行上下文策略：
+
+| 执行上下文                         | 读取 | 创建、更新、忘记 |
+| ---------------------------------- | ---- | ---------------- |
+| 顶层交互式 Main/Runtime Session    | 允许 | 按 Workspace ACL |
+| Scheduled Run（group 或 isolated） | 允许 | 拒绝             |
+| SDK Task Sub-Agent                 | 允许 | 拒绝             |
+
+定时任务和 Sub-Agent 即使继承 Workspace owner 身份，也不能写入 Workspace Memory；
+只读限制由 MCP 暴露面与主进程 IPC broker 共同执行，不能由模型参数扩大权限。
+
+旧 `/api/memory/sources`、`/api/memory/search`、`/api/memory/file` 和
+`/api/memory/global` 只要求有效登录，但无论角色均返回 410；它们不提供旧文件读取
+或兼容写入能力。
 
 ## 5. 工作区与 Session 渠道绑定
 

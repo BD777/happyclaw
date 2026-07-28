@@ -178,6 +178,23 @@ import {
   updateQueuedFollowUpContent,
 } from './db.js';
 import {
+  createWorkspaceMemory,
+  forgetWorkspaceMemory,
+  getWorkspaceMemory,
+  getWorkspaceMemorySnapshot,
+  searchWorkspaceMemory,
+  updateWorkspaceMemory,
+  WorkspaceMemoryServiceError,
+} from './memory-service.js';
+import {
+  buildWorkspaceMemoryUpdateInput,
+  workspaceMemoryWriteRejection,
+} from './workspace-memory-ipc.js';
+import {
+  grantWorkspaceMemoryTurnToCurrentRunner,
+  verifyAndConsumeWorkspaceMemoryMutation,
+} from './workspace-memory-capability.js';
+import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
   buildNativeThreadWorkspaceUpdate,
@@ -1486,8 +1503,17 @@ function injectPreparedFollowUp(
           (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
             chatJid: receipt.chatJid,
             messageId: cursor.id,
+            runtimeTurnId: receipt.deliveryId,
             scheduledTaskId: null,
           })),
+        );
+        grantWorkspaceMemoryTurnToCurrentRunner(
+          {
+            groupFolder: runtime.effectiveGroup.folder,
+            agentId: runtime.agentId ?? null,
+            taskRunId: null,
+          },
+          receipt.deliveryId,
         );
       }
       if (runtime?.agentId) {
@@ -4841,54 +4867,6 @@ function loadState(): void {
     }
   }
 
-  // Migrate shared global CLAUDE.md → per-user user-global directories
-  migrateGlobalMemoryToPerUser();
-
-  // Initialize per-user global CLAUDE.md from template for users missing it
-  const templatePath = path.resolve(
-    process.cwd(),
-    'config',
-    'global-claude-md.template.md',
-  );
-  if (fs.existsSync(templatePath)) {
-    const template = fs.readFileSync(templatePath, 'utf-8');
-    const userGlobalBase = path.join(GROUPS_DIR, 'user-global');
-    // Ensure every active user has a user-global dir
-    try {
-      let page = 1;
-      const allUsers: Array<{ id: string }> = [];
-      while (true) {
-        const result = listUsers({ status: 'active', page, pageSize: 200 });
-        allUsers.push(...result.users);
-        if (allUsers.length >= result.total) break;
-        page++;
-      }
-      for (const u of allUsers) {
-        const userDir = path.join(userGlobalBase, u.id);
-        fs.mkdirSync(userDir, { recursive: true });
-        const userClaudeMd = path.join(userDir, 'CLAUDE.md');
-        if (!fs.existsSync(userClaudeMd)) {
-          try {
-            fs.writeFileSync(userClaudeMd, template, { flag: 'wx' });
-            logger.info(
-              { userId: u.id },
-              'Initialized user-global CLAUDE.md from template',
-            );
-          } catch (err: unknown) {
-            if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
-              logger.warn(
-                { userId: u.id, err },
-                'Failed to initialize user-global CLAUDE.md',
-              );
-            }
-          }
-        }
-      }
-    } catch (err) {
-      logger.warn({ err }, 'Failed to initialize user-global CLAUDE.md files');
-    }
-  }
-
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -6607,6 +6585,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     missedMessages.map((message) => ({
       chatJid,
       messageId: message.id,
+      runtimeTurnId: lastProcessed.id,
       scheduledTaskId: message.task_id ?? null,
     })),
   );
@@ -10368,6 +10347,7 @@ function startIpcWatcher(): void {
           'agent_profile_prepare_result_',
           'agent_profile_publish_result_',
           'agent_profile_discard_result_',
+          'workspace_memory_result_',
         ];
         const isResultFile = (name: string) =>
           RESULT_FILE_PREFIXES.some((p) => name.startsWith(p));
@@ -10663,9 +10643,20 @@ function writeTaskResult(
   }
   try {
     fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
-    const tmpPath = `${resultFilePath}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(payload));
-    fs.renameSync(tmpPath, resultFilePath);
+    const tmpPath = `${resultFilePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, JSON.stringify(payload), {
+        flag: 'wx',
+        mode: 0o600,
+      });
+      fs.renameSync(tmpPath, resultFilePath);
+    } finally {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        /* already renamed or never created */
+      }
+    }
   } catch (err) {
     logger.error(
       { tasksDir, type, requestId, err },
@@ -10715,6 +10706,25 @@ async function processTaskIpc(
     inputTurnId?: string;
     operation?: string;
     params?: Record<string, unknown>;
+    // Workspace Memory v2. Workspace/actor/sourceType are never accepted from
+    // IPC; processTaskIpc derives them from the verified namespace.
+    query?: string;
+    kind?: string;
+    maxChars?: number;
+    itemId?: string;
+    title?: string;
+    content?: string;
+    canonicalKey?: string | null;
+    importance?: number;
+    confidence?: number;
+    validFrom?: string | null;
+    validUntil?: string | null;
+    expiresAt?: string | null;
+    patch?: Record<string, unknown>;
+    sessionId?: string;
+    timestamp?: string;
+    runnerInstanceId?: string;
+    mutationSignature?: string;
     // For the main HappyClaw's conversational Agent Builder
     profileId?: string;
     draftId?: string;
@@ -10801,6 +10811,208 @@ async function processTaskIpc(
   };
 
   switch (data.type) {
+    case 'workspace_memory': {
+      const finish = (payload: Record<string, unknown>): void =>
+        writeTaskResult(tasksDir, 'workspace_memory', data.requestId, payload);
+      try {
+        if (!data.requestId || !SAFE_REQUEST_ID_RE.test(data.requestId)) {
+          throw new Error('Invalid Workspace Memory request ID');
+        }
+        const ownerId = sourceGroupEntry?.created_by;
+        const actor = ownerId ? getUserById(ownerId) : undefined;
+        if (!actor || actor.status !== 'active') {
+          throw new WorkspaceMemoryServiceError(
+            'not_found',
+            'Workspace memory not found',
+          );
+        }
+        // Folder IPC is shared by Web and bound IM sessions. Resolve the
+        // canonical registered Web workspace; never trust a model-supplied JID.
+        const siblingJids = getJidsByFolder(sourceGroup);
+        const workspaceJid =
+          siblingJids.find((jid) => jid.startsWith('web:')) ?? siblingJids[0];
+        if (!workspaceJid) {
+          throw new WorkspaceMemoryServiceError(
+            'not_found',
+            'Workspace memory not found',
+          );
+        }
+        const base = {
+          actor: { id: actor.id, role: actor.role },
+          workspaceJid,
+        };
+        const hostTurnKind = ipcTaskId
+          ? ('scheduled' as const)
+          : activeAgentBuilderTurns.classifyActiveTurn(
+              agentBuilderTurnScope(sourceGroup, ipcAgentId),
+              data.inputTurnId,
+              getAgentBuilderInputMessage,
+            );
+        const runtimeAgentKind = ipcAgentId
+          ? (getAgent(ipcAgentId)?.kind ?? null)
+          : null;
+        const sourceType =
+          hostTurnKind === 'scheduled'
+            ? ('scheduled_task' as const)
+            : ('agent_runtime' as const);
+        const mutation = {
+          sourceType,
+          provenance: {
+            // Correlation fields are non-authoritative provenance only. Actor,
+            // workspace, and source type are host-derived above.
+            sourceId: data.inputTurnId ?? null,
+            sessionId: data.sessionId ?? null,
+            observedAt: new Date().toISOString(),
+          },
+        };
+        const mutationOperation =
+          data.operation === 'create' ||
+          data.operation === 'update' ||
+          data.operation === 'delete';
+        const capabilityValid =
+          mutationOperation &&
+          (!ipcAgentId || runtimeAgentKind === 'conversation') &&
+          hostTurnKind === 'interactive' &&
+          verifyAndConsumeWorkspaceMemoryMutation(
+            {
+              groupFolder: sourceGroup,
+              agentId: ipcAgentId,
+              taskRunId: ipcTaskId,
+            },
+            data as Record<string, unknown>,
+            data.mutationSignature,
+          );
+        const writeRejection = workspaceMemoryWriteRejection({
+          operation: data.operation,
+          hostTurnKind,
+          runtimeAgentId: ipcAgentId,
+          runtimeAgentKind,
+          capabilityValid,
+        });
+        if (writeRejection) {
+          finish({
+            success: false,
+            ...writeRejection,
+          });
+          break;
+        }
+
+        let result: Record<string, unknown>;
+        switch (data.operation) {
+          case 'snapshot': {
+            const snapshot = getWorkspaceMemorySnapshot({
+              ...base,
+              query: data.query,
+              kind: data.kind as
+                | 'fact'
+                | 'decision'
+                | 'lesson'
+                | 'open_loop'
+                | undefined,
+              limit: data.limit,
+              maxChars: data.maxChars,
+            });
+            result = { snapshot };
+            logger.info(
+              {
+                sourceGroup,
+                workspaceJid,
+                storeRevision: snapshot.storeRevision,
+                retrievalTrace: snapshot.retrievalTrace,
+              },
+              'Workspace Memory snapshot retrieved for runtime turn',
+            );
+            break;
+          }
+          case 'search':
+            result = searchWorkspaceMemory({
+              ...base,
+              query: data.query ?? '',
+              kind: data.kind as
+                | 'fact'
+                | 'decision'
+                | 'lesson'
+                | 'open_loop'
+                | undefined,
+              limit: data.limit,
+            });
+            break;
+          case 'get':
+            result = getWorkspaceMemory({
+              ...base,
+              itemId: data.itemId ?? '',
+            });
+            break;
+          case 'create':
+            result = createWorkspaceMemory({
+              ...base,
+              ...mutation,
+              kind: data.kind as 'fact' | 'decision' | 'lesson' | 'open_loop',
+              title: data.title,
+              content: data.content ?? '',
+              canonicalKey: data.canonicalKey,
+              importance: data.importance,
+              confidence: data.confidence,
+              validFrom: data.validFrom,
+              validUntil: data.validUntil,
+              expiresAt: data.expiresAt,
+              idempotencyKey: data.idempotencyKey,
+            });
+            break;
+          case 'update': {
+            result = updateWorkspaceMemory(
+              buildWorkspaceMemoryUpdateInput(data, {
+                ...base,
+                ...mutation,
+              }) as unknown as Parameters<typeof updateWorkspaceMemory>[0],
+            );
+            break;
+          }
+          case 'delete':
+            result = forgetWorkspaceMemory({
+              ...base,
+              ...mutation,
+              itemId: data.itemId ?? '',
+              expectedRevision: data.expectedRevision ?? 0,
+              idempotencyKey: data.idempotencyKey,
+            });
+            break;
+          default:
+            throw new WorkspaceMemoryServiceError(
+              'invalid_request',
+              'Unknown Workspace Memory operation',
+            );
+        }
+        finish({ success: true, ...result });
+      } catch (error) {
+        const code =
+          error instanceof WorkspaceMemoryServiceError
+            ? error.code
+            : 'internal_error';
+        finish({
+          success: false,
+          code,
+          error:
+            error instanceof WorkspaceMemoryServiceError
+              ? error.message
+              : 'Internal error while processing Workspace Memory request.',
+          ...(error instanceof WorkspaceMemoryServiceError && error.details
+            ? { details: error.details }
+            : {}),
+        });
+        logger.warn(
+          {
+            sourceGroup,
+            operation: data.operation,
+            code,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'Workspace Memory IPC request failed',
+        );
+      }
+      break;
+    }
+
     case 'agent_profile_list': {
       try {
         const actor = requireAgentBuilderActor();
@@ -12814,6 +13026,7 @@ async function processAgentConversation(
     missedMessages.map((message) => ({
       chatJid: virtualChatJid,
       messageId: message.id,
+      runtimeTurnId: lastProcessed.id,
       scheduledTaskId: message.task_id ?? null,
     })),
   );
@@ -15882,9 +16095,18 @@ async function startMessageLoop(): Promise<void> {
                     (cursor) => ({
                       chatJid: receipt.chatJid,
                       messageId: cursor.id,
+                      runtimeTurnId: receipt.deliveryId,
                       scheduledTaskId: injectionTaskId ?? null,
                     }),
                   ),
+                );
+                grantWorkspaceMemoryTurnToCurrentRunner(
+                  {
+                    groupFolder: group.folder,
+                    agentId: null,
+                    taskRunId: null,
+                  },
+                  receipt.deliveryId,
                 );
                 bindActiveChannelTurn(
                   channelTurnScope(group.folder),
@@ -17395,9 +17617,18 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
                     (cursor) => ({
                       chatJid: receipt.chatJid,
                       messageId: cursor.id,
+                      runtimeTurnId: receipt.deliveryId,
                       scheduledTaskId: null,
                     }),
                   ),
+                );
+                grantWorkspaceMemoryTurnToCurrentRunner(
+                  {
+                    groupFolder: agent?.group_folder ?? group.folder,
+                    agentId,
+                    taskRunId: null,
+                  },
+                  receipt.deliveryId,
                 );
               }
             },
@@ -18239,90 +18470,6 @@ function migrateDataDirectories(): void {
   }
 }
 
-/**
- * One-shot migration: copy shared global CLAUDE.md → first admin's user-global dir.
- * Creates user-global directories for all existing users.
- * Idempotent via flag file.
- */
-function migrateGlobalMemoryToPerUser(): void {
-  const flagFile = path.join(DATA_DIR, 'config', '.memory-migration-v1-done');
-  if (fs.existsSync(flagFile)) return;
-
-  const oldGlobalMd = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
-  const userGlobalBase = path.join(GROUPS_DIR, 'user-global');
-
-  let migrationSucceeded = true;
-  let copiedLegacyGlobal = !fs.existsSync(oldGlobalMd);
-
-  // Find first admin user
-  try {
-    const result = listUsers({
-      role: 'admin',
-      status: 'active',
-      page: 1,
-      pageSize: 1,
-    });
-    const firstAdmin = result.users[0];
-
-    if (firstAdmin && fs.existsSync(oldGlobalMd)) {
-      const adminDir = path.join(userGlobalBase, firstAdmin.id);
-      fs.mkdirSync(adminDir, { recursive: true });
-      const target = path.join(adminDir, 'CLAUDE.md');
-      if (!fs.existsSync(target)) {
-        fs.copyFileSync(oldGlobalMd, target);
-        logger.info(
-          { userId: firstAdmin.id, src: oldGlobalMd, dst: target },
-          'Migrated global CLAUDE.md to admin user-global',
-        );
-      }
-      copiedLegacyGlobal = true;
-    } else if (!firstAdmin && fs.existsSync(oldGlobalMd)) {
-      migrationSucceeded = false;
-      logger.warn(
-        'No active admin found for legacy global memory migration; will retry on next startup',
-      );
-    }
-
-    // Create user-global dirs for all users
-    let page = 1;
-    const allUsers: Array<{ id: string }> = [];
-    while (true) {
-      const r = listUsers({ status: 'active', page, pageSize: 200 });
-      allUsers.push(...r.users);
-      if (allUsers.length >= r.total) break;
-      page++;
-    }
-    for (const u of allUsers) {
-      fs.mkdirSync(path.join(userGlobalBase, u.id), { recursive: true });
-    }
-  } catch (err) {
-    migrationSucceeded = false;
-    logger.warn({ err }, 'Global memory migration encountered an error');
-  }
-
-  if (!migrationSucceeded) {
-    logger.warn(
-      'Global memory migration incomplete; will retry on next startup',
-    );
-    return;
-  }
-
-  if (!copiedLegacyGlobal) {
-    logger.warn(
-      'Legacy global memory has not been copied; will retry on next startup',
-    );
-    return;
-  }
-
-  try {
-    fs.mkdirSync(path.dirname(flagFile), { recursive: true });
-    fs.writeFileSync(flagFile, new Date().toISOString());
-    logger.info('Global memory migration to per-user completed');
-  } catch (err) {
-    logger.warn({ err }, 'Failed to persist global memory migration flag');
-  }
-}
-
 async function main(): Promise<void> {
   migrateDataDirectories();
   initDatabase();
@@ -19055,10 +19202,21 @@ async function main(): Promise<void> {
             {
               chatJid: inputChatJid,
               messageId: inputCursor.id,
+              runtimeTurnId: inputTurnId ?? inputCursor.id,
               scheduledTaskId: inputTaskId ?? null,
             },
           ],
         );
+        if (inputTurnId) {
+          grantWorkspaceMemoryTurnToCurrentRunner(
+            {
+              groupFolder: folder,
+              agentId: runtimeAgentId ?? null,
+              taskRunId: null,
+            },
+            inputTurnId,
+          );
+        }
       }
       if (inputTurnId) {
         const scope = channelTurnScope(folder, runtimeAgentId);

@@ -69,8 +69,6 @@ function setup(contextValue: ChannelTurnContext = feishuContext()) {
     currentInputTurnId: 'delivery-1',
     workspaceIpc: root,
     workspaceGroup: root,
-    workspaceGlobal: root,
-    workspaceMemory: root,
   };
   return { root, context, tools: createMcpTools(context) };
 }

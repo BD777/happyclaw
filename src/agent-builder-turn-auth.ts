@@ -8,6 +8,8 @@ import {
 export interface AgentBuilderTurnContext {
   chatJid: string;
   messageId: string;
+  /** Host-issued identity used by the runner for this cold/warm input turn. */
+  runtimeTurnId: string;
   scheduledTaskId: string | null;
 }
 
@@ -244,6 +246,7 @@ export class AgentBuilderTurnRegistry {
       {
         chatJid,
         messageId,
+        runtimeTurnId: messageId,
         scheduledTaskId: scheduledTaskId ?? null,
       },
     ]);
@@ -304,6 +307,46 @@ export class AgentBuilderTurnRegistry {
   delete(folder: string): void {
     this.active.delete(folder);
     this.queued.delete(folder);
+  }
+
+  /**
+   * Classify only the host-owned batch currently executing in this runtime.
+   * Queued turns must not affect the authorization of the active turn.
+   * Missing durable input fails closed because runner-supplied task flags are
+   * intentionally not authorization inputs.
+   */
+  classifyActiveTurn(
+    folder: string,
+    runtimeTurnId: string | null | undefined,
+    loadPersistedInput: (
+      chatJid: string,
+      messageId: string,
+    ) => AgentBuilderPersistedInput | null,
+  ): 'interactive' | 'scheduled' | 'unknown' {
+    const active = this.active.get(folder);
+    if (
+      !active?.length ||
+      !runtimeTurnId ||
+      active.some((turn) => turn.runtimeTurnId !== runtimeTurnId)
+    ) {
+      return 'unknown';
+    }
+    const observed = active.map((turn) => ({
+      turn,
+      input: loadPersistedInput(turn.chatJid, turn.messageId),
+    }));
+    if (observed.some(({ input }) => !input)) return 'unknown';
+    if (
+      observed.some(
+        ({ turn, input }) =>
+          turn.scheduledTaskId !== null ||
+          input!.task_id !== null ||
+          input!.source_kind === 'scheduled_task_prompt',
+      )
+    ) {
+      return 'scheduled';
+    }
+    return 'interactive';
   }
 
   requireOwnerHumanTurn(

@@ -122,6 +122,24 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('PROJECT_ENV=kept');
   });
 
+  test('blocks legacy internal workspace path variables from custom env', () => {
+    const lines = buildContainerEnvLines(
+      config({ anthropicBaseUrl: '', anthropicModel: '' }),
+      {
+        customEnv: {
+          HAPPYCLAW_WORKSPACE_GLOBAL: '/attacker/global',
+          HAPPYCLAW_WORKSPACE_MEMORY: '/attacker/memory',
+          PROJECT_ENV: 'kept',
+        },
+      },
+      NO_CUSTOM_ENV,
+    );
+
+    expect(lines).not.toContain('HAPPYCLAW_WORKSPACE_GLOBAL=/attacker/global');
+    expect(lines).not.toContain('HAPPYCLAW_WORKSPACE_MEMORY=/attacker/memory');
+    expect(lines).toContain('PROJECT_ENV=kept');
+  });
+
   test('injects an authoritative endpoint kind that custom env cannot replace', () => {
     const thirdParty = buildContainerEnvLines(
       config({ anthropicBaseUrl: 'https://proxy.test' }),

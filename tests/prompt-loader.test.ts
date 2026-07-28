@@ -21,8 +21,7 @@ const REQUIRED_FILES = [
   'background-tasks.md',
   'delivery-contract.assistant.md',
   'delivery-contract.proactive.md',
-  'memory-system.home.md',
-  'memory-system.guest.md',
+  'memory-system.workspace.md',
 ];
 
 const REQUIRED_CHANNELS = [
@@ -95,22 +94,18 @@ describe('prompts/ files', () => {
       path.join(PROMPTS_DIR, 'web-fetch.md'),
       'utf-8',
     );
-    const homeMemory = fs.readFileSync(
-      path.join(PROMPTS_DIR, 'memory-system.home.md'),
-      'utf-8',
-    );
-    const guestMemory = fs.readFileSync(
-      path.join(PROMPTS_DIR, 'memory-system.guest.md'),
+    const workspaceMemory = fs.readFileSync(
+      path.join(PROMPTS_DIR, 'memory-system.workspace.md'),
       'utf-8',
     );
 
     expect(webFetch).not.toContain('WebFetch');
     expect(webFetch).not.toContain('web-content-fetcher');
-    expect(homeMemory).toContain(
-      '不等同于用户原生 `~/.claude/CLAUDE.md` playbook',
+    expect(workspaceMemory).toContain(
+      'workspace is the only durable continuity boundary',
     );
-    expect(guestMemory).toContain(
-      '不等同于用户原生 `~/.claude/CLAUDE.md` playbook',
+    expect(workspaceMemory).toContain(
+      'Scheduled/task runs and sub-agents are read-only',
     );
   });
 

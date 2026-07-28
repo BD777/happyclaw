@@ -26,7 +26,7 @@
 | `/api/channel-accounts`            | `src/routes/channel-accounts.ts` | 多渠道账号                    |
 | `/api/config`                      | `src/routes/config.ts`           | Provider、系统与兼容渠道配置  |
 | `/api/tasks`                       | `src/routes/tasks.ts`            | 定时任务和运行                |
-| `/api/memory`                      | `src/routes/memory.ts`           | 记忆                          |
+| `/api/memory`                      | `src/routes/memory.ts`           | Workspace Memory v2           |
 | `/api/skills`                      | `src/routes/skills.ts`           | 用户 Skills                   |
 | `/api/mcp-servers`                 | `src/routes/mcp-servers.ts`      | 用户/系统 MCP                 |
 | `/api/plugins`                     | `src/routes/plugins.ts`          | Plugin Catalog 与用户启用状态 |
@@ -304,12 +304,124 @@ Plugins：
 - `POST /api/plugins/sync-host`
 - `GET /api/plugins/available-on-host`
 
-## 记忆
+## Workspace Memory v2
 
-- `GET /api/memory/sources`
-- `GET /api/memory/search`
-- `GET|PUT /api/memory/file`
-- `GET|PUT /api/memory/global`
+Workspace Memory 是 Workspace 范围内、跨 Session 复用的结构化知识。客户端必须先从
+`GET /api/workspaces` 的 `workspaces[].jid` 取得 Workspace JID，再把它作为
+`:workspaceJid`；不能使用 `folder` 代替。路径参数需要 URL 编码。
+
+### 读取与搜索
+
+- `GET /api/memory/workspaces/:workspaceJid/items`
+  - Query：`status`、`kind`、`limit=1..100`、`cursor` 均可选。
+  - 返回 `{ storeRevision, items, nextCursor }`。
+- `GET /api/memory/workspaces/:workspaceJid/items/search`
+  - Query：必填 `q`，可选 `kind`、`limit=1..100`。
+  - 返回 `{ storeRevision, hits: [{ item, rank, snippet }] }`。
+- `GET /api/memory/workspaces/:workspaceJid/items/:itemId`
+  - 返回 `{ storeRevision, item }`。
+- `GET /api/memory/workspaces/:workspaceJid/items/:itemId/versions`
+  - Query：可选 `limit=1..100`、`cursor`。
+  - 返回 `{ storeRevision, itemId, versions, nextCursor }`，按 revision
+    从新到旧排列。
+
+`kind` 为 `fact | decision | lesson | open_loop`。`status` 为
+`active | proposed | conflicted | superseded | deleted`。Memory item 的主要字段：
+
+```json
+{
+  "id": "mem_...",
+  "workspaceJid": "web:...",
+  "kind": "decision",
+  "title": "采用 SQLite",
+  "content": "Workspace Memory 以 SQLite 为唯一真相源。",
+  "canonicalKey": "memory-store",
+  "status": "active",
+  "importance": 0.9,
+  "confidence": 1,
+  "validFrom": null,
+  "validUntil": null,
+  "expiresAt": null,
+  "revision": 2,
+  "createdAt": "2026-07-28T08:00:00.000Z",
+  "updatedAt": "2026-07-28T09:00:00.000Z",
+  "deletedAt": null,
+  "provenance": {
+    "sourceType": "web_user",
+    "sourceId": null,
+    "sessionId": "session-id",
+    "observedAt": "2026-07-28T08:30:00.000Z"
+  }
+}
+```
+
+Version 还包含 `changeType: create | update | forget` 和
+`actor: { type, id }`，用于展示修订来源；历史版本不可通过 API 原地修改。
+
+### 创建、编辑与忘记
+
+- `POST /api/memory/workspaces/:workspaceJid/items`
+- `PATCH /api/memory/workspaces/:workspaceJid/items/:itemId`
+- `DELETE /api/memory/workspaces/:workspaceJid/items/:itemId`
+
+创建请求必须包含 `kind` 和非空 `content`，可以包含 `title`、`canonicalKey`、
+`status`、`importance`、`confidence`、有效期字段、`provenance` 和
+`idempotencyKey`。Web 客户端不能提交 `sourceType` 或 writer 身份；服务端根据认证
+上下文生成它们。示例：
+
+```json
+{
+  "kind": "lesson",
+  "title": "迁移前先验证备份",
+  "content": "恢复演练通过后再切换生产数据。",
+  "importance": 0.8,
+  "provenance": {
+    "sessionId": "session-id",
+    "observedAt": "2026-07-28T08:30:00.000Z"
+  },
+  "idempotencyKey": "client-generated-stable-key"
+}
+```
+
+PATCH 至少包含一个可修改的 Memory 字段，并必须携带当前
+`expectedRevision`。DELETE 表示“忘记”：写入 tombstone/修订历史，而不是删除来源
+Session；请求体必须包含 `expectedRevision`，可选 `reason`、`provenance` 和
+`idempotencyKey`。
+
+```json
+{
+  "expectedRevision": 2,
+  "reason": "Outdated product decision",
+  "provenance": {
+    "observedAt": "2026-07-28T10:00:00.000Z"
+  }
+}
+```
+
+POST、PATCH 和 DELETE 均返回
+`{ storeRevision, item, replayed }`；GET item 返回相同 wrapper，但不含
+`replayed`。`replayed` 表示服务端按相同 idempotency key 返回了已有写入结果。
+
+并发编辑使用 compare-and-set。`expectedRevision` 过期时返回：
+
+```json
+{
+  "error": "revision_conflict",
+  "currentRevision": 3,
+  "storeRevision": 9
+}
+```
+
+客户端必须保留用户草稿并让用户显式加载最新版，不能盲目重试覆盖。相同
+idempotency key 被不同请求复用时返回 409 `idempotency_conflict`。校验失败返回
+400；无权访问和不存在统一返回 404，避免泄露 Workspace 是否存在。
+
+旧的 `/api/memory/sources`、`/api/memory/search`、`/api/memory/file` 和
+`/api/memory/global` 已退役并返回 410。旧文件只保留用于显式离线导出/迁移，
+Web 和 Runtime 不再把它们当作第二个可写真相源。
+
+完整产品边界与交互约定见
+[Workspace Memory v2](workspace-memory-v2.md)。
 
 ## 用量与计费
 

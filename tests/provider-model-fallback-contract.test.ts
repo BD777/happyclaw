@@ -106,9 +106,10 @@ describe('provider fallback source contracts', () => {
 
   test('maintenance provider failures cannot project or replay a completed input', () => {
     expect(agentRunner).toContain('providerFailureMaintenance: true');
-    expect(agentRunner).toContain(
-      'queryResult.durableInputTurnCompleted === true',
-    );
+    // Workspace Memory no longer launches a post-compaction model side-query;
+    // compaction persistence and provider retry are independent.
+    expect(agentRunner).not.toContain('Running memory flush query');
+    expect(agentRunner).not.toContain('needsMemoryFlush');
     expect(
       hostRunner.match(/output\.providerFailureMaintenance &&/g),
     ).toHaveLength(2);

@@ -436,21 +436,150 @@ export const AgentProfileRefinePromptSchema = z
     }
   });
 
-// Schema 层 cap：路由 handler 还有 byteLength 校验作为底线。Schema 层 cap
-// 让 Hono 在 c.req.json() 之后立刻拒绝，攻击者无法用单条巨大 JSON 把内存
-// 撑爆（早期 fail-fast）。略大于 byte 上限以避免 char vs byte 把 emoji
-// 多字节字符提前拦死。
-const MAX_MEMORY_FILE_CHARS = 600_000;
-const MAX_GLOBAL_MEMORY_CHARS = 240_000;
+const WorkspaceMemoryKindSchema = z.enum([
+  'fact',
+  'decision',
+  'lesson',
+  'open_loop',
+]);
+const WorkspaceMemoryStatusSchema = z.enum([
+  'active',
+  'proposed',
+  'conflicted',
+  'superseded',
+  'deleted',
+]);
+const WritableWorkspaceMemoryStatusSchema = WorkspaceMemoryStatusSchema.exclude(
+  ['deleted'],
+);
+const WorkspaceMemoryTimestampSchema = z
+  .string()
+  .refine(
+    (value) => Number.isFinite(Date.parse(value)),
+    'Invalid ISO timestamp',
+  );
+const WorkspaceMemoryOptionalTimestampSchema =
+  WorkspaceMemoryTimestampSchema.nullable().optional();
 
-export const MemoryFileSchema = z.object({
-  path: z.string().min(1).max(1024),
-  content: z.string().max(MAX_MEMORY_FILE_CHARS),
-});
+export const WorkspaceMemoryProvenanceSchema = z
+  .object({
+    sourceId: z.string().trim().min(1).max(512).nullable().optional(),
+    sessionId: z.string().trim().min(1).max(512).nullable().optional(),
+    observedAt: WorkspaceMemoryOptionalTimestampSchema,
+  })
+  .strict();
 
-export const MemoryGlobalSchema = z.object({
-  content: z.string().max(MAX_GLOBAL_MEMORY_CHARS),
-});
+const WorkspaceMemoryValueFields = {
+  kind: WorkspaceMemoryKindSchema,
+  title: z.string().trim().min(1).max(500).nullable().optional(),
+  content: z.string().trim().min(1).max(32_768),
+  canonicalKey: z.string().trim().min(1).max(500).nullable().optional(),
+  status: WritableWorkspaceMemoryStatusSchema.optional(),
+  importance: z.number().min(0).max(1).optional(),
+  confidence: z.number().min(0).max(1).optional(),
+  validFrom: WorkspaceMemoryOptionalTimestampSchema,
+  validUntil: WorkspaceMemoryOptionalTimestampSchema,
+  expiresAt: WorkspaceMemoryOptionalTimestampSchema,
+} as const;
+
+function validateWorkspaceMemoryValidity(
+  value: { validFrom?: string | null; validUntil?: string | null },
+  ctx: z.RefinementCtx,
+): void {
+  if (
+    value.validFrom &&
+    value.validUntil &&
+    Date.parse(value.validFrom) >= Date.parse(value.validUntil)
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['validUntil'],
+      message: 'validUntil must be later than validFrom',
+    });
+  }
+}
+
+export const WorkspaceMemoryCreateSchema = z
+  .object({
+    ...WorkspaceMemoryValueFields,
+    provenance: WorkspaceMemoryProvenanceSchema.optional(),
+    idempotencyKey: z.string().trim().min(1).max(128).optional(),
+  })
+  .strict()
+  .superRefine(validateWorkspaceMemoryValidity);
+
+export const WorkspaceMemoryPatchSchema = z
+  .object({
+    expectedRevision: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(128).optional(),
+    kind: WorkspaceMemoryKindSchema.optional(),
+    title: WorkspaceMemoryValueFields.title,
+    content: WorkspaceMemoryValueFields.content.optional(),
+    canonicalKey: WorkspaceMemoryValueFields.canonicalKey,
+    status: WritableWorkspaceMemoryStatusSchema.optional(),
+    importance: WorkspaceMemoryValueFields.importance,
+    confidence: WorkspaceMemoryValueFields.confidence,
+    validFrom: WorkspaceMemoryValueFields.validFrom,
+    validUntil: WorkspaceMemoryValueFields.validUntil,
+    expiresAt: WorkspaceMemoryValueFields.expiresAt,
+    provenance: WorkspaceMemoryProvenanceSchema.optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    validateWorkspaceMemoryValidity(value, ctx);
+    if (
+      ![
+        'kind',
+        'title',
+        'content',
+        'canonicalKey',
+        'status',
+        'importance',
+        'confidence',
+        'validFrom',
+        'validUntil',
+        'expiresAt',
+      ].some((key) => Object.prototype.hasOwnProperty.call(value, key))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'At least one memory field must be provided',
+      });
+    }
+  });
+
+export const WorkspaceMemoryForgetSchema = z
+  .object({
+    expectedRevision: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(128).optional(),
+    reason: z.string().trim().min(1).max(1000).nullable().optional(),
+    provenance: WorkspaceMemoryProvenanceSchema.optional(),
+  })
+  .strict();
+
+export const WorkspaceMemoryListQuerySchema = z
+  .object({
+    status: WorkspaceMemoryStatusSchema.optional(),
+    kind: WorkspaceMemoryKindSchema.optional(),
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+    cursor: z.string().min(1).max(2048).optional(),
+  })
+  .strict();
+
+export const WorkspaceMemorySearchQuerySchema = z
+  .object({
+    q: z.string().trim().min(1).max(500),
+    kind: WorkspaceMemoryKindSchema.optional(),
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+  })
+  .strict();
+
+export const WorkspaceMemoryVersionsQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+    cursor: z.string().min(1).max(2048).optional(),
+  })
+  .strict();
 
 export const ClaudeConfigSchema = z.object({
   anthropicBaseUrl: z.string(),
@@ -940,34 +1069,6 @@ export const RedeemCodeCreateSchema = z
 export const RedeemCodeSchema = z.object({
   code: z.string().min(1).max(64),
 });
-
-// Memory types
-export type MemoryType = 'global' | 'session' | 'date' | 'conversation';
-
-export interface MemorySource {
-  path: string;
-  label: string;
-  type: MemoryType;
-  writable: boolean;
-  exists: boolean;
-  updatedAt: string | null;
-  size: number;
-  ownerName?: string;
-  folder?: string;
-}
-
-export interface MemoryFilePayload {
-  path: string;
-  content: string;
-  updatedAt: string | null;
-  size: number;
-  writable: boolean;
-}
-
-export interface MemorySearchHit extends MemorySource {
-  hits: number;
-  snippet: string;
-}
 
 // --- Bug Report schemas ---
 

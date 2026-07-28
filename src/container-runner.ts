@@ -45,6 +45,11 @@ import {
 import { providerPool } from './provider-pool.js';
 import { resolveProviderFailureDisposition } from './provider-failure.js';
 import {
+  issueWorkspaceMemoryWriteCapability,
+  revokeWorkspaceMemoryWriteCapability,
+  type WorkspaceMemoryCapabilityScope,
+} from './workspace-memory-capability.js';
+import {
   deleteSession,
   getUserById,
   getSessionProviderId,
@@ -201,8 +206,11 @@ function ensureSymlinkTo(localPath: string, targetPath: string): void {
 /** Required env flags for settings.json — 每次启动时强制写入，不可被宿主机配置覆盖。 */
 const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
-  CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  // Workspace Memory is the sole managed long-term store. Additional
+  // directories must not smuggle user-global/date files into SDK context,
+  // and Claude's native auto-memory must not create a second truth source.
+  CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '0',
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
   // 禁用 SDK 附件注入（token_usage, changed_files, todo_reminders 等 20+ 种动态消息）。
   // 这些附件在每次 query() 时动态生成但不持久化到 JSONL，导致跨进程的消息数组
   // 前缀不匹配，prompt cache 永远失效（cache_read 始终 = 11224 静态 system prompt）。
@@ -347,6 +355,13 @@ export interface ContainerInput {
   isHome?: boolean;
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
+  /**
+   * Internal per-runner HMAC secret delivered only in the stdin bootstrap.
+   * Never expose this in environment variables, files, logs, prompts, or IPC.
+   */
+  workspaceMemoryMutationSigningSecret?: string;
+  /** Public identity paired with the runner-private signing secret. */
+  workspaceMemoryRunnerInstanceId?: string;
   /** Isolated task run ID — determines IPC namespace (tasks-run/{taskRunId}/) */
   taskRunId?: string;
   /** Claude session/provider namespace. Tasks use task:<id> while IPC still uses taskRunId. */
@@ -1094,28 +1109,7 @@ export function buildVolumeMounts(
   let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
   const projectRoot = process.cwd();
   const groupDir = path.join(GROUPS_DIR, group.folder);
-
-  // Per-user global memory directory:
-  // Each user gets their own user-global/{userId}/ mounted as /workspace/global
   const ownerId = group.created_by;
-  if (ownerId) {
-    const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
-    mkdirForContainer(userGlobalDir);
-    mounts.push({
-      hostPath: userGlobalDir,
-      containerPath: '/workspace/global',
-      readonly: !group.is_home,
-    });
-  } else {
-    // Legacy fallback for rows without created_by.
-    const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
-    mkdirForContainer(legacyGlobalDir);
-    mounts.push({
-      hostPath: legacyGlobalDir,
-      containerPath: '/workspace/global',
-      readonly: !isAdminHome,
-    });
-  }
 
   if (isAdminHome) {
     // Admin home gets the entire project root mounted
@@ -1139,18 +1133,6 @@ export function buildVolumeMounts(
       readonly: false,
     });
   }
-
-  // Memory directory: home containers write their own; non-home containers read owner's home memory
-  const memoryFolder = group.is_home
-    ? group.folder
-    : ownerHomeFolder || group.folder;
-  const memoryDir = path.join(DATA_DIR, 'memory', memoryFolder);
-  mkdirForContainer(memoryDir);
-  mounts.push({
-    hostPath: memoryDir,
-    containerPath: '/workspace/memory',
-    readonly: !group.is_home,
-  });
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Sub-agents and task sessions get their own session dir under agents/{id}/.claude/
@@ -1582,6 +1564,18 @@ export async function runContainerAgent(
     input = { ...input, sessionId: undefined };
   }
 
+  const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
+    groupFolder: group.folder,
+    agentId: input.agentId ?? null,
+    taskRunId: input.taskRunId ?? null,
+  };
+  const {
+    runnerInstanceId: workspaceMemoryRunnerInstanceId,
+    signingSecret: workspaceMemoryMutationSigningSecret,
+  } = issueWorkspaceMemoryWriteCapability(
+    workspaceMemoryCapabilityScope,
+    input.turnId,
+  );
   try {
     const isAdminHome = !!input.isAdminHome;
     // Per-user skills: always mount if the group has an owner
@@ -1653,6 +1647,8 @@ export async function runContainerAgent(
       // the caller's `input` object (queue/log/retry paths reuse the same ref).
       const dockerInput: ContainerInput = {
         ...input,
+        workspaceMemoryMutationSigningSecret,
+        workspaceMemoryRunnerInstanceId,
         plugins: group.created_by
           ? loadUserPlugins(group.created_by, { runtime: 'docker' })
           : [],
@@ -2015,6 +2011,10 @@ export async function runContainerAgent(
 
     return result;
   } finally {
+    revokeWorkspaceMemoryWriteCapability(
+      workspaceMemoryCapabilityScope,
+      workspaceMemoryRunnerInstanceId,
+    );
     // Guarantee session release even if buildVolumeMounts/spawn throws
     if (selectedProfileId) {
       providerPool.releaseSession(selectedProfileId);
@@ -2228,9 +2228,6 @@ export async function runHostAgent(
   // Always store logs in data/groups/{folder}/logs/, not in customCwd
   const logsBaseDir = path.join(defaultGroupDir, 'logs');
   fs.mkdirSync(logsBaseDir, { recursive: true });
-  fs.mkdirSync(path.join(DATA_DIR, 'memory', group.folder), {
-    recursive: true,
-  });
 
   // 2. 确保目录结构（宿主机模式下限制目录权限）
   // Sub-agents get their own IPC and session directories
@@ -2276,7 +2273,8 @@ export async function runHostAgent(
 
   // 3. Resolve the selected native Claude user layer. Workspace remains cwd.
   // 4. Skills / Rules / CLAUDE.md / native capabilities project into session.
-  // 宿主 Claude 配置与 HappyClaw 记忆层始终叠加，冲突通过 audit 明示。
+  // Native instructions remain distinct from the host-authorized Workspace
+  // Memory snapshot; Claude native auto-memory is disabled in settings.
   const hostUserSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
     group.created_by,
     input.agentProfile,
@@ -2298,7 +2296,6 @@ export async function runHostAgent(
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
     pluginSkillLayers: pluginSkillLayers(preparedHostPlugins),
-    happyclawMemoryActive: true,
   });
   const hostClaudeContextSync = syncHostClaudeContext(
     hostClaudeContextPlan,
@@ -2381,6 +2378,18 @@ export async function runHostAgent(
     input = { ...input, sessionId: undefined };
   }
 
+  const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
+    groupFolder: group.folder,
+    agentId: input.agentId ?? null,
+    taskRunId: input.taskRunId ?? null,
+  };
+  const {
+    runnerInstanceId: workspaceMemoryRunnerInstanceId,
+    signingSecret: workspaceMemoryMutationSigningSecret,
+  } = issueWorkspaceMemoryWriteCapability(
+    workspaceMemoryCapabilityScope,
+    input.turnId,
+  );
   try {
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
@@ -2494,26 +2503,6 @@ export async function runHostAgent(
     // 路径映射
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
     hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
-
-    // Per-user global memory（HappyClaw 自带 memory 层）
-    const ownerId = group.created_by;
-    if (ownerId) {
-      const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
-      fs.mkdirSync(userGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
-    } else {
-      const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
-      fs.mkdirSync(legacyGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
-    }
-    const memoryFolder = group.is_home
-      ? group.folder
-      : ownerHomeFolder || group.folder;
-    hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
-      DATA_DIR,
-      'memory',
-      memoryFolder,
-    );
 
     // Resolve symlinks so CLAUDE_CONFIG_DIR ends up as the real on-disk path.
     // Host mode also goes through the synchronized session .claude directory so
@@ -2678,6 +2667,8 @@ export async function runHostAgent(
       // plugins.
       const hostInput: ContainerInput = {
         ...input,
+        workspaceMemoryMutationSigningSecret,
+        workspaceMemoryRunnerInstanceId,
         plugins: preparedHostPlugins,
         contextAudit: hostClaudeContextPlan.audit,
         skillManifest: {
@@ -2930,6 +2921,10 @@ export async function runHostAgent(
 
     return hostResult;
   } finally {
+    revokeWorkspaceMemoryWriteCapability(
+      workspaceMemoryCapabilityScope,
+      workspaceMemoryRunnerInstanceId,
+    );
     // Guarantee session release even if spawn/setup throws
     if (hostSelectedProfileId) {
       providerPool.releaseSession(hostSelectedProfileId);

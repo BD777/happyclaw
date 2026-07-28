@@ -51,7 +51,7 @@ HappyClaw 不是一个简单的聊天 API Wrapper。智能体运行在真实的 
 - **Claude Code 原生运行时** — 直接使用版本锁定的 Claude Agent SDK 与 Claude Code CLI，不重新实现工具调用和运行循环。
 - **智能体优先工作台** — 智能体管身份和能力，工作区管文件与执行环境，会话管对话上下文，产品层级清晰。
 - **随时可访问** — Web、PWA 和 7 种 IM 渠道统一接入，任务完成后可以主动把结果送回消息渠道。
-- **多用户与多账号** — 用户、渠道凭据、工作区、记忆、Skills、MCP 和运行数据彼此隔离。
+- **多用户与多账号** — 用户、渠道凭据、工作区及其 Memory、Skills、MCP 和运行数据彼此隔离。
 - **宿主机与容器双模式** — 管理员可以使用授权的本机项目目录，普通成员默认在 Docker 沙箱中运行。
 - **面向长期运行** — 提供调度任务、运行历史、消息回执、故障恢复、用量统计、监控与一致性备份。
 
@@ -65,7 +65,7 @@ HappyClaw 不是一个简单的聊天 API Wrapper。智能体运行在真实的 
 | **消息渠道**   | 飞书、Telegram、QQ、钉钉、微信、Discord、WhatsApp，多账号、扫码登录、工作区/会话绑定    |
 | **模型提供商** | Anthropic 官方与第三方兼容端点、多 Provider、轮询/加权/故障转移、健康检查、会话粘性     |
 | **定时任务**   | Cron、固定间隔、一次性任务，智能体/Script 执行，隔离上下文，幂等立即运行，通知重试      |
-| **记忆与文件** | 用户全局记忆、工作区记忆、日期记忆、上下文压缩归档、全文搜索、文件上传下载与终端        |
+| **记忆与文件** | Workspace Memory（事实、决策、经验、待跟进）、来源与修订、CAS 编辑、搜索、文件与终端    |
 | **用量与计费** | Token 分类统计、智能体/工作区/模型筛选、明细与 CSV 导出、订阅、余额、兑换码与配额       |
 | **运维与安全** | RBAC、邀请注册、登录设备、审计日志、运行监控、Docker 镜像管理、备份与安全恢复           |
 | **客户端体验** | 实时流式输出、工具轨迹、Markdown/Mermaid/KaTeX、消息分享图片、响应式布局与 PWA          |
@@ -77,6 +77,7 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
 ```text
 智能体（身份、提示词、Skills、MCP）
 └── Workspace（项目目录、执行模式、环境变量、渠道挂载）
+    ├── Workspace Memory（跨 Session 的事实、决策、经验、待跟进）
     ├── Main Session（工作区主会话）
     ├── Runtime Session（独立对话或渠道原生话题）
     └── Scheduled Run（定时任务的普通或隔离运行）
@@ -85,7 +86,8 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
 - **智能体** 保存长期身份和能力策略。主 HappyClaw 智能体始终存在，也可以创建代码审查、研究、运维等自定义智能体。
 - **对话式智能体构建器** 在主 HappyClaw 名下的所有 Workspace 主会话与普通 Runtime Session 中生效，允许用户多轮讨论需求、保存并预览智能体草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新智能体；定时任务与 Sub-Agent 不能代替用户发布。
 - **Workspace** 是私有的文件与执行隔离边界。创建时必须选择智能体，后续可以迁移归属。
-- **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层智能体。
+- **Workspace Memory** 是该工作区跨 Session 复用的结构化知识，不是用户全局记忆，也不是任意文件或日期归档。
+- **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层智能体；Session 历史与 Workspace Memory 分开保存，忘记一条 Memory 不会删除聊天历史。
 - **Channel Mount** 把 IM 群聊、私聊或原生话题挂载到工作区或具体会话。
 
 ### 执行模式
@@ -289,10 +291,10 @@ Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-
 
 ```text
 data/
-├── db/messages.db     # SQLite 主数据库
+├── db/messages.db     # SQLite 主数据库（含 Workspace Memory v2）
 ├── config/            # 加密配置、密钥与系统设置
 ├── groups/            # 工作区目录和项目文件
-├── memory/            # 日期记忆
+├── memory/            # 旧版文件记忆，仅供离线迁移/归档
 ├── sessions/          # 主会话与 Runtime Session 的 Claude 数据
 ├── ipc/               # Runner 输入、工具请求和回执
 ├── skills/            # 用户 Skills
@@ -348,11 +350,11 @@ flowchart LR
 
 HappyClaw 会执行代码和访问第三方消息平台，部署前请理解以下边界：
 
-- 用户、渠道账号、工作区、记忆、Skills、MCP、Plugin 状态和用量记录按 owner 隔离。
+- 用户、渠道账号、工作区及其 Memory、Skills、MCP、Plugin 状态和用量记录按 owner 隔离。
 - Provider 与渠道密钥使用本机 AES-256-GCM 密钥加密，密钥文件权限限制为 `0600`。
 - REST、WebSocket、IM 命令和 MCP 工具分别执行身份、owner、角色与能力策略检查。
 - 普通成员固定使用 Container 模式；管理员 Host 模式只允许访问授权目录。
-- 智能体不提供只读或受限安全模式，工具执行权限完整开放；Skills 与 MCP 是否启用由用户显式选择。
+- 智能体的通用代码与文件工具不提供全局只读模式；Skills 与 MCP 是否启用由用户显式选择。Workspace Memory 控制面是例外：定时任务与 Sub-Agent 只能读取，只有顶层交互式 Session 可以按 Workspace ACL 写入。
 - Script 定时任务只允许管理员在授权的 Host 工作区执行。
 - Skill ZIP、文件上传、备份恢复和 Git 操作包含路径、符号链接、大小与目标校验。
 - 对公网开放时，建议使用 HTTPS 反向代理、强密码、关闭开放注册，并定期备份 `data/`。
@@ -409,6 +411,7 @@ happyclaw/
 | --------------------------------------------------------------------- | -------------------------------------------------- |
 | [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、智能体、用量等接口 |
 | [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求               |
+| [Workspace Memory v2](docs/workspace-memory-v2.md)                    | Workspace 知识边界、数据模型、并发和 UI 语义       |
 | [智能体优先架构记录](docs/agent-first-architecture-plan.md)           | 智能体、工作区、运行会话与渠道挂载的迁移背景       |
 | [Plugin 自动化设计记录](docs/claude-code-plugin-automation-design.md) | Claude Code Plugin catalog 与运行快照的历史设计    |
 

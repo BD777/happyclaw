@@ -39,7 +39,7 @@ export interface HappyClawPromptSources {
   interaction: string;
   security: string;
   memory?: {
-    id: 'memory-system.home' | 'memory-system.guest';
+    id: 'memory-system.workspace';
     text: string;
   };
   agentBuilder?: string;

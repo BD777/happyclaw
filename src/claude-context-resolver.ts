@@ -58,8 +58,6 @@ export interface ClaudeContextPlanArgs {
   managedSkillPolicy?: ManagedSkillPolicy;
   workspaceSkillsDirOverride?: string;
   pluginSkillLayers?: EffectiveSkillLayer[];
-  // true 且 admin 原生 ~/.claude/CLAUDE.md 存在时，两套全局记忆并存，触发 audit 告警。
-  happyclawMemoryActive?: boolean;
 }
 
 export interface ClaudeContextPlan {
@@ -358,16 +356,6 @@ export function buildClaudeContextPlan(
     warnings.push('rules missing');
   if (includeHostSkills && !exists(externalSkillsDir))
     warnings.push('external skills missing');
-  // 记忆层未禁用 + 原生 ~/.claude/CLAUDE.md 存在 → 两套全局记忆并存，提醒 admin。
-  if (
-    includeHostClaudeContext &&
-    args.happyclawMemoryActive &&
-    exists(claudeMdSource)
-  ) {
-    warnings.push(
-      '两套全局记忆同时生效：~/.claude/CLAUDE.md（原生 Playbook）+ HappyClaw 记忆层',
-    );
-  }
 
   const audit: ClaudeContextAudit = {
     executionMode: args.executionMode,

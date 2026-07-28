@@ -1,0 +1,32 @@
+import type {
+  HookCallback,
+  PreToolUseHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
+
+const WRITE_TOOLS = new Set([
+  'mcp__happyclaw__workspace_memory_remember',
+  'mcp__happyclaw__workspace_memory_update',
+  'mcp__happyclaw__workspace_memory_forget',
+]);
+
+/** Sub-agents inherit the MCP server, so enforce read-only access in a hook. */
+export function createWorkspaceMemoryWriteGuard(): HookCallback {
+  return async (input) => {
+    const preTool = input as PreToolUseHookInput;
+    if (
+      preTool.hook_event_name === 'PreToolUse' &&
+      preTool.agent_id &&
+      WRITE_TOOLS.has(preTool.tool_name)
+    ) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'Sub-agents have read-only Workspace Memory access. Return proposed learnings to the top-level session.',
+        },
+      };
+    }
+    return {};
+  };
+}

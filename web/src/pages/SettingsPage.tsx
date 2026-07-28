@@ -149,7 +149,7 @@ export function SettingsPage() {
     security: '安全与设备',
     groups: '会话管理',
     'agent-profiles': '智能体',
-    memory: '记忆管理',
+    memory: 'Workspace Memory',
     skills: '技能(Skill)管理',
     'mcp-servers': 'MCP 服务器',
     plugins: '插件 (Plugins)',

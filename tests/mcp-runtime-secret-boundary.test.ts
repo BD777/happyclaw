@@ -170,6 +170,16 @@ afterAll(() => {
 });
 
 describe('managed MCP runtime secret boundary', () => {
+  test('image and entrypoint do not recreate legacy filesystem memory roots', () => {
+    const dockerfile = fs.readFileSync('container/Dockerfile', 'utf8');
+    const entrypoint = fs.readFileSync('container/entrypoint.sh', 'utf8');
+
+    for (const legacyRoot of ['/workspace/global', '/workspace/memory']) {
+      expect(dockerfile).not.toContain(legacyRoot);
+      expect(entrypoint).not.toContain(legacyRoot);
+    }
+  });
+
   test('isolates generated env paths by Bot identity and runtime', () => {
     const botAAgent = getContainerRuntimeEnvDir(
       'workspace',
@@ -272,7 +282,16 @@ describe('managed MCP runtime secret boundary', () => {
       }),
     );
 
-    buildVolumeMounts(group('member-workspace', ownerId) as any, false);
+    const mounts = buildVolumeMounts(
+      group('member-workspace', ownerId) as any,
+      false,
+    );
+    expect(mounts.map((mount) => mount.containerPath)).not.toContain(
+      '/workspace/global',
+    );
+    expect(mounts.map((mount) => mount.containerPath)).not.toContain(
+      '/workspace/memory',
+    );
 
     const raw = fs.readFileSync(target, 'utf8');
     const settings = JSON.parse(raw) as {
@@ -280,6 +299,8 @@ describe('managed MCP runtime secret boundary', () => {
       mcpServers: Record<string, Record<string, unknown>>;
     };
     expect(settings.env.KEEP_ME).toBe('yes');
+    expect(settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
+    expect(settings.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe('0');
     expect(settings.mcpServers).toMatchObject({
       sharedStdio: {
         command: 'shared-system-mcp',

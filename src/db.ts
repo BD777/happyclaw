@@ -81,6 +81,11 @@ import {
   bindChannelReliabilityDatabase,
   createChannelReliabilitySchema,
 } from './channel-reliability-store.js';
+import {
+  bindWorkspaceMemoryDatabase,
+  createWorkspaceMemorySchema,
+  deleteWorkspaceMemoryData,
+} from './memory-store.js';
 import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
 
 let db: InstanceType<typeof Database>;
@@ -89,7 +94,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 64;
+export const CURRENT_SCHEMA_VERSION = 65;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -732,6 +737,13 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_workspace ON agent_channel_mounts(workspace_jid);
     CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_session ON agent_channel_mounts(session_id);
   `);
+
+  // v64 -> v65: Workspace is the only durable memory continuity boundary.
+  // Create and bind this before canonical projection reconciliation because
+  // that pass can delete ghost workspaces and must also purge their memory
+  // even when legacy FK violations forced foreign_keys=OFF.
+  createWorkspaceMemorySchema(db);
+  bindWorkspaceMemoryDatabase(db);
 
   // Auth tables
   db.exec(`
@@ -8367,6 +8379,7 @@ function syncWorkspaceFromRegisteredGroup(
 }
 
 function deleteWorkspaceMirror(jid: string, folder?: string): void {
+  deleteWorkspaceMemoryData(jid);
   db.prepare('DELETE FROM workspaces WHERE jid = ?').run(jid);
   db.prepare(
     'DELETE FROM workspace_runtime_sessions WHERE workspace_jid = ?',
@@ -8632,6 +8645,18 @@ export function syncAllWorkspaceRuntimeSessionsFromSessions(): void {
  */
 export function reconcileCanonicalRuntimeProjections(): void {
   db.transaction(() => {
+    const ghostWorkspaces = db
+      .prepare(
+        `SELECT jid FROM workspaces
+         WHERE NOT EXISTS (
+           SELECT 1 FROM registered_groups rg
+           WHERE rg.jid = workspaces.jid AND rg.jid LIKE 'web:%'
+         )`,
+      )
+      .all() as Array<{ jid: string }>;
+    for (const workspace of ghostWorkspaces) {
+      deleteWorkspaceMemoryData(workspace.jid);
+    }
     db.exec(`
       DELETE FROM workspaces
       WHERE NOT EXISTS (
@@ -9693,27 +9718,6 @@ export function ensureUserHomeGroup(
   // Ensure chat row exists
   ensureChatExists(jid);
 
-  // Create user-global memory directory and initialize CLAUDE.md from template
-  const userGlobalDir = path.join(GROUPS_DIR, 'user-global', userId);
-  fs.mkdirSync(userGlobalDir, { recursive: true });
-  const userClaudeMd = path.join(userGlobalDir, 'CLAUDE.md');
-  if (!fs.existsSync(userClaudeMd)) {
-    const templatePath = path.resolve(
-      process.cwd(),
-      'config',
-      'global-claude-md.template.md',
-    );
-    if (fs.existsSync(templatePath)) {
-      try {
-        fs.writeFileSync(userClaudeMd, fs.readFileSync(templatePath, 'utf-8'), {
-          flag: 'wx',
-        });
-      } catch {
-        // EEXIST race or read error — ignore
-      }
-    }
-  }
-
   return jid;
 }
 
@@ -9844,6 +9848,7 @@ export function deleteGroupData(
       'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
     ).run(folder);
     // 3b. 删除 canonical workspace/session 镜像
+    deleteWorkspaceMemoryData(jid);
     db.prepare('DELETE FROM workspaces WHERE jid = ?').run(jid);
     db.prepare(
       'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
@@ -12779,6 +12784,7 @@ export function closeDatabase(): void {
   _stmts = null;
   _newMsgStmtCache.clear();
   bindChannelReliabilityDatabase(null);
+  bindWorkspaceMemoryDatabase(null);
   if (db) {
     db.close();
   }

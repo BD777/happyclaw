@@ -19,6 +19,7 @@ import {
   normalizeChannelTurnContext,
   type ChannelTurnContext,
 } from './types.js';
+import { signWorkspaceMemoryMutation } from './workspace-memory-auth.js';
 
 /** Context required by MCP tools. Passed at construction time. */
 export interface McpContext {
@@ -41,20 +42,30 @@ export interface McpContext {
    * Cold starts use the triggering message id; IPC turns use the host-issued
    * delivery id from their receipt. */
   currentInputTurnId?: string | null;
+  /** Current provider session id, used only as server-side provenance. */
+  currentSessionId?: string | null;
+  /** Runner-private HMAC material. Never expose through a tool schema/result. */
+  workspaceMemoryMutationAuth?: {
+    runnerInstanceId: string;
+    secret: string;
+    agentId?: string | null;
+    taskRunId?: string | null;
+  };
   workspaceIpc: string;
   workspaceGroup: string;
-  workspaceGlobal: string;
-  workspaceMemory: string;
 }
 
 function writeIpcFile(dir: string, data: object): string {
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
   const filepath = path.join(dir, filename);
-  const tempPath = `${filepath}.tmp`;
+  const tempPath = `${filepath}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
   try {
     fs.mkdirSync(dir, { recursive: true });
     // Atomic write: temp file then rename
-    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), {
+      flag: 'wx',
+      mode: 0o600,
+    });
     fs.renameSync(tempPath, filepath);
   } catch (err) {
     // Clean up temp file on failure
@@ -109,75 +120,165 @@ function newRequestId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-// --- Memory helpers ---
-const MEMORY_EXTENSIONS = new Set(['.md', '.txt']);
-const MEMORY_SUBDIRS = new Set(['memory', 'conversations']);
-const MEMORY_SKIP_DIRS = new Set(['logs', '.claude', 'node_modules', '.git']);
-const MAX_MEMORY_FILE_SIZE = 512 * 1024; // 512KB per file
-const MAX_MEMORY_APPEND_SIZE = 16 * 1024; // 16KB per append
-const MEMORY_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-
-function collectMemoryFiles(
-  baseDir: string,
-  out: string[],
-  maxDepth: number,
-  depth = 0,
-): void {
-  if (depth > maxDepth || !fs.existsSync(baseDir)) return;
-  try {
-    const entries = fs.readdirSync(baseDir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(baseDir, entry.name);
-      if (entry.isDirectory()) {
-        if (MEMORY_SKIP_DIRS.has(entry.name)) continue;
-        if (depth === 0 || MEMORY_SUBDIRS.has(entry.name)) {
-          collectMemoryFiles(fullPath, out, maxDepth, depth + 1);
-        }
-      } else if (entry.isFile()) {
-        if (
-          entry.name === 'CLAUDE.md' ||
-          MEMORY_EXTENSIONS.has(path.extname(entry.name))
-        ) {
-          out.push(fullPath);
-        }
-      }
-    }
-  } catch {
-    /* skip unreadable */
-  }
-}
-
-function createToRelativePath(ctx: McpContext) {
-  return (filePath: string): string => {
-    if (
-      filePath === ctx.workspaceGlobal ||
-      filePath.startsWith(ctx.workspaceGlobal + path.sep)
-    ) {
-      return `[global] ${path.relative(ctx.workspaceGlobal, filePath)}`;
-    }
-    if (
-      filePath === ctx.workspaceMemory ||
-      filePath.startsWith(ctx.workspaceMemory + path.sep)
-    ) {
-      return `[memory] ${path.relative(ctx.workspaceMemory, filePath)}`;
-    }
-    return path.relative(ctx.workspaceGroup, filePath);
+export interface WorkspaceMemorySnapshot {
+  workspaceJid: string;
+  storeRevision: number;
+  items: Array<Record<string, unknown>>;
+  renderedText: string;
+  retrievalTrace: {
+    itemRevisions: Array<{ id: string; revision: number }>;
+    query?: string | null;
+    generatedAt: string;
   };
 }
 
-function parseMemoryFileReference(fileRef: string): {
-  pathRef: string;
-  lineFromRef?: number;
-} {
-  const trimmed = fileRef.trim();
-  const lineRefMatch = trimmed.match(/^(.*?):(\d+)$/);
-  if (!lineRefMatch) return { pathRef: trimmed };
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
 
-  const lineFromRef = Number(lineRefMatch[2]);
-  if (!Number.isInteger(lineFromRef) || lineFromRef <= 0) {
-    return { pathRef: trimmed };
+export function parseWorkspaceMemorySnapshot(
+  value: unknown,
+): WorkspaceMemorySnapshot | null {
+  if (!isRecord(value)) return null;
+  const trace = value.retrievalTrace;
+  if (
+    typeof value.workspaceJid !== 'string' ||
+    !Number.isInteger(value.storeRevision) ||
+    (value.storeRevision as number) < 0 ||
+    !Array.isArray(value.items) ||
+    typeof value.renderedText !== 'string' ||
+    !isRecord(trace) ||
+    !Array.isArray(trace.itemRevisions) ||
+    !trace.itemRevisions.every(
+      (item) =>
+        isRecord(item) &&
+        typeof item.id === 'string' &&
+        Number.isInteger(item.revision) &&
+        (item.revision as number) >= 0,
+    ) ||
+    typeof trace.generatedAt !== 'string' ||
+    !(
+      trace.query === undefined ||
+      trace.query === null ||
+      typeof trace.query === 'string'
+    )
+  ) {
+    return null;
   }
-  return { pathRef: lineRefMatch[1].trim(), lineFromRef };
+  return {
+    workspaceJid: value.workspaceJid,
+    storeRevision: value.storeRevision as number,
+    items: value.items as Array<Record<string, unknown>>,
+    renderedText: value.renderedText,
+    retrievalTrace: {
+      itemRevisions: trace.itemRevisions as Array<{
+        id: string;
+        revision: number;
+      }>,
+      query: trace.query as string | null | undefined,
+      generatedAt: trace.generatedAt,
+    },
+  };
+}
+
+const WORKSPACE_MEMORY_RESULT_PREFIX = 'workspace_memory_result';
+
+async function callWorkspaceMemory(
+  ctx: McpContext,
+  operation: 'snapshot' | 'search' | 'get' | 'create' | 'update' | 'delete',
+  payload: Record<string, unknown>,
+  timeoutMs = 30_000,
+): Promise<Record<string, unknown>> {
+  const tasksDir = path.join(ctx.workspaceIpc, 'tasks');
+  const requestId = newRequestId();
+  const request: Record<string, unknown> & { requestId: string } = {
+    ...payload,
+    type: 'workspace_memory',
+    operation,
+    requestId,
+    inputTurnId: ctx.currentInputTurnId || undefined,
+    taskId: ctx.currentTaskId || undefined,
+    sessionId: ctx.currentSessionId || undefined,
+    timestamp: new Date().toISOString(),
+  };
+  if (
+    operation === 'create' ||
+    operation === 'update' ||
+    operation === 'delete'
+  ) {
+    const auth = ctx.workspaceMemoryMutationAuth;
+    if (auth) {
+      request.runnerInstanceId = auth.runnerInstanceId;
+      request.mutationSignature = signWorkspaceMemoryMutation(
+        auth.secret,
+        {
+          groupFolder: ctx.groupFolder,
+          agentId: auth.agentId ?? null,
+          taskRunId: auth.taskRunId ?? null,
+        },
+        request,
+      );
+    }
+  }
+  const result = await pollIpcResult(
+    tasksDir,
+    request,
+    WORKSPACE_MEMORY_RESULT_PREFIX,
+    timeoutMs,
+  );
+  if (!result.success) {
+    const code = typeof result.code === 'string' ? ` (${result.code})` : '';
+    throw new Error(
+      `${typeof result.error === 'string' ? result.error : 'Workspace memory request failed'}${code}`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Fetch a bounded, query-relevant snapshot for the next model turn.
+ * Failure is fail-open for answering: the turn can continue without memory,
+ * while all mutation paths remain server-authorized and fail-closed.
+ */
+export async function fetchWorkspaceMemorySnapshot(
+  ctx: McpContext,
+  query: string,
+  options: { limit?: number; maxChars?: number; timeoutMs?: number } = {},
+): Promise<WorkspaceMemorySnapshot | null> {
+  try {
+    const result = await callWorkspaceMemory(
+      ctx,
+      'snapshot',
+      {
+        query: query.slice(0, 500),
+        limit: Math.min(Math.max(options.limit ?? 8, 1), 20),
+        maxChars: Math.min(Math.max(options.maxChars ?? 6000, 500), 12_000),
+      },
+      options.timeoutMs ?? 5_000,
+    );
+    return parseWorkspaceMemorySnapshot(result.snapshot);
+  } catch {
+    return null;
+  }
+}
+
+function workspaceMemoryToolResult(result: Record<string, unknown>) {
+  const { success: _success, ...payload } = result;
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(payload, null, 2),
+      },
+    ],
+  };
+}
+
+function memoryIdempotencyKey(
+  supplied: string | undefined,
+  fallback: string,
+): string {
+  return (supplied ?? fallback).slice(0, 128);
 }
 
 /**
@@ -226,7 +327,6 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
   const MESSAGE_RESULTS_DIR = path.join(ctx.workspaceIpc, 'message-results');
   const TASKS_DIR = path.join(ctx.workspaceIpc, 'tasks');
   const hasCrossGroupAccess = ctx.isAdminHome;
-  const toRelativePath = createToRelativePath(ctx);
 
   /**
    * Must stay in step with `usesProactiveInteractiveContract()` in
@@ -2326,334 +2426,156 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers)
-  if (ctx.isHome) {
+  // Workspace is the only durable continuity boundary. The model never
+  // supplies a workspace, owner, actor, or filesystem path: the host derives
+  // all authorization and provenance from this IPC namespace.
+  const memoryKindSchema = z.enum(['fact', 'decision', 'lesson', 'open_loop']);
+  const callMemoryTool = async (
+    operation: 'search' | 'get' | 'create' | 'update' | 'delete',
+    payload: Record<string, unknown>,
+  ) => {
+    try {
+      return workspaceMemoryToolResult(
+        await callWorkspaceMemory(ctx, operation, payload),
+      );
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: err instanceof Error ? err.message : String(err),
+          },
+        ],
+        isError: true,
+      };
+    }
+  };
+
+  tools.push(
+    tool(
+      'workspace_memory_search',
+      'Search durable memory belonging only to the current workspace. Results include stable item IDs, revisions, provenance, and the workspace store revision. Session transcripts and other workspaces are never searched.',
+      {
+        query: z
+          .string()
+          .min(1)
+          .max(500)
+          .describe('What to recall from this workspace'),
+        kind: memoryKindSchema
+          .optional()
+          .describe('Optional memory kind filter'),
+        limit: z.number().int().min(1).max(50).optional().default(10),
+      },
+      async (args) =>
+        callMemoryTool('search', {
+          query: args.query.trim(),
+          kind: args.kind,
+          limit: args.limit,
+        }),
+    ),
+    tool(
+      'workspace_memory_get',
+      'Get one durable memory item from the current workspace by its opaque item ID. Use after workspace_memory_search when full provenance or content is needed.',
+      {
+        item_id: z.string().min(1).describe('Opaque workspace memory item ID'),
+      },
+      async (args) => callMemoryTool('get', { itemId: args.item_id }),
+    ),
+  );
+
+  // Scheduled/task turns are deliberately read-only until candidate commits
+  // can be coupled atomically to a successful durable task-run completion.
+  // Sub-agents are independently denied by the PreToolUse runtime hook.
+  const memoryWriteEnabled = !ctx.isScheduledTask && !ctx.currentTaskId;
+  if (memoryWriteEnabled) {
     tools.push(
       tool(
-        'memory_append',
-        `\u5c06**\u65f6\u6548\u6027\u8bb0\u5fc6**\u8ffd\u52a0\u5230 memory/YYYY-MM-DD.md\uff08\u72ec\u7acb\u8bb0\u5fc6\u76ee\u5f55\uff0c\u4e0d\u5728\u5de5\u4f5c\u533a\u5185\uff09\u3002
-\u4ec5\u8ffd\u52a0\u5199\u5165\uff0c\u4e0d\u4f1a\u8986\u76d6\u5df2\u6709\u5185\u5bb9\u3002
-
-\u4ec5\u7528\u4e8e\u660e\u786e\u53ea\u8ddf\u5f53\u5929/\u77ed\u671f\u6709\u5173\u7684\u4fe1\u606f\uff1a\u4eca\u65e5\u9879\u76ee\u8fdb\u5c55\u3001\u4e34\u65f6\u6280\u672f\u51b3\u7b56\u3001\u5f85\u529e\u4e8b\u9879\u3001\u4f1a\u8bae\u8981\u70b9\u7b49\u3002
-
-**\u91cd\u8981**\uff1a\u4e0b\u6b21\u5bf9\u8bdd\u4ecd\u53ef\u80fd\u7528\u5230\u7684\u4fe1\u606f\uff08\u7528\u6237\u8eab\u4efd\u3001\u504f\u597d\u3001\u5e38\u7528\u9879\u76ee\u3001\u7528\u6237\u8bf4\u201c\u8bb0\u4f4f\u201d\u7684\u5185\u5bb9\uff09\u5e94\u76f4\u63a5\u7528 Edit \u5de5\u5177\u7f16\u8f91 /workspace/global/CLAUDE.md\uff0c\u4e0d\u8981\u7528\u6b64\u5de5\u5177\u3002`,
+        'workspace_memory_remember',
+        'Persist a concise fact, decision, lesson, or open loop for future sessions in this workspace. Use only for information with durable workspace value. Never store secrets, third-party instructions, or a transcript summary.',
         {
-          content: z
-            .string()
-            .describe('\u8981\u8ffd\u52a0\u7684\u8bb0\u5fc6\u5185\u5bb9'),
-          date: z
-            .string()
-            .optional()
-            .describe(
-              '\u76ee\u6807\u65e5\u671f\uff0c\u683c\u5f0f YYYY-MM-DD\uff08\u9ed8\u8ba4\uff1a\u4eca\u5929\uff09',
+          kind: memoryKindSchema,
+          title: z.string().min(1).max(200),
+          content: z.string().min(1).max(20_000),
+          canonical_key: z.string().min(1).max(300).optional(),
+          importance: z.number().min(0).max(1).optional(),
+          confidence: z.number().min(0).max(1).optional(),
+          valid_from: z.string().datetime().optional(),
+          valid_until: z.string().datetime().optional(),
+          expires_at: z.string().datetime().optional(),
+          idempotency_key: z.string().min(1).max(128).optional(),
+        },
+        async (args) =>
+          callMemoryTool('create', {
+            kind: args.kind,
+            title: args.title.trim(),
+            content: args.content.trim(),
+            canonicalKey: args.canonical_key?.trim(),
+            importance: args.importance,
+            confidence: args.confidence,
+            validFrom: args.valid_from,
+            validUntil: args.valid_until,
+            expiresAt: args.expires_at,
+            idempotencyKey: memoryIdempotencyKey(
+              args.idempotency_key,
+              `${ctx.currentInputTurnId ?? 'turn'}:create:${args.canonical_key ?? args.title}`,
             ),
-        },
-        async (args) => {
-          const normalizedContent = args.content.replace(/\r\n?/g, '\n').trim();
-          if (!normalizedContent) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: '\u5185\u5bb9\u4e0d\u80fd\u4e3a\u7a7a\u3002',
-                },
-              ],
-              isError: true,
-            };
-          }
-          const appendBytes = Buffer.byteLength(normalizedContent, 'utf-8');
-          if (appendBytes > MAX_MEMORY_APPEND_SIZE) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `\u5185\u5bb9\u8fc7\u5927\uff1a${appendBytes} \u5b57\u8282\uff08\u4e0a\u9650 ${MAX_MEMORY_APPEND_SIZE}\uff09\u3002`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          const date = (
-            args.date ?? new Date().toISOString().split('T')[0]
-          ).trim();
-          if (!MEMORY_DATE_PATTERN.test(date)) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `\u65e5\u671f\u683c\u5f0f\u65e0\u6548\uff1a\u201c${date}\u201d\uff0c\u8bf7\u4f7f\u7528 YYYY-MM-DD\u3002`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          const resolvedPath = path.normalize(
-            path.join(ctx.workspaceMemory, `${date}.md`),
-          );
-          const inMemory =
-            resolvedPath === ctx.workspaceMemory ||
-            resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
-          if (!inMemory) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
-                },
-              ],
-              isError: true,
-            };
-          }
-          try {
-            fs.mkdirSync(ctx.workspaceMemory, { recursive: true });
-            const fileExists = fs.existsSync(resolvedPath);
-            const currentSize = fileExists ? fs.statSync(resolvedPath).size : 0;
-            const separator = currentSize > 0 ? '\n---\n\n' : '';
-            const entry = `${separator}### ${new Date().toISOString()}\n${normalizedContent}\n`;
-            const nextSize = currentSize + Buffer.byteLength(entry, 'utf-8');
-            if (nextSize > MAX_MEMORY_FILE_SIZE) {
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: `\u8bb0\u5fc6\u6587\u4ef6\u5c06\u8d85\u8fc7 ${MAX_MEMORY_FILE_SIZE} \u5b57\u8282\u4e0a\u9650\uff0c\u8bf7\u7f29\u77ed\u5185\u5bb9\u3002`,
-                  },
-                ],
-                isError: true,
-              };
-            }
-            fs.appendFileSync(resolvedPath, entry, 'utf-8');
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `\u5df2\u8ffd\u52a0\u5230 memory/${date}.md\uff08${appendBytes} \u5b57\u8282\uff09\u3002`,
-                },
-              ],
-            };
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `\u8ffd\u52a0\u8bb0\u5fc6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-        },
+          }),
       ),
-    );
-  }
-
-  // --- memory_search + memory_get ---
-  {
-    tools.push(
       tool(
-        'memory_search',
-        `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
-\u8fd4\u56de\u6587\u4ef6\u8def\u5f84\u3001\u884c\u53f7\u548c\u4e0a\u4e0b\u6587\u7247\u6bb5\u3002\u8d85\u8fc7 512KB \u7684\u6587\u4ef6\u4f1a\u88ab\u8df3\u8fc7\u3002
-\u7528\u4e8e\u56de\u5fc6\u8fc7\u53bb\u7684\u51b3\u7b56\u3001\u504f\u597d\u3001\u9879\u76ee\u4e0a\u4e0b\u6587\u6216\u5bf9\u8bdd\u5386\u53f2\u3002`,
+        'workspace_memory_update',
+        'Update an existing current-workspace memory using optimistic concurrency. expected_revision is mandatory; on conflict, search/get the latest item and reconcile rather than overwriting it.',
         {
-          query: z
-            .string()
-            .describe(
-              '\u641c\u7d22\u5173\u952e\u8bcd\u6216\u77ed\u8bed\uff08\u4e0d\u533a\u5206\u5927\u5c0f\u5199\uff09',
-            ),
-          max_results: z
-            .number()
-            .optional()
-            .default(20)
-            .describe(
-              '\u6700\u5927\u7ed3\u679c\u6570\uff08\u9ed8\u8ba4 20\uff0c\u4e0a\u9650 50\uff09',
-            ),
+          item_id: z.string().min(1),
+          expected_revision: z.number().int().min(1),
+          kind: memoryKindSchema.optional(),
+          title: z.string().min(1).max(200).optional(),
+          content: z.string().min(1).max(20_000).optional(),
+          canonical_key: z.string().min(1).max(300).nullable().optional(),
+          importance: z.number().min(0).max(1).optional(),
+          confidence: z.number().min(0).max(1).optional(),
+          valid_from: z.string().datetime().nullable().optional(),
+          valid_until: z.string().datetime().nullable().optional(),
+          expires_at: z.string().datetime().nullable().optional(),
+          idempotency_key: z.string().min(1).max(128).optional(),
         },
-        async (args) => {
-          if (!args.query.trim()) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: '\u641c\u7d22\u5173\u952e\u8bcd\u4e0d\u80fd\u4e3a\u7a7a\u3002',
-                },
-              ],
-              isError: true,
-            };
-          }
-          const maxResults = Math.min(Math.max(args.max_results ?? 20, 1), 50);
-          const queryLower = args.query.toLowerCase();
-          const files: string[] = [];
-          collectMemoryFiles(ctx.workspaceMemory, files, 4);
-          collectMemoryFiles(ctx.workspaceGroup, files, 4);
-          collectMemoryFiles(ctx.workspaceGlobal, files, 4);
-          const uniqueFiles = Array.from(new Set(files));
-          if (uniqueFiles.length === 0) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: '\u672a\u627e\u5230\u8bb0\u5fc6\u6587\u4ef6\u3002',
-                },
-              ],
-            };
-          }
-          const results: string[] = [];
-          let skippedLarge = 0;
-          for (const filePath of uniqueFiles) {
-            if (results.length >= maxResults) break;
-            try {
-              const stat = fs.statSync(filePath);
-              if (stat.size > MAX_MEMORY_FILE_SIZE) {
-                skippedLarge++;
-                continue;
-              }
-              const content = fs.readFileSync(filePath, 'utf-8');
-              const lines = content.split('\n');
-              let lastEnd = -1;
-              for (let i = 0; i < lines.length; i++) {
-                if (results.length >= maxResults) break;
-                if (lines[i].toLowerCase().includes(queryLower)) {
-                  const start = Math.max(0, i - 1);
-                  if (start <= lastEnd) continue;
-                  const end = Math.min(lines.length, i + 2);
-                  lastEnd = end;
-                  const snippet = lines.slice(start, end).join('\n');
-                  results.push(
-                    `${toRelativePath(filePath)}:${i + 1}\n${snippet}`,
-                  );
-                }
-              }
-            } catch {
-              /* skip unreadable */
-            }
-          }
-          const skippedNote =
-            skippedLarge > 0
-              ? `\uff08\u8df3\u8fc7 ${skippedLarge} \u4e2a\u5927\u6587\u4ef6\uff09`
-              : '';
-          if (results.length === 0) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `\u5728 ${uniqueFiles.length} \u4e2a\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u672a\u627e\u5230\u201c${args.query}\u201d\u7684\u5339\u914d\u3002${skippedNote}`,
-                },
-              ],
-            };
-          }
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `\u627e\u5230 ${results.length} \u6761\u5339\u914d${skippedNote}\uff1a\n\n${results.join('\n---\n')}`,
-              },
-            ],
-          };
-        },
+        async (args) =>
+          callMemoryTool('update', {
+            itemId: args.item_id,
+            expectedRevision: args.expected_revision,
+            patch: {
+              kind: args.kind,
+              title: args.title?.trim(),
+              content: args.content?.trim(),
+              canonicalKey: args.canonical_key,
+              importance: args.importance,
+              confidence: args.confidence,
+              validFrom: args.valid_from,
+              validUntil: args.valid_until,
+              expiresAt: args.expires_at,
+            },
+            idempotencyKey: memoryIdempotencyKey(
+              args.idempotency_key,
+              `${ctx.currentInputTurnId ?? 'turn'}:update:${args.item_id}:${args.expected_revision}`,
+            ),
+          }),
       ),
-
-      // --- memory_get ---
       tool(
-        'memory_get',
-        `\u8bfb\u53d6\u8bb0\u5fc6\u6587\u4ef6\u6216\u6307\u5b9a\u884c\u8303\u56f4\u3002\u5728 memory_search \u4e4b\u540e\u4f7f\u7528\u4ee5\u83b7\u53d6\u5b8c\u6574\u4e0a\u4e0b\u6587\u3002`,
+        'workspace_memory_forget',
+        'Forget one current-workspace memory item. This creates an auditable tombstone and requires the item revision to prevent deleting a concurrently corrected memory.',
         {
-          file: z
-            .string()
-            .describe(
-              '\u76f8\u5bf9\u8def\u5f84\uff0c\u53ef\u5e26 :\u884c\u53f7\uff08\u5982 "CLAUDE.md:12"\u3001"[global] CLAUDE.md:8" \u6216 "[memory] 2026-01-15.md"\uff09',
-            ),
-          from_line: z
-            .number()
-            .optional()
-            .describe(
-              '\u8d77\u59cb\u884c\u53f7\uff08\u4ece 1 \u5f00\u59cb\uff0c\u9ed8\u8ba4\uff1a1\uff09',
-            ),
-          lines: z
-            .number()
-            .optional()
-            .describe(
-              '\u8bfb\u53d6\u884c\u6570\uff08\u9ed8\u8ba4\uff1a\u5168\u90e8\uff0c\u4e0a\u9650\uff1a200\uff09',
-            ),
+          item_id: z.string().min(1),
+          expected_revision: z.number().int().min(1),
+          idempotency_key: z.string().min(1).max(128).optional(),
         },
-        async (args) => {
-          const { pathRef, lineFromRef } = parseMemoryFileReference(args.file);
-          let resolvedPath: string;
-          if (pathRef.startsWith('[global] ')) {
-            resolvedPath = path.join(
-              ctx.workspaceGlobal,
-              pathRef.slice('[global] '.length),
-            );
-          } else if (pathRef.startsWith('[memory] ')) {
-            resolvedPath = path.join(
-              ctx.workspaceMemory,
-              pathRef.slice('[memory] '.length),
-            );
-          } else {
-            resolvedPath = path.join(ctx.workspaceGroup, pathRef);
-          }
-          resolvedPath = path.normalize(resolvedPath);
-          const inGroup =
-            resolvedPath === ctx.workspaceGroup ||
-            resolvedPath.startsWith(ctx.workspaceGroup + path.sep);
-          const inGlobal =
-            resolvedPath === ctx.workspaceGlobal ||
-            resolvedPath.startsWith(ctx.workspaceGlobal + path.sep);
-          const inMemory =
-            resolvedPath === ctx.workspaceMemory ||
-            resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
-          if (!inGroup && !inGlobal && !inMemory) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
-                },
-              ],
-              isError: true,
-            };
-          }
-          if (!fs.existsSync(resolvedPath)) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `\u6587\u4ef6\u672a\u627e\u5230\uff1a${pathRef}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          try {
-            const content = fs.readFileSync(resolvedPath, 'utf-8');
-            const allLines = content.split('\n');
-            const fromLine = Math.max(
-              (args.from_line ?? lineFromRef ?? 1) - 1,
-              0,
-            );
-            const maxLines = Math.min(args.lines ?? allLines.length, 200);
-            const slice = allLines.slice(fromLine, fromLine + maxLines);
-            const header = `${pathRef}\uff08\u7b2c ${fromLine + 1}-${fromLine + slice.length} \u884c\uff0c\u5171 ${allLines.length} \u884c\uff09`;
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `${header}\n\n${slice.join('\n')}`,
-                },
-              ],
-            };
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `\u8bfb\u53d6\u6587\u4ef6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-        },
+        async (args) =>
+          callMemoryTool('delete', {
+            itemId: args.item_id,
+            expectedRevision: args.expected_revision,
+            idempotencyKey: memoryIdempotencyKey(
+              args.idempotency_key,
+              `${ctx.currentInputTurnId ?? 'turn'}:delete:${args.item_id}:${args.expected_revision}`,
+            ),
+          }),
       ),
     );
   }

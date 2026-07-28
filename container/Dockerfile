@@ -162,8 +162,9 @@ COPY agent-runner/ ./
 # Build TypeScript
 RUN npm run build
 
-# Create workspace directories
-RUN mkdir -p /workspace/group /workspace/global /workspace/memory /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
+# Create workspace directories. Long-term memory is host-managed and workspace
+# scoped; legacy global/memory filesystem roots must not exist in the runtime.
+RUN mkdir -p /workspace/group /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
 # Copy entrypoint script (runs as root, drops to node user via runuser)
 COPY entrypoint.sh /app/entrypoint.sh

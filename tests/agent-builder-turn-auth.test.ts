@@ -19,6 +19,77 @@ const ownerInput = {
 };
 
 describe('Agent Builder host turn authorization', () => {
+  test('classifies only the host-owned active batch for runtime mutation authorization', () => {
+    const registry = new AgentBuilderTurnRegistry();
+    registry.set('home', 'web:home', 'owner-active');
+    registry.enqueueBatch('home', [
+      {
+        chatJid: 'web:home',
+        messageId: 'scheduled-queued',
+        runtimeTurnId: 'scheduled-delivery',
+        scheduledTaskId: 'task-queued',
+      },
+    ]);
+    const load = (_chatJid: string, messageId: string) =>
+      messageId === 'scheduled-queued'
+        ? {
+            ...ownerInput,
+            task_id: 'task-queued',
+            source_kind: 'scheduled_task_prompt',
+          }
+        : ownerInput;
+
+    expect(registry.classifyActiveTurn('home', 'owner-active', load)).toBe(
+      'interactive',
+    );
+    registry.clearCompleted('home', [
+      { chatJid: 'web:home', messageId: 'owner-active' },
+    ]);
+    expect(
+      registry.classifyActiveTurn('home', 'scheduled-delivery', load),
+    ).toBe('scheduled');
+    registry.clearCompleted('home', [
+      { chatJid: 'web:home', messageId: 'scheduled-queued' },
+    ]);
+    expect(
+      registry.classifyActiveTurn('home', 'scheduled-delivery', load),
+    ).toBe('unknown');
+  });
+
+  test('active turn classification fails closed when durable input is missing', () => {
+    const registry = new AgentBuilderTurnRegistry();
+    registry.set('home', 'web:home', 'missing');
+    expect(registry.classifyActiveTurn('home', 'missing', () => null)).toBe(
+      'unknown',
+    );
+  });
+
+  test('classifies only the exact runtime turn that owns the active batch', () => {
+    const registry = new AgentBuilderTurnRegistry();
+    registry.startBatch('home', [
+      {
+        chatJid: 'web:home',
+        messageId: 'cursor-a',
+        runtimeTurnId: 'delivery-current',
+        scheduledTaskId: null,
+      },
+      {
+        chatJid: 'web:home',
+        messageId: 'cursor-b',
+        runtimeTurnId: 'delivery-current',
+        scheduledTaskId: null,
+      },
+    ]);
+    const load = () => ownerInput;
+
+    expect(registry.classifyActiveTurn('home', 'delivery-old', load)).toBe(
+      'unknown',
+    );
+    expect(registry.classifyActiveTurn('home', 'delivery-current', load)).toBe(
+      'interactive',
+    );
+  });
+
   test('isolates concurrent runtime sessions in the same workspace', () => {
     const registry = new AgentBuilderTurnRegistry();
     const sessionA = agentBuilderTurnScope('workspace', 'session-a');
@@ -54,6 +125,7 @@ describe('Agent Builder host turn authorization', () => {
     ).toEqual({
       chatJid: 'web:home',
       messageId: 'human-1',
+      runtimeTurnId: 'human-1',
       scheduledTaskId: null,
       content: ownerInput.content,
     });
@@ -137,6 +209,7 @@ describe('Agent Builder host turn authorization', () => {
       {
         chatJid: 'web:home',
         messageId: 'owner-queued',
+        runtimeTurnId: 'owner-queued',
         scheduledTaskId: null,
       },
     ]);
@@ -169,6 +242,7 @@ describe('Agent Builder host turn authorization', () => {
       {
         chatJid: 'web:home',
         messageId: 'scheduled-queued',
+        runtimeTurnId: 'scheduled-queued',
         scheduledTaskId: 'task-2',
       },
     ]);
@@ -191,6 +265,7 @@ describe('Agent Builder host turn authorization', () => {
       {
         chatJid: 'web:home',
         messageId: 'boot-drained-owner',
+        runtimeTurnId: 'boot-drained-owner',
         scheduledTaskId: null,
       },
     ]);
@@ -216,6 +291,7 @@ describe('Agent Builder host turn authorization', () => {
       {
         chatJid: 'web:home',
         messageId: 'confirmation-turn',
+        runtimeTurnId: 'confirmation-delivery',
         scheduledTaskId: null,
       },
     ]);
