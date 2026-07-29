@@ -38,15 +38,17 @@ seedDb
   .run('stale chunk');
 seedDb.close();
 
-const { initDatabase, CURRENT_SCHEMA_VERSION } = await import('../src/db.js');
+const { initDatabase, closeDatabase, CURRENT_SCHEMA_VERSION } =
+  await import('../src/db.js');
 
 afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 describe('v67 legacy memory_chunks drop', () => {
-  test('removes the dead tables, their FTS shadows, and stamps the new version', () => {
+  test('backs up an unversioned legacy index before dropping it', () => {
     initDatabase();
+    closeDatabase();
 
     const probe = new Database(dbPath, { readonly: true });
     const leftover = probe
@@ -61,5 +63,44 @@ describe('v67 legacy memory_chunks drop', () => {
         .get('schema_version'),
     ).toEqual({ value: String(CURRENT_SCHEMA_VERSION) });
     probe.close();
+
+    const backupDir = path.join(tmpStoreDir, 'migration-backups');
+    const backupNames = fs.readdirSync(backupDir);
+    expect(backupNames).toHaveLength(1);
+    const backup = new Database(path.join(backupDir, backupNames[0]), {
+      readonly: true,
+    });
+    expect(
+      backup
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE name LIKE 'memory_chunks%' ORDER BY name",
+        )
+        .all(),
+    ).toEqual(
+      expect.arrayContaining([
+        { name: 'memory_chunks' },
+        { name: 'memory_chunks_fts' },
+      ]),
+    );
+    expect(
+      backup
+        .prepare(
+          'SELECT workspace, content, updated_at FROM memory_chunks WHERE id = 1',
+        )
+        .get(),
+    ).toEqual({
+      workspace: 'flow-legacy',
+      content: 'stale chunk',
+      updated_at: '2026-02-28T00:00:00.000Z',
+    });
+    expect(
+      backup
+        .prepare(
+          "SELECT content FROM memory_chunks_fts WHERE memory_chunks_fts MATCH 'stale'",
+        )
+        .all(),
+    ).toEqual([{ content: 'stale chunk' }]);
+    expect(backup.pragma('quick_check', { simple: true })).toBe('ok');
+    backup.close();
   });
 });

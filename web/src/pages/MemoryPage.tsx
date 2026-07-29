@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import {
+  useBeforeUnload,
+  useBlocker,
+  useLocation,
+  useSearchParams,
+  type BlockerFunction,
+} from 'react-router-dom';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -20,6 +26,7 @@ import {
 import { toast } from 'sonner';
 import { api, apiFetch } from '../api/client';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { createUnsavedNavigationGuard } from '@/utils/unsaved-navigation';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -184,7 +191,22 @@ function MemoryListItem({
 }
 
 export function MemoryPage() {
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigationGuardRef = useRef(createUnsavedNavigationGuard());
+  const setAllowedSearchParams = useCallback(
+    (next: URLSearchParams, options: { replace?: boolean } = {}) => {
+      const serialized = next.toString();
+      const token = navigationGuardRef.current.allowNext({
+        pathname: location.pathname,
+        search: serialized ? `?${serialized}` : '',
+        hash: location.hash,
+      });
+      setSearchParams(next, options);
+      queueMicrotask(() => navigationGuardRef.current.cancelAllowance(token));
+    },
+    [location.hash, location.pathname, setSearchParams],
+  );
   const requestedWorkspace = searchParams.get('workspace');
   const legacyFolder = searchParams.get('folder');
   const isMobile = useMediaQuery('(max-width: 1023px)');
@@ -203,6 +225,10 @@ export function MemoryPage() {
 
   const [kindFilter, setKindFilter] = useState<KindFilter>('all');
   const [query, setQuery] = useState('');
+  const queryRef = useRef('');
+  const kindFilterRef = useRef<KindFilter>('all');
+  queryRef.current = query;
+  kindFilterRef.current = kindFilter;
   const [searching, setSearching] = useState(false);
   const [searchHits, setSearchHits] = useState<
     WorkspaceMemorySearchResult['hits'] | null
@@ -263,6 +289,36 @@ export function MemoryPage() {
       draft.content !== selectedItem.content
     );
   }, [draft, selectedItem]);
+  const shouldBlockNavigation = useCallback<BlockerFunction>(
+    ({ currentLocation, nextLocation }) =>
+      navigationGuardRef.current.shouldBlock(
+        dirty,
+        currentLocation,
+        nextLocation,
+      ),
+    [dirty],
+  );
+  const navigationBlocker = useBlocker(shouldBlockNavigation);
+
+  useBeforeUnload(
+    useCallback(
+      (event) => {
+        if (!dirty) return;
+        event.preventDefault();
+        event.returnValue = '';
+      },
+      [dirty],
+    ),
+  );
+
+  useEffect(() => {
+    if (navigationBlocker.state !== 'blocked') return;
+    if (window.confirm('当前记忆有未保存修改，离开页面会丢失。是否继续？')) {
+      navigationBlocker.proceed();
+    } else {
+      navigationBlocker.reset();
+    }
+  }, [navigationBlocker]);
 
   const syncSelectedItem = useCallback((item: WorkspaceMemoryItem | null) => {
     detailTargetRef.current = item?.id || null;
@@ -336,9 +392,9 @@ export function MemoryPage() {
       const next = new URLSearchParams(searchParams);
       next.delete('folder');
       next.set('workspace', workspaceJid);
-      setSearchParams(next, { replace: true });
+      setAllowedSearchParams(next, { replace: true });
     },
-    [searchParams, setSearchParams],
+    [searchParams, setAllowedSearchParams],
   );
 
   useEffect(() => {
@@ -444,29 +500,32 @@ export function MemoryPage() {
     if (selectedWorkspaceJid) void loadItems();
   }, [selectedWorkspaceJid, loadItems]);
 
-  useEffect(() => {
-    const trimmed = query.trim();
-    if (!trimmed || !selectedWorkspaceJid) {
-      searchGenerationRef.current += 1;
-      setSearchHits(null);
-      setSearching(false);
-      return;
-    }
-    const workspaceJid = selectedWorkspaceJid;
-    const workspaceEpoch = workspaceEpochRef.current;
-    const requestGeneration = ++searchGenerationRef.current;
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      if (!isCurrentWorkspace(workspaceJid, workspaceEpoch)) return;
+  const loadSearch = useCallback(
+    async (options?: { query?: string; kind?: KindFilter }) => {
+      const trimmed = (options?.query ?? queryRef.current).trim();
+      const requestedKind = options?.kind ?? kindFilterRef.current;
+      const workspaceJid = activeWorkspaceRef.current;
+      const workspaceEpoch = workspaceEpochRef.current;
+      if (
+        !trimmed ||
+        !workspaceJid ||
+        !isCurrentWorkspace(workspaceJid, workspaceEpoch)
+      ) {
+        searchGenerationRef.current += 1;
+        setSearchHits(null);
+        setSearching(false);
+        return;
+      }
+
+      const requestGeneration = ++searchGenerationRef.current;
       setSearching(true);
       try {
         const params = new URLSearchParams({ q: trimmed, limit: '100' });
-        if (kindFilter !== 'all') params.set('kind', kindFilter);
+        if (requestedKind !== 'all') params.set('kind', requestedKind);
         const data = await api.get<WorkspaceMemorySearchResult>(
           `${memoryItemsPath(workspaceJid)}/search?${params}`,
         );
         if (
-          cancelled ||
           !isCurrentWorkspace(workspaceJid, workspaceEpoch) ||
           searchGenerationRef.current !== requestGeneration
         ) {
@@ -476,7 +535,6 @@ export function MemoryPage() {
         setSearchHits(data.hits);
       } catch (error) {
         if (
-          cancelled ||
           !isCurrentWorkspace(workspaceJid, workspaceEpoch) ||
           searchGenerationRef.current !== requestGeneration
         ) {
@@ -486,19 +544,40 @@ export function MemoryPage() {
         toast.error(getErrorMessage(error, '搜索工作区记忆失败'));
       } finally {
         if (
-          !cancelled &&
           isCurrentWorkspace(workspaceJid, workspaceEpoch) &&
           searchGenerationRef.current === requestGeneration
         ) {
           setSearching(false);
         }
       }
+    },
+    [isCurrentWorkspace],
+  );
+
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!trimmed || !selectedWorkspaceJid) {
+      searchGenerationRef.current += 1;
+      setSearchHits(null);
+      setSearching(false);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void loadSearch({ query: trimmed, kind: kindFilter });
     }, 280);
     return () => {
-      cancelled = true;
       window.clearTimeout(timer);
+      // Invalidate a request that may already have started before dependencies
+      // changed, so it cannot briefly repaint results for the previous query.
+      searchGenerationRef.current += 1;
     };
-  }, [isCurrentWorkspace, kindFilter, query, selectedWorkspaceJid]);
+  }, [kindFilter, loadSearch, query, selectedWorkspaceJid]);
+
+  const refreshMemoryView = useCallback(async () => {
+    const refreshes: Promise<void>[] = [loadItems()];
+    if (queryRef.current.trim()) refreshes.push(loadSearch());
+    await Promise.all(refreshes);
+  }, [loadItems, loadSearch]);
 
   const loadDetail = useCallback(
     async (itemId: string, options?: { discardDraft?: boolean }) => {
@@ -686,7 +765,7 @@ export function MemoryPage() {
       setCreateOpen(false);
       setStoreRevision(result.storeRevision);
       toast.success('已添加到当前工作区记忆');
-      await loadItems();
+      await refreshMemoryView();
       if (
         !isCurrentWorkspace(workspaceJid, workspaceEpoch) ||
         createGenerationRef.current !== requestGeneration
@@ -741,7 +820,7 @@ export function MemoryPage() {
       toast.success(`已保存 revision ${result.item.revision}`);
       setStoreRevision(result.storeRevision);
       syncSelectedItem(result.item);
-      await loadItems();
+      await refreshMemoryView();
       if (
         !isCurrentWorkspace(workspaceJid, workspaceEpoch) ||
         saveGenerationRef.current !== requestGeneration ||
@@ -805,7 +884,7 @@ export function MemoryPage() {
       syncSelectedItem(null);
       setVersions([]);
       setShowDetail(false);
-      await loadItems();
+      await refreshMemoryView();
     } catch (error) {
       if (
         !isCurrentWorkspace(workspaceJid, workspaceEpoch) ||
@@ -1014,10 +1093,12 @@ export function MemoryPage() {
                   <Button
                     variant="outline"
                     className="h-10"
-                    onClick={() => void loadItems()}
-                    disabled={listLoading}
+                    onClick={() => void refreshMemoryView()}
+                    disabled={listLoading || searching}
                   >
-                    <RefreshCw className={listLoading ? 'animate-spin' : ''} />
+                    <RefreshCw
+                      className={listLoading || searching ? 'animate-spin' : ''}
+                    />
                     刷新
                   </Button>
                 </div>

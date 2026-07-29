@@ -65,12 +65,14 @@ import {
 } from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import {
+  acknowledgeHappyClawOwnerProfileFirstWake,
   createMcpTools,
   fetchHappyClawOwnerProfileTurn,
   fetchWorkspaceMemorySnapshot,
   type McpContext,
   type WorkspaceMemorySnapshot,
 } from './mcp-tools.js';
+import { HappyClawFirstWakeAcknowledger } from './owner-profile-first-wake.js';
 import {
   createSerializedAsyncTrigger,
   loadWorkspaceMemoryTurnContext,
@@ -1740,6 +1742,11 @@ async function runQueryAttempt(
         { snapshot: null, block: '' },
         { result: null, block: '' },
       ];
+  const firstWakeAcknowledger = new HappyClawFirstWakeAcknowledger();
+  firstWakeAcknowledger.register(
+    activeOutputInputTurnId || coldInputTurnId,
+    ownerProfileTurn.result,
+  );
   if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
     logWarn(
       'Workspace memory snapshot unavailable; continuing this turn without durable memory context',
@@ -2174,6 +2181,12 @@ async function runQueryAttempt(
             { snapshot: null, block: '' },
             { result: null, block: '' },
           ];
+      if (msg.receipt?.deliveryId) {
+        firstWakeAcknowledger.register(
+          msg.receipt.deliveryId,
+          ownerProfileTurn.result,
+        );
+      }
       if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
         logWarn(
           'Workspace memory snapshot unavailable for warm turn; continuing without durable memory context',
@@ -3028,6 +3041,23 @@ async function runQueryAttempt(
         lastAssistantUuid = (message as { uuid: string }).uuid;
         const assistantMsg = message as Record<string, unknown>;
         if ((assistantMsg.parent_tool_use_id ?? null) === null) {
+          if (!assistantError && emitOutput && mcpToolsContext) {
+            const inputTurnId = outputCorrelation.currentInputTurnId;
+            const acknowledged = await firstWakeAcknowledger.acknowledge(
+              inputTurnId,
+              (candidate) =>
+                acknowledgeHappyClawOwnerProfileFirstWake(
+                  mcpToolsContext,
+                  candidate.leaseToken,
+                  candidate.inputTurnId,
+                ),
+            );
+            if (acknowledged) {
+              log(
+                `Acknowledged HappyClaw first-wake after healthy Assistant progress for ${inputTurnId}`,
+              );
+            }
+          }
           if (
             processor.getBlockingBackgroundCompletionDebtCount() > 0 &&
             ipcDeliveryTracker.pendingTurnCount <= 1

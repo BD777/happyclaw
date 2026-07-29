@@ -5,11 +5,13 @@ import path from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import {
+  acknowledgeHappyClawOwnerProfileFirstWake,
   createMcpTools,
   fetchHappyClawOwnerProfileTurn,
   type HappyClawOwnerProfileProjection,
   type McpContext,
 } from '../container/agent-runner/src/mcp-tools.js';
+import { HappyClawFirstWakeAcknowledger } from '../container/agent-runner/src/owner-profile-first-wake.js';
 import {
   loadHappyClawOwnerProfileTurnContext,
   renderHappyClawOwnerProfileBlock,
@@ -223,6 +225,58 @@ describe('HappyClaw Owner Profile runner projection refresh', () => {
     expect(fs.existsSync(path.join(root, 'tasks'))).toBe(false);
   });
 
+  test('uses a signed private IPC operation to acknowledge first wake', async () => {
+    const root = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'happyclaw-owner-profile-runner-ack-'),
+    );
+    roots.push(root);
+    const scope = { groupFolder: 'home-folder' };
+    const capability = issueWorkspaceMemoryWriteCapability(
+      scope,
+      'owner-turn-a',
+    );
+    const ctx = context(root, {
+      workspaceMemoryMutationAuth: {
+        runnerInstanceId: capability.runnerInstanceId,
+        secret: capability.signingSecret,
+      },
+    });
+
+    const pending = acknowledgeHappyClawOwnerProfileFirstWake(
+      ctx,
+      7,
+      'owner-turn-a',
+      2_000,
+    );
+    const request = await readOwnerProfileRequest(root);
+    expect(request.request).toMatchObject({
+      type: 'happyclaw_owner_profile',
+      operation: 'ack_first_wake',
+      inputTurnId: 'owner-turn-a',
+      leaseToken: 7,
+      runnerInstanceId: capability.runnerInstanceId,
+    });
+    expect(
+      verifyWorkspaceMemoryCapability(
+        scope,
+        request.request,
+        request.request.mutationSignature,
+        true,
+      ),
+    ).toBe(true);
+    fs.writeFileSync(
+      path.join(
+        root,
+        'tasks',
+        `happyclaw_owner_profile_result_${request.request.requestId}.json`,
+      ),
+      JSON.stringify({ success: true, acknowledged: true }),
+    );
+    fs.unlinkSync(request.file);
+    await expect(pending).resolves.toBe(true);
+    revokeWorkspaceMemoryWriteCapability(scope, capability.runnerInstanceId);
+  });
+
   test('renders profile data safely and reserves just-woke wording for the new lease claimant', async () => {
     const awaiting = {
       projection: projection(null, null),
@@ -287,6 +341,13 @@ describe('HappyClaw Owner Profile MCP isolation', () => {
       createMcpTools(ctx).map((definition) => definition.name);
 
     expect(names(context(root))).toContain('happyclaw_owner_profile');
+    expect(names(context(root))).not.toContain('ack_first_wake');
+    // Terminal warmup has no active turn, but its structurally eligible
+    // built-in Home runner must retain the tool for a later admitted owner
+    // turn. Fetch remains fail-closed until that exact turn exists.
+    expect(names(context(root, { currentInputTurnId: null }))).toContain(
+      'happyclaw_owner_profile',
+    );
     for (const denied of [
       context(root, { ownerProfileEnabled: false }),
       context(root, { isScheduledTask: true }),
@@ -294,6 +355,50 @@ describe('HappyClaw Owner Profile MCP isolation', () => {
     ]) {
       expect(names(denied)).not.toContain('happyclaw_owner_profile');
     }
+  });
+
+  test('first-wake acknowledgement is registered without side effects and correlated to one turn', async () => {
+    const tracker = new HappyClawFirstWakeAcknowledger();
+    const firstWake = {
+      projection: {
+        ...projection(null, null),
+        onboarding: {
+          ...projection(null, null).onboarding,
+          state: 'claimed' as const,
+          leaseOwner: 'runner-a',
+          leaseToken: 9,
+        },
+      },
+      onboardingStatus: 'awaiting' as const,
+      firstWake: true,
+      leaseAcquired: true,
+    };
+    expect(tracker.register('owner-turn-a', firstWake)).toBe(true);
+    expect(tracker.hasPending('owner-turn-a')).toBe(true);
+
+    const send = vi.fn(async () => true);
+    await expect(tracker.acknowledge('different-turn', send)).resolves.toBe(
+      false,
+    );
+    expect(send).not.toHaveBeenCalled();
+
+    await expect(tracker.acknowledge('owner-turn-a', send)).resolves.toBe(true);
+    expect(send).toHaveBeenCalledWith({
+      inputTurnId: 'owner-turn-a',
+      leaseToken: 9,
+    });
+    expect(tracker.hasPending('owner-turn-a')).toBe(false);
+
+    expect(tracker.register('owner-turn-retry', firstWake)).toBe(true);
+    const failToSend = vi.fn(async () => false);
+    await expect(
+      tracker.acknowledge('owner-turn-retry', failToSend),
+    ).resolves.toBe(false);
+    expect(failToSend).toHaveBeenCalledWith({
+      inputTurnId: 'owner-turn-retry',
+      leaseToken: 9,
+    });
+    expect(tracker.hasPending('owner-turn-retry')).toBe(true);
   });
 
   test('SDK sub-agents cannot read or mutate the owner profile', async () => {

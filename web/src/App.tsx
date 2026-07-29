@@ -15,11 +15,31 @@ import { SetupChannelsPage } from './pages/SetupChannelsPage';
 import { AuthGuard } from './components/auth/AuthGuard';
 import { AppLayout } from './components/layout/AppLayout';
 import { APP_BASE, shouldUseHashRouter } from './utils/url';
+import { shouldPreloadChatRoute } from './utils/chat-route-preload';
 import { Toaster } from '@/components/ui/sonner';
 
-const ChatPage = lazy(() =>
-  import('./pages/ChatPage').then((m) => ({ default: m.ChatPage })),
-);
+let chatPagePromise:
+  | Promise<{ default: typeof import('./pages/ChatPage').ChatPage }>
+  | undefined;
+const loadChatPage = () =>
+  (chatPagePromise ??= import('./pages/ChatPage').then((m) => ({
+    default: m.ChatPage,
+  })));
+const ChatPage = lazy(loadChatPage);
+
+// Start the expensive chat split as soon as the entry executes, but only for
+// the default/chat routes. Static HTML modulepreloads made login, setup, tasks,
+// and memory download ChatPage + MarkdownRenderer even when never used.
+if (
+  typeof window !== 'undefined' &&
+  shouldPreloadChatRoute(
+    window.location.pathname,
+    window.location.hash,
+    APP_BASE,
+  )
+) {
+  void loadChatPage();
+}
 const TasksPage = lazy(() =>
   import('./pages/TasksPage').then((m) => ({ default: m.TasksPage })),
 );

@@ -42,6 +42,7 @@ describe('database upgrade safety gate', () => {
   test('backs up before destructive migration, preserves audit orphans, and aborts when backup fails', () => {
     db.initDatabase();
     db.closeDatabase();
+    expect(fs.existsSync(migrationBackups)).toBe(false);
 
     const legacy = new Database(dbPath);
     legacy.exec(`

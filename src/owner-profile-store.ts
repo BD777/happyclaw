@@ -238,19 +238,24 @@ export function createOwnerProfileSchema(db: SqliteDatabase): void {
   const columns = db
     .prepare(`PRAGMA table_info(workspace_onboarding_states)`)
     .all() as Array<{ name: string }>;
-  if (!columns.some((column) => column.name === 'first_wake_at')) {
+  const addedFirstWakeAt = !columns.some(
+    (column) => column.name === 'first_wake_at',
+  );
+  if (addedFirstWakeAt) {
     db.exec(
       `ALTER TABLE workspace_onboarding_states ADD COLUMN first_wake_at TEXT`,
     );
+    // Pre-release v66 databases may already have acquired an onboarding lease
+    // before first_wake_at existed. Backfill only while adding the column:
+    // under the two-phase protocol a normal restart may legitimately observe
+    // lease_token > 0 with first_wake_at still NULL until the runner ACKs
+    // healthy Assistant progress.
+    db.exec(`
+      UPDATE workspace_onboarding_states
+      SET first_wake_at = COALESCE(updated_at, created_at)
+      WHERE first_wake_at IS NULL AND lease_token > 0;
+    `);
   }
-  // Pre-release v66 databases may already have acquired an onboarding lease
-  // before first_wake_at existed. A positive lease token proves the one-shot
-  // wake was claimed, so preserve that fact instead of greeting again.
-  db.exec(`
-    UPDATE workspace_onboarding_states
-    SET first_wake_at = COALESCE(updated_at, created_at)
-    WHERE first_wake_at IS NULL AND lease_token > 0;
-  `);
 }
 
 export function getHappyClawOwnerProfileProjection(
@@ -463,8 +468,8 @@ export function claimHappyClawOwnerIntroduction(input: {
       return {
         claimed: true,
         leaseAcquired: false,
-        firstWake: false,
-        newlyClaimed: false,
+        firstWake: row.first_wake_at === null,
+        newlyClaimed: row.first_wake_at === null,
         leaseToken: Number(row.lease_token),
         leaseExpiresAt: expiresAt,
         projection: getHappyClawOwnerProfileProjection(input.workspaceJid),
@@ -476,7 +481,7 @@ export function claimHappyClawOwnerIntroduction(input: {
         `UPDATE workspace_onboarding_states
        SET state = 'claimed', revision = revision + 1, lease_owner = ?,
            lease_token = lease_token + 1, lease_expires_at = ?,
-           first_wake_at = COALESCE(first_wake_at, ?), updated_at = ?
+           updated_at = ?
        WHERE workspace_jid = ? AND flow_key = ?
          AND (
            state = 'pending'
@@ -489,7 +494,6 @@ export function claimHappyClawOwnerIntroduction(input: {
       .run(
         leaseOwner,
         expiresAt,
-        at,
         at,
         input.workspaceJid,
         HAPPYCLAW_OWNER_INTRODUCTION_FLOW_KEY,
@@ -512,6 +516,108 @@ export function claimHappyClawOwnerIntroduction(input: {
       projection: getHappyClawOwnerProfileProjection(input.workspaceJid),
     };
   })();
+}
+
+/**
+ * Commit the one-shot first-wake marker only after the runner has observed
+ * healthy top-level Assistant progress for the claiming turn. Both fences are
+ * required so a stale/overlapping runner cannot acknowledge another lease.
+ */
+export function acknowledgeHappyClawOwnerIntroduction(input: {
+  workspaceJid: string;
+  leaseOwner: string;
+  leaseToken: number;
+  now?: string;
+}): {
+  acknowledged: boolean;
+  projection: HappyClawOwnerProfileProjection;
+} {
+  requireHomeWorkspace(input.workspaceJid);
+  const leaseOwner = input.leaseOwner.trim();
+  if (
+    !leaseOwner ||
+    !Number.isInteger(input.leaseToken) ||
+    input.leaseToken < 1
+  ) {
+    throw new OwnerProfileStoreError(
+      'lease_conflict',
+      'Owner introduction acknowledgement lease is invalid',
+    );
+  }
+  const at = input.now ?? nowIso();
+  if (!Number.isFinite(Date.parse(at))) {
+    throw new OwnerProfileStoreError(
+      'lease_conflict',
+      'Owner introduction acknowledgement timestamp is invalid',
+    );
+  }
+  const db = requireDatabase();
+  return db.transaction(() => {
+    const row = ensureOnboardingRow(input.workspaceJid, at);
+    if (
+      row.state !== 'claimed' ||
+      row.lease_owner !== leaseOwner ||
+      Number(row.lease_token) !== input.leaseToken
+    ) {
+      throw new OwnerProfileStoreError(
+        'lease_conflict',
+        'Owner introduction acknowledgement lease no longer matches',
+      );
+    }
+    if (row.first_wake_at !== null) {
+      return {
+        acknowledged: false,
+        projection: getHappyClawOwnerProfileProjection(input.workspaceJid),
+      };
+    }
+    const result = db
+      .prepare(
+        `UPDATE workspace_onboarding_states
+         SET first_wake_at = ?, revision = revision + 1, updated_at = ?
+         WHERE workspace_jid = ? AND flow_key = ?
+           AND state = 'claimed' AND lease_owner = ? AND lease_token = ?
+           AND first_wake_at IS NULL`,
+      )
+      .run(
+        at,
+        at,
+        input.workspaceJid,
+        HAPPYCLAW_OWNER_INTRODUCTION_FLOW_KEY,
+        leaseOwner,
+        input.leaseToken,
+      );
+    if (result.changes !== 1) {
+      throw new OwnerProfileStoreError(
+        'lease_conflict',
+        'Owner introduction acknowledgement lease no longer matches',
+      );
+    }
+    return {
+      acknowledged: true,
+      projection: getHappyClawOwnerProfileProjection(input.workspaceJid),
+    };
+  })();
+}
+
+/**
+ * Release an uncompleted runner lease on process exit. The first-wake marker is
+ * intentionally retained only when it was separately acknowledged.
+ */
+export function releaseHappyClawOwnerIntroductionLease(
+  leaseOwner: string,
+  now: string = nowIso(),
+): number {
+  const normalized = leaseOwner.trim();
+  if (!normalized) return 0;
+  const result = requireDatabase()
+    .prepare(
+      `UPDATE workspace_onboarding_states
+       SET state = 'pending', revision = revision + 1,
+           lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+       WHERE state = 'claimed' AND lease_owner = ?`,
+    )
+    .run(now, normalized);
+  return result.changes;
 }
 
 export function skipHappyClawOwnerIntroduction(input: {

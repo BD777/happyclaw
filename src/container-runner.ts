@@ -49,6 +49,7 @@ import {
   revokeWorkspaceMemoryWriteCapability,
   type WorkspaceMemoryCapabilityScope,
 } from './workspace-memory-capability.js';
+import { releaseHappyClawOwnerIntroductionLease } from './owner-profile-store.js';
 import {
   deleteSession,
   getUserById,
@@ -2054,6 +2055,14 @@ export async function runContainerAgent(
       workspaceMemoryCapabilityScope,
       workspaceMemoryRunnerInstanceId,
     );
+    try {
+      releaseHappyClawOwnerIntroductionLease(workspaceMemoryRunnerInstanceId);
+    } catch (err) {
+      logger.warn(
+        { err, runnerInstanceId: workspaceMemoryRunnerInstanceId },
+        'Failed to release Owner Profile introduction lease',
+      );
+    }
     // Guarantee session release even if buildVolumeMounts/spawn throws
     if (selectedProfileId) {
       providerPool.releaseSession(selectedProfileId);
@@ -2964,6 +2973,14 @@ export async function runHostAgent(
       workspaceMemoryCapabilityScope,
       workspaceMemoryRunnerInstanceId,
     );
+    try {
+      releaseHappyClawOwnerIntroductionLease(workspaceMemoryRunnerInstanceId);
+    } catch (err) {
+      logger.warn(
+        { err, runnerInstanceId: workspaceMemoryRunnerInstanceId },
+        'Failed to release Owner Profile introduction lease',
+      );
+    }
     // Guarantee session release even if spawn/setup throws
     if (hostSelectedProfileId) {
       providerPool.releaseSession(hostSelectedProfileId);

@@ -1714,7 +1714,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // 首屏有两个入口（ChatPage 路由解析 + ChatView 挂载）会各发一次同参请求；
     // 同一目标的首页加载在途时直接复用，避免重复拉 50 条。
-    const inFlightKey = `${jid} ${before ?? 'first'}`;
+    const inFlightKey = `${jid}\0${before ?? 'first'}`;
     const inFlight = loadMessagesInFlight.get(inFlightKey);
     if (inFlight) return inFlight;
     const request = (async () => {

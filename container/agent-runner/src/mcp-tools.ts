@@ -268,7 +268,7 @@ async function callWorkspaceMemory(
 
 async function callHappyClawOwnerProfile(
   ctx: McpContext,
-  operation: 'get' | 'set' | 'clear' | 'skip',
+  operation: 'get' | 'set' | 'clear' | 'skip' | 'ack_first_wake',
   payload: Record<string, unknown>,
   timeoutMs = 30_000,
   inputTurnId: string | null | undefined = ctx.currentInputTurnId,
@@ -310,6 +310,40 @@ async function callHappyClawOwnerProfile(
     );
   }
   return result;
+}
+
+/**
+ * Internal runner control-plane acknowledgement. This operation is
+ * intentionally absent from createMcpTools(): the model can neither discover
+ * nor invoke it, and the host additionally requires the exact active owner
+ * turn plus the signed runner capability.
+ */
+export async function acknowledgeHappyClawOwnerProfileFirstWake(
+  ctx: McpContext,
+  leaseToken: number,
+  inputTurnId: string,
+  timeoutMs: number = 5_000,
+): Promise<boolean> {
+  if (
+    !ctx.ownerProfileEnabled ||
+    !inputTurnId ||
+    !Number.isInteger(leaseToken) ||
+    leaseToken < 1
+  ) {
+    return false;
+  }
+  try {
+    const result = await callHappyClawOwnerProfile(
+      ctx,
+      'ack_first_wake',
+      { leaseToken },
+      timeoutMs,
+      inputTurnId,
+    );
+    return result.acknowledged === true || result.acknowledged === false;
+  } catch {
+    return false;
+  }
 }
 
 export async function fetchHappyClawOwnerProfileTurn(

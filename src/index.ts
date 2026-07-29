@@ -193,8 +193,12 @@ import {
   WorkspaceMemoryServiceError,
 } from './memory-service.js';
 import { type WorkspaceMemoryMutationContext } from './memory-store.js';
-import { isHappyClawBootstrapTurn } from './happyclaw-bootstrap.js';
 import {
+  isHappyClawBootstrapTurn,
+  isHappyClawOwnerProfileRuntimeStructurallyEligible,
+} from './happyclaw-bootstrap.js';
+import {
+  acknowledgeHappyClawOwnerIntroduction,
   claimHappyClawOwnerIntroduction,
   clearHappyClawOwnerPreferredAddress,
   getHappyClawOwnerProfileProjection,
@@ -2228,15 +2232,13 @@ function isHappyClawOwnerProfileRuntimeEligible(input: {
   runtimeAgentId?: string | null;
   runtimeAgentKind?: 'task' | 'conversation' | 'spawn' | null;
 }): boolean {
-  return (
-    isHappyClawBootstrapTurn({
-      turnId: input.turnId,
-      isHome: input.group.is_home === true,
-      isDefaultProfile: input.profile?.is_default === true,
-      isScheduledTask: input.isScheduledTask,
-    }) &&
-    (!input.runtimeAgentId || input.runtimeAgentKind === 'conversation')
-  );
+  return isHappyClawOwnerProfileRuntimeStructurallyEligible({
+    isHome: input.group.is_home === true,
+    isDefaultProfile: input.profile?.is_default === true,
+    isScheduledTask: input.isScheduledTask,
+    runtimeAgentId: input.runtimeAgentId,
+    runtimeAgentKind: input.runtimeAgentKind,
+  });
 }
 
 function hasSessionAgentProfileMismatch(
@@ -10969,6 +10971,7 @@ async function processTaskIpc(
     // Dedicated built-in HappyClaw Owner Profile facade.
     preferredAddress?: string;
     expectedOnboardingRevision?: number;
+    leaseToken?: number;
     // For the main HappyClaw's conversational Agent Builder
     profileId?: string;
     draftId?: string;
@@ -11218,6 +11221,26 @@ async function processTaskIpc(
               firstWake: claim.firstWake,
               leaseAcquired: claim.leaseAcquired,
             };
+            break;
+          }
+          case 'ack_first_wake': {
+            if (!data.runnerInstanceId) {
+              throw new OwnerProfileStoreError(
+                'lease_conflict',
+                'Owner Profile runner identity is required',
+              );
+            }
+            if (!Number.isInteger(data.leaseToken) || data.leaseToken! < 1) {
+              throw new OwnerProfileStoreError(
+                'lease_conflict',
+                'Owner Profile lease token is required',
+              );
+            }
+            result = acknowledgeHappyClawOwnerIntroduction({
+              workspaceJid: principal.workspaceJid,
+              leaseOwner: data.runnerInstanceId,
+              leaseToken: data.leaseToken!,
+            });
             break;
           }
           case 'set':

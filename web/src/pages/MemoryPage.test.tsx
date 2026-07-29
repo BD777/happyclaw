@@ -3,7 +3,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -67,6 +67,14 @@ const item = {
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+
+beforeEach(() => {
+  Object.defineProperty(window, 'confirm', {
+    configurable: true,
+    writable: true,
+    value: vi.fn(() => true),
+  });
+});
 
 function configureGetMock() {
   mocks.get.mockImplementation(async (path: string) => {
@@ -237,7 +245,10 @@ async function renderPage(options?: {
   document.body.append(container);
   root = createRoot(container);
   const router = createMemoryRouter(
-    [{ path: '/memory', element: <MemoryPage /> }],
+    [
+      { path: '/memory', element: <MemoryPage /> },
+      { path: '/other', element: <div>Other page</div> },
+    ],
     {
       initialEntries: [
         options?.initialEntry || '/memory?workspace=workspace%3Aalpha',
@@ -361,6 +372,147 @@ describe('Workspace Memory v2 page', () => {
         expectedRevision: 2,
         content: '我的本地 CAS 草稿',
       }),
+    );
+  });
+
+  test('blocks SPA and document navigation while an edit is dirty', async () => {
+    const router = await renderPage();
+    await act(async () => {
+      buttonWithText(item.title).click();
+    });
+    const textarea =
+      container!.querySelector<HTMLTextAreaElement>('#memory-content')!;
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      'value',
+    )?.set;
+    await act(async () => {
+      valueSetter?.call(textarea, '尚未保存的工作区记忆');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    const beforeUnload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(beforeUnload);
+    expect(beforeUnload.defaultPrevented).toBe(true);
+
+    const confirm = vi.mocked(window.confirm);
+    confirm.mockReturnValueOnce(false);
+    await act(async () => {
+      await router.navigate('/other');
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(router.state.location.pathname).toBe('/memory');
+    expect(container!.textContent).not.toContain('Other page');
+
+    confirm.mockReturnValueOnce(true);
+    await act(async () => {
+      await router.navigate('/other');
+    });
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(router.state.location.pathname).toBe('/other');
+    expect(container!.textContent).toContain('Other page');
+  });
+
+  test('refreshes the visible search results and reruns search after save', async () => {
+    let currentItem = memoryItem(
+      'memory-search',
+      alphaWorkspace.jid,
+      '搜索旧结果',
+      '旧内容',
+    );
+    let searchCalls = 0;
+    mocks.get.mockImplementation(async (path: string) => {
+      if (path === '/api/workspaces') {
+        return { workspaces: [alphaWorkspace] };
+      }
+      if (
+        path ===
+        '/api/memory/workspaces/workspace%3Aalpha/items?status=active&limit=100'
+      ) {
+        return {
+          storeRevision: currentItem.revision,
+          items: [currentItem],
+          nextCursor: null,
+        };
+      }
+      if (
+        path ===
+        '/api/memory/workspaces/workspace%3Aalpha/items/search?q=SQLite&limit=100'
+      ) {
+        searchCalls += 1;
+        return {
+          storeRevision: currentItem.revision,
+          hits: [{ item: currentItem, rank: 1, snippet: currentItem.content }],
+        };
+      }
+      if (path.endsWith('/items/memory-search')) {
+        return { storeRevision: currentItem.revision, item: currentItem };
+      }
+      if (path.endsWith('/items/memory-search/versions?limit=20')) {
+        return {
+          storeRevision: currentItem.revision,
+          itemId: currentItem.id,
+          versions: [],
+          nextCursor: null,
+        };
+      }
+      throw new Error(`Unexpected GET ${path}`);
+    });
+
+    await renderPage({
+      configure: false,
+      waitForText: currentItem.title,
+    });
+    const search = container!.querySelector<HTMLInputElement>(
+      '[aria-label="搜索当前工作区的记忆"]',
+    )!;
+    const inputValueSetter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value',
+    )?.set;
+    await act(async () => {
+      inputValueSetter?.call(search, 'SQLite');
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await vi.waitFor(() => expect(searchCalls).toBe(1));
+
+    currentItem = { ...currentItem, title: '刷新后的搜索结果', revision: 3 };
+    await act(async () => {
+      buttonWithText('刷新').click();
+    });
+    await vi.waitFor(() =>
+      expect(container!.textContent).toContain('刷新后的搜索结果'),
+    );
+    expect(searchCalls).toBe(2);
+
+    await act(async () => {
+      buttonWithText('刷新后的搜索结果').click();
+    });
+    const content =
+      container!.querySelector<HTMLTextAreaElement>('#memory-content')!;
+    const textareaValueSetter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      'value',
+    )?.set;
+    await act(async () => {
+      textareaValueSetter?.call(content, '保存后的最新内容');
+      content.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    mocks.patch.mockImplementationOnce(async () => {
+      currentItem = {
+        ...currentItem,
+        content: '保存后的最新内容',
+        revision: 4,
+      };
+      return { storeRevision: 4, item: currentItem };
+    });
+    await act(async () => {
+      buttonWithText('保存 revision').click();
+    });
+    await vi.waitFor(() => expect(searchCalls).toBe(3));
+    expect(mocks.patch).toHaveBeenCalledWith(
+      '/api/memory/workspaces/workspace%3Aalpha/items/memory-search',
+      expect.objectContaining({ content: '保存后的最新内容' }),
     );
   });
 

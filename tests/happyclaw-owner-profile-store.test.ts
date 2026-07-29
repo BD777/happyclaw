@@ -485,7 +485,7 @@ describe('HappyClaw owner preferred-address facade', () => {
 });
 
 describe('HappyClaw owner introduction onboarding state', () => {
-  test('uses a fenced lease and can be permanently skipped', () => {
+  test('claims first wake without consuming it until a fenced acknowledgement', () => {
     const workspaceJid = createWorkspace('onboarding-lease');
     const now = '2026-07-28T12:00:00.000Z';
     const first = ownerProfile.claimHappyClawOwnerIntroduction({
@@ -504,6 +504,19 @@ describe('HappyClaw owner introduction onboarding state', () => {
       projection: { onboarding: { state: 'claimed' } },
     });
 
+    const sameRunnerBeforeAck = ownerProfile.claimHappyClawOwnerIntroduction({
+      workspaceJid,
+      leaseOwner: 'session-a',
+      leaseMs: 60_000,
+      now: '2026-07-28T12:00:15.000Z',
+    });
+    expect(sameRunnerBeforeAck).toMatchObject({
+      claimed: true,
+      leaseAcquired: false,
+      firstWake: true,
+      leaseToken: first.leaseToken,
+    });
+
     const contending = ownerProfile.claimHappyClawOwnerIntroduction({
       workspaceJid,
       leaseOwner: 'session-b',
@@ -516,7 +529,7 @@ describe('HappyClaw owner introduction onboarding state', () => {
       firstWake: false,
       newlyClaimed: false,
       leaseToken: first.leaseToken,
-      leaseExpiresAt: first.leaseExpiresAt,
+      leaseExpiresAt: sameRunnerBeforeAck.leaseExpiresAt,
       projection: { onboarding: { state: 'claimed' } },
     });
 
@@ -524,21 +537,62 @@ describe('HappyClaw owner introduction onboarding state', () => {
       workspaceJid,
       leaseOwner: 'session-b',
       leaseMs: 60_000,
-      now: '2026-07-28T12:01:01.000Z',
+      now: '2026-07-28T12:01:16.000Z',
     });
     expect(reclaimed).toMatchObject({
       claimed: true,
       leaseAcquired: true,
-      firstWake: false,
-      newlyClaimed: false,
+      firstWake: true,
+      newlyClaimed: true,
       leaseToken: expect.any(Number),
       projection: { onboarding: { state: 'claimed' } },
     });
     expect(reclaimed.leaseToken).toBeGreaterThan(first.leaseToken!);
 
+    expect(() =>
+      ownerProfile.acknowledgeHappyClawOwnerIntroduction({
+        workspaceJid,
+        leaseOwner: 'session-a',
+        leaseToken: reclaimed.leaseToken!,
+        now: '2026-07-28T12:01:17.000Z',
+      }),
+    ).toThrow('lease no longer matches');
+    expect(() =>
+      ownerProfile.acknowledgeHappyClawOwnerIntroduction({
+        workspaceJid,
+        leaseOwner: 'session-b',
+        leaseToken: first.leaseToken!,
+        now: '2026-07-28T12:01:17.000Z',
+      }),
+    ).toThrow('lease no longer matches');
+
+    const acknowledged = ownerProfile.acknowledgeHappyClawOwnerIntroduction({
+      workspaceJid,
+      leaseOwner: 'session-b',
+      leaseToken: reclaimed.leaseToken!,
+      now: '2026-07-28T12:01:17.000Z',
+    });
+    expect(acknowledged).toMatchObject({
+      acknowledged: true,
+      projection: {
+        onboarding: {
+          state: 'claimed',
+          firstWakeAt: '2026-07-28T12:01:17.000Z',
+        },
+      },
+    });
+    expect(
+      ownerProfile.acknowledgeHappyClawOwnerIntroduction({
+        workspaceJid,
+        leaseOwner: 'session-b',
+        leaseToken: reclaimed.leaseToken!,
+        now: '2026-07-28T12:01:18.000Z',
+      }),
+    ).toMatchObject({ acknowledged: false });
+
     const skipped = ownerProfile.skipHappyClawOwnerIntroduction({
       workspaceJid,
-      expectedOnboardingRevision: reclaimed.projection.onboarding.revision,
+      expectedOnboardingRevision: acknowledged.projection.onboarding.revision,
       context: mutationContext(),
     });
     expect(skipped).toMatchObject({
@@ -557,6 +611,67 @@ describe('HappyClaw owner introduction onboarding state', () => {
     ).toMatchObject({
       claimed: false,
       projection: { onboarding: { state: 'skipped' } },
+    });
+  });
+
+  test('runner exit releases an unacknowledged lease without consuming first wake', () => {
+    const workspaceJid = createWorkspace('onboarding-release');
+    const first = ownerProfile.claimHappyClawOwnerIntroduction({
+      workspaceJid,
+      leaseOwner: 'failed-runner',
+      now: '2026-07-28T12:00:00.000Z',
+    });
+    expect(first).toMatchObject({ firstWake: true, leaseAcquired: true });
+
+    expect(
+      ownerProfile.releaseHappyClawOwnerIntroductionLease(
+        'failed-runner',
+        '2026-07-28T12:00:01.000Z',
+      ),
+    ).toBe(1);
+    const retry = ownerProfile.claimHappyClawOwnerIntroduction({
+      workspaceJid,
+      leaseOwner: 'retry-runner',
+      now: '2026-07-28T12:00:02.000Z',
+    });
+    expect(retry).toMatchObject({
+      claimed: true,
+      leaseAcquired: true,
+      firstWake: true,
+      projection: {
+        onboarding: {
+          leaseOwner: 'retry-runner',
+          firstWakeAt: null,
+        },
+      },
+    });
+  });
+
+  test('normal database restart does not consume an unacknowledged first wake', () => {
+    const workspaceJid = createWorkspace('onboarding-restart');
+    const first = ownerProfile.claimHappyClawOwnerIntroduction({
+      workspaceJid,
+      leaseOwner: 'restart-runner',
+      leaseMs: 60_000,
+      now: '2026-07-28T12:00:00.000Z',
+    });
+    expect(first).toMatchObject({ firstWake: true, leaseToken: 1 });
+
+    db.closeDatabase();
+    db.initDatabase();
+
+    const resumed = ownerProfile.claimHappyClawOwnerIntroduction({
+      workspaceJid,
+      leaseOwner: 'restart-runner',
+      leaseMs: 60_000,
+      now: '2026-07-28T12:00:30.000Z',
+    });
+    expect(resumed).toMatchObject({
+      claimed: true,
+      leaseAcquired: false,
+      firstWake: true,
+      leaseToken: first.leaseToken,
+      projection: { onboarding: { firstWakeAt: null } },
     });
   });
 

@@ -435,7 +435,17 @@ function createPreMigrationBackup(dbPath: string, schemaVersion: number): void {
 
 function enforcePreMigrationBackup(dbPath: string): void {
   const rawVersion = getRouterStateInternal('schema_version');
-  if (rawVersion === undefined) return;
+  if (rawVersion === undefined) {
+    // Pre-versioned installations (and partially damaged router_state rows)
+    // can still carry the legacy memory chunk index. v67 drops those tables,
+    // so treat their presence as an upgrade even without a version marker.
+    // A genuinely fresh database has neither table and must not create an
+    // empty, misleading migration backup.
+    if (tableExists('memory_chunks') || tableExists('memory_chunks_fts')) {
+      createPreMigrationBackup(dbPath, 0);
+    }
+    return;
+  }
 
   const schemaVersion = Number(rawVersion);
   if (!Number.isInteger(schemaVersion) || schemaVersion < 0) {
