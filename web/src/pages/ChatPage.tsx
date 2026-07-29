@@ -84,6 +84,13 @@ export function ChatPage() {
   const runnerStates = useGroupsStore((s) => s.runnerStates);
   const hasGroups = Object.keys(groups).length > 0;
 
+  // 移动端唯一的工作区列表入口：桌面侧边栏改为条件挂载后，/chat 落地页
+  // 不再有其他组件触发 loadGroups（store 内部有 in-flight 去重，桌面端
+  // 与侧边栏的并发调用只会发一个请求）。
+  useEffect(() => {
+    void loadGroups();
+  }, [loadGroups]);
+
   // Mobile and desktop share the same Agent-first navigation contract.
   const agentSections = useMemo(() => {
     const entries: GroupEntry[] = Object.entries(groups).map(([jid, info]) => ({

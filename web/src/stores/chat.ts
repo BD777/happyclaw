@@ -270,6 +270,7 @@ function mergeMessagesChronologically(
 
 const MAX_THINKING_CACHE_SIZE = 500;
 const loadMessagesInFlight = new Map<string, Promise<void>>();
+let loadGroupsInFlight: Promise<void> | null = null;
 
 /** Evict oldest entries when cache exceeds capacity (relies on insertion order) */
 function capThinkingCache<V>(cache: Record<string, V>): Record<string, V> {
@@ -1648,46 +1649,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
   unreadReplies: {},
 
   loadGroups: async () => {
-    set({ loading: true });
-    try {
-      const data = await api.get<{ groups: Record<string, GroupInfo> }>(
-        '/api/groups',
-      );
-      const groups = Object.fromEntries(
-        Object.entries(data.groups).map(([jid, group]) => [
-          jid,
-          normalizeGroupInteractionMode(group),
-        ]),
-      );
-      set((state) => {
-        const currentStillExists =
-          state.currentGroup && !!groups[state.currentGroup];
+    // 桌面端（侧边栏 + ChatPage）会各触发一次；同一时刻只发一个请求。
+    if (loadGroupsInFlight) return loadGroupsInFlight;
+    loadGroupsInFlight = (async () => {
+      set({ loading: true });
+      try {
+        const data = await api.get<{ groups: Record<string, GroupInfo> }>(
+          '/api/groups',
+        );
+        const groups = Object.fromEntries(
+          Object.entries(data.groups).map(([jid, group]) => [
+            jid,
+            normalizeGroupInteractionMode(group),
+          ]),
+        );
+        set((state) => {
+          const currentStillExists =
+            state.currentGroup && !!groups[state.currentGroup];
 
-        let nextCurrent = currentStillExists ? state.currentGroup : null;
-        if (!nextCurrent) {
-          const homeEntry = Object.entries(groups).find(
-            ([_, group]) => group.is_my_home,
-          );
-          if (homeEntry) {
-            nextCurrent = homeEntry[0];
-          } else {
-            nextCurrent = Object.keys(groups)[0] || null;
+          let nextCurrent = currentStillExists ? state.currentGroup : null;
+          if (!nextCurrent) {
+            const homeEntry = Object.entries(groups).find(
+              ([_, group]) => group.is_my_home,
+            );
+            if (homeEntry) {
+              nextCurrent = homeEntry[0];
+            } else {
+              nextCurrent = Object.keys(groups)[0] || null;
+            }
           }
-        }
 
-        return {
-          groups,
-          currentGroup: nextCurrent,
+          return {
+            groups,
+            currentGroup: nextCurrent,
+            loading: false,
+            error: null,
+          };
+        });
+      } catch (err) {
+        set({
           loading: false,
-          error: null,
-        };
-      });
-    } catch (err) {
-      set({
-        loading: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })().finally(() => {
+      loadGroupsInFlight = null;
+    });
+    return loadGroupsInFlight;
   },
 
   selectGroup: (jid: string) => {
