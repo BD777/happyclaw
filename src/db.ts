@@ -86,10 +86,12 @@ import {
   createWorkspaceMemorySchema,
   deleteWorkspaceMemoryData,
   enforceHappyClawOwnerAddressCanonicalInvariant,
+  resetWorkspaceMemoryData,
 } from './memory-store.js';
 import {
   bindOwnerProfileDatabase,
   createOwnerProfileSchema,
+  HAPPYCLAW_OWNER_INTRODUCTION_FLOW_KEY,
   reconcileLegacyOwnerProfileMemory,
 } from './owner-profile-store.js';
 import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
@@ -4355,6 +4357,109 @@ export function getDeletedTasks(): ScheduledTask[] {
     )
     .all()
     .map(mapTaskRow);
+}
+
+export interface WorkspaceTaskRebuildPause {
+  groupFolder: string;
+  tasks: Array<{
+    id: string;
+    originalStatus: ScheduledTask['status'];
+    originalNextRun: string | null;
+    preparedRevision: number;
+  }>;
+  activeRunIds: string[];
+}
+
+/**
+ * Freeze every runnable task definition before workspace rebuild performs its
+ * first await. Completed tasks cannot run, and genuinely parsing tasks must
+ * keep their revision so an in-flight parser is not orphaned if rebuild later
+ * rolls back. Failure recovery restores changed rows with CAS.
+ */
+export function pauseWorkspaceTasksForRebuild(
+  groupFolder: string,
+): WorkspaceTaskRebuildPause {
+  return db
+    .transaction((): WorkspaceTaskRebuildPause => {
+      const tasks = db
+        .prepare(
+          `SELECT * FROM scheduled_tasks
+           WHERE group_folder = ? AND deleted_at IS NULL
+           ORDER BY id`,
+        )
+        .all(groupFolder)
+        .map(mapTaskRow);
+      const now = new Date().toISOString();
+      const pause = db.prepare(
+        `UPDATE scheduled_tasks
+         SET status = 'parsing', next_run = NULL, running_until = NULL,
+             runner_id = NULL, revision = revision + 1, updated_at = ?
+         WHERE id = ? AND revision = ? AND deleted_at IS NULL`,
+      );
+      const snapshots: WorkspaceTaskRebuildPause['tasks'] = [];
+      for (const task of tasks) {
+        if (task.status === 'completed' || task.status === 'parsing') continue;
+        const result = pause.run(now, task.id, task.revision);
+        if (result.changes !== 1) {
+          throw new Error(
+            `Scheduled task changed while preparing workspace rebuild: ${task.id}`,
+          );
+        }
+        snapshots.push({
+          id: task.id,
+          originalStatus: task.status,
+          originalNextRun: task.next_run,
+          preparedRevision: task.revision + 1,
+        });
+      }
+      const activeRunIds = (
+        db
+          .prepare(
+            `SELECT tr.id
+             FROM task_runs tr
+             JOIN scheduled_tasks st ON st.id = tr.task_id
+             WHERE st.group_folder = ?
+               AND tr.status IN ('queued','running','retry_wait')
+             ORDER BY tr.created_at, tr.id`,
+          )
+          .all(groupFolder) as Array<{ id: string }>
+      ).map((row) => row.id);
+      return { groupFolder, tasks: snapshots, activeRunIds };
+    })
+    .immediate();
+}
+
+/**
+ * Best-effort CAS rollback for the preparatory task pause. A concurrent task
+ * edit wins rather than being overwritten by rebuild failure recovery.
+ */
+export function restoreWorkspaceTasksAfterFailedRebuild(
+  pause: WorkspaceTaskRebuildPause,
+): { restored: string[]; conflicts: string[] } {
+  return db
+    .transaction(() => {
+      const restored: string[] = [];
+      const conflicts: string[] = [];
+      const now = new Date().toISOString();
+      const restore = db.prepare(
+        `UPDATE scheduled_tasks
+         SET status = ?, next_run = ?, revision = revision + 1, updated_at = ?
+         WHERE id = ? AND revision = ? AND deleted_at IS NULL`,
+      );
+      for (const task of pause.tasks) {
+        const result = restore.run(
+          task.originalStatus,
+          task.originalNextRun,
+          now,
+          task.id,
+          task.preparedRevision,
+        );
+        if (result.changes === 1) restored.push(task.id);
+        else conflicts.push(task.id);
+      }
+      return { restored, conflicts };
+    })
+    .immediate();
 }
 
 export function updateTask(
@@ -9986,6 +10091,208 @@ export function deleteChatHistory(chatJid: string): void {
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
   });
   tx(chatJid);
+}
+
+/**
+ * Clear all knowledge owned by a retained workspace during a content rebuild.
+ * The generic Memory lineage and the hidden Home Owner Profile lifecycle are
+ * reset atomically, while the workspace identity/configuration remains intact.
+ */
+export function resetWorkspaceKnowledgeForRebuild(workspaceJid: string): void {
+  db.transaction(() => {
+    const workspace = db
+      .prepare('SELECT is_home FROM workspaces WHERE jid = ?')
+      .get(workspaceJid) as { is_home: number } | undefined;
+    if (!workspace) {
+      throw new Error(`Workspace not found: ${workspaceJid}`);
+    }
+
+    resetWorkspaceMemoryData(workspaceJid);
+    db.prepare(
+      `DELETE FROM workspace_onboarding_states
+       WHERE workspace_jid = ? AND flow_key = ?`,
+    ).run(workspaceJid, HAPPYCLAW_OWNER_INTRODUCTION_FLOW_KEY);
+
+    if (workspace.is_home === 1) {
+      const at = new Date().toISOString();
+      db.prepare(
+        `INSERT INTO workspace_onboarding_states (
+          workspace_jid, flow_key, state, revision, lease_owner, lease_token,
+          lease_expires_at, first_wake_at, completed_at, skipped_at,
+          created_at, updated_at
+        ) VALUES (?, ?, 'pending', 0, NULL, 0, NULL, NULL, NULL, NULL, ?, ?)`,
+      ).run(workspaceJid, HAPPYCLAW_OWNER_INTRODUCTION_FLOW_KEY, at, at);
+    }
+  })();
+}
+
+export class WorkspaceRebuildPersistentStateError extends Error {
+  constructor(
+    public readonly code: 'workspace_missing' | 'active_task_runs',
+    message: string,
+    public readonly activeRunIds: string[] = [],
+  ) {
+    super(message);
+    this.name = 'WorkspaceRebuildPersistentStateError';
+  }
+}
+
+export interface WorkspaceRebuildPersistentStateResult {
+  deletedAgentIds: string[];
+  recycledTaskIds: string[];
+}
+
+/**
+ * Commit every SQLite-owned part of a workspace rebuild as one transaction.
+ * Filesystem staging is handled by the route before this call; throwing here
+ * leaves all database state untouched so the route can restore staged files.
+ */
+export function rebuildWorkspacePersistentState(input: {
+  groupFolder: string;
+  workspaceJids: string[];
+  siblingJids: string[];
+}): WorkspaceRebuildPersistentStateResult {
+  return db
+    .transaction((): WorkspaceRebuildPersistentStateResult => {
+      const workspaceJids = [...new Set(input.workspaceJids)];
+      const siblingJids = [...new Set(input.siblingJids)];
+      for (const workspaceJid of workspaceJids) {
+        const workspace = db
+          .prepare('SELECT folder FROM workspaces WHERE jid = ?')
+          .get(workspaceJid) as { folder: string } | undefined;
+        if (!workspace || workspace.folder !== input.groupFolder) {
+          throw new WorkspaceRebuildPersistentStateError(
+            'workspace_missing',
+            `Workspace changed while rebuilding: ${workspaceJid}`,
+          );
+        }
+      }
+
+      const activeRunIds = (
+        db
+          .prepare(
+            `SELECT tr.id
+             FROM task_runs tr
+             JOIN scheduled_tasks st ON st.id = tr.task_id
+             WHERE st.group_folder = ?
+               AND tr.status IN ('queued','running','retry_wait')
+             ORDER BY tr.created_at, tr.id`,
+          )
+          .all(input.groupFolder) as Array<{ id: string }>
+      ).map((row) => row.id);
+      if (activeRunIds.length > 0) {
+        throw new WorkspaceRebuildPersistentStateError(
+          'active_task_runs',
+          'Scheduled task runs are still active during workspace rebuild',
+          activeRunIds,
+        );
+      }
+
+      const recycledTaskIds = (
+        db
+          .prepare(
+            `SELECT id FROM scheduled_tasks
+             WHERE group_folder = ? AND deleted_at IS NULL
+             ORDER BY id`,
+          )
+          .all(input.groupFolder) as Array<{ id: string }>
+      ).map((row) => row.id);
+      if (recycledTaskIds.length > 0) {
+        const now = new Date().toISOString();
+        db.prepare(
+          `UPDATE task_run_logs
+           SET status = 'error',
+               error = COALESCE(error, 'Workspace rebuilt while task was running')
+           WHERE status = 'running'
+             AND task_id IN (
+               SELECT id FROM scheduled_tasks
+               WHERE group_folder = ? AND deleted_at IS NULL
+             )`,
+        ).run(input.groupFolder);
+        db.prepare(
+          `UPDATE scheduled_tasks
+           SET deleted_at = ?, status = 'paused', next_run = NULL,
+               running_until = NULL, runner_id = NULL,
+               workspace_jid = NULL, workspace_folder = NULL,
+               revision = revision + 1, updated_at = ?
+           WHERE group_folder = ? AND deleted_at IS NULL`,
+        ).run(now, now, input.groupFolder);
+      }
+
+      const agents = db
+        .prepare(
+          `SELECT id, chat_jid FROM agents
+             WHERE group_folder = ?
+             ORDER BY id`,
+        )
+        .all(input.groupFolder) as Array<{
+        id: string;
+        chat_jid: string;
+      }>;
+      const deletedAgentIds = agents.map((agent) => agent.id);
+
+      db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(
+        input.groupFolder,
+      );
+      db.prepare(
+        'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+      ).run(input.groupFolder);
+      db.prepare('DELETE FROM router_state WHERE key = ?').run(
+        sessionChannelOwnerKey(input.groupFolder),
+      );
+      for (const agentId of deletedAgentIds) {
+        db.prepare('DELETE FROM router_state WHERE key = ?').run(
+          sessionChannelOwnerKey(input.groupFolder, agentId),
+        );
+      }
+
+      for (const workspaceJid of workspaceJids) {
+        resetWorkspaceKnowledgeForRebuild(workspaceJid);
+        db.prepare(
+          'DELETE FROM im_context_bindings WHERE workspace_jid = ?',
+        ).run(workspaceJid);
+      }
+
+      for (const siblingJid of siblingJids) {
+        db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(siblingJid);
+        db.prepare('DELETE FROM chats WHERE jid = ?').run(siblingJid);
+      }
+      for (const agent of agents) {
+        const virtualJid = `${agent.chat_jid}#agent:${agent.id}`;
+        db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(virtualJid);
+        db.prepare('DELETE FROM chats WHERE jid = ?').run(virtualJid);
+      }
+
+      if (deletedAgentIds.length > 0) {
+        const placeholders = deletedAgentIds.map(() => '?').join(', ');
+        db.prepare(
+          `UPDATE registered_groups
+           SET target_agent_id = NULL, binding_mode = 'single_context'
+           WHERE target_agent_id IN (${placeholders})`,
+        ).run(...deletedAgentIds);
+        db.prepare(
+          `DELETE FROM channel_mounts
+           WHERE session_id IN (${placeholders})`,
+        ).run(...deletedAgentIds);
+        db.prepare(
+          `DELETE FROM agent_channel_mounts
+           WHERE session_id IN (${placeholders})`,
+        ).run(...deletedAgentIds);
+        db.prepare(
+          `DELETE FROM im_context_bindings
+           WHERE agent_id IN (${placeholders})`,
+        ).run(...deletedAgentIds);
+      }
+      db.prepare('DELETE FROM agents WHERE group_folder = ?').run(
+        input.groupFolder,
+      );
+
+      for (const siblingJid of siblingJids) {
+        ensureChatExists(siblingJid);
+      }
+      return { deletedAgentIds, recycledTaskIds };
+    })
+    .immediate();
 }
 
 /**

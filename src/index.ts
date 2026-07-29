@@ -428,6 +428,7 @@ import {
   stopSchedulerLoop,
   triggerTaskNow,
   cancelTaskRunNow,
+  waitForTaskRunsToStop,
   notifyTaskSchedulerChanged,
   computeNextRunForSchedule,
   computeNextRunForTaskResume,
@@ -20300,6 +20301,8 @@ async function main(): Promise<void> {
     webDeps.triggerTaskRun = (taskId: string, idempotencyKey?: string) =>
       triggerTaskNow(taskId, schedulerDeps, idempotencyKey);
     webDeps.cancelTaskRun = (runId: string) => cancelTaskRunNow(runId);
+    webDeps.waitForTaskRunsToStop = (runIds: string[], timeoutMs?: number) =>
+      waitForTaskRunsToStop(runIds, timeoutMs);
   }
 
   // --- IM Connection Pool: connect per-user IM channels ---

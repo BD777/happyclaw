@@ -1882,7 +1882,7 @@ export function notifyTaskSchedulerChanged(): void {
 function scheduleSafePrestartRetry(
   claim: ClaimedTaskRun,
   reason: string,
-  options: { countsAsAttempt?: boolean } = {},
+  options: { countsAsAttempt?: boolean; retryDelayMs?: number } = {},
 ): void {
   const countsAsAttempt = options.countsAsAttempt !== false;
   if (countsAsAttempt && claim.attempt >= MAX_SAFE_PRESTART_ATTEMPTS) {
@@ -1894,7 +1894,9 @@ function scheduleSafePrestartRetry(
     return;
   }
   const exponent = Math.max(0, claim.attempt - 1);
-  const delayMs = countsAsAttempt ? Math.min(60_000, 1_000 * 2 ** exponent) : 0;
+  const delayMs =
+    options.retryDelayMs ??
+    (countsAsAttempt ? Math.min(60_000, 1_000 * 2 ** exponent) : 0);
   releaseTaskRunForRetry(
     claim.id,
     claim.lease_owner,
@@ -2241,6 +2243,17 @@ function executeClaimedTaskRun(
       status: 'failed',
       error: `Target group not registered: ${task.chat_jid}`,
       notificationStatus: 'skipped',
+    });
+    return;
+  }
+  // Script runs bypass GroupQueue.enqueueTask(), so checking only at enqueue
+  // would let a detached process start while a workspace mutation is moving or
+  // replacing its filesystem. Retry without consuming an attempt; the caller
+  // holding the gate decides whether the task will survive the mutation.
+  if (deps.queue.isGroupMutationPaused?.(targetGroupJid)) {
+    scheduleSafePrestartRetry(claim, 'Workspace mutation is in progress', {
+      countsAsAttempt: false,
+      retryDelayMs: 1_000,
     });
     return;
   }
@@ -2926,8 +2939,31 @@ export function cancelTaskRunNow(runId: string): {
   } catch (err) {
     logger.error({ runId, err }, 'Failed to stop cancelled task-run process');
   }
-  activeDurableExecutions.delete(runId);
-  activeDurableTaskIds.delete(run.task_id);
   notifyTaskSchedulerChanged();
   return { success: true };
+}
+
+/**
+ * Wait until the process-side execution records disappear after cancellation.
+ * DB cancellation alone is not enough for workspace rebuild: a script process
+ * may still be unwinding and writing to the workspace directory.
+ */
+export async function waitForTaskRunsToStop(
+  runIds: string[],
+  timeoutMs = 30_000,
+): Promise<boolean> {
+  const pending = new Set(runIds);
+  if (pending.size === 0) return true;
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (true) {
+    for (const runId of pending) {
+      if (!activeDurableExecutions.has(runId)) pending.delete(runId);
+    }
+    if (pending.size === 0) return true;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return false;
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(25, remainingMs)),
+    );
+  }
 }

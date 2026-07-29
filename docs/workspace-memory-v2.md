@@ -24,6 +24,10 @@ HappyClaw 的相关数据分成三个彼此独立的层次：
 - 来源 Session 只用于回溯 provenance；忘记一条 Memory 不会删除 Session 或聊天
   历史。
 - Workspace 文件仍通过文件功能管理，不能通过 Memory API 任意读取或改写。
+- “重建工作区”是明确的内容级永久重置：保留 Workspace 外壳，但删除整个 Memory
+  store 及其 versions、provenance、tombstones、audit/outbox。Home 同时删除
+  Owner Profile 称呼并把首次唤醒生命周期重置为 `pending`；关联定时任务停止并
+  移入回收站，运行历史保留。
 
 ### Home、Agent 与首次唤醒
 

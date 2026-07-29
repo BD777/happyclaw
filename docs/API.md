@@ -67,7 +67,10 @@ Public：
 - `POST /api/groups/:jid/stop`
 - `POST /api/groups/:jid/interrupt`
 - `POST /api/groups/:jid/reset-session`
-- `POST /api/groups/:jid/clear-history`
+- `POST /api/groups/:jid/clear-history`，重建工作区内容：永久清除聊天、
+  Runtime Session、子对话、工作目录及 Workspace Memory（含版本历史和
+  Home Owner Profile），关联定时任务停止并移入回收站；保留工作区外壳、
+  `data/extra/` 和任务运行历史
 - `POST /api/groups/:jid/reset-owner`，admin break-glass
 - `GET /api/groups/:jid/messages`
 - `DELETE /api/groups/:jid/messages/:messageId`

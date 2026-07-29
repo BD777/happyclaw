@@ -194,6 +194,11 @@ export interface WebDeps {
   ) => { success: boolean; error?: string; runId?: string };
   /** Stop one occurrence only; future schedule remains unchanged. */
   cancelTaskRun?: (runId: string) => { success: boolean; error?: string };
+  /** Wait for cancelled task processes to leave the workspace filesystem. */
+  waitForTaskRunsToStop?: (
+    runIds: string[],
+    timeoutMs?: number,
+  ) => Promise<boolean>;
   handleSpawnCommand?: (
     chatJid: string,
     message: string,

@@ -192,8 +192,13 @@ describe('GroupQueue mutation pause', () => {
 
   test('overlapping mutation tokens keep work parked until the last release', async () => {
     let taskRuns = 0;
+    expect(queue.isGroupMutationPaused(WEB_JID)).toBe(false);
     const first = queue.pauseGroupsForMutation([WEB_JID]);
     const second = queue.pauseGroupsForMutation([IM_JID]);
+    expect(queue.isGroupMutationPaused(WEB_JID)).toBe(true);
+    expect(
+      queue.isGroupMutationPaused(`${WEB_JID}#task:created-during-mutation`),
+    ).toBe(true);
     queue.enqueueTask(`${WEB_JID}#task:overlap`, 'overlap', async () => {
       taskRuns++;
     });
@@ -201,10 +206,12 @@ describe('GroupQueue mutation pause', () => {
     queue.resumeGroupsAfterMutation(first);
     await tick();
     expect(taskRuns).toBe(0);
+    expect(queue.isGroupMutationPaused(IM_JID)).toBe(true);
 
     queue.resumeGroupsAfterMutation(second);
     await tick();
     expect(taskRuns).toBe(1);
+    expect(queue.isGroupMutationPaused(WEB_JID)).toBe(false);
   });
 
   test('preserve stop requires a mutation pause token', async () => {

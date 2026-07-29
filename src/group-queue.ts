@@ -319,6 +319,15 @@ export class GroupQueue {
     return paused;
   }
 
+  /**
+   * Report whether a workspace serialization family is behind a mutation gate.
+   * Detached schedulers must consult this before starting work because script
+   * executions do not pass through enqueueTask().
+   */
+  isGroupMutationPaused(groupJid: string): boolean {
+    return this.isMutationPaused(groupJid);
+  }
+
   blockGroupsForRuntimeSafety(
     groupJids: string[],
     reason: string,

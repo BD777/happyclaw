@@ -430,7 +430,7 @@ export function UnifiedSidebar({
         onClose={closeClear}
         onConfirm={handleClearConfirm}
         title="重建工作区"
-        message={`确认重建「${clearState.name}」？会清除全部聊天记录、上下文、所有子对话及其消息，并删除工作目录文件。持久化目录 (data/extra/) 与定时任务本身保留。不可撤销。`}
+        message={`确认重建「${clearState.name}」？会永久删除全部聊天记录、上下文、所有子对话及其消息、工作目录文件，以及该工作区的全部 Memory（含版本历史、遗忘记录和 HappyClaw 称呼偏好）；Home 还会重置首次唤醒状态。关联定时任务会停止并移入回收站，运行历史与持久化目录 (data/extra/) 保留。不可撤销。`}
         confirmText="确认重建"
         confirmVariant="danger"
         loading={clearLoading}

@@ -37,6 +37,9 @@ import {
   deleteSession,
   deleteWorkspaceSessions,
   deleteChatHistory,
+  pauseWorkspaceTasksForRebuild,
+  rebuildWorkspacePersistentState,
+  restoreWorkspaceTasksAfterFailedRebuild,
   deleteGroupData,
   deleteImGroupRecord,
   ensureChatExists,
@@ -57,8 +60,6 @@ import {
   getUserPinnedGroups,
   pinGroup,
   unpinGroup,
-  deleteAgent,
-  deleteImContextBindingsByWorkspace,
   assignWorkspaceAgentProfile,
   deleteWorkspaceAgentProfile,
   getAgentProfileForUser,
@@ -405,30 +406,99 @@ class WorkspaceMissingDuringMigrationError extends Error {
   }
 }
 
-function resetWorkspaceForGroup(folder: string): void {
-  // 1. 清除工作目录（Agent 文件、CLAUDE.md、logs/ 等），然后重建空目录
+interface StagedWorkspaceReset {
+  commit(): Array<{ path: string; error: unknown }>;
+  rollback(): void;
+}
+
+class WorkspaceFilesystemRollbackError extends AggregateError {
+  constructor(errors: Iterable<unknown>, folder: string) {
+    super(
+      errors,
+      `Failed to stage and roll back workspace filesystem reset for ${folder}`,
+    );
+    this.name = 'WorkspaceFilesystemRollbackError';
+  }
+}
+
+/**
+ * Move destructive filesystem targets aside before touching SQLite. A handled
+ * database failure can then restore the exact original directories instead of
+ * returning 500 after files have already been permanently deleted.
+ */
+function stageWorkspaceResetForGroup(folder: string): StagedWorkspaceReset {
+  const suffix = `.rebuild-backup-${crypto.randomUUID()}`;
   const groupDir = path.join(GROUPS_DIR, folder);
-  fs.rmSync(groupDir, { recursive: true, force: true });
-  fs.mkdirSync(groupDir, { recursive: true });
-
-  // 2. 清除整个 Claude 会话目录（下次启动时 container-runner 会重建）
-  fs.rmSync(path.join(DATA_DIR, 'sessions', folder), {
-    recursive: true,
-    force: true,
-  });
-
-  // 3. 清除 IPC 残留并重建目录结构
+  const sessionDir = path.join(DATA_DIR, 'sessions', folder);
   const ipcDir = path.join(DATA_DIR, 'ipc', folder);
-  fs.rmSync(ipcDir, { recursive: true, force: true });
-  fs.mkdirSync(path.join(ipcDir, 'input'), { recursive: true });
-  fs.mkdirSync(path.join(ipcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(ipcDir, 'tasks'), { recursive: true });
+  const legacyMemoryDir = path.join(DATA_DIR, 'memory', folder);
+  const targets = [groupDir, sessionDir, ipcDir, legacyMemoryDir].map(
+    (targetPath) => ({
+      targetPath,
+      backupPath: `${targetPath}${suffix}`,
+      moved: false,
+    }),
+  );
 
-  // 4. 清理 legacy date-memory archive（data/memory/{folder}/）
-  fs.rmSync(path.join(DATA_DIR, 'memory', folder), {
-    recursive: true,
-    force: true,
-  });
+  const rollback = () => {
+    const errors: unknown[] = [];
+    for (const target of [...targets].reverse()) {
+      try {
+        fs.rmSync(target.targetPath, { recursive: true, force: true });
+        if (target.moved) {
+          fs.renameSync(target.backupPath, target.targetPath);
+          target.moved = false;
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(
+        errors,
+        `Failed to roll back staged workspace filesystem reset for ${folder}`,
+      );
+    }
+  };
+
+  try {
+    for (const target of targets) {
+      if (!fs.existsSync(target.targetPath)) continue;
+      fs.renameSync(target.targetPath, target.backupPath);
+      target.moved = true;
+    }
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.mkdirSync(path.join(ipcDir, 'input'), { recursive: true });
+    fs.mkdirSync(path.join(ipcDir, 'messages'), { recursive: true });
+    fs.mkdirSync(path.join(ipcDir, 'tasks'), { recursive: true });
+  } catch (error) {
+    try {
+      rollback();
+    } catch (rollbackError) {
+      throw new WorkspaceFilesystemRollbackError(
+        [error, rollbackError],
+        folder,
+      );
+    }
+    throw error;
+  }
+
+  return {
+    rollback,
+    commit: () => {
+      const failures: Array<{ path: string; error: unknown }> = [];
+      for (const target of targets) {
+        if (!target.moved) continue;
+        try {
+          fs.rmSync(target.backupPath, { recursive: true, force: true });
+          target.moved = false;
+        } catch (error) {
+          failures.push({ path: target.backupPath, error });
+        }
+      }
+      return failures;
+    },
+  };
 }
 
 function toPublicContainerEnvForUser(
@@ -1963,113 +2033,176 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
 
   // Collect all JIDs sharing the same folder (e.g., web:main + feishu groups)
   const siblingJids = getJidsByFolder(group.folder);
+  const workspaceJids = siblingJids.filter((candidate) =>
+    candidate.startsWith('web:'),
+  );
 
-  // 1. Stop ALL active processes for this folder first to avoid writes during cleanup.
-  //    This must include descendant virtual JIDs — sub-agents (`{jid}#agent:{id}`)
-  //    and scheduled tasks (`{jid}#task:{id}`) — otherwise they'd keep running
-  //    with their cwd/session dirs pulled out from under them (ENOENT / undefined
-  //    behavior in container mode).
+  // Freeze the whole serialization family before the first await. Work arriving
+  // during rebuild remains parked and runs against the fresh workspace after
+  // the mutation gate is released.
   const descendantJids = Array.from(
     new Set(siblingJids.flatMap((j) => deps.queue.listDescendantJids(j))),
   );
-  const stopJids = [...siblingJids, ...descendantJids];
+  const stopJids = Array.from(
+    new Set([jid, ...siblingJids, ...descendantJids]),
+  );
+  const pauseToken = deps.queue.pauseGroupsForMutation(stopJids);
+  let taskPause: ReturnType<typeof pauseWorkspaceTasksForRebuild> | null = null;
+  let stagedReset: StagedWorkspaceReset | null = null;
+  let databaseCommitted = false;
   try {
+    // Pause definitions synchronously so the scheduler cannot admit another
+    // occurrence while active task processes are being cancelled.
+    taskPause = pauseWorkspaceTasksForRebuild(group.folder);
+    if (taskPause.activeRunIds.length > 0 && !deps.cancelTaskRun) {
+      throw new Error(
+        'Scheduler is unavailable while task runs are active; workspace not rebuilt',
+      );
+    }
+    for (const runId of taskPause.activeRunIds) {
+      const cancelled = deps.cancelTaskRun!(runId);
+      if (!cancelled.success) {
+        throw new Error(
+          cancelled.error ||
+            `Failed to cancel scheduled task run during rebuild: ${runId}`,
+        );
+      }
+    }
+
+    // Stop every current Main/Session/Task/Spawn runner before moving files.
     await Promise.all(
       stopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
     );
-  } catch (err) {
-    logger.error(
-      { jid, stopJids, err },
-      'Failed to stop containers before clearing history',
-    );
-    return c.json(
-      { error: 'Failed to stop container, history not cleared' },
-      500,
-    );
-  }
-
-  // 2. Reset workspace: clear working directory, session files, and IPC artifacts.
-  try {
-    resetWorkspaceForGroup(group.folder);
-  } catch (err) {
-    logger.error(
-      { jid, folder: group.folder, err },
-      'Failed to reset workspace while clearing history',
-    );
-    return c.json(
-      { error: 'Failed to reset workspace, history not cleared' },
-      500,
-    );
-  }
-
-  // 3. Clear session state and message history for ALL sibling JIDs.
-  try {
-    deleteSession(group.folder);
-    clearSessionChannelOwner(group.folder);
-    delete deps.getSessions()[group.folder];
-    for (const siblingJid of siblingJids) {
-      deleteChatHistory(siblingJid);
-      // Re-create the chats row so subsequent messages work properly
-      ensureChatExists(siblingJid);
-      deps.setLastAgentTimestamp(siblingJid, { timestamp: '', id: '' });
-    }
-  } catch (err) {
-    logger.error(
-      { jid, folder: group.folder, err },
-      'Failed to clear history state',
-    );
-    return c.json({ error: 'Failed to clear history' }, 500);
-  }
-
-  // 4. Clear conversation agents and their messages, then unbind IM groups
-  // pointing at those deleted agents. Main-conversation bindings stay valid.
-  try {
-    const agentsById = new Map<
-      string,
-      ReturnType<typeof listAgentsByJid>[number]
-    >();
-    for (const siblingJid of siblingJids) {
-      if (!siblingJid.startsWith('web:')) continue;
-      for (const agent of listAgentsByJid(siblingJid)) {
-        agentsById.set(agent.id, agent);
-      }
-    }
-    const deletedAgentIds = new Set<string>();
-    const agents = Array.from(agentsById.values());
-    for (const agent of agents) {
-      const virtualJid = `${agent.chat_jid}#agent:${agent.id}`;
-      deleteChatHistory(virtualJid);
-      deleteAgent(agent.id);
-      deletedAgentIds.add(agent.id);
-    }
-    const unboundCount = clearTargetAgentBindingsForDeletedAgents(
-      deps.getRegisteredGroups(),
-      deletedAgentIds,
-      (targetJid, updated) => {
-        setRegisteredGroup(targetJid, updated);
-        deps.getRegisteredGroups()[targetJid] = updated;
-        deps.clearImFailCounts?.(targetJid);
-      },
-    );
-    deleteImContextBindingsByWorkspace(jid);
-    if (unboundCount > 0) {
-      logger.info(
-        { jid, folder: group.folder, unboundCount },
-        'Cleared IM agent bindings for rebuilt workspace',
+    if (
+      taskPause.activeRunIds.length > 0 &&
+      deps.waitForTaskRunsToStop &&
+      !(await deps.waitForTaskRunsToStop(taskPause.activeRunIds))
+    ) {
+      throw new Error(
+        'Timed out waiting for scheduled task processes to stop; workspace not rebuilt',
       );
     }
-  } catch (err) {
-    logger.warn(
-      { jid, err },
-      'Failed to clear agents during workspace rebuild (non-fatal)',
-    );
-  }
+    if (taskPause.activeRunIds.length > 0 && !deps.waitForTaskRunsToStop) {
+      throw new Error(
+        'Scheduler cannot confirm task process shutdown; workspace not rebuilt',
+      );
+    }
 
-  logger.info(
-    { jid, folder: group.folder, siblingJids },
-    'Cleared workspace, context and chat history for group and all siblings',
-  );
-  return c.json({ success: true });
+    // Files are moved aside rather than deleted. The SQLite transaction below
+    // either commits the whole rebuild or leaves the database untouched, in
+    // which case catch restores these exact directories.
+    stagedReset = stageWorkspaceResetForGroup(group.folder);
+    const result = rebuildWorkspacePersistentState({
+      groupFolder: group.folder,
+      workspaceJids,
+      siblingJids,
+    });
+    databaseCommitted = true;
+
+    const cleanupFailures = stagedReset.commit();
+    stagedReset = null;
+    if (cleanupFailures.length > 0) {
+      logger.warn(
+        { jid, folder: group.folder, cleanupFailures },
+        'Workspace rebuild committed but backup cleanup was incomplete',
+      );
+    }
+
+    // Refresh process-local projections only after the durable commit. A cache
+    // refresh failure must not turn a successfully committed rebuild into a
+    // misleading 500 response: the authoritative state is already in SQLite.
+    try {
+      delete deps.getSessions()[group.folder];
+      for (const siblingJid of siblingJids) {
+        deps.setLastAgentTimestamp(siblingJid, { timestamp: '', id: '' });
+      }
+      const deletedAgentIds = new Set(result.deletedAgentIds);
+      const unboundCount = clearTargetAgentBindingsForDeletedAgents(
+        deps.getRegisteredGroups(),
+        deletedAgentIds,
+        (targetJid, updated) => {
+          setRegisteredGroup(targetJid, updated);
+          deps.getRegisteredGroups()[targetJid] = updated;
+          deps.clearImFailCounts?.(targetJid);
+        },
+      );
+      if (unboundCount > 0) {
+        logger.info(
+          { jid, folder: group.folder, unboundCount },
+          'Cleared IM agent bindings for rebuilt workspace',
+        );
+      }
+    } catch (cacheRefreshError) {
+      logger.warn(
+        { jid, folder: group.folder, cacheRefreshError },
+        'Workspace rebuild committed but process-local cache refresh failed',
+      );
+    }
+
+    logger.info(
+      {
+        jid,
+        folder: group.folder,
+        siblingJids,
+        deletedAgentCount: result.deletedAgentIds.length,
+        recycledTaskCount: result.recycledTaskIds.length,
+      },
+      'Rebuilt workspace files, Memory, tasks, context and chat history',
+    );
+    return c.json({ success: true });
+  } catch (err) {
+    let rollbackError: unknown =
+      err instanceof WorkspaceFilesystemRollbackError ? err : undefined;
+    if (!databaseCommitted && stagedReset) {
+      try {
+        stagedReset.rollback();
+        stagedReset = null;
+      } catch (error) {
+        rollbackError = error;
+      }
+    }
+    let taskRestore:
+      | ReturnType<typeof restoreWorkspaceTasksAfterFailedRebuild>
+      | undefined;
+    if (!databaseCommitted && taskPause) {
+      try {
+        taskRestore = restoreWorkspaceTasksAfterFailedRebuild(taskPause);
+        if (taskRestore.conflicts.length > 0) {
+          const conflictError = new Error(
+            `Task rollback conflicted for: ${taskRestore.conflicts.join(', ')}`,
+          );
+          rollbackError = rollbackError
+            ? new AggregateError([rollbackError, conflictError])
+            : conflictError;
+        }
+      } catch (error) {
+        rollbackError = rollbackError
+          ? new AggregateError([rollbackError, error])
+          : error;
+      }
+    }
+    logger.error(
+      {
+        jid,
+        folder: group.folder,
+        stopJids,
+        err,
+        rollbackError,
+        taskRestore,
+      },
+      'Workspace rebuild failed',
+    );
+    return c.json(
+      {
+        error: rollbackError
+          ? 'Workspace rebuild failed and automatic rollback was incomplete'
+          : 'Workspace rebuild failed; original data was restored',
+      },
+      500,
+    );
+  } finally {
+    deps.queue.resumeGroupsAfterMutation(pauseToken);
+  }
 });
 
 // GET /api/groups/:jid/messages - 获取消息历史

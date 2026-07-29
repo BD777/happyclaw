@@ -148,6 +148,7 @@ function makeDeps(groups: Record<string, any>) {
     closeStdin: vi.fn(),
     enqueueMessageCheck: vi.fn(),
     isShuttingDown: () => false,
+    isGroupMutationPaused: vi.fn(() => false),
   };
 
   return {
@@ -1395,5 +1396,51 @@ describe('scheduled task workspace/session contract', () => {
 
     expect(runContainerAgentMock).toHaveBeenCalledTimes(1);
     expect(db.getTaskById(taskId)?.status).toBe('paused');
+  });
+
+  test('does not start a detached task process behind a workspace mutation gate', () => {
+    const ownerId = 'mutation-gated-script-owner';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    db.setRegisteredGroup(GROUP_JID, {
+      name: 'Task Contract Host Workspace',
+      folder: GROUP_FOLDER,
+      added_at: now,
+      executionMode: 'host',
+      created_by: ownerId,
+      is_home: false,
+    } as any);
+    const taskId = createTask({
+      id: 'mutation-gated-script-task',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'echo gated',
+      created_by: ownerId,
+    });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    const { deps, queue } = makeDeps(groups);
+    queue.isGroupMutationPaused.mockReturnValue(true);
+
+    const result = triggerTaskNow(taskId, deps);
+
+    expect(result.success).toBe(true);
+    expect(queue.isGroupMutationPaused).toHaveBeenCalledWith(GROUP_JID);
+    expect(runScriptMock).not.toHaveBeenCalled();
+    expect(db.getTaskRunById(result.runId!)).toMatchObject({
+      status: 'retry_wait',
+      error: 'Workspace mutation is in progress',
+    });
   });
 });

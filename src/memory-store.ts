@@ -869,6 +869,38 @@ export function deleteWorkspaceMemoryData(workspaceJid: string): void {
   db.prepare('DELETE FROM workspace_memory_stores WHERE id = ?').run(store.id);
 }
 
+/**
+ * Replace a retained workspace's complete Memory lineage with a new empty
+ * store. Workspace rebuild keeps the workspace row itself, so deleting the old
+ * store without recreating it would leave Memory APIs in a permanent
+ * store_not_found state.
+ */
+export function resetWorkspaceMemoryData(
+  workspaceJid: string,
+): WorkspaceMemoryStore {
+  const db = requireDatabase();
+  return db.transaction(() => {
+    const workspace = db
+      .prepare('SELECT 1 FROM workspaces WHERE jid = ?')
+      .get(workspaceJid);
+    if (!workspace) {
+      throw new WorkspaceMemoryStoreError(
+        'store_not_found',
+        'Workspace memory store not found',
+      );
+    }
+
+    deleteWorkspaceMemoryData(workspaceJid);
+    const at = nowIso();
+    db.prepare(
+      `INSERT INTO workspace_memory_stores (
+        id, workspace_jid, revision, created_at, updated_at
+      ) VALUES (?, ?, 0, ?, ?)`,
+    ).run(newId('wms'), workspaceJid, at, at);
+    return requireStore(workspaceJid);
+  })();
+}
+
 export function getWorkspaceMemoryStore(
   workspaceJid: string,
 ): WorkspaceMemoryStore | null {
