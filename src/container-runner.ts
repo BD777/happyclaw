@@ -1463,6 +1463,18 @@ export function buildVolumeMounts(
     readonly: true,
   });
 
+  // Prompts must ride along with the source for the same reason: the image
+  // bakes a copy at build time, so a prompt file added after the last image
+  // build (e.g. identity.happyclaw.md) is missing inside the container while
+  // the freshly-mounted runner code already requires it — every container
+  // startup then dies with ENOENT. The entrypoint's /tmp/prompts symlink
+  // resolves through this mount.
+  mounts.push({
+    hostPath: path.join(projectRoot, 'container', 'agent-runner', 'prompts'),
+    containerPath: '/app/prompts',
+    readonly: true,
+  });
+
   // Native Claude user config overlays the isolated session config. Workspace
   // remains the SDK cwd; these read-only mounts provide the same user-level
   // capabilities without redirecting file and shell operations into ~/.claude.
