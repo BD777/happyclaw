@@ -116,7 +116,17 @@ const appRoutes = createRoutesFromElements(
       <Route
         path="/chat/:groupFolder?"
         element={
-          <Suspense fallback={null}>
+          <Suspense
+            fallback={
+              <div
+                className="flex h-full items-center justify-center text-sm text-muted-foreground motion-safe:animate-pulse"
+                role="status"
+                aria-live="polite"
+              >
+                正在加载会话…
+              </div>
+            }
+          >
             <ChatPage />
           </Suspense>
         }

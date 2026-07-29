@@ -31,6 +31,18 @@
 
     <!-- DM Sans: loaded locally via @font-face in globals.css -->
 
+    <!-- 预热认证：AuthGuard 放行前整棵已登录子树都不渲染，若等入口 JS 执行后
+         才发 /api/auth/me，这个 RTT 会和分片下载串行。这里在 HTML 解析阶段就
+         发出请求，stores/auth.ts 一次性消费 window.__authPrewarm。 -->
+    <script>
+      window.__authPrewarm = fetch('%BASE_URL%api/auth/me', {
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+      }).catch(function () {
+        return null;
+      });
+    </script>
+
     <title>HappyClaw</title>
   </head>
   <body>

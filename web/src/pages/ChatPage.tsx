@@ -32,8 +32,12 @@ import { useDeleteWorkspace } from '../hooks/useDeleteWorkspace';
 export function ChatPage() {
   const { groupFolder } = useParams<{ groupFolder?: string }>();
   const navigate = useNavigate();
-  const { groups, currentGroup, selectGroup, loadGroups, togglePin } =
-    useChatStore();
+  // 窄 selector：整 store 订阅会让整个页面跟着流式输出每帧重渲染。
+  const groups = useChatStore((s) => s.groups);
+  const currentGroup = useChatStore((s) => s.currentGroup);
+  const selectGroup = useChatStore((s) => s.selectGroup);
+  const loadGroups = useChatStore((s) => s.loadGroups);
+  const togglePin = useChatStore((s) => s.togglePin);
   const {
     clearState,
     clearLoading,

@@ -269,6 +269,7 @@ function mergeMessagesChronologically(
 }
 
 const MAX_THINKING_CACHE_SIZE = 500;
+const loadMessagesInFlight = new Map<string, Promise<void>>();
 
 /** Evict oldest entries when cache exceeds capacity (relies on insertion order) */
 function capThinkingCache<V>(cache: Record<string, V>): Record<string, V> {
@@ -1703,39 +1704,50 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const before =
       loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
 
-    try {
-      const data = await api.get<{ messages: Message[]; hasMore: boolean }>(
-        `/api/groups/${encodeURIComponent(jid)}/messages?${new URLSearchParams(
-          before ? { before: String(before), limit: '50' } : { limit: '50' },
-        )}`,
-      );
-      // Messages come in DESC order from API, reverse to chronological for display
-      const sorted = [...data.messages].reverse();
-      set((s) => {
-        const merged = mergeMessagesChronologically(
-          s.messages[jid] || [],
-          sorted,
+    // 首屏有两个入口（ChatPage 路由解析 + ChatView 挂载）会各发一次同参请求；
+    // 同一目标的首页加载在途时直接复用，避免重复拉 50 条。
+    const inFlightKey = `${jid} ${before ?? 'first'}`;
+    const inFlight = loadMessagesInFlight.get(inFlightKey);
+    if (inFlight) return inFlight;
+    const request = (async () => {
+      try {
+        const data = await api.get<{ messages: Message[]; hasMore: boolean }>(
+          `/api/groups/${encodeURIComponent(jid)}/messages?${new URLSearchParams(
+            before ? { before: String(before), limit: '50' } : { limit: '50' },
+          )}`,
         );
-        const nextWaiting = { ...s.waiting };
-        if (s.activeRuns[jid]) {
-          nextWaiting[jid] = true;
-        } else {
-          delete nextWaiting[jid];
-        }
+        // Messages come in DESC order from API, reverse to chronological for display
+        const sorted = [...data.messages].reverse();
+        set((s) => {
+          const merged = mergeMessagesChronologically(
+            s.messages[jid] || [],
+            sorted,
+          );
+          const nextWaiting = { ...s.waiting };
+          if (s.activeRuns[jid]) {
+            nextWaiting[jid] = true;
+          } else {
+            delete nextWaiting[jid];
+          }
 
-        return {
-          messages: {
-            ...s.messages,
-            [jid]: merged,
-          },
-          waiting: nextWaiting,
-          hasMore: { ...s.hasMore, [jid]: data.hasMore },
-          error: null,
-        };
-      });
-    } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
-    }
+          return {
+            messages: {
+              ...s.messages,
+              [jid]: merged,
+            },
+            waiting: nextWaiting,
+            hasMore: { ...s.hasMore, [jid]: data.hasMore },
+            error: null,
+          };
+        });
+      } catch (err) {
+        set({ error: err instanceof Error ? err.message : String(err) });
+      }
+    })().finally(() => {
+      loadMessagesInFlight.delete(inFlightKey);
+    });
+    loadMessagesInFlight.set(inFlightKey, request);
+    return request;
   },
 
   refreshMessages: async (jid: string) => {

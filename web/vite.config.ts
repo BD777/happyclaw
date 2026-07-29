@@ -1,5 +1,5 @@
 import path from 'path';
-import { defineConfig } from 'vite';
+import { defineConfig, type IndexHtmlTransformResult, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
@@ -17,9 +17,61 @@ const APP_BASE = (() => {
   return base;
 })();
 
+/**
+ * /chat 是默认落地页，但 ChatPage 走 React.lazy：没有这些标签时，它的分片
+ * （含静态依赖 MarkdownRenderer，两者约占聊天首屏 JS 的 93%）要等入口 JS
+ * 下载并执行、AuthGuard 放行之后才开始下载。预加载让它们与入口并行到达。
+ */
+function preloadChatChunks(): Plugin {
+  return {
+    name: 'happyclaw:preload-chat-chunks',
+    transformIndexHtml: {
+      order: 'post',
+      handler(html, ctx): IndexHtmlTransformResult {
+        if (!ctx.bundle) return html;
+        const tags: Extract<
+          IndexHtmlTransformResult,
+          { tags: unknown[] }
+        >['tags'] = [];
+        for (const [fileName, output] of Object.entries(ctx.bundle)) {
+          if (
+            output.type === 'chunk' &&
+            (output.name === 'ChatPage' || output.name === 'MarkdownRenderer')
+          ) {
+            tags.push({
+              tag: 'link',
+              attrs: {
+                rel: 'modulepreload',
+                crossorigin: true,
+                href: `${APP_BASE}${fileName}`,
+              },
+              injectTo: 'head',
+            });
+          } else if (
+            output.type === 'asset' &&
+            /^assets\/MarkdownRenderer-.*\.css$/.test(fileName)
+          ) {
+            tags.push({
+              tag: 'link',
+              attrs: {
+                rel: 'preload',
+                as: 'style',
+                crossorigin: true,
+                href: `${APP_BASE}${fileName}`,
+              },
+              injectTo: 'head',
+            });
+          }
+        }
+        return { html, tags };
+      },
+    },
+  };
+}
+
 export default defineConfig({
   base: APP_BASE,
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), preloadChatChunks()],
   server: {
     port: 5173,
     host: '0.0.0.0',

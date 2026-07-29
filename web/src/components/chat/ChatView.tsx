@@ -89,6 +89,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const { mode: displayMode, toggle: toggleDisplayMode } = useDisplayMode();
   const { theme, toggle: toggleTheme } = useTheme();
   const [panelOpen, setPanelOpen] = useState(false);
+  const [panelEverOpened, setPanelEverOpened] = useState(false);
+  useEffect(() => {
+    if (panelOpen) setPanelEverOpened(true);
+  }, [panelOpen]);
   const [mobileContextOpen, setMobileContextOpen] = useState(false);
   const [contextPanelView, setContextPanelView] = useState<'files' | 'env'>(
     'files',
@@ -1187,7 +1191,11 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         aria-hidden={!panelOpen}
         inert={!panelOpen}
       >
-        <div className="h-full w-80 shrink-0">{renderContextPanel()}</div>
+        {/* 首次打开前不挂载：面板默认关闭，w-0+inert 只是视觉隐藏，此前
+            FilePanel 首屏就会发 /files 请求。打开过之后保持挂载以保留收起动画。 */}
+        <div className="h-full w-80 shrink-0">
+          {panelEverOpened && renderContextPanel()}
+        </div>
       </aside>
 
       {mobileSessionsVisible && (

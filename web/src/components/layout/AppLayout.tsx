@@ -5,6 +5,7 @@ import { BottomTabBar } from './BottomTabBar';
 import { ConnectionBanner } from '../common/ConnectionBanner';
 import { wsManager } from '../../api/ws';
 import { useTheme } from '../../hooks/useTheme';
+import { useMediaQuery } from '../../hooks/useMediaQuery';
 import { useRouteRestore } from '../../hooks/useRouteRestore';
 import { useBillingStore } from '../../stores/billing';
 import { useGroupsStore } from '../../stores/groups';
@@ -14,6 +15,7 @@ import { ErrorBoundary } from '../common/ErrorBoundary';
 
 export function AppLayout() {
   const location = useLocation();
+  const isDesktop = useMediaQuery('(min-width: 1024px)');
   const isChatRoute = location.pathname.startsWith('/chat');
   const hideMobileTabBar = /^\/chat\/.+/.test(location.pathname);
   useTheme(); // 应用并同步持久化的主题偏好
@@ -151,12 +153,17 @@ export function AppLayout() {
 
   return (
     <div className="h-screen supports-[height:100dvh]:h-dvh flex flex-col lg:flex-row overflow-hidden safe-area-top">
-      <div className="hidden lg:block h-full flex-shrink-0">
-        <UnifiedSidebar
-          collapsed={sidebarCollapsed}
-          onToggleCollapse={() => setUserCollapsed((prev) => !prev)}
-        />
-      </div>
+      {/* `hidden lg:block` 只是视觉隐藏，移动端此前仍会挂载整棵侧边栏
+          （含每个工作区一个 DropdownMenu/Tooltip）并触发数据加载；
+          条件挂载让手机只渲染真正可见的那份列表。 */}
+      {isDesktop && (
+        <div className="hidden lg:block h-full flex-shrink-0">
+          <UnifiedSidebar
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={() => setUserCollapsed((prev) => !prev)}
+          />
+        </div>
+      )}
 
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
         <ConnectionBanner />

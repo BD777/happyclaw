@@ -79,8 +79,13 @@ export function UnifiedSidebar({
     handleClearConfirm,
   } = useClearWorkspace();
 
-  const { groups, currentGroup, selectGroup, loadGroups, loading, togglePin } =
-    useChatStore();
+  // 窄 selector：整 store 订阅会让侧边栏跟着流式输出每帧重渲染。
+  const groups = useChatStore((s) => s.groups);
+  const currentGroup = useChatStore((s) => s.currentGroup);
+  const selectGroup = useChatStore((s) => s.selectGroup);
+  const loadGroups = useChatStore((s) => s.loadGroups);
+  const loading = useChatStore((s) => s.loading);
+  const togglePin = useChatStore((s) => s.togglePin);
   const runnerStates = useGroupsStore((s) => s.runnerStates);
   const {
     deleteState,

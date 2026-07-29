@@ -91,17 +91,32 @@ async function getHostClaudeCodeVersion(): Promise<string | null> {
   }
 }
 
+// /api/status 由前端 10 秒轮询；每次请求都 fork 一个 docker CLI 子进程
+// （冷启 50-200ms、生产实测 33-90ms）纯属浪费。镜像 ID 30 秒内视为不变。
+const DOCKER_IMAGE_ID_TTL_MS = 30_000;
+let cachedDockerImageId: { id: string | null; fetchedAt: number } | null = null;
+
 async function getDockerImageId(): Promise<string | null> {
+  const now = Date.now();
+  if (
+    cachedDockerImageId &&
+    now - cachedDockerImageId.fetchedAt < DOCKER_IMAGE_ID_TTL_MS
+  ) {
+    return cachedDockerImageId.id;
+  }
+  let id: string | null = null;
   try {
     const { stdout } = await execFileAsync(
       'docker',
       ['images', CONTAINER_IMAGE, '--format', '{{.ID}}'],
-      { timeout: 5000 },
+      { timeout: 10000 },
     );
-    return stdout.trim() || null;
+    id = stdout.trim() || null;
   } catch {
-    return null;
+    id = null;
   }
+  cachedDockerImageId = { id, fetchedAt: now };
+  return id;
 }
 
 /** Get container Claude Code version from Docker image */
@@ -226,16 +241,7 @@ monitorRoutes.get('/health', async (c) => {
 async function checkDockerImageExists(): Promise<boolean> {
   // Skip Docker check entirely when no groups use container mode
   if (!hasContainerModeGroups()) return false;
-  try {
-    const { stdout } = await execFileAsync(
-      'docker',
-      ['images', CONTAINER_IMAGE, '--format', '{{.ID}}'],
-      { timeout: 10000 },
-    );
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
+  return Boolean(await getDockerImageId());
 }
 
 // GET /api/status - 获取系统状态

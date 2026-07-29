@@ -128,8 +128,14 @@ export function MessageInput({
   const groupJidRef = useRef(groupJid);
   groupJidRef.current = groupJid;
 
-  const { uploadFiles, uploading, uploadProgress } = useFileStore();
-  const { drafts, saveDraft, clearDraft } = useChatStore();
+  // 窄 selector：这是 1200+ 行常驻组件，无 selector 的整 store 订阅会让它在
+  // 流式输出的每一帧（rAF 级 set()）都重渲染一次。actions 引用稳定。
+  const uploadFiles = useFileStore((s) => s.uploadFiles);
+  const uploading = useFileStore((s) => s.uploading);
+  const uploadProgress = useFileStore((s) => s.uploadProgress);
+  const drafts = useChatStore((s) => s.drafts);
+  const saveDraft = useChatStore((s) => s.saveDraft);
+  const clearDraft = useChatStore((s) => s.clearDraft);
   const { mode: displayMode } = useDisplayMode();
   const isCompact = displayMode === 'compact';
   const isMobile = useMediaQuery('(max-width: 1023px)');

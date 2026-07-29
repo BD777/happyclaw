@@ -43,6 +43,7 @@ import {
   storeMessageDirect,
   getMessagesPage,
   getMessagesAfter,
+  getLatestMessagePreviewPerChat,
   getMessagesPageMulti,
   getMessagesAfterMulti,
   getAgent,
@@ -61,7 +62,7 @@ import {
   assignWorkspaceAgentProfile,
   deleteWorkspaceAgentProfile,
   getAgentProfileForUser,
-  getAgentProfileForWorkspace,
+  peekAgentProfileForWorkspace,
   getOrCreateDefaultAgentProfile,
   getWorkspaceAgentProfileId,
   getWorkspaceInteractionMode,
@@ -339,25 +340,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     visibleEntries.push([jid, group]);
   }
 
-  // 批量获取每个 jid 的最新消息（替代 N+1 逐个查询）
+  // 每个 jid 各取最新一条（分区窗口，不再被高频群吃光全局窗口）
   const visibleJids = visibleEntries.map(([jid]) => jid);
-  const latestByJid = new Map<string, { content: string; timestamp: string }>();
-  if (visibleJids.length > 0) {
-    // 用 multi 查询获取足够多的消息来覆盖所有 jid
-    const allLatest = getMessagesPageMulti(
-      visibleJids,
-      undefined,
-      visibleJids.length * 3,
-    );
-    for (const msg of allLatest) {
-      if (!latestByJid.has(msg.chat_jid)) {
-        latestByJid.set(msg.chat_jid, {
-          content: msg.content,
-          timestamp: msg.timestamp,
-        });
-      }
-    }
-  }
+  const latestByJid = getLatestMessagePreviewPerChat(visibleJids);
 
   // Fetch user's pinned groups
   const pins = getUserPinnedGroups(user.id);
@@ -367,8 +352,10 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     const isWeb = jid.startsWith('web:');
 
     const latest = latestByJid.get(jid);
+    // 只读投影：列表 GET 不允许因为某个工作区绑定缺失而顺手开写事务修复
+    // （那属于启动 backfill 和运行时解析的职责）。
     const agentProfile = isWeb
-      ? getAgentProfileForWorkspace(group.folder, group.created_by)
+      ? peekAgentProfileForWorkspace(group.folder, group.created_by)
       : undefined;
 
     result[jid] = {

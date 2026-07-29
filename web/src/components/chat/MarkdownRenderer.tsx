@@ -255,28 +255,41 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   // singleDollarTextMath: false — disables `$...$` inline math so dollar-sign
   // amounts ($113, $5.51) in everyday text aren't parsed as LaTeX. Block math
   // ($$...$$) still works for the rare case real formulas are needed.
+  //
+  // 按内容启用重型插件：完整管线实测 ~18ms/条，首屏要一次性渲染十几条历史
+  // 消息。绝大多数消息既没有公式也没有代码块，检测两个廉价子串就能把 KaTeX
+  // 和 highlight 从这些消息的渲染路径上拿掉，且无视觉差异。安全相关的
+  // rehypeRaw + rehypeSanitize 永远保留。
+  const hasMath = content.includes('$$');
+  const hasCodeFence = content.includes('```') || content.includes('~~~');
   const remarkPluginsList = useMemo(
     () =>
-      streaming
+      streaming || !hasMath
         ? [remarkGfm, remarkBreaks]
         : [
             remarkGfm,
             remarkBreaks,
             [remarkMath, { singleDollarTextMath: false }] as const,
           ],
-    [streaming],
+    [streaming, hasMath],
   );
   const rehypePluginsList = useMemo(
     () =>
       streaming
-        ? [[rehypeHighlight, { plainText: ['mermaid'] }] as const]
+        ? hasCodeFence
+          ? [[rehypeHighlight, { plainText: ['mermaid'] }] as const]
+          : []
         : [
             rehypeRaw,
-            [rehypeHighlight, { plainText: ['mermaid'] }] as const,
-            [rehypeKatex, { throwOnError: false, strict: false }] as const,
+            ...(hasCodeFence
+              ? [[rehypeHighlight, { plainText: ['mermaid'] }] as const]
+              : []),
+            ...(hasMath
+              ? [[rehypeKatex, { throwOnError: false, strict: false }] as const]
+              : []),
             [rehypeSanitize, sanitizeSchema] as const,
           ],
-    [streaming],
+    [streaming, hasCodeFence, hasMath],
   );
 
   return (

@@ -198,5 +198,52 @@ describe('Claude Code Workflow session projection', () => {
         },
       },
     });
+
+    // Incremental follow-up: an active session keeps appending to the same
+    // transcript. A half-written line must stay invisible until completed,
+    // then the next pass parses only the appended bytes.
+    const transcript = path.join(workflowDir, '..', '..', `${sessionId}.jsonl`);
+    const turn2User = JSON.stringify({
+      type: 'user',
+      uuid: 'user-turn-2',
+      message: { content: '<messages><message>继续</message></messages>' },
+    });
+    const turn2Assistant = JSON.stringify({
+      type: 'assistant',
+      uuid: 'final-sdk-2',
+      message: {
+        id: 'assistant-api-call-2',
+        model: 'glm-5.2',
+        usage: { input_tokens: 7, output_tokens: 5 },
+        content: [{ type: 'text', text: '第二轮' }],
+      },
+    });
+    const half = turn2Assistant.slice(0, 40);
+    fs.appendFileSync(transcript, `\n${turn2User}\n${half}`);
+    const followUpMessage = () => ({
+      id: 'final-2',
+      timestamp: '2026-07-21T06:59:38.000Z',
+      session_id: sessionId,
+      sdk_message_uuid: 'final-sdk-2',
+      is_from_me: true,
+      token_usage: JSON.stringify({ inputTokens: 0, outputTokens: 0 }),
+    });
+    const midWrite = attachSessionWorkflowRuns([followUpMessage()], {
+      groupFolder: group,
+      agentId: null,
+    });
+    expect(JSON.parse(midWrite[0].token_usage ?? '{}').inputTokens ?? 0).toBe(
+      0,
+    );
+
+    fs.appendFileSync(transcript, turn2Assistant.slice(40));
+    const completed = attachSessionWorkflowRuns([followUpMessage()], {
+      groupFolder: group,
+      agentId: null,
+    });
+    expect(JSON.parse(completed[0].token_usage ?? '{}')).toMatchObject({
+      inputTokens: 7,
+      outputTokens: 5,
+    });
   });
 });

@@ -42,10 +42,23 @@ interface SessionAssistantUsage {
   >;
 }
 
-const assistantUsageCache = new Map<
-  string,
-  { signature: string; bySdkUuid: Map<string, SessionAssistantUsage> }
->();
+/** Incremental transcript parse state; see loadSessionAssistantUsage. */
+interface TranscriptParseState {
+  path: string;
+  /** Bytes already parsed into complete lines. */
+  consumed: number;
+  /** Raw bytes of a trailing partial line (mid-write or split UTF-8). */
+  leftover: Buffer;
+  turn: number;
+  turnBySdkUuid: Map<string, number>;
+  entriesByTurn: Map<
+    number,
+    Map<string, { model: string; usage: SessionAssistantUsage }>
+  >;
+  bySdkUuid: Map<string, SessionAssistantUsage>;
+}
+
+const assistantUsageCache = new Map<string, TranscriptParseState>();
 
 function finite(value: unknown): number | undefined {
   const numeric = Number(value);
@@ -227,6 +240,14 @@ function usageTotal(usage: SessionAssistantUsage): number {
  * Recover assistant usage from the SDK transcript for old ledger rows written
  * by providers that exposed live usage in camelCase. The SDK transcript is the
  * durable authority and serializes the final counters in snake_case.
+ *
+ * Transcripts are append-only JSONL that keep growing while a session runs, so
+ * the whole-file signature cache missed on every request of an active session
+ * (measured 2.4MB reparsed per message-list request, on a 2s poll). The parse
+ * state is therefore kept per session and only bytes appended since the last
+ * pass are read; a shrunk file (rotation) resets the state. A partial trailing
+ * line is buffered as raw bytes so mid-write reads and multi-byte UTF-8 at the
+ * chunk boundary stay intact.
  */
 function loadSessionAssistantUsage(input: {
   groupFolder: string;
@@ -239,72 +260,143 @@ function loadSessionAssistantUsage(input: {
   if (!transcript) return new Map();
   const stat = fs.statSync(transcript);
   if (!stat.isFile() || stat.size > 64 * 1024 * 1024) return new Map();
-  const signature = `${transcript}:${stat.mtimeMs}:${stat.size}`;
   const cacheKey = `${input.groupFolder}:${input.agentId ?? 'main'}:${input.sessionId}`;
-  const cached = assistantUsageCache.get(cacheKey);
-  if (cached?.signature === signature) return cached.bySdkUuid;
-
-  let turn = 0;
-  const turnBySdkUuid = new Map<string, number>();
-  const entriesByTurn = new Map<
-    number,
-    Map<string, { model: string; usage: SessionAssistantUsage }>
-  >();
-  for (const line of fs.readFileSync(transcript, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    let raw: Record<string, unknown>;
-    try {
-      raw = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    const message = raw.message as Record<string, unknown> | undefined;
-    if (
-      raw.type === 'user' &&
-      typeof message?.content === 'string' &&
-      /<messages(?:\s|>)/u.test(message.content)
-    ) {
-      turn += 1;
-      continue;
-    }
-    if (raw.type !== 'assistant' || !message || turn === 0) continue;
-    const sdkUuid = text(raw.uuid);
-    const messageId = text(message.id);
-    const rawUsage = message.usage as Record<string, unknown> | undefined;
-    if (!sdkUuid || !messageId || !rawUsage) continue;
-    turnBySdkUuid.set(sdkUuid, turn);
-    const snapshot: SessionAssistantUsage = {
-      inputTokens: usageValue(rawUsage, 'input_tokens', 'inputTokens'),
-      outputTokens: usageValue(rawUsage, 'output_tokens', 'outputTokens'),
-      cacheReadInputTokens: usageValue(
-        rawUsage,
-        'cache_read_input_tokens',
-        'cacheReadInputTokens',
-      ),
-      cacheCreationInputTokens: usageValue(
-        rawUsage,
-        'cache_creation_input_tokens',
-        'cacheCreationInputTokens',
-      ),
-      reasoningTokens: Math.max(
-        usageValue(
-          rawUsage,
-          'reasoning_output_tokens',
-          'reasoningOutputTokens',
-        ),
-        finite(rawUsage.reasoningTokens) ?? 0,
-      ),
-      modelUsage: {},
+  let state = assistantUsageCache.get(cacheKey);
+  if (
+    !state ||
+    state.path !== transcript ||
+    stat.size < state.consumed + state.leftover.length
+  ) {
+    state = {
+      path: transcript,
+      consumed: 0,
+      leftover: Buffer.alloc(0),
+      turn: 0,
+      turnBySdkUuid: new Map(),
+      entriesByTurn: new Map(),
+      bySdkUuid: new Map(),
     };
-    const model = text(message.model) ?? 'unknown';
-    const entries = entriesByTurn.get(turn) ?? new Map();
-    const previous = entries.get(messageId);
-    if (!previous || usageTotal(snapshot) > usageTotal(previous.usage)) {
-      entries.set(messageId, { model, usage: snapshot });
-    }
-    entriesByTurn.set(turn, entries);
+    assistantUsageCache.set(cacheKey, state);
   }
+  const alreadyExamined = state.consumed + state.leftover.length;
+  if (stat.size === alreadyExamined) return state.bySdkUuid;
 
+  const appended = Buffer.allocUnsafe(stat.size - alreadyExamined);
+  const fd = fs.openSync(transcript, 'r');
+  let appendedLength = 0;
+  try {
+    while (appendedLength < appended.length) {
+      const read = fs.readSync(
+        fd,
+        appended,
+        appendedLength,
+        appended.length - appendedLength,
+        alreadyExamined + appendedLength,
+      );
+      if (read <= 0) break;
+      appendedLength += read;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  const combined = Buffer.concat([
+    state.leftover,
+    appended.subarray(0, appendedLength),
+  ]);
+  const lastNewline = combined.lastIndexOf(0x0a);
+  const parseable =
+    lastNewline >= 0
+      ? combined.subarray(0, lastNewline + 1).toString('utf8')
+      : '';
+  state.leftover = Buffer.from(combined.subarray(lastNewline + 1));
+  // 不变量：consumed + leftover.length === 已从文件检视的总字节数
+  state.consumed = alreadyExamined + appendedLength - state.leftover.length;
+
+  let mutated = false;
+  for (const line of parseable.split('\n')) {
+    consumeTranscriptLine(state, line);
+    mutated = true;
+  }
+  // 无终止换行的尾行：只有当它已是完整 JSON 时才提交（写到一半的行会解析
+  // 失败并留在缓冲区，等下一轮追加补齐）。
+  if (state.leftover.length > 0) {
+    const tail = state.leftover.toString('utf8');
+    try {
+      JSON.parse(tail);
+      consumeTranscriptLine(state, tail);
+      state.consumed += state.leftover.length;
+      state.leftover = Buffer.alloc(0);
+      mutated = true;
+    } catch {
+      /* 残行未写完，保留待续 */
+    }
+  }
+  if (mutated) state.bySdkUuid = aggregateAssistantUsage(state);
+  return state.bySdkUuid;
+}
+
+function consumeTranscriptLine(
+  state: TranscriptParseState,
+  line: string,
+): void {
+  if (!line.trim()) return;
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  const message = raw.message as Record<string, unknown> | undefined;
+  if (
+    raw.type === 'user' &&
+    typeof message?.content === 'string' &&
+    /<messages(?:\s|>)/u.test(message.content)
+  ) {
+    state.turn += 1;
+    return;
+  }
+  if (raw.type !== 'assistant' || !message || state.turn === 0) return;
+  const turn = state.turn;
+  const { turnBySdkUuid, entriesByTurn } = state;
+  const sdkUuid = text(raw.uuid);
+  const messageId = text(message.id);
+  const rawUsage = message.usage as Record<string, unknown> | undefined;
+  if (!sdkUuid || !messageId || !rawUsage) return;
+  turnBySdkUuid.set(sdkUuid, turn);
+  const snapshot: SessionAssistantUsage = {
+    inputTokens: usageValue(rawUsage, 'input_tokens', 'inputTokens'),
+    outputTokens: usageValue(rawUsage, 'output_tokens', 'outputTokens'),
+    cacheReadInputTokens: usageValue(
+      rawUsage,
+      'cache_read_input_tokens',
+      'cacheReadInputTokens',
+    ),
+    cacheCreationInputTokens: usageValue(
+      rawUsage,
+      'cache_creation_input_tokens',
+      'cacheCreationInputTokens',
+    ),
+    reasoningTokens: Math.max(
+      usageValue(rawUsage, 'reasoning_output_tokens', 'reasoningOutputTokens'),
+      finite(rawUsage.reasoningTokens) ?? 0,
+    ),
+    modelUsage: {},
+  };
+  const model = text(message.model) ?? 'unknown';
+  const entries =
+    entriesByTurn.get(turn) ??
+    new Map<string, { model: string; usage: SessionAssistantUsage }>();
+  const previous = entries.get(messageId);
+  if (!previous || usageTotal(snapshot) > usageTotal(previous.usage)) {
+    entries.set(messageId, { model, usage: snapshot });
+  }
+  entriesByTurn.set(turn, entries);
+}
+
+function aggregateAssistantUsage(
+  state: TranscriptParseState,
+): Map<string, SessionAssistantUsage> {
+  const { turnBySdkUuid, entriesByTurn } = state;
   const aggregateByTurn = new Map<number, SessionAssistantUsage>();
   for (const [turnId, entries] of entriesByTurn) {
     const aggregate = emptyAssistantUsage();
@@ -338,7 +430,6 @@ function loadSessionAssistantUsage(input: {
       bySdkUuid.set(sdkUuid, aggregate);
     }
   }
-  assistantUsageCache.set(cacheKey, { signature, bySdkUuid });
   return bySdkUuid;
 }
 

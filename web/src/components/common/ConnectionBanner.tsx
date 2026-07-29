@@ -1,6 +1,9 @@
 import { useEffect, useRef } from 'react';
 import { toast } from 'sonner';
-import { useConnectionStatus, type ConnectionStatus } from '../../hooks/useConnectionStatus';
+import {
+  useConnectionStatus,
+  type ConnectionStatus,
+} from '../../hooks/useConnectionStatus';
 
 /**
  * ConnectionBanner — now toast-based, renders no DOM.
@@ -10,6 +13,9 @@ export function ConnectionBanner() {
   const status = useConnectionStatus();
   const prevStatus = useRef<ConnectionStatus>(status);
   const offlineToastId = useRef<string | number | undefined>(undefined);
+  // 冷启动时 WS 从「未连接」直达「已连接」，从未真正断开过；
+  // 只有真实断线重连（曾经 connected）才提示恢复。
+  const hasConnectedOnce = useRef(false);
 
   useEffect(() => {
     const prev = prevStatus.current;
@@ -18,17 +24,27 @@ export function ConnectionBanner() {
     if (status === 'offline' && prev !== 'offline') {
       // Dismiss any existing toast first
       if (offlineToastId.current) toast.dismiss(offlineToastId.current);
-      offlineToastId.current = toast.error('网络已断开', { duration: Infinity });
+      offlineToastId.current = toast.error('网络已断开', {
+        duration: Infinity,
+      });
     } else if (status === 'reconnecting' && prev !== 'reconnecting') {
       if (offlineToastId.current) toast.dismiss(offlineToastId.current);
-      offlineToastId.current = toast.loading('连接中断，正在重连...', { duration: Infinity });
-    } else if (status === 'connected' && (prev === 'offline' || prev === 'reconnecting')) {
+      offlineToastId.current = toast.loading('连接中断，正在重连...', {
+        duration: Infinity,
+      });
+    } else if (
+      status === 'connected' &&
+      (prev === 'offline' || prev === 'reconnecting')
+    ) {
       if (offlineToastId.current) {
         toast.dismiss(offlineToastId.current);
         offlineToastId.current = undefined;
       }
-      toast.success('已恢复连接', { duration: 2000 });
+      if (hasConnectedOnce.current) {
+        toast.success('已恢复连接', { duration: 2000 });
+      }
     }
+    if (status === 'connected') hasConnectedOnce.current = true;
 
     return () => {
       if (offlineToastId.current) {

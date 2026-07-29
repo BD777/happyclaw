@@ -25,7 +25,7 @@ import {
   updateAgentInfo,
   updateAgentContextInfo,
   updateChatName,
-  getMessagesPageMulti,
+  getLatestMessagePreviewPerChat,
   listImContextBindingsByAgent,
   listChannelMountsBySession,
   getChannelAccount,
@@ -298,23 +298,7 @@ router.get('/:jid/agents', authMiddleware, async (c) => {
   const virtualChatJids = agents
     .filter((a) => a.kind === 'conversation')
     .map((a) => `${jid}#agent:${a.id}`);
-  const latestMessages = getMessagesPageMulti(
-    virtualChatJids,
-    undefined,
-    Math.max(virtualChatJids.length * 2, 50),
-  );
-  const latestByChatJid = new Map<
-    string,
-    { content: string; timestamp: string }
-  >();
-  for (const msg of latestMessages) {
-    if (!latestByChatJid.has(msg.chat_jid)) {
-      latestByChatJid.set(msg.chat_jid, {
-        content: msg.content,
-        timestamp: msg.timestamp,
-      });
-    }
-  }
+  const latestByChatJid = getLatestMessagePreviewPerChat(virtualChatJids);
   return c.json({
     agents: agents.map((a) => {
       const base = {
@@ -369,23 +353,7 @@ router.get('/:jid/sessions', authMiddleware, async (c) => {
 
   const agents = listAgentsByJid(jid).filter((a) => a.kind === 'conversation');
   const virtualChatJids = agents.map((a) => `${jid}#agent:${a.id}`);
-  const latestMessages = getMessagesPageMulti(
-    virtualChatJids,
-    undefined,
-    Math.max(virtualChatJids.length * 2, 50),
-  );
-  const latestByChatJid = new Map<
-    string,
-    { content: string; timestamp: string }
-  >();
-  for (const msg of latestMessages) {
-    if (!latestByChatJid.has(msg.chat_jid)) {
-      latestByChatJid.set(msg.chat_jid, {
-        content: msg.content,
-        timestamp: msg.timestamp,
-      });
-    }
-  }
+  const latestByChatJid = getLatestMessagePreviewPerChat(virtualChatJids);
 
   return c.json({
     sessions: [

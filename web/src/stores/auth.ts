@@ -181,6 +181,45 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
     checkAuthInFlight = (async () => {
       set({ checking: true });
+      // index.html 在 HTML 解析阶段预发了 /api/auth/me（见 web/index.html），
+      // 这里一次性消费，省掉「入口 JS 执行完才发认证请求」的整跳串行。
+      // 任何异常都静默回落到下面的常规重试流程。
+      const prewarm = (window as { __authPrewarm?: Promise<Response | null> })
+        .__authPrewarm;
+      if (prewarm) {
+        (window as { __authPrewarm?: unknown }).__authPrewarm = undefined;
+        try {
+          const res = await prewarm;
+          if (res?.ok) {
+            const data = (await res.json()) as {
+              user: UserPublic;
+              setupStatus?: SetupStatus;
+              appearance?: AppearanceConfig;
+            };
+            set({
+              authenticated: true,
+              user: data.user,
+              setupStatus: data.setupStatus ?? null,
+              appearance: data.appearance ?? null,
+              initialized: true,
+              checking: false,
+            });
+            return;
+          }
+          if (res?.status === 401) {
+            await get().checkStatus();
+            set({
+              authenticated: false,
+              user: null,
+              setupStatus: null,
+              checking: false,
+            });
+            return;
+          }
+        } catch {
+          /* fall through to the regular retry flow */
+        }
+      }
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const data = await api.get<{

@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { Hono } from 'hono';
 import { compress } from 'hono/compress';
 import { cors } from 'hono/cors';
@@ -1246,15 +1248,84 @@ async function handleAgentConversationMessage(
 
 // --- Static Files ---
 
+// @hono/node-server 的 serveStatic 不支持条件请求：带 If-None-Match /
+// If-Modified-Since 也永远返回 200 全量。中间反代若把响应降级为 no-cache
+// （曾在生产实测发生），每次打开就要重下整个前端。这里按文件 stat 生成弱
+// ETag，命中即 304 空体，作为缓存链路的兜底。
+const STATIC_DIST_ROOT = path.resolve('./web/dist');
+function conditionalStatic() {
+  return async (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+    next: () => Promise<void>,
+  ) => {
+    const relPath = decodeURIComponent(c.req.path);
+    const filePath = path.resolve(path.join(STATIC_DIST_ROOT, relPath));
+    // 防路径穿越：解析后必须仍在 dist 根内
+    if (
+      filePath.startsWith(STATIC_DIST_ROOT + path.sep) &&
+      (c.req.method === 'GET' || c.req.method === 'HEAD')
+    ) {
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.isFile()) {
+          const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+          const ifNoneMatch = c.req.header('if-none-match');
+          const ifModifiedSince = c.req.header('if-modified-since');
+          const notModified = ifNoneMatch
+            ? ifNoneMatch === etag
+            : ifModifiedSince
+              ? stat.mtimeMs <= new Date(ifModifiedSince).getTime() + 999
+              : false;
+          if (notModified) {
+            return c.body(null, 304, { ETag: etag });
+          }
+          await next();
+          if (c.res.status === 200) c.res.headers.set('ETag', etag);
+          return;
+        }
+      } catch {
+        /* 不存在或不可读：交给 serveStatic 走正常 404 路径 */
+      }
+    }
+    await next();
+  };
+}
+
 // 带 content hash 的静态资源：长期不可变缓存
 app.use(
   '/assets/*',
   async (c, next) => {
     await next();
-    if (c.res.status === 200) {
+    if (c.res.status === 200 || c.res.status === 304) {
       c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
     }
   },
+  conditionalStatic(),
+  serveStatic({ root: './web/dist' }),
+);
+
+// 字体（16.2MB 中文字体族）与图标：内容事实上不可变（变更时改文件名），
+// 缺缓存头曾导致每次打开全量重下。
+app.use(
+  '/fonts/*',
+  async (c, next) => {
+    await next();
+    if (c.res.status === 200 || c.res.status === 304) {
+      c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  },
+  conditionalStatic(),
+  serveStatic({ root: './web/dist' }),
+);
+app.use(
+  '/icons/*',
+  async (c, next) => {
+    await next();
+    if (c.res.status === 200 || c.res.status === 304) {
+      c.res.headers.set('Cache-Control', 'public, max-age=2592000');
+    }
+  },
+  conditionalStatic(),
   serveStatic({ root: './web/dist' }),
 );
 

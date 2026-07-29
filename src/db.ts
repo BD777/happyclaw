@@ -8103,6 +8103,45 @@ export function countWorkspaceAgentProfileMappings(profileId: string): number {
   return row.count;
 }
 
+/**
+ * Read-only projection of getAgentProfileForWorkspace for list/GET endpoints.
+ * The full resolver self-heals (materializes a default profile, repairs the
+ * workspace binding) inside write transactions — correct for runtime paths,
+ * but a GET such as /api/groups must never open a write transaction as a side
+ * effect of listing. Startup backfill and runtime resolution keep ownership
+ * of the repairs; this variant only reports current state.
+ */
+export function peekAgentProfileForWorkspace(
+  groupFolder: string,
+  ownerUserId?: string | null,
+): AgentProfile | undefined {
+  const readDefaultProfile = (userId: string): AgentProfile | undefined => {
+    const row = db
+      .prepare(
+        "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND is_default = 1 AND status = 'active' LIMIT 1",
+      )
+      .get(userId) as Record<string, unknown> | undefined;
+    return row ? mapAgentProfileRow(row) : undefined;
+  };
+  const home = db
+    .prepare(
+      `SELECT created_by
+       FROM registered_groups
+       WHERE folder = ? AND jid LIKE 'web:%' AND is_home = 1
+       ORDER BY added_at ASC
+       LIMIT 1`,
+    )
+    .get(groupFolder) as { created_by: string | null } | undefined;
+  if (home?.created_by) return readDefaultProfile(home.created_by);
+  const mappedId = getWorkspaceAgentProfileId(groupFolder);
+  if (mappedId) {
+    const mapped = getAgentProfile(mappedId);
+    if (mapped?.status === 'active') return mapped;
+  }
+  if (!ownerUserId) return undefined;
+  return readDefaultProfile(ownerUserId);
+}
+
 export function getAgentProfileForWorkspace(
   groupFolder: string,
   ownerUserId?: string | null,
@@ -10179,6 +10218,45 @@ export function getMessagesAfter(
 /**
  * 多 JID 分页查询（用于主容器合并 web:main + feishu:xxx 消息）。
  */
+/**
+ * Latest-message preview per chat. Callers previously shared one global
+ * top-N window over all requested chats, which a single busy chat exhausts —
+ * 13 of 18 production workspaces silently lost their sidebar preview.
+ * Partitioning by chat fixes that, and previews deliberately skip the
+ * attachments column: it is irrelevant for a preview yet dominated row bytes
+ * in production (single rows up to 6.4MB of embedded attachment JSON).
+ */
+export function getLatestMessagePreviewPerChat(
+  chatJids: string[],
+): Map<string, { content: string; timestamp: string }> {
+  const result = new Map<string, { content: string; timestamp: string }>();
+  if (chatJids.length === 0) return result;
+  const placeholders = chatJids.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT chat_jid, content, timestamp FROM (
+         SELECT chat_jid, content, timestamp,
+                ROW_NUMBER() OVER (
+                  PARTITION BY chat_jid ORDER BY timestamp DESC, id DESC
+                ) AS rn
+         FROM messages
+         WHERE chat_jid IN (${placeholders})
+       ) WHERE rn = 1`,
+    )
+    .all(...chatJids) as Array<{
+    chat_jid: string;
+    content: unknown;
+    timestamp: string;
+  }>;
+  for (const row of rows) {
+    result.set(row.chat_jid, {
+      content: toUtf8String(row.content),
+      timestamp: row.timestamp,
+    });
+  }
+  return result;
+}
+
 export function getMessagesPageMulti(
   chatJids: string[],
   before?: string,
