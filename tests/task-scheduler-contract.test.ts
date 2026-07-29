@@ -404,6 +404,25 @@ describe('scheduled task workspace/session contract', () => {
     expect(db.getAllChats().some((chat) => chat.jid === virtualChatJid)).toBe(
       false,
     );
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringMatching(
+        /## ✅ 定时任务执行完成[\s\S]*\*\*运行 ID\*\*[\s\S]*task result/,
+      ),
+      expect.objectContaining({
+        sourceKind: 'scheduled_task_result',
+        messageId: `scheduled-task-result:${result.runId}`,
+        workspaceFolder: GROUP_FOLDER,
+      }),
+    );
+    expect(db.getMessagesPage(GROUP_JID)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: expect.stringContaining('task result'),
+          is_from_me: true,
+        }),
+      ]),
+    );
     expect(
       fs.existsSync(
         path.join(tmpDir, 'ipc', GROUP_FOLDER, 'tasks-run', input.taskRunId),

@@ -464,6 +464,7 @@ export type MessageSourceKind =
   | 'compact_partial'
   | 'user_command'
   | 'scheduled_task_prompt'
+  | 'scheduled_task_result'
   | 'legacy'
   | 'auto_continue'
   | 'truncation_continue';

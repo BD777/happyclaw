@@ -20117,6 +20117,7 @@ async function main(): Promise<void> {
     storeResultAndNotify: async (chatJid, text, options) => {
       if (!options.skipStore) {
         await sendMessage(chatJid, text, {
+          messageId: options.messageId,
           sendToIM: false,
           source: 'scheduled_task',
           messageMeta: {

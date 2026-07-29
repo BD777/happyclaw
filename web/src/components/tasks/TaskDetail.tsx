@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Check, Pencil, RefreshCw, X } from 'lucide-react';
+import { Check, Eye, Pencil, RefreshCw, X } from 'lucide-react';
 import { ScheduledTask, TaskRunLog, useTasksStore } from '../../stores/tasks';
 import type { ApiError } from '../../api/client';
 import { showToast } from '../../utils/toast';
@@ -25,6 +25,14 @@ import {
   CHANNEL_LABEL,
   formatGroupLabel,
 } from '../settings/channel-meta';
+import { MarkdownRenderer } from '../chat/MarkdownRenderer';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '../ui/dialog';
 
 interface TaskDetailProps {
   task: ScheduledTask;
@@ -140,6 +148,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
   const loadGroups = useGroupsStore((state) => state.loadGroups);
   const taskLogs = logs[task.id] || [];
   const [logsLoading, setLogsLoading] = useState(false);
+  const [selectedLog, setSelectedLog] = useState<TaskRunLog | null>(null);
 
   useEffect(() => {
     loadLogs(task.id);
@@ -873,16 +882,23 @@ export function TaskDetail({ task }: TaskDetailProps) {
                         log.notification_status || 'skipped'
                       ] || log.notification_status}
                     </td>
-                    <td
-                      className="px-4 py-2.5 text-foreground truncate max-w-xs"
-                      title={log.error || log.result || ''}
-                    >
-                      {log.error ? (
-                        <span className="text-red-600 dark:text-red-400">
-                          {log.error.slice(0, 100)}
-                        </span>
-                      ) : log.result ? (
-                        log.result.slice(0, 100)
+                    <td className="max-w-xs px-4 py-2.5 text-foreground">
+                      {log.error || log.result ? (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedLog(log)}
+                          className="group/result flex w-full cursor-pointer items-center gap-2 text-left hover:text-primary"
+                          title="查看完整结果"
+                        >
+                          <span
+                            className={`min-w-0 flex-1 truncate ${
+                              log.error ? 'text-red-600 dark:text-red-400' : ''
+                            }`}
+                          >
+                            {(log.error || log.result || '').slice(0, 100)}
+                          </span>
+                          <Eye className="h-4 w-4 shrink-0 opacity-50 group-hover/result:opacity-100" />
+                        </button>
                       ) : ['queued', 'running', 'recovering'].includes(
                           log.status,
                         ) ? (
@@ -900,6 +916,61 @@ export function TaskDetail({ task }: TaskDetailProps) {
           </div>
         )}
       </div>
+
+      <Dialog
+        open={selectedLog !== null}
+        onOpenChange={(open) => {
+          if (!open) setSelectedLog(null);
+        }}
+      >
+        <DialogContent className="max-h-[90vh] grid-rows-[auto_minmax(0,1fr)] overflow-hidden sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>定时任务完整结果</DialogTitle>
+            <DialogDescription>
+              {selectedLog
+                ? `${formatDate(selectedLog.started_at ?? selectedLog.run_at)} · ${TRIGGER_LABEL[selectedLog.trigger_type || 'scheduled'] || selectedLog.trigger_type || '计划触发'}`
+                : '查看本次定时任务的完整业务结果'}
+            </DialogDescription>
+            {selectedLog && (
+              <div className="flex flex-wrap items-center gap-2 pt-1 text-xs text-muted-foreground">
+                <RunLogStatusBadge status={selectedLog.status} />
+                <span>耗时 {formatDuration(selectedLog.duration_ms)}</span>
+                <span>
+                  通知：
+                  {NOTIFICATION_LABEL[
+                    selectedLog.notification_status || 'skipped'
+                  ] ||
+                    selectedLog.notification_status ||
+                    '无需通知'}
+                </span>
+                <span className="font-mono">Run {selectedLog.id}</span>
+              </div>
+            )}
+          </DialogHeader>
+
+          <div className="min-h-0 overflow-y-auto rounded-lg border border-border bg-muted/20 p-4">
+            {selectedLog?.error && (
+              <div className="mb-4 rounded-lg border border-error/20 bg-error-bg p-3 text-sm text-error">
+                <div className="mb-1 font-medium">执行错误</div>
+                <div className="whitespace-pre-wrap break-words">
+                  {selectedLog.error}
+                </div>
+              </div>
+            )}
+            {selectedLog?.result ? (
+              <MarkdownRenderer
+                content={selectedLog.result}
+                groupJid={task.chat_jid}
+                variant="docs"
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                本次运行没有留下可展示的业务结果。
+              </p>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
