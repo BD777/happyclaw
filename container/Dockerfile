@@ -151,7 +151,7 @@ RUN set -eu; \
       HEADROOM_SPEC="headroom-ai[code,mcp]==${HEADROOM_VERSION}"; \
     fi; \
     pip install --no-cache-dir --upgrade "$HEADROOM_SPEC"; \
-    headroom --version
+    python3 -c "from importlib.metadata import version; print('headroom-ai', version('headroom-ai'))"
 
 # Resolve the newest stable feishu-cli GitHub release by default, then verify
 # the selected archive against the checksums file published with that release.
@@ -240,7 +240,7 @@ RUN set -eu; \
       printf 'uv=%s\n' "$(uv --version | awk '{print $2}')"; \
       node -e "const fs=require('node:fs'); for (const p of ['@anthropic-ai/claude-agent-sdk','@anthropic-ai/claude-code','agent-browser']) { const j=JSON.parse(fs.readFileSync('/app/node_modules/'+p+'/package.json','utf8')); console.log(p+'='+j.version); }"; \
       printf 'feishu-cli=%s\n' "$(cat /usr/local/share/feishu-cli-version)"; \
-      printf 'headroom=%s\n' "$(headroom --version | awk '{print $NF}')"; \
+      printf 'headroom=%s\n' "$(python3 -c "from importlib.metadata import version; print(version('headroom-ai'))")"; \
       printf 'chromium=%s\n' "$(chromium --version | awk '{print $2}')"; \
       printf 'oh-my-zsh=%s\n' "$(cat /usr/local/share/oh-my-zsh-version)"; \
     } > /usr/local/share/happyclaw-tool-versions.txt; \

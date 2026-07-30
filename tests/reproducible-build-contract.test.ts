@@ -90,6 +90,7 @@ describe('reproducible build contract', () => {
     );
     expect(dockerfile).toContain('sha256sum -c checksum.txt');
     expect(dockerfile).toContain('happyclaw-tool-versions.txt');
+    expect(dockerfile).toContain("version('headroom-ai')");
     expect(dockerfile).toContain('PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1');
     expect(dockerfile).not.toContain('npm install -g');
     expect(buildScript).not.toContain('CACHEBUST');
