@@ -229,7 +229,7 @@ cd happyclaw
 make start
 ```
 
-首次启动会自动安装三端依赖、编译后端/Web/Agent Runner，并在 Docker 可用时构建智能体镜像。启动完成后打开：
+首次启动会自动安装三端依赖、编译后端/Web/Agent Runner，并在 Docker 可用时拉取最新的多架构智能体镜像。启动完成后打开：
 
 <http://localhost:3000>
 
@@ -259,6 +259,7 @@ make dev
 | `WEB_PORT=8080 make start`                      | 使用自定义端口启动                                    |
 | `make status`                                   | 查看端口、健康状态、日志文件和 Docker 容器            |
 | `make stop`                                     | 停止当前端口上的 HappyClaw 服务                       |
+| `make docker-build-local`                       | 开发时显式在本机重新构建 Agent 镜像                   |
 | `make install-host-tools`                       | 安装 Host 工具并刷新 Host/Container 共用的内置 Skills |
 | `make backup`                                   | 创建一致性运行数据备份                                |
 | `make restore FILE=happyclaw-backup-xxx.tar.gz` | 停止服务后恢复指定备份                                |
@@ -282,18 +283,18 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 
 ### 可选环境变量
 
-| 变量                        | 默认值                   | 说明                               |
-| --------------------------- | ------------------------ | ---------------------------------- |
-| `WEB_PORT`                  | `3000`                   | Web、REST API 与 WebSocket 端口    |
-| `WEB_SESSION_SECRET`        | 自动生成并持久化         | Web 登录会话签名密钥               |
-| `CONTAINER_IMAGE`           | `happyclaw-agent:latest` | 智能体容器镜像                     |
-| `CONTAINER_TIMEOUT`         | `1800000`                | 容器硬超时，毫秒                   |
-| `IDLE_TIMEOUT`              | `1800000`                | 容器空闲保活时间，毫秒             |
-| `MAX_CONCURRENT_CONTAINERS` | `20`                     | 最大并发容器数                     |
-| `MAX_FILE_SIZE_MB`          | `50`                     | Web 和 IM 入站文件大小上限         |
-| `CORS_ALLOWED_ORIGINS`      | 仅 localhost             | 公网部署的 WebSocket Origin 白名单 |
-| `TRUST_PROXY`               | `false`                  | 位于可信反向代理后时设为 `true`    |
-| `TZ`                        | 系统时区                 | 日志与定时任务时区                 |
+| 变量                        | 默认值                            | 说明                               |
+| --------------------------- | --------------------------------- | ---------------------------------- |
+| `WEB_PORT`                  | `3000`                            | Web、REST API 与 WebSocket 端口    |
+| `WEB_SESSION_SECRET`        | 自动生成并持久化                  | Web 登录会话签名密钥               |
+| `CONTAINER_IMAGE`           | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                     |
+| `CONTAINER_TIMEOUT`         | `1800000`                         | 容器硬超时，毫秒                   |
+| `IDLE_TIMEOUT`              | `1800000`                         | 容器空闲保活时间，毫秒             |
+| `MAX_CONCURRENT_CONTAINERS` | `20`                              | 最大并发容器数                     |
+| `MAX_FILE_SIZE_MB`          | `50`                              | Web 和 IM 入站文件大小上限         |
+| `CORS_ALLOWED_ORIGINS`      | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单 |
+| `TRUST_PROXY`               | `false`                           | 位于可信反向代理后时设为 `true`    |
+| `TZ`                        | 系统时区                          | 日志与定时任务时区                 |
 
 Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-GCM 加密存储，相关 API 只返回是否已配置，不返回密钥明文。
 

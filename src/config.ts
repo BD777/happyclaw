@@ -35,7 +35,7 @@ export const MAX_FILE_SIZE_MB =
 export const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 export const CONTAINER_IMAGE =
-  process.env.CONTAINER_IMAGE || 'happyclaw-agent:latest';
+  process.env.CONTAINER_IMAGE || 'riba2534/happyclaw-agent:latest';
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses TZ env var with Asia/Shanghai fallback
 export const TIMEZONE =
