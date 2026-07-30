@@ -9,6 +9,8 @@ export interface SystemStatus {
   queueLength: number;
   uptime: number;
   dockerImageExists: boolean;
+  dockerRequired?: boolean;
+  adminHostOnlyMode?: boolean;
   dockerPullInProgress?: boolean;
   claudeCodeVersions?: {
     host: string | null;

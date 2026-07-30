@@ -21,6 +21,7 @@ import {
   deleteAgent,
   getRegisteredGroup,
   getAllRegisteredGroups,
+  forceActiveAdminRuntimesToHost,
   setRegisteredGroup,
   updateChatName,
   getAgent,
@@ -157,6 +158,7 @@ import {
   withAgentProfileLocks,
   WorkspaceRuntimeQuiesceError,
 } from '../agent-profile-runtime.js';
+import { notifyTaskSchedulerChanged } from '../task-scheduler.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 /**
@@ -2198,6 +2200,7 @@ function toHostIntegrationResponse(
   return {
     externalClaudeDir: settings.externalClaudeDir,
     pluginAutoScan: settings.pluginAutoScan,
+    adminHostOnlyMode: settings.adminHostOnlyMode,
     mainAgentContextSource: settings.mainAgentContextSource,
     mainAgentAutoCompactWindow: settings.mainAgentAutoCompactWindow,
     mainAgentAutoCompactPercentage: settings.mainAgentAutoCompactPercentage,
@@ -2251,6 +2254,11 @@ configRoutes.put(
       validation.data.externalClaudeDir !== before.externalClaudeDir;
     const hostContextChanged =
       mainContextSourceChanged || externalClaudeDirChanged;
+    const adminHostOnlyModeChanged =
+      validation.data.adminHostOnlyMode !== undefined &&
+      validation.data.adminHostOnlyMode !== before.adminHostOnlyMode;
+    const enablingAdminHostOnlyMode =
+      adminHostOnlyModeChanged && validation.data.adminHostOnlyMode === true;
     const defaultCompactChanged =
       (validation.data.mainAgentAutoCompactWindow !== undefined &&
         validation.data.mainAgentAutoCompactWindow !==
@@ -2259,45 +2267,107 @@ configRoutes.put(
         validation.data.mainAgentAutoCompactPercentage !==
           before.mainAgentAutoCompactPercentage);
     const contextMutationRequested =
-      hostContextChanged || defaultCompactChanged;
-    const workspaces = contextMutationRequested
-      ? Object.entries(getAllRegisteredGroups())
-          .map(([jid, group]) => ({
-            jid,
-            group,
-            profile: group.created_by
-              ? getAgentProfileForWorkspace(group.folder, group.created_by)
-              : undefined,
-          }))
-          .filter(({ group, profile }) => {
-            if (!group.created_by || !profile) return false;
-            const isActiveAdmin =
-              getUserById(group.created_by)?.role === 'admin';
-            const currentContextSource =
-              resolveEffectiveAgentProfile(profile)?.runtime_policy.context
-                .source ?? 'managed';
-            const nextContextSource = profile.is_default
-              ? (validation.data.mainAgentContextSource ??
-                before.mainAgentContextSource)
-              : profile.runtime_policy.context.source;
-            return (
-              (defaultCompactChanged && profile.is_default) ||
-              (mainContextSourceChanged &&
-                profile.is_default &&
-                isActiveAdmin) ||
-              (externalClaudeDirChanged &&
-                isActiveAdmin &&
-                (currentContextSource === 'host_claude' ||
-                  nextContextSource === 'host_claude'))
-            );
-          })
-      : [];
+      hostContextChanged || defaultCompactChanged || enablingAdminHostOnlyMode;
+    const contextWorkspaces =
+      hostContextChanged || defaultCompactChanged
+        ? Object.entries(getAllRegisteredGroups())
+            .map(([jid, group]) => ({
+              jid,
+              group,
+              profile: group.created_by
+                ? getAgentProfileForWorkspace(group.folder, group.created_by)
+                : undefined,
+            }))
+            .filter(({ group, profile }) => {
+              if (!group.created_by || !profile) return false;
+              const isActiveAdmin =
+                getUserById(group.created_by)?.role === 'admin';
+              const currentContextSource =
+                resolveEffectiveAgentProfile(profile)?.runtime_policy.context
+                  .source ?? 'managed';
+              const nextContextSource = profile.is_default
+                ? (validation.data.mainAgentContextSource ??
+                  before.mainAgentContextSource)
+                : profile.runtime_policy.context.source;
+              return (
+                (defaultCompactChanged && profile.is_default) ||
+                (mainContextSourceChanged &&
+                  profile.is_default &&
+                  isActiveAdmin) ||
+                (externalClaudeDirChanged &&
+                  isActiveAdmin &&
+                  (currentContextSource === 'host_claude' ||
+                    nextContextSource === 'host_claude'))
+              );
+            })
+        : [];
+    const allGroups = enablingAdminHostOnlyMode ? getAllRegisteredGroups() : {};
+    const activeAdminFolders = enablingAdminHostOnlyMode
+      ? new Set(
+          Object.values(allGroups)
+            .filter((group) => {
+              const owner = group.created_by
+                ? getUserById(group.created_by)
+                : undefined;
+              return owner?.role === 'admin' && owner.status === 'active';
+            })
+            .map((group) => group.folder),
+        )
+      : new Set<string>();
+    const policyWorkspaces = Array.from(activeAdminFolders)
+      .map((folder) => {
+        const entries = Object.entries(allGroups).filter(
+          ([, group]) => group.folder === folder,
+        );
+        const preferred =
+          entries.find(([jid]) => jid.startsWith('web:')) ?? entries[0];
+        if (!preferred) return null;
+        const [jid, group] = preferred;
+        return {
+          jid,
+          group,
+          profile: group.created_by
+            ? getAgentProfileForWorkspace(group.folder, group.created_by)
+            : undefined,
+        };
+      })
+      .filter(
+        (workspace): workspace is NonNullable<typeof workspace> =>
+          workspace !== null,
+      );
+    const workspaceByFolder = new Map<
+      string,
+      (typeof contextWorkspaces)[number] | (typeof policyWorkspaces)[number]
+    >();
+    for (const workspace of [...contextWorkspaces, ...policyWorkspaces]) {
+      workspaceByFolder.set(workspace.group.folder, workspace);
+    }
+    const workspaces = Array.from(workspaceByFolder.values());
     const sessionResetFolders = Array.from(
       new Set(workspaces.map(({ group }) => group.folder)),
     );
+    let hostOnlyMigration:
+      | ReturnType<typeof forceActiveAdminRuntimesToHost>
+      | undefined;
     const commit = () => {
-      const value = saveSystemSettings(validation.data);
+      if (enablingAdminHostOnlyMode) {
+        hostOnlyMigration = forceActiveAdminRuntimesToHost();
+        if (deps) {
+          const liveGroups = deps.getRegisteredGroups();
+          for (const { jid } of hostOnlyMigration.affectedGroups) {
+            const fresh = getRegisteredGroup(jid);
+            if (fresh) liveGroups[jid] = fresh;
+          }
+        }
+      }
       for (const folder of sessionResetFolders) deleteWorkspaceSessions(folder);
+      if (deps?.sessions) {
+        for (const folder of sessionResetFolders) delete deps.sessions[folder];
+      }
+      const value = saveSystemSettings(validation.data);
+      if (hostOnlyMigration?.migratedTaskIds.length) {
+        notifyTaskSchedulerChanged();
+      }
       return value;
     };
     let saved: ReturnType<typeof saveSystemSettings>;
@@ -2357,6 +2427,14 @@ configRoutes.put(
         details: {
           changed_fields: changedFields,
           external_claude_dir_configured: Boolean(response.externalClaudeDir),
+          ...(hostOnlyMigration
+            ? {
+                host_only_migrated_groups:
+                  hostOnlyMigration.affectedGroups.length,
+                host_only_migrated_tasks:
+                  hostOnlyMigration.migratedTaskIds.length,
+              }
+            : {}),
         },
       });
     }

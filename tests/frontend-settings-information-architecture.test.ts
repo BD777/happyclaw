@@ -116,6 +116,9 @@ describe('settings information architecture', () => {
     expect(system).toMatch(
       /当前目录同时作为提示词、Rules、Skills、MCP 与 Plugin\s+Marketplace\s+的来源/,
     );
+    expect(system).toMatch(
+      /管理员纯宿主机模式[\s\S]*普通成员仍固定使用\s+Docker/,
+    );
     expect(page).toContain("currentUser?.role !== 'admin'");
   });
 

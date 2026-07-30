@@ -262,7 +262,11 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
         return canAccessGroup({ id: authUser.id, role: authUser.role }, group);
       });
 
-  const dockerImageExists = await checkDockerImageExists();
+  const dockerRequired = hasContainerModeGroups();
+  const dockerImageExists = dockerRequired
+    ? await checkDockerImageExists()
+    : false;
+  const systemSettings = getSystemSettings();
 
   // For non-admin users, derive aggregate metrics from their own filtered groups only
   // to prevent leaking global system load information across users
@@ -324,11 +328,13 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
       ? queueStatus.activeHostProcessCount
       : undefined,
     activeTotal: isAdmin ? queueStatus.activeCount : activeContainers,
-    maxConcurrentContainers: getSystemSettings().maxConcurrentContainers,
+    maxConcurrentContainers: systemSettings.maxConcurrentContainers,
     queueLength,
     uptime: Math.floor(process.uptime()),
     groups: enrichedGroups,
     dockerImageExists,
+    dockerRequired,
+    adminHostOnlyMode: isAdmin ? systemSettings.adminHostOnlyMode : undefined,
     dockerPullInProgress: pullState.pulling,
     claudeCodeVersions: isAdmin ? await getClaudeCodeVersions() : undefined,
     dockerPullLogs:

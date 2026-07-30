@@ -3824,6 +3824,9 @@ export interface SystemSettings {
   billingCurrencyRate: number;
   // External Claude directory (admin only)
   externalClaudeDir: string;
+  // 管理员纯宿主机模式：开启后，所有 active admin 拥有的 Workspace/任务
+  // 都必须使用 host；普通成员仍保持 container 隔离。
+  adminHostOnlyMode: boolean;
   // 默认主 Agent 是否继承宿主机 Claude 配置（仅 admin 生效）。
   mainAgentContextSource: 'managed' | 'host_claude';
   // 兼容旧版固定 token 阈值；新配置使用模型感知的百分比策略。
@@ -3862,6 +3865,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   billingCurrency: 'USD',
   billingCurrencyRate: 1,
   externalClaudeDir: '',
+  adminHostOnlyMode: false,
   mainAgentContextSource: 'host_claude',
   mainAgentAutoCompactWindow: 0,
   mainAgentAutoCompactPercentage: 0,
@@ -4067,6 +4071,10 @@ function normalizeSystemSettings(
       false,
     ),
     externalClaudeDir,
+    adminHostOnlyMode: booleanField(
+      'adminHostOnlyMode',
+      DEFAULT_SYSTEM_SETTINGS.adminHostOnlyMode,
+    ),
     mainAgentContextSource,
     mainAgentAutoCompactWindow:
       mainAgentAutoCompactPercentage > 0 ? 0 : mainAgentAutoCompactWindow,
@@ -4113,6 +4121,7 @@ function buildEnvFallbackSettings(): SystemSettings {
       billingCurrency: process.env.BILLING_CURRENCY,
       billingCurrencyRate: process.env.BILLING_CURRENCY_RATE,
       externalClaudeDir: process.env.EXTERNAL_CLAUDE_DIR,
+      adminHostOnlyMode: process.env.ADMIN_HOST_ONLY_MODE,
       mainAgentContextSource: process.env.MAIN_AGENT_CONTEXT_SOURCE,
       mainAgentAutoCompactWindow:
         process.env.MAIN_AGENT_AUTO_COMPACT_WINDOW ??

@@ -121,6 +121,7 @@ import {
   type TaskRunNotificationPayload,
   type TaskRunNotificationReceipt,
   getUserHomeGroup,
+  forceActiveAdminRuntimesToHost,
   initDatabase,
   listUsers,
   setLastGroupSync,
@@ -3866,6 +3867,11 @@ function handleUnbindCommand(chatJid: string): string {
   return '已恢复 Bot 默认工作区。';
 }
 
+function isAdminHostOnlyOwner(ownerId: string | null | undefined): boolean {
+  if (!ownerId || !getSystemSettings().adminHostOnlyMode) return false;
+  return canExecuteOnHost(getUserById(ownerId));
+}
+
 function handleBindCommand(chatJid: string, rawSpec: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
@@ -3936,7 +3942,11 @@ async function handleNewCommand(
     name,
     folder,
     added_at: now,
-    executionMode: (await isDockerAvailable()) ? 'container' : 'host',
+    executionMode: isAdminHostOnlyOwner(userId)
+      ? 'host'
+      : getUserById(userId)?.role === 'admin' && !(await isDockerAvailable())
+        ? 'host'
+        : 'container',
     created_by: userId,
   };
 
@@ -5001,6 +5011,29 @@ function loadState(): void {
     }
   }
 
+  // Repair persisted runtime rows on every startup as well as on the settings
+  // transition. This also makes ADMIN_HOST_ONLY_MODE=true safe on first boot.
+  if (getSystemSettings().adminHostOnlyMode) {
+    const migration = forceActiveAdminRuntimesToHost();
+    if (
+      migration.affectedGroups.length > 0 ||
+      migration.migratedTaskIds.length > 0
+    ) {
+      registeredGroups = getAllRegisteredGroups();
+      for (const folder of migration.affectedFolders) {
+        delete sessions[folder];
+        deleteSession(folder);
+      }
+      logger.info(
+        {
+          migratedGroups: migration.affectedGroups.length,
+          migratedTasks: migration.migratedTaskIds.length,
+        },
+        'Repaired administrator runtimes for host-only mode',
+      );
+    }
+  }
+
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -5059,6 +5092,10 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // bypass-permissions 模式下完全可达）。规则与典型 unix 目录命名一致。
   if (!group.folder || !isValidWorkspaceFolderName(group.folder)) {
     throw new Error(`registerGroup: invalid folder name: ${group.folder}`);
+  }
+
+  if (isAdminHostOnlyOwner(group.created_by)) {
+    group = { ...group, executionMode: 'host' };
   }
 
   // register_group is reachable from an agent IPC channel. Treat its
@@ -12259,15 +12296,29 @@ async function processTaskIpc(
         // The requested mode is part of task identity: otherwise an identical
         // prompt could silently reuse a task running across a different security
         // boundary (host vs container).
+        const taskCreatedBy = resolveTaskOwner(
+          {},
+          sourceGroupEntry,
+          targetGroupEntry,
+        );
+        const forceHostOnly = isAdminHostOnlyOwner(taskCreatedBy);
+        if (forceHostOnly && data.execution_mode === 'container') {
+          failSchedule(
+            'Administrator host-only mode is enabled; container task execution is unavailable.',
+          );
+          break;
+        }
         let executionMode: 'host' | 'container';
         try {
-          executionMode = resolveTaskExecutionModeForTarget(
-            targetGroupEntry.executionMode,
-            data.execution_mode === 'host' ||
-              data.execution_mode === 'container'
-              ? data.execution_mode
-              : undefined,
-          );
+          executionMode = forceHostOnly
+            ? 'host'
+            : resolveTaskExecutionModeForTarget(
+                targetGroupEntry.executionMode,
+                data.execution_mode === 'host' ||
+                  data.execution_mode === 'container'
+                  ? data.execution_mode
+                  : undefined,
+              );
         } catch (err) {
           failSchedule(err instanceof Error ? err.message : String(err));
           break;
@@ -12276,12 +12327,6 @@ async function processTaskIpc(
           failSchedule(SCRIPT_TASK_HOST_REQUIRED_ERROR);
           break;
         }
-        const taskCreatedBy = resolveTaskOwner(
-          {},
-          sourceGroupEntry,
-          targetGroupEntry,
-        );
-
         // 幂等去重：仅对 agent 任务生效。#564 的递归增殖只发生在 agent 触发回放路径；
         // 而 script 任务真正承载工作的是 script_command（prompt 常为空），prompt/schedule
         // 相同但命令不同的多个 script 任务是合法的，按 prompt 去重会静默丢任务。agent
@@ -12652,6 +12697,14 @@ async function processTaskIpc(
         failUpdate('Not authorized to update this task.');
         break;
       }
+      const targetGroup =
+        registeredGroups[task.chat_jid] ?? getRegisteredGroup(task.chat_jid);
+      const targetOwnerId =
+        targetGroup?.created_by ??
+        Object.values(registeredGroups).find(
+          (group) => group.folder === task.group_folder && !!group.created_by,
+        )?.created_by;
+      const forceHostOnly = isAdminHostOnlyOwner(targetOwnerId);
       const patch: Parameters<typeof updateTask>[1] = {};
       if (data.execution_type !== undefined) {
         if (data.execution_type === 'script' && !isAdminHome) {
@@ -12662,6 +12715,12 @@ async function processTaskIpc(
           data.execution_type === 'script' ? 'script' : 'agent';
       }
       if (data.execution_mode !== undefined) {
+        if (forceHostOnly && data.execution_mode === 'container') {
+          failUpdate(
+            'Administrator host-only mode is enabled; container task execution is unavailable.',
+          );
+          break;
+        }
         if (data.execution_mode === 'host' && !isAdminHome) {
           failUpdate(
             'Only the admin home container can set host execution mode.',
@@ -12670,6 +12729,8 @@ async function processTaskIpc(
         }
         patch.execution_mode =
           data.execution_mode === 'host' ? 'host' : 'container';
+      } else if (forceHostOnly && task.execution_mode !== 'host') {
+        patch.execution_mode = 'host';
       }
       // An update must not be a way around the create-time bound.
       if (
@@ -12744,8 +12805,6 @@ async function processTaskIpc(
         }
       }
       if (finalExecutionMode === 'host') {
-        const targetGroup =
-          registeredGroups[task.chat_jid] ?? getRegisteredGroup(task.chat_jid);
         if (!targetGroup || targetGroup.executionMode !== 'host') {
           failUpdate(
             'Target workspace runs in container mode; host execution is not allowed.',
@@ -13249,8 +13308,9 @@ async function processTaskIpc(
         const sourceEntry = Object.values(registeredGroups).find(
           (g) => g.folder === sourceGroup,
         );
-        const execMode =
-          data.executionMode === 'host' || data.executionMode === 'container'
+        const execMode = isAdminHostOnlyOwner(sourceEntry?.created_by)
+          ? 'host'
+          : data.executionMode === 'host' || data.executionMode === 'container'
             ? data.executionMode
             : undefined;
         try {
@@ -17643,6 +17703,9 @@ function buildOnNewChat(
       // we should claim ownership but preserve the user's chosen folder.
       if (!existing.created_by) {
         existing.created_by = userId;
+        if (isAdminHostOnlyOwner(userId)) {
+          existing.executionMode = 'host';
+        }
         setRegisteredGroup(chatJid, existing);
         registeredGroups[chatJid] = existing;
         logger.info(
@@ -17691,6 +17754,7 @@ function buildOnNewChat(
           Object.assign(existing, releaseOwner(existing), {
             folder: homeFolder,
             created_by: userId,
+            executionMode: isAdminHostOnlyOwner(userId) ? 'host' : 'container',
             // Trust belongs to the previous HappyClaw user's channel binding,
             // not merely to the provider chat id. Never carry that trust into
             // the new user's Agent Builder authorization boundary.

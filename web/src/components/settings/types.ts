@@ -98,6 +98,7 @@ export interface SystemSettings {
 }
 
 export interface HostIntegrationSettings {
+  adminHostOnlyMode: boolean;
   mainAgentContextSource: 'managed' | 'host_claude';
   mainAgentAutoCompactWindow: number;
   mainAgentAutoCompactPercentage: number;

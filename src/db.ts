@@ -10481,6 +10481,79 @@ export function hasContainerModeGroups(): boolean {
   return row !== undefined;
 }
 
+export interface AdminHostOnlyMigrationResult {
+  affectedGroups: Array<{ jid: string; folder: string }>;
+  affectedFolders: string[];
+  migratedTaskIds: string[];
+}
+
+/**
+ * Persist the admin host-only policy across every runtime record owned by an
+ * active administrator. Folder matching intentionally includes legacy IM rows
+ * without created_by when they share an administrator-owned Workspace folder.
+ *
+ * The setting itself lives in system-settings.json; callers must quiesce the
+ * returned folders before invoking this mutation and save the setting in the
+ * same commit callback.
+ */
+export function forceActiveAdminRuntimesToHost(): AdminHostOnlyMigrationResult {
+  return db
+    .transaction((): AdminHostOnlyMigrationResult => {
+      const adminFolderSql = `
+        SELECT DISTINCT rg.folder
+        FROM registered_groups rg
+        JOIN users u ON u.id = rg.created_by
+        WHERE u.role = 'admin' AND u.status = 'active'
+      `;
+      const affectedGroups = db
+        .prepare(
+          `SELECT jid, folder
+           FROM registered_groups
+           WHERE folder IN (${adminFolderSql})
+             AND COALESCE(execution_mode, 'container') <> 'host'
+           ORDER BY jid`,
+        )
+        .all() as Array<{ jid: string; folder: string }>;
+      const affectedTasks = db
+        .prepare(
+          `SELECT id, group_folder
+           FROM scheduled_tasks
+           WHERE group_folder IN (${adminFolderSql})
+             AND COALESCE(execution_mode, 'container') <> 'host'
+           ORDER BY id`,
+        )
+        .all() as Array<{ id: string; group_folder: string }>;
+      const migratedTaskIds = affectedTasks.map((row) => row.id);
+      const affectedFolders = Array.from(
+        new Set([
+          ...affectedGroups.map((group) => group.folder),
+          ...affectedTasks.map((task) => task.group_folder),
+        ]),
+      ).sort();
+
+      db.prepare(
+        `UPDATE registered_groups
+         SET execution_mode = 'host'
+         WHERE folder IN (${adminFolderSql})
+           AND COALESCE(execution_mode, 'container') <> 'host'`,
+      ).run();
+
+      if (migratedTaskIds.length > 0) {
+        db.prepare(
+          `UPDATE scheduled_tasks
+           SET execution_mode = 'host',
+               revision = revision + 1,
+               updated_at = ?
+           WHERE group_folder IN (${adminFolderSql})
+             AND COALESCE(execution_mode, 'container') <> 'host'`,
+        ).run(new Date().toISOString());
+      }
+
+      return { affectedGroups, affectedFolders, migratedTaskIds };
+    })
+    .immediate();
+}
+
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   const rows = db
     .prepare('SELECT * FROM registered_groups')

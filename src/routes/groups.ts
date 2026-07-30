@@ -79,6 +79,7 @@ import {
 } from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
+  getSystemSettings,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
 } from '../runtime-config.js';
@@ -120,6 +121,7 @@ const execFileAsync = promisify(execFile);
  * persisted — a client-correctable conflict, never a server fault.
  */
 class WorkspaceAgentProfileMissingError extends Error {}
+class AdminHostOnlyModeConflictError extends Error {}
 
 /**
  * 检查 hostname 是否为内网地址（SSRF 防护）。
@@ -524,7 +526,11 @@ function toPublicContainerEnvForUser(
 groupRoutes.get('/', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = buildGroupsPayload(user);
-  return c.json({ groups });
+  return c.json({
+    groups,
+    admin_host_only_mode:
+      user.role === 'admin' && getSystemSettings().adminHostOnlyMode,
+  });
 });
 
 // POST /api/groups - 创建新群组
@@ -560,15 +566,33 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: 'Group name is required' }, 400);
   }
 
-  // If user didn't specify execution mode, pick based on Docker availability
-  const executionMode =
-    validation.data.execution_mode ||
-    ((await isDockerAvailable()) ? 'container' : 'host');
+  const authUser = c.get('user') as AuthUser;
+  const adminHostOnlyMode =
+    authUser.role === 'admin' &&
+    authUser.status === 'active' &&
+    getSystemSettings().adminHostOnlyMode;
+  if (adminHostOnlyMode && validation.data.execution_mode === 'container') {
+    return c.json(
+      {
+        error: '管理员纯宿主机模式已开启，不能创建 Docker 工作区',
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      },
+      409,
+    );
+  }
+
+  // Members always stay container-isolated. Administrators in hybrid mode
+  // retain the existing Docker-availability fallback.
+  const executionMode = adminHostOnlyMode
+    ? 'host'
+    : validation.data.execution_mode ||
+      (authUser.role === 'admin' && !(await isDockerAvailable())
+        ? 'host'
+        : 'container');
   const interactionMode = validation.data.interaction_mode ?? 'assistant';
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
-  const authUser = c.get('user') as AuthUser;
   const requestedAdditionalMounts = validation.data.additional_mounts ?? [];
   const agentProfile = validation.data.agent_profile_id
     ? getAgentProfileForUser(validation.data.agent_profile_id, authUser.id)
@@ -948,6 +972,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   let publishedAgentProfile;
+  let hostOnlyPolicyChangedDuringCreate = false;
   try {
     publishedAgentProfile = await withAgentProfileLocks(
       [agentProfile.id],
@@ -960,6 +985,15 @@ groupRoutes.post('/', authMiddleware, async (c) => {
           authUser.id,
         );
         if (!lockedProfile) return undefined;
+        if (
+          group.executionMode !== 'host' &&
+          authUser.role === 'admin' &&
+          authUser.status === 'active' &&
+          getSystemSettings().adminHostOnlyMode
+        ) {
+          hostOnlyPolicyChangedDuringCreate = true;
+          return undefined;
+        }
 
         try {
           // Mapping first and registered-group publication immediately after
@@ -997,6 +1031,15 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
   if (!publishedAgentProfile) {
     fs.rmSync(groupDir, { recursive: true, force: true });
+    if (hostOnlyPolicyChangedDuringCreate) {
+      return c.json(
+        {
+          error: '管理员纯宿主机模式已开启，请按宿主机模式重新创建工作区',
+          code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+        },
+        409,
+      );
+    }
     return c.json({ error: '该智能体配置已失效；请选择其他智能体' }, 409);
   }
 
@@ -1091,6 +1134,20 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
+    );
+  }
+  if (
+    execution_mode === 'container' &&
+    authUser.role === 'admin' &&
+    authUser.status === 'active' &&
+    getSystemSettings().adminHostOnlyMode
+  ) {
+    return c.json(
+      {
+        error: '管理员纯宿主机模式已开启，不能切换到 Docker 执行',
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      },
+      409,
     );
   }
 
@@ -1198,6 +1255,14 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
 
     const commitUpdate = () => {
       if (
+        execution_mode === 'container' &&
+        authUser.role === 'admin' &&
+        authUser.status === 'active' &&
+        getSystemSettings().adminHostOnlyMode
+      ) {
+        throw new AdminHostOnlyModeConflictError();
+      }
+      if (
         name ||
         activation_mode !== undefined ||
         execution_mode !== undefined
@@ -1259,6 +1324,15 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         );
         deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
       } catch (err) {
+        if (err instanceof AdminHostOnlyModeConflictError) {
+          return c.json(
+            {
+              error: '管理员纯宿主机模式已开启，不能切换到 Docker 执行',
+              code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+            },
+            409,
+          );
+        }
         if (err instanceof WorkspaceAgentProfileMissingError) {
           deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
           return c.json(
@@ -1291,6 +1365,15 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       try {
         commitUpdate();
       } catch (err) {
+        if (err instanceof AdminHostOnlyModeConflictError) {
+          return c.json(
+            {
+              error: '管理员纯宿主机模式已开启，不能切换到 Docker 执行',
+              code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+            },
+            409,
+          );
+        }
         if (!(err instanceof WorkspaceAgentProfileMissingError)) throw err;
         return c.json(
           {

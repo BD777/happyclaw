@@ -80,6 +80,7 @@ describe('system settings capability boundaries', () => {
     const body = await response.json();
     expect(body).not.toHaveProperty('externalClaudeDir');
     expect(body).not.toHaveProperty('pluginAutoScan');
+    expect(body).not.toHaveProperty('adminHostOnlyMode');
     expect(body).not.toHaveProperty('mainAgentContextSource');
     expect(body).not.toHaveProperty('mainAgentAutoCompactWindow');
     expect(body).not.toHaveProperty('mainAgentAutoCompactPercentage');
@@ -252,6 +253,92 @@ describe('system settings capability boundaries', () => {
     expect(
       db.listWorkspaceRuntimeSessionsByWorkspace('web:settings-admin-custom'),
     ).toEqual([]);
+  });
+
+  test('admin host-only mode migrates only active-admin runtimes and preserves member isolation', async () => {
+    const now = new Date().toISOString();
+    db.setRegisteredGroup('web:settings-admin-container', {
+      name: 'Admin container before policy',
+      folder: 'settings-admin-container',
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'settings-admin-owner',
+    });
+    db.setRegisteredGroup('web:settings-member-container', {
+      name: 'Member container before policy',
+      folder: 'settings-member-container',
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'settings-member-owner',
+    });
+    db.createTask({
+      id: 'settings-admin-container-task',
+      group_folder: 'settings-admin-container',
+      chat_jid: 'web:settings-admin-container',
+      prompt: 'admin policy migration',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      execution_mode: 'container',
+      next_run: new Date(Date.now() + 60_000).toISOString(),
+      status: 'active',
+      created_at: now,
+      created_by: 'settings-admin-owner',
+      notify_channels: null,
+    });
+    db.createTask({
+      id: 'settings-member-container-task',
+      group_folder: 'settings-member-container',
+      chat_jid: 'web:settings-member-container',
+      prompt: 'member remains isolated',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      execution_mode: 'container',
+      next_run: new Date(Date.now() + 60_000).toISOString(),
+      status: 'active',
+      created_at: now,
+      created_by: 'settings-member-owner',
+      notify_channels: null,
+    });
+
+    stopGroup.mockClear();
+    asUser('admin');
+    const response = await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: true }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ adminHostOnlyMode: true });
+    expect(
+      db.getRegisteredGroup('web:settings-admin-container')?.executionMode,
+    ).toBe('host');
+    expect(
+      db.getTaskById('settings-admin-container-task')?.execution_mode,
+    ).toBe('host');
+    expect(
+      db.getRegisteredGroup('web:settings-member-container')?.executionMode,
+    ).toBe('container');
+    expect(
+      db.getTaskById('settings-member-container-task')?.execution_mode,
+    ).toBe('container');
+    expect(stopGroup).toHaveBeenCalledWith(
+      'web:settings-admin-container',
+      expect.objectContaining({ force: true, preserveQueuedWork: true }),
+    );
+
+    const disableResponse = await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: false }),
+    });
+    expect(disableResponse.status).toBe(200);
+    expect(
+      db.getRegisteredGroup('web:settings-admin-container')?.executionMode,
+    ).toBe('host');
   });
 });
 
