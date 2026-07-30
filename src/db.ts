@@ -5696,6 +5696,8 @@ export interface TaskRunTextNotificationPayload {
     ownerId?: string;
     notifyChannels?: string[] | null;
     sourceKind?: string;
+    /** Stable id for replay-safe Web workspace projection. */
+    messageId?: string;
     skipStore?: boolean;
     workspaceFolder?: string;
     /** The source IM received this exact message through a prior strict ACK. */

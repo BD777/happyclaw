@@ -28,6 +28,10 @@ describe('task run status contract', () => {
     expect(detail).toMatch(/queued:\s*\{[\s\S]*label: '已排队'/);
     expect(detail).toContain("label: '等待重试'");
     expect(detail).toContain("label: '已投递到主会话'");
+    expect(detail).toContain('定时任务完整结果');
+    expect(detail).toContain('setSelectedLog(log)');
+    expect(detail).toContain('<MarkdownRenderer');
+    expect(detail).toContain('content={selectedLog.result}');
     expect(detail).toContain('task.permissions?.can_edit === false');
     for (const permission of [
       'can_run',

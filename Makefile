@@ -1,7 +1,7 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
-       backup restore help _ensure-docker-image logs status stop \
+       backup restore help _ensure-docker-image docker-build-local logs status stop \
        _check-sync _ensure-builtin-skills _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
 
 # ─── Runtime ────────────────────────────────────────────────
@@ -16,10 +16,12 @@ RUN     := npx
 RUNNER  := npx tsx src/index.ts
 RUNTIME_DATA_DIR ?= data
 BACKUP_DIR ?= .
+CONTAINER_IMAGE ?= riba2534/happyclaw-agent:latest
+export CONTAINER_IMAGE
 
 # ─── Development ─────────────────────────────────────────────
 
-dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
+dev: ## 启动前后端（首次自动安装依赖并拉取容器镜像）
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
@@ -170,33 +172,21 @@ format-check: ## 检查代码格式
 
 # ─── Docker Image ─────────────────────────────────────────────
 
-# Docker 镜像源文件：Dockerfile、entrypoint.sh、agent-runner 源码和运行时 prompts
-DOCKER_SRC := container/Dockerfile container/entrypoint.sh \
-	container/agent-runner/package.json container/agent-runner/package-lock.json \
-	$(wildcard container/agent-runner/src/*.ts) \
-	$(shell find container/agent-runner/prompts -type f 2>/dev/null)
-
-_ensure-docker-image: ## (内部) 检测 Docker 镜像是否需要构建/重建
+_ensure-docker-image: ## (内部) 拉取远端镜像；网络不可用时回退到本地缓存
 	@if command -v docker >/dev/null 2>&1; then \
-	  if ! docker image inspect happyclaw-agent:latest >/dev/null 2>&1; then \
-	    echo "🐳 Docker 镜像不存在，正在构建..."; \
-	    ./container/build.sh; \
-	  elif [ ! -f .docker-build-sentinel ]; then \
-	    echo "🐳 Docker 镜像 sentinel 缺失，正在重建..."; \
-	    ./container/build.sh; \
+	  echo "🐳 拉取 Docker 镜像 $(CONTAINER_IMAGE)..."; \
+	  if docker pull "$(CONTAINER_IMAGE)"; then \
+	    echo "✅ Docker 镜像已就绪：$(CONTAINER_IMAGE)"; \
+	  elif docker image inspect "$(CONTAINER_IMAGE)" >/dev/null 2>&1; then \
+	    echo "⚠️  无法拉取远端镜像，继续使用本地缓存：$(CONTAINER_IMAGE)"; \
 	  else \
-	    STALE=0; \
-	    for f in $(DOCKER_SRC); do \
-	      if [ "$$f" -nt .docker-build-sentinel ]; then STALE=1; break; fi; \
-	    done; \
-	    if [ "$$STALE" = "1" ]; then \
-	      echo "🐳 检测到容器源码变更，正在重建 Docker 镜像..."; \
-	      ./container/build.sh; \
-	    else \
-	      echo "✅ Docker 镜像无需重建"; \
-	    fi; \
+	    echo "❌ 无法拉取且本地没有镜像：$(CONTAINER_IMAGE)"; \
+	    exit 1; \
 	  fi; \
 	fi
+
+docker-build-local: ## 显式在本机为 CONTAINER_IMAGE 构建 Agent 镜像
+	./container/build.sh "$(CONTAINER_IMAGE)"
 
 # ─── Shared Types ────────────────────────────────────────────
 
@@ -334,7 +324,7 @@ restore: ## 从 happyclaw-backup-*.tar.gz 恢复数据（用法：make restore �
 	echo "✅ 数据恢复完成"; \
 	echo ""; \
 	echo "后续步骤："; \
-	echo "  1. 如需 Docker 容器支持：./container/build.sh"; \
+	echo "  1. 拉取 Agent 镜像：docker pull $(CONTAINER_IMAGE)"; \
 	echo "  2. 启动服务：make start"
 
 # ─── Help ────────────────────────────────────────────────────

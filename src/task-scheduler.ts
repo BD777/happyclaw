@@ -81,6 +81,7 @@ import {
   AgentProfile,
   ClaimedTaskRun,
   ExecutionMode,
+  MessageSourceKind,
   RegisteredGroup,
   ScheduledTask,
   TaskRun,
@@ -459,7 +460,9 @@ export interface SchedulerDependencies {
     options: {
       ownerId?: string;
       notifyChannels?: string[] | null;
-      sourceKind?: ContainerOutput['sourceKind'];
+      sourceKind?: MessageSourceKind;
+      /** Stable id for replay-safe Web workspace projection. */
+      messageId?: string;
       skipStore?: boolean;
       workspaceFolder?: string;
       /** Skip the source channel only after its connector strictly ACKed. */
@@ -476,6 +479,46 @@ export interface SchedulerDependencies {
     payload: TaskRunAtomicNotificationPayload,
   ) => Promise<TaskRunNotificationReceipt>;
   assistantName: string;
+}
+
+function scheduledTaskDisplayName(task: ScheduledTask): string {
+  const firstLine =
+    task.prompt
+      .split('\n')
+      .map((line) => line.trim())
+      .find(Boolean) || task.id;
+  const normalized = firstLine
+    .replace(/^#{1,6}\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized.length > 120
+    ? `${normalized.slice(0, 117)}...`
+    : normalized;
+}
+
+export function formatScheduledTaskWorkspaceResult(input: {
+  task: ScheduledTask;
+  runId: string;
+  result: string | null;
+  error: string | null;
+}): string {
+  const title = input.error
+    ? '## ❌ 定时任务执行失败'
+    : '## ✅ 定时任务执行完成';
+  const metadata = [
+    `**任务**：${scheduledTaskDisplayName(input.task)}`,
+    `**运行 ID**：\`${input.runId}\``,
+  ];
+  if (input.error) metadata.push(`**错误**：${input.error}`);
+
+  const content = input.result?.trim();
+  if (content) {
+    return `${title}\n\n${metadata.join('\n')}\n\n---\n\n${content}`;
+  }
+  const emptyNotice = input.error
+    ? '本次运行没有留下可展示的业务结果，请查看执行日志。'
+    : '本次运行已结束，但 Agent 没有返回可展示的业务结果。';
+  return `${title}\n\n${metadata.join('\n')}\n\n${emptyNotice}`;
 }
 
 export interface RunTaskOptions {
@@ -1297,12 +1340,15 @@ async function runTaskInner(
     runningTaskIds.delete(task.id);
   }
 
-  if (deps.storeResultAndNotify && (result || error)) {
-    const text = error ? `执行出错: ${error}` : stripAgentInternalTags(result!);
+  if (deps.storeResultAndNotify) {
+    const cleanedResult = result ? stripAgentInternalTags(result) : null;
+    const taskSessionText = error
+      ? `执行出错: ${error}`
+      : cleanedResult?.trim() || null;
 
-    if (text) {
+    if (taskSessionText) {
       try {
-        await deps.storeResultAndNotify(effectiveJid, text, {
+        await deps.storeResultAndNotify(effectiveJid, taskSessionText, {
           // Successful scheduled Agent runs deliver user-visible output via
           // send_message/send_image.  Their IPC payload carries task.id and is
           // routed to chat_jid/notify_channels by the host watcher.  Keep the
@@ -1320,6 +1366,33 @@ async function runTaskInner(
         logger.error(
           { taskId: task.id, err },
           'Failed to store/notify task result',
+        );
+      }
+    }
+
+    // Isolated runs execute in a short-lived #task session. Preserve their
+    // complete SDK final (or terminal error) in the canonical Web workspace as
+    // a durable, user-visible result. External delivery remains owned by the
+    // Agent's chosen tool (send_message, feishu-cli, etc.); this projection is
+    // Web-only and therefore never duplicates an IM mutation.
+    if (options?.taskRunId && effectiveJid !== workspace.jid) {
+      const runId = String(options.durableRun?.id ?? runLogId);
+      const workspaceResult = formatScheduledTaskWorkspaceResult({
+        task,
+        runId,
+        result: cleanedResult,
+        error,
+      });
+      try {
+        await deps.storeResultAndNotify(workspace.jid, workspaceResult, {
+          sourceKind: 'scheduled_task_result',
+          messageId: `scheduled-task-result:${runId}`,
+          workspaceFolder: workspace.folder || undefined,
+        });
+      } catch (err) {
+        logger.error(
+          { taskId: task.id, runId, err },
+          'Failed to project scheduled task result to source workspace',
         );
       }
     }

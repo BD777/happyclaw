@@ -60,6 +60,7 @@ export interface Message {
   source_kind?:
     | 'sdk_final'
     | 'sdk_send_message'
+    | 'scheduled_task_result'
     | 'interrupt_partial'
     | 'legacy'
     | null;

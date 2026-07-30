@@ -165,7 +165,11 @@ describe('prompts/ files', () => {
     expect(proactiveOutput).toContain('在第一个可能明显耗时的工具调用前');
     expect(proactive).not.toContain('minimal internal acknowledgement');
     expect(proactiveOutput).not.toContain('最终回复必须自包含');
-    expect(taskOutput).toContain('最终 SDK Assistant 文本不会自动发送');
+    expect(taskOutput).toContain(
+      '最终 SDK Assistant 文本会自动作为正式任务结果归档',
+    );
+    expect(taskOutput).toContain('完整、可独立阅读的业务结果');
+    expect(taskOutput).toContain('`feishu-cli` 等其他工具');
     for (const delivery of [assistant, proactive]) {
       expect(delivery).toContain('not an identity or personality instruction');
       expect(delivery).not.toContain('person-like');
