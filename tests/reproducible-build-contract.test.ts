@@ -72,23 +72,27 @@ describe('reproducible build contract', () => {
     }
   });
 
-  test('container downloads use pinned versions and integrity checks', () => {
+  test('container tools refresh to latest with rollback and audit controls', () => {
     const dockerfile = read('container/Dockerfile');
     const buildScript = read('container/build.sh');
+    const publishWorkflow = read('.github/workflows/docker-publish.yml');
 
-    expect(dockerfile).toMatch(
-      /^FROM node:\d+\.\d+\.\d+-slim@sha256:[a-f0-9]{64}$/m,
+    expect(dockerfile).toMatch(/^FROM node:24-slim$/m);
+    expect(dockerfile).toContain('COPY --from=ghcr.io/astral-sh/uv:latest');
+    expect(dockerfile).toContain('ARG CLAUDE_AGENT_SDK_VERSION=latest');
+    expect(dockerfile).toContain('ARG CLAUDE_CODE_VERSION=latest');
+    expect(dockerfile).toContain('ARG AGENT_BROWSER_VERSION=latest');
+    expect(dockerfile).toContain('ARG HEADROOM_VERSION=latest');
+    expect(dockerfile).toContain('ARG FEISHU_CLI_VERSION=latest');
+    expect(dockerfile).toContain('ARG OH_MY_ZSH_REF=master');
+    expect(dockerfile).toContain(
+      'github.com/riba2534/feishu-cli/releases/latest/download',
     );
-    expect(dockerfile).toMatch(
-      /COPY --from=ghcr\.io\/astral-sh\/uv:\d+\.\d+\.\d+@sha256:[a-f0-9]{64}/,
-    );
-    expect(dockerfile).toMatch(/ARG FEISHU_CLI_VERSION=v\d+\.\d+\.\d+/);
-    expect(dockerfile).toMatch(/ARG OH_MY_ZSH_COMMIT=[a-f0-9]{40}/);
-    expect(dockerfile).toContain('headroom-ai[code,mcp]==0.27.0');
-    expect(dockerfile).toContain('sha256sum -c -');
-    expect(dockerfile).not.toContain('releases/latest');
-    expect(dockerfile).not.toMatch(/(?:^|[/:])latest(?:\s|$)/m);
+    expect(dockerfile).toContain('sha256sum -c checksum.txt');
+    expect(dockerfile).toContain('happyclaw-tool-versions.txt');
+    expect(dockerfile).toContain('PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1');
     expect(dockerfile).not.toContain('npm install -g');
     expect(buildScript).not.toContain('CACHEBUST');
+    expect(publishWorkflow).toContain('TOOL_REFRESH=${{ github.sha }}');
   });
 });

@@ -265,6 +265,13 @@ make dev
 | `make restore FILE=happyclaw-backup-xxx.tar.gz` | 停止服务后恢复指定备份                                |
 | `make help`                                     | 查看完整命令列表                                      |
 
+`main` 分支每次推送都会重新构建并发布
+`riba2534/happyclaw-agent:latest`（amd64/arm64）。镜像构建时会解析 Claude Code、
+Claude Agent SDK、agent-browser、feishu-cli、uv 和 Headroom 的最新稳定版；
+实际安装版本记录在镜像内的
+`/usr/local/share/happyclaw-tool-versions.txt`，需要回滚时也可以通过 Docker
+build args 指定精确版本。
+
 ## 配置与数据
 
 HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞大的环境变量。
@@ -440,7 +447,11 @@ happyclaw/
 <details>
 <summary><strong>需要另外安装 Claude Code CLI 吗？</strong></summary>
 
-不需要。HappyClaw 锁定的 Claude Agent SDK 依赖已经包含对应 Claude Code 运行时。固定版本的内置 Skills 会在 `make install`、`make dev` 和 `make start` 时自动物化，并由 Host/Container 共用同一 Manifest；其他 Host 工具可通过 `make install-host-tools` 安装。
+不需要。官方 Agent 镜像会在每次发布时安装最新稳定版 Claude Agent SDK 和
+Claude Code，并把实际版本写入
+`/usr/local/share/happyclaw-tool-versions.txt`。固定版本的内置 Skills 会在
+`make install`、`make dev` 和 `make start` 时自动物化，并由 Host/Container
+共用同一 Manifest；其他 Host 工具可通过 `make install-host-tools` 安装。
 
 </details>
 
