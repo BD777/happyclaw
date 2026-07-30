@@ -14,6 +14,7 @@ describe('Docker image distribution contract', () => {
     expect(workflow).toContain('type=raw,value=latest');
     expect(workflow).toContain('type=sha,format=long,prefix=git-');
     expect(workflow).toContain('platforms: linux/amd64,linux/arm64');
+    expect(workflow).toContain('TOOL_REFRESH=${{ github.sha }}');
     expect(workflow).toContain('username: ${{ secrets.DOCKERHUB_USERNAME }}');
     expect(workflow).toContain('password: ${{ secrets.DOCKERHUB_TOKEN }}');
     expect(workflow).not.toContain(`${['dckr', 'pat'].join('_')}_`);
