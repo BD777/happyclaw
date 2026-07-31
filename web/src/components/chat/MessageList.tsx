@@ -12,6 +12,7 @@ import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { ErrorBoundary } from '../common';
+import { ScrollIndicator } from '../ui/ScrollIndicator';
 import {
   Loader2,
   ChevronUp,
@@ -478,6 +479,7 @@ export function MessageList({
 
   return (
     <div className="relative flex-1 overflow-hidden overflow-x-hidden">
+      <ScrollIndicator containerRef={parentRef} />
       <div
         ref={parentRef}
         className="h-full overflow-y-auto overflow-x-hidden pb-10 pt-6"
