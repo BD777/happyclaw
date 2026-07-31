@@ -42,6 +42,7 @@ import {
   getChannelAccount,
   getGroupsByTargetAgent,
   updateAgentLastImJid,
+  countAgentProfilesByModelConfigId,
 } from '../db.js';
 import {
   channelConversationJid,
@@ -83,6 +84,8 @@ import {
   appendClaudeConfigAudit,
   getProviders,
   getEnabledProviders,
+  getDefaultProviderId,
+  setDefaultProvider,
   getBalancingConfig,
   saveBalancingConfig,
   createProvider,
@@ -870,10 +873,86 @@ configRoutes.get(
         })),
         balancing,
         enabledCount: enabledProviders.length,
+        defaultProviderId: getDefaultProviderId(),
       });
     } catch (err) {
       logger.error({ err }, 'Failed to list providers');
       return c.json({ error: 'Failed to list providers' }, 500);
+    }
+  },
+);
+
+// ─── PUT /claude/default — 设置所有继承型 Agent 使用的默认模型配置 ─────
+configRoutes.put(
+  '/claude/default',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const providerId =
+      typeof body.providerId === 'string' ? body.providerId.trim() : '';
+    if (!providerId) {
+      return c.json({ error: 'providerId (string) is required' }, 400);
+    }
+    const actor = (c.get('user') as AuthUser).username;
+
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        const previousProviderId = getDefaultProviderId();
+        if (previousProviderId === providerId) {
+          const provider = getProviders().find(
+            (item) => item.id === providerId,
+          );
+          if (!provider) throw new Error('未找到指定模型配置');
+          return c.json({
+            provider: toPublicProvider(provider),
+            defaultProviderId: provider.id,
+            applied: {
+              success: true,
+              stoppedCount: 0,
+              failedCount: 0,
+              persisted: true,
+            },
+          });
+        }
+        const mutation = await mutateClaudeConfigForAllGroups(
+          actor,
+          {
+            trigger: 'default_model_update',
+            previousProviderId,
+            providerId,
+          },
+          () => {
+            const provider = setDefaultProvider(providerId);
+            appendClaudeConfigAuditBestEffort(actor, 'set_default_model', [
+              `id:${provider.id}`,
+            ]);
+            return provider;
+          },
+        );
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          defaultProviderId: mutation.value!.id,
+          applied: mutation.applied,
+        });
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to set default model';
+      logger.warn({ err, providerId }, 'Failed to set default model');
+      return c.json({ error: message }, 400);
     }
   },
 );
@@ -945,7 +1024,13 @@ configRoutes.patch(
           validation.data.anthropicModel !== undefined &&
           validation.data.anthropicModel !== previous.anthropicModel
         );
-        const protocolFieldChanged = baseUrlChanged || modelChanged;
+        const customEnvChanged = !!(
+          validation.data.customEnv !== undefined &&
+          JSON.stringify(validation.data.customEnv) !==
+            JSON.stringify(previous.customEnv)
+        );
+        const protocolFieldChanged =
+          baseUrlChanged || modelChanged || customEnvChanged;
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
         const sessionInvalidation = {
           modelChanged:
@@ -953,18 +1038,15 @@ configRoutes.patch(
           baseUrlChanged:
             baseUrlChanged || pendingInvalidation?.baseUrlChanged === true,
         };
-        // Preserve this PR's model/base-URL resume behavior for third-party
-        // gateways. We do not have a reproducible third-party backend failure
-        // proving that their sessions must be invalidated.
         const shouldClearSessions =
-          !!pendingInvalidation ||
-          (protocolFieldChanged && previous.type === 'official');
+          !!pendingInvalidation || protocolFieldChanged;
         const metadata = {
           trigger: 'provider_update',
           providerId: id,
           protocolFieldChanged,
           baseUrlChanged,
           modelChanged,
+          customEnvChanged,
         };
         const commit = () => {
           const updated = updateProvider(id, validation.data);
@@ -1110,6 +1192,13 @@ configRoutes.put(
                 providerId: id,
               },
               commit,
+              {
+                clearSessionsForProviderId: id,
+                sessionInvalidation: {
+                  modelChanged: true,
+                  baseUrlChanged: true,
+                },
+              },
             )
           : {
               value: commit(),
@@ -1162,6 +1251,12 @@ configRoutes.delete(
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
         if (!previous && !pendingInvalidation) {
           throw new Error('未找到指定供应商');
+        }
+        const referencedAgentCount = countAgentProfilesByModelConfigId(id);
+        if (referencedAgentCount > 0) {
+          throw new Error(
+            `该模型配置仍被 ${referencedAgentCount} 个智能体使用，请先重新分配`,
+          );
         }
         const sessionInvalidation = pendingInvalidation ?? {
           modelChanged: true,
@@ -1219,6 +1314,14 @@ configRoutes.post(
 
     try {
       return await withClaudeConfigMutationLock(async () => {
+        if (!body.enabled) {
+          const referencedAgentCount = countAgentProfilesByModelConfigId(id);
+          if (referencedAgentCount > 0) {
+            throw new Error(
+              `该模型配置仍被 ${referencedAgentCount} 个智能体使用，不能禁用`,
+            );
+          }
+        }
         const mutation = await mutateClaudeConfigForAllGroups(
           actor,
           { trigger: 'provider_toggle', providerId: id },

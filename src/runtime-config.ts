@@ -402,7 +402,7 @@ interface ClaudeStoredProfileResolved {
   officialUpdatedAt: string | null;
 }
 
-// ─── V4 统一供应商模型 ────────────────────────────────────────
+// ─── V5 模型配置（每项都是一套完整 Provider 运行环境）──────────
 
 export interface BalancingConfig {
   strategy: 'round-robin' | 'weighted-round-robin' | 'failover';
@@ -433,6 +433,16 @@ interface StoredProviderV4 {
 interface StoredClaudeProviderConfigV4 {
   version: 4;
   providers: StoredProviderV4[];
+  balancing: BalancingConfig;
+  updatedAt: string;
+}
+
+interface StoredClaudeProviderConfigV5 {
+  version: 5;
+  providers: StoredProviderV4[];
+  /** Null is only valid while no model configuration exists. */
+  defaultProviderId: string | null;
+  /** Kept for disk/API compatibility; Agent-bound selection no longer uses it. */
   balancing: BalancingConfig;
   updatedAt: string;
 }
@@ -1098,7 +1108,7 @@ function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
   writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
 }
 
-// ─── V4 统一供应商 Read / Write / CRUD ──────────────────────────
+// ─── V5 模型配置 Read / Write / CRUD ───────────────────────────
 
 function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
   const secrets: SecretPayload = {
@@ -1248,20 +1258,59 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
   return { providers, balancing };
 }
 
-/** Read V4 config, with automatic V3→V4 migration */
+function resolveDefaultProviderId(
+  providers: UnifiedProvider[],
+  requestedId?: string | null,
+): string | null {
+  const requested = requestedId
+    ? providers.find((provider) => provider.id === requestedId)
+    : undefined;
+  if (requested?.enabled) return requested.id;
+  return (
+    providers.find((provider) => provider.enabled)?.id ??
+    providers[0]?.id ??
+    null
+  );
+}
+
+/** Read V5 config, with automatic V3/V4 migration. */
 function readStoredStateV4(): {
   providers: UnifiedProvider[];
   balancing: BalancingConfig;
+  defaultProviderId: string | null;
 } | null {
   if (!fs.existsSync(CLAUDE_CONFIG_FILE)) return null;
   try {
     const content = fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8');
     const parsed = JSON.parse(content) as Record<string, unknown>;
 
+    if (parsed.version === 5) {
+      const v5 = parsed as unknown as StoredClaudeProviderConfigV5;
+      const providers = v5.providers.map(fromStoredProviderV4);
+      return {
+        providers,
+        defaultProviderId: resolveDefaultProviderId(
+          providers,
+          v5.defaultProviderId,
+        ),
+        balancing: {
+          strategy: v5.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
+          unhealthyThreshold:
+            v5.balancing?.unhealthyThreshold ??
+            DEFAULT_BALANCING_CONFIG.unhealthyThreshold,
+          recoveryIntervalMs:
+            v5.balancing?.recoveryIntervalMs ??
+            DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
+        },
+      };
+    }
+
     if (parsed.version === 4) {
       const v4 = parsed as unknown as StoredClaudeProviderConfigV4;
-      return {
-        providers: v4.providers.map(fromStoredProviderV4),
+      const providers = v4.providers.map(fromStoredProviderV4);
+      const migrated = {
+        providers,
+        defaultProviderId: resolveDefaultProviderId(providers),
         balancing: {
           strategy: v4.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
           unhealthyThreshold:
@@ -1272,6 +1321,16 @@ function readStoredStateV4(): {
             DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
         },
       };
+      writeStoredStateV4(
+        migrated.providers,
+        migrated.balancing,
+        migrated.defaultProviderId,
+      );
+      logger.info(
+        { defaultProviderId: migrated.defaultProviderId },
+        'Migrated Claude model configuration from V4 to V5',
+      );
+      return migrated;
     }
 
     // V3 or older → read as V3, then migrate
@@ -1280,18 +1339,23 @@ function readStoredStateV4(): {
 
     const migrated = migrateV3toV4(v3);
 
-    // Auto-save as V4 on first read (lazy migration)
-    writeStoredStateV4(migrated.providers, migrated.balancing);
+    const defaultProviderId = resolveDefaultProviderId(migrated.providers);
+    // Auto-save as V5 on first read (lazy migration)
+    writeStoredStateV4(
+      migrated.providers,
+      migrated.balancing,
+      defaultProviderId,
+    );
     logger.info(
-      { providerCount: migrated.providers.length },
-      'Migrated Claude provider config from V3 to V4',
+      { providerCount: migrated.providers.length, defaultProviderId },
+      'Migrated Claude provider config from V3 to V5',
     );
 
-    return migrated;
+    return { ...migrated, defaultProviderId };
   } catch (err) {
     logger.error(
       { err, file: CLAUDE_CONFIG_FILE },
-      'Failed to read Claude provider config V4',
+      'Failed to read Claude model configuration V5',
     );
     return null;
   }
@@ -1300,10 +1364,12 @@ function readStoredStateV4(): {
 function writeStoredStateV4(
   providers: UnifiedProvider[],
   balancing: BalancingConfig,
+  defaultProviderId?: string | null,
 ): void {
-  const payload: StoredClaudeProviderConfigV4 = {
-    version: 4,
+  const payload: StoredClaudeProviderConfigV5 = {
+    version: 5,
     providers: providers.map(toStoredProviderV4),
+    defaultProviderId: resolveDefaultProviderId(providers, defaultProviderId),
     balancing,
     updatedAt: new Date().toISOString(),
   };
@@ -1312,7 +1378,7 @@ function writeStoredStateV4(
   writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
 }
 
-// ─── V4 公开 API ─────────────────────────────────────────────
+// ─── V5 公开 API ─────────────────────────────────────────────
 
 export function getProviders(): UnifiedProvider[] {
   const state = readStoredStateV4();
@@ -1321,6 +1387,20 @@ export function getProviders(): UnifiedProvider[] {
 
 export function getEnabledProviders(): UnifiedProvider[] {
   return getProviders().filter((p) => p.enabled);
+}
+
+export function getDefaultProviderId(): string | null {
+  return readStoredStateV4()?.defaultProviderId ?? null;
+}
+
+export function setDefaultProvider(id: string): UnifiedProvider {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('模型配置不存在');
+  const provider = state.providers.find((item) => item.id === id);
+  if (!provider) throw new Error('未找到指定模型配置');
+  if (!provider.enabled) throw new Error('默认模型配置必须处于启用状态');
+  writeStoredStateV4(state.providers, state.balancing, provider.id);
+  return provider;
 }
 
 export function getBalancingConfig(): BalancingConfig {
@@ -1334,12 +1414,13 @@ export function saveBalancingConfig(
   const state = readStoredStateV4() || {
     providers: [],
     balancing: { ...DEFAULT_BALANCING_CONFIG },
+    defaultProviderId: null,
   };
   const merged: BalancingConfig = {
     ...state.balancing,
     ...config,
   };
-  writeStoredStateV4(state.providers, merged);
+  writeStoredStateV4(state.providers, merged, state.defaultProviderId);
   return merged;
 }
 
@@ -1359,6 +1440,7 @@ export function createProvider(input: {
   const state = readStoredStateV4() || {
     providers: [],
     balancing: { ...DEFAULT_BALANCING_CONFIG },
+    defaultProviderId: null,
   };
 
   if (state.providers.length >= MAX_PROVIDERS) {
@@ -1370,7 +1452,7 @@ export function createProvider(input: {
     id: crypto.randomBytes(8).toString('hex'),
     name: normalizeProfileName(input.name),
     type: input.type,
-    enabled: input.enabled ?? state.providers.length === 0,
+    enabled: state.providers.length === 0 ? true : (input.enabled ?? false),
     weight: Math.max(1, Math.min(100, input.weight ?? 1)),
     anthropicBaseUrl: input.anthropicBaseUrl
       ? normalizeBaseUrl(input.anthropicBaseUrl)
@@ -1395,7 +1477,9 @@ export function createProvider(input: {
   };
 
   state.providers.push(provider);
-  writeStoredStateV4(state.providers, state.balancing);
+  const defaultProviderId =
+    state.defaultProviderId ?? (provider.enabled ? provider.id : null);
+  writeStoredStateV4(state.providers, state.balancing, defaultProviderId);
   return provider;
 }
 
@@ -1441,7 +1525,7 @@ export function updateProvider(
   };
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(state.providers, state.balancing, state.defaultProviderId);
   return updated;
 }
 
@@ -1503,7 +1587,7 @@ export function updateProviderSecrets(
   }
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(state.providers, state.balancing, state.defaultProviderId);
   return updated;
 }
 
@@ -1520,6 +1604,10 @@ export function setProviderEnabled(
   const provider = state.providers[idx];
   if (provider.enabled === enabled) return provider;
 
+  if (!enabled && state.defaultProviderId === id) {
+    throw new Error('默认模型配置不能禁用，请先选择新的默认模型');
+  }
+
   // Prevent disabling the last enabled provider
   if (!enabled && state.providers.filter((p) => p.enabled).length <= 1) {
     throw new Error('至少需要保留一个启用的供应商');
@@ -1530,7 +1618,7 @@ export function setProviderEnabled(
     enabled,
     updatedAt: new Date().toISOString(),
   };
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(state.providers, state.balancing, state.defaultProviderId);
   return state.providers[idx];
 }
 
@@ -1551,6 +1639,10 @@ export function deleteProvider(id: string): void {
     throw new Error('至少需要保留一个供应商');
   }
 
+  if (state.defaultProviderId === id) {
+    throw new Error('默认模型配置不能删除，请先选择新的默认模型');
+  }
+
   const wasEnabled = state.providers[idx].enabled;
   state.providers.splice(idx, 1);
 
@@ -1559,7 +1651,7 @@ export function deleteProvider(id: string): void {
     state.providers[0].enabled = true;
   }
 
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(state.providers, state.balancing, state.defaultProviderId);
 }
 
 /** Convert a UnifiedProvider to the flat ClaudeProviderConfig used by container runner */
@@ -1970,9 +2062,11 @@ export function getClaudeProviderConfig(): ClaudeProviderConfig {
   try {
     const state = readStoredStateV4();
     if (state) {
-      const enabled =
-        state.providers.find((p) => p.enabled) || state.providers[0];
-      if (enabled) return providerToConfig(enabled);
+      const selected =
+        state.providers.find((p) => p.id === state.defaultProviderId) ??
+        state.providers.find((p) => p.enabled) ??
+        state.providers[0];
+      if (selected) return providerToConfig(selected);
     }
   } catch {
     // ignore corrupted file and use env fallback
@@ -2526,10 +2620,13 @@ export function getActiveProfileCustomEnv(): Record<string, string> {
   const state = readStoredStateV4();
   if (!state) return {};
 
-  const enabled = state.providers.find((p) => p.enabled) || state.providers[0];
-  if (!enabled) return {};
+  const selected =
+    state.providers.find((p) => p.id === state.defaultProviderId) ??
+    state.providers.find((p) => p.enabled) ??
+    state.providers[0];
+  if (!selected) return {};
 
-  return sanitizeCustomEnvMap(enabled.customEnv || {}, {
+  return sanitizeCustomEnvMap(selected.customEnv || {}, {
     skipReservedClaudeKeys: true,
   });
 }

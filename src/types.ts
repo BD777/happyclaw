@@ -297,6 +297,8 @@ export interface AgentProfile {
   avatar_emoji: string | null;
   avatar_color: string | null;
   avatar_url: string | null;
+  /** Null means inherit the system default model configuration. */
+  model_config_id: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;

@@ -2188,6 +2188,7 @@ function toContainerAgentProfile(
     identityHash: profile.identity_hash,
     identityPrompt: buildAgentProfilePrompt(profile),
     includeClaudePreset: profile.prompt_mode === 'append',
+    modelConfigId: profile.model_config_id,
     runtimePolicy: profile.runtime_policy,
   };
 }
@@ -5802,7 +5803,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   } else if (
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, undefined)
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      undefined,
+      agentProfile?.model_config_id,
+    )
   ) {
     // Proactive provider switch (sticky binding unhealthy/disabled) will clear
     // the SDK session inside the runner. Inject history so the new provider's
@@ -14140,7 +14145,11 @@ async function processAgentConversation(
   const startsFreshSession =
     !sessionId ||
     resetForAgentProfile ||
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId);
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      agentId,
+      agentProfile?.model_config_id,
+    );
   let historyContext: ReturnType<typeof buildRecentConversationHistoryContext> =
     null;
   if (startsFreshSession) {

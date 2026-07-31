@@ -33,8 +33,10 @@ import {
   clearInheritedClaudeProviderEnv,
   getClaudeProviderConfig,
   getContainerEnvConfig,
+  getDefaultProviderId,
   getEnabledProviders,
   getBalancingConfig,
+  getProviders,
   getSystemSettings,
   getEffectiveExternalDir,
   mergeClaudeEnvConfig,
@@ -381,6 +383,8 @@ export interface ContainerInput {
     identityHash: string;
     identityPrompt: string;
     includeClaudePreset: boolean;
+    /** Null means inherit the system default model configuration. */
+    modelConfigId?: string | null;
     runtimePolicy?: AgentProfileRuntimePolicy;
   };
   /**
@@ -472,13 +476,16 @@ export interface ContainerOutput {
 function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
+  allowFailover = true,
 ): boolean {
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
-  const disposition = resolveProviderFailureDisposition(
-    selectedProfileId,
-    providerPool.getHealthStatuses(),
-  );
+  const disposition = allowFailover
+    ? resolveProviderFailureDisposition(
+        selectedProfileId,
+        providerPool.getHealthStatuses(),
+      )
+    : { terminal: true };
   applyKnownProviderFailureDisposition(output, disposition.terminal);
   return disposition.terminal;
 }
@@ -743,24 +750,11 @@ function getAgentProfileMcpPolicyMode(
 }
 
 /**
- * One-time provider overrides per group folder.
- * Set by switchProvider(), consumed (and deleted) by trySelectPoolProvider().
- */
-const providerOverrides = new Map<string, string>();
-
-export function setProviderOverride(
-  groupFolder: string,
-  providerId: string,
-): void {
-  providerOverrides.set(groupFolder, providerId);
-}
-
-/**
  * Read-only prediction of whether the next provider selection will *clear* the
  * resumable Claude session because it has to switch away from the bound
- * provider (the binding is unhealthy or no longer enabled, or a one-time
- * override targets a different provider). Mirrors the `resetSession` conditions
- * in trySelectPoolProvider without mutating sticky bindings.
+ * provider (the binding is unhealthy or no longer enabled). Mirrors the
+ * `resetSession` conditions in trySelectPoolProvider without mutating sticky
+ * bindings.
  *
  * The orchestration layer calls this *before* building the prompt so a
  * proactive provider switch injects recent conversation history into the fresh
@@ -773,7 +767,14 @@ export function setProviderOverride(
 export function willClearSessionOnProviderSwitch(
   groupFolder: string,
   agentId?: string | null,
+  modelConfigId?: string | null,
 ): boolean {
+  const selectedModelConfigId = modelConfigId ?? getDefaultProviderId();
+  const boundId = getSessionProviderId(groupFolder, agentId);
+  if (selectedModelConfigId) {
+    return !!boundId && boundId !== selectedModelConfigId;
+  }
+
   // Env-level provider override means the pool is bypassed entirely — no
   // pool-driven switch, so the session is never cleared on this account.
   const override = getContainerEnvConfig(groupFolder);
@@ -785,15 +786,7 @@ export function willClearSessionOnProviderSwitch(
     return false;
   }
 
-  const boundId = getSessionProviderId(groupFolder, agentId);
   if (!boundId) return false;
-
-  // One-time override (from switchProvider) targeting a different provider will
-  // reset. Peek without consuming — trySelectPoolProvider consumes it later.
-  const overrideProviderId = providerOverrides.get(groupFolder);
-  if (overrideProviderId) {
-    return overrideProviderId !== boundId;
-  }
 
   const enabledProviders = getEnabledProviders();
   if (enabledProviders.length === 0) return false;
@@ -819,8 +812,6 @@ export function willClearSessionOnProviderSwitch(
  * Try to select a provider from the pool. Returns profileId + resolved config,
  * or null if no providers are enabled / group has env-level provider override / selection fails.
  * For single-provider setups, returns the provider for display without pool balancing.
- * One-time overrides (from switchProvider) are consumed on use.
- *
  * Session-sticky binding (when groupFolder + agentId identifies a resumable Claude
  * session): if the session has a previously-bound provider that is still enabled,
  * prefer it over load-balancing. This prevents "Invalid signature in thinking
@@ -832,48 +823,47 @@ export function willClearSessionOnProviderSwitch(
 export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
+  modelConfigId?: string | null,
 ): {
   profileId: string;
   resolved: ResolvedProvider;
   previousProviderId?: string;
   resetSession?: boolean;
 } | null {
+  const selectedModelConfigId = modelConfigId ?? getDefaultProviderId();
+  const existingBoundId = getSessionProviderId(groupFolder, agentId);
+  if (selectedModelConfigId) {
+    // Agent/default selection is authoritative. Workspace credentials must
+    // never move a Workspace away from the model configuration selected for
+    // its top-level Agent.
+    const enabledProviders = getEnabledProviders();
+    const selected = getProviders().find(
+      (provider) => provider.id === selectedModelConfigId,
+    );
+    if (!selected || !selected.enabled) {
+      throw new Error(
+        `agent_model_unavailable: model configuration ${selectedModelConfigId} is missing or disabled`,
+      );
+    }
+    providerPool.refreshFromConfig(enabledProviders, getBalancingConfig());
+    const resolved = resolveProviderById(selected.id);
+    providerPool.acquireSession(selected.id);
+    setSessionProviderId(groupFolder, agentId, selected.id);
+    return {
+      profileId: selected.id,
+      resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      previousProviderId: existingBoundId,
+      resetSession: !!existingBoundId && existingBoundId !== selected.id,
+    };
+  }
+
   const override = getContainerEnvConfig(groupFolder);
   const hasOverride = !!(
     override.anthropicApiKey ||
     override.anthropicAuthToken ||
     override.anthropicBaseUrl
   );
-  const existingBoundId = getSessionProviderId(groupFolder, agentId);
   if (hasOverride) return null;
-
-  // Check one-time override (consumed on use)
-  const overrideProviderId = providerOverrides.get(groupFolder);
-  if (overrideProviderId) {
-    providerOverrides.delete(groupFolder);
-    try {
-      const resolved = resolveProviderById(overrideProviderId);
-      providerPool.acquireSession(overrideProviderId);
-      // Override path also updates sticky binding so subsequent runs follow.
-      setSessionProviderId(groupFolder, agentId, overrideProviderId);
-      logger.info(
-        { groupFolder, providerId: overrideProviderId },
-        'Using one-time provider override',
-      );
-      return {
-        profileId: overrideProviderId,
-        resolved: { config: resolved.config, customEnv: resolved.customEnv },
-        previousProviderId: existingBoundId,
-        resetSession:
-          !!existingBoundId && existingBoundId !== overrideProviderId,
-      };
-    } catch (err) {
-      logger.warn(
-        { err, providerId: overrideProviderId },
-        'Provider override failed, falling back to pool',
-      );
-    }
-  }
 
   // Refresh pool state from V4 config
   const enabledProviders = getEnabledProviders();
@@ -1375,9 +1365,12 @@ export function buildVolumeMounts(
   fs.mkdirSync(envDir, { recursive: true });
   const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
   const containerOverride = getContainerEnvConfig(group.folder);
+  const effectiveContainerOverride = resolvedProvider
+    ? { customEnv: containerOverride.customEnv }
+    : containerOverride;
   const envLines = buildContainerEnvLines(
     globalConfig,
-    containerOverride,
+    effectiveContainerOverride,
     resolvedProvider?.customEnv,
   );
   // Agent policy is authoritative; do not inherit global/custom runtime env.
@@ -1576,9 +1569,16 @@ export async function runContainerAgent(
   mkdirForContainer(groupDir);
 
   // ─── Provider Pool selection ───
-  const poolResult = trySelectPoolProvider(group.folder, sessionAgentId);
+  const poolResult = trySelectPoolProvider(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
+  const modelSelectionPinned = !!(
+    input.agentProfile?.modelConfigId ?? getDefaultProviderId()
+  );
   let providerFailureReported = false;
   let providerFailureTerminal: boolean | undefined;
   let providerFailureMaintenance = false;
@@ -1905,6 +1905,7 @@ export async function runContainerAgent(
               const terminal = applyProviderFailureDisposition(
                 output,
                 selectedProfileId,
+                !modelSelectionPinned,
               );
               providerFailureTerminal = terminal;
               logger.warn(
@@ -2043,6 +2044,7 @@ export async function runContainerAgent(
         providerFailureTerminal = applyProviderFailureDisposition(
           result,
           selectedProfileId,
+          !modelSelectionPinned,
         );
       } else {
         applyKnownProviderFailureDisposition(result, providerFailureTerminal);
@@ -2398,8 +2400,15 @@ export async function runHostAgent(
 
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);
-  const hostPoolResult = trySelectPoolProvider(group.folder, sessionAgentId);
+  const hostPoolResult = trySelectPoolProvider(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
+  const hostModelSelectionPinned = !!(
+    input.agentProfile?.modelConfigId ?? getDefaultProviderId()
+  );
   const globalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
@@ -2442,7 +2451,9 @@ export async function runHostAgent(
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
       globalConfig,
-      containerOverride,
+      hostSelectedProfileId
+        ? { customEnv: containerOverride.customEnv }
+        : containerOverride,
       hostPoolResult?.resolved.customEnv,
     );
     const injectsAnthropicAuthToken = envLines.some((line) =>
@@ -2831,6 +2842,7 @@ export async function runHostAgent(
               const terminal = applyProviderFailureDisposition(
                 output,
                 hostSelectedProfileId,
+                !hostModelSelectionPinned,
               );
               hostProviderFailureTerminal = terminal;
               logger.warn(
@@ -2958,6 +2970,7 @@ export async function runHostAgent(
         hostProviderFailureTerminal = applyProviderFailureDisposition(
           hostResult,
           hostSelectedProfileId,
+          !hostModelSelectionPinned,
         );
       } else {
         applyKnownProviderFailureDisposition(
@@ -3010,9 +3023,15 @@ export async function runAgentWithModelFallback(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
-  const maxAttempts = input.isScheduledTask
-    ? Math.max(1, getEnabledProviders().length)
-    : 1;
+  // A top-level Agent owns exactly one complete model configuration. Retrying
+  // through other enabled configurations would violate that contract and can
+  // send a Workspace to a different gateway or official subscription. Keep
+  // the old pool fallback only for an unmigrated/no-model installation.
+  const selectedModelConfigId =
+    input.agentProfile?.modelConfigId ?? getDefaultProviderId();
+  const maxAttempts = selectedModelConfigId
+    ? 1
+    : Math.max(1, getEnabledProviders().length);
   let lastOutput: ContainerOutput | undefined;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {

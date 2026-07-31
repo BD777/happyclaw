@@ -45,6 +45,7 @@ export interface ProvidersListResponse {
   providers: ProviderWithHealth[];
   balancing: BalancingConfig;
   enabledCount: number;
+  defaultProviderId: string | null;
 }
 
 export interface ClaudeApplyResult {

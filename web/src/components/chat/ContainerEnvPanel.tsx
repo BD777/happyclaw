@@ -203,7 +203,7 @@ export function ContainerEnvPanel({
         {hasLegacySystemOverride && (
           <p className="rounded-md border border-warning/30 bg-warning-bg px-3 py-2 text-[11px] leading-5 text-warning">
             该工作区包含旧版模型或 Provider
-            覆盖。为兼容现有运行暂时保留，但不再允许在工作区编辑；请迁移到系统“模型与提供商”设置。
+            覆盖。为兼容现有运行暂时保留，但不再允许在工作区编辑；请迁移到系统“模型配置”设置。
           </p>
         )}
 

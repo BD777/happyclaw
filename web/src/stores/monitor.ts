@@ -48,10 +48,6 @@ interface MonitorState {
   loadStatus: () => Promise<void>;
   pullDockerImage: () => Promise<void>;
   clearPullResult: () => void;
-  switchProvider: (
-    folder: string,
-    providerId: string,
-  ) => Promise<{ ok: boolean; restarted: boolean }>;
 }
 
 export const useMonitorStore = create<MonitorState>((set) => ({
@@ -117,12 +113,4 @@ export const useMonitorStore = create<MonitorState>((set) => ({
   },
 
   clearPullResult: () => set({ pullResult: null, pullLogs: [] }),
-
-  switchProvider: async (folder: string, providerId: string) => {
-    const res = await api.post<{ ok: boolean; restarted: boolean }>(
-      `/api/status/groups/${encodeURIComponent(folder)}/switch-provider`,
-      { providerId },
-    );
-    return res;
-  },
 }));

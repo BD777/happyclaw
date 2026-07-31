@@ -184,6 +184,8 @@ export function AgentProfilesPage() {
   const requestedProfileId = searchParams.get('agent');
   const {
     profiles,
+    modelConfigs = [],
+    defaultModelConfigId = null,
     loading,
     profilesError,
     loadProfiles,
@@ -213,6 +215,7 @@ export function AgentProfilesPage() {
   const [toolsPrompt, setToolsPrompt] = useState('');
   const [promptMode, setPromptMode] =
     useState<AgentProfilePromptMode>('append');
+  const [modelConfigId, setModelConfigId] = useState('inherit');
   const [assistantSection, setAssistantSection] =
     useState<AgentPromptSection>('identity');
   const [avatarEmoji, setAvatarEmoji] = useState<string | null>(null);
@@ -466,6 +469,7 @@ export function AgentProfilesPage() {
         tools_prompt: '',
       });
       setPromptMode('append');
+      setModelConfigId('inherit');
       setAvatarEmoji(null);
       setAvatarColor(null);
       setAvatarUrl(null);
@@ -481,6 +485,7 @@ export function AgentProfilesPage() {
       tools_prompt: selected.tools_prompt,
     });
     setPromptMode(selected.prompt_mode);
+    setModelConfigId(selected.model_config_id ?? 'inherit');
     setAvatarEmoji(selected.avatar_emoji);
     setAvatarColor(selected.avatar_color);
     setAvatarUrl(selected.avatar_url);
@@ -504,6 +509,8 @@ export function AgentProfilesPage() {
       agentsPrompt !== selected.agents_prompt ||
       toolsPrompt !== selected.tools_prompt ||
       promptMode !== selected.prompt_mode ||
+      (modelConfigId === 'inherit' ? null : modelConfigId) !==
+        selected.model_config_id ||
       avatarEmoji !== selected.avatar_emoji ||
       avatarColor !== selected.avatar_color ||
       !sameRuntimePolicy(currentRuntimePolicy, selected.runtime_policy));
@@ -516,6 +523,7 @@ export function AgentProfilesPage() {
       !!agentsPrompt.trim() ||
       !!toolsPrompt.trim() ||
       promptMode !== 'append' ||
+      modelConfigId !== 'inherit' ||
       avatarEmoji !== null ||
       avatarColor !== null ||
       !sameRuntimePolicy(currentRuntimePolicy, DEFAULT_RUNTIME_POLICY));
@@ -696,6 +704,7 @@ export function AgentProfilesPage() {
         tools_prompt: draft.tools_prompt,
       });
       setPromptMode(draft.prompt_mode);
+      setModelConfigId('inherit');
       setAvatarEmoji(null);
       setAvatarColor(null);
       setAvatarUrl(null);
@@ -724,6 +733,7 @@ export function AgentProfilesPage() {
       tools_prompt: '',
     });
     setPromptMode('append');
+    setModelConfigId('inherit');
     setAvatarEmoji(null);
     setAvatarColor(null);
     setAvatarUrl(null);
@@ -752,6 +762,7 @@ export function AgentProfilesPage() {
         prompt_mode: promptMode,
         avatar_emoji: avatarEmoji,
         avatar_color: avatarColor,
+        model_config_id: modelConfigId === 'inherit' ? null : modelConfigId,
         runtime_policy: currentRuntimePolicy,
       });
       setCreateDescription('');
@@ -789,6 +800,11 @@ export function AgentProfilesPage() {
       }
       if (avatarColor !== selected.avatar_color) {
         changes.avatar_color = avatarColor;
+      }
+      const persistedModelConfigId =
+        modelConfigId === 'inherit' ? null : modelConfigId;
+      if (persistedModelConfigId !== selected.model_config_id) {
+        changes.model_config_id = persistedModelConfigId;
       }
       if (!sameRuntimePolicy(currentRuntimePolicy, selected.runtime_policy)) {
         changes.runtime_policy = currentRuntimePolicy;
@@ -1478,6 +1494,43 @@ export function AgentProfilesPage() {
                           onChange={(event) => setName(event.target.value)}
                         />
                       </div>
+                      <div>
+                        <label className="mb-2 block text-sm font-medium">
+                          模型配置
+                        </label>
+                        <Select
+                          value={modelConfigId}
+                          onValueChange={setModelConfigId}
+                        >
+                          <SelectTrigger aria-label="智能体模型配置">
+                            <SelectValue placeholder="选择模型配置" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="inherit">
+                              跟随系统默认
+                              {defaultModelConfigId
+                                ? `（${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}）`
+                                : '（尚未配置）'}
+                            </SelectItem>
+                            {modelConfigs.map((model) => (
+                              <SelectItem
+                                key={model.id}
+                                value={model.id}
+                                disabled={!model.enabled}
+                              >
+                                {model.name}
+                                {model.anthropic_model
+                                  ? ` · ${model.anthropic_model}`
+                                  : ''}
+                                {!model.enabled ? '（已禁用）' : ''}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                          该智能体所属的所有工作区、会话和定时任务都会使用这里解析出的完整模型网关环境。
+                        </p>
+                      </div>
                       <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
                         <div className="flex flex-wrap items-center gap-4">
                           <EmojiAvatar
@@ -1739,6 +1792,16 @@ export function AgentProfilesPage() {
                           label="Claude 默认提示词"
                           value={
                             promptMode === 'append' ? '保留并追加' : '完全替换'
+                          }
+                        />
+                        <SummaryItem
+                          label="模型配置"
+                          value={
+                            modelConfigId === 'inherit'
+                              ? `跟随系统默认${defaultModelConfigId ? `：${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}` : ''}`
+                              : (modelConfigs.find(
+                                  (item) => item.id === modelConfigId,
+                                )?.name ?? '不可用模型配置')
                           }
                         />
                         <SummaryItem
