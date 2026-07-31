@@ -80,7 +80,14 @@ export function ScrollIndicator({
       resizeObserver.observe(child);
     }
     const mutationObserver = new MutationObserver(scheduleMeasure);
-    mutationObserver.observe(el, { childList: true, subtree: true });
+    // Virtualized lists resize by writing an inline height onto a spacer, which
+    // is an attribute mutation rather than a child list change.
+    mutationObserver.observe(el, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'class'],
+    });
 
     measure();
 
@@ -101,13 +108,17 @@ export function ScrollIndicator({
     <div
       aria-hidden="true"
       className={cn(
-        'pointer-events-none absolute right-0.5 top-0 z-10 w-1.5 rounded-full bg-foreground/25',
+        'pointer-events-none absolute right-1 top-0 bottom-0 z-10 w-2 rounded-full bg-foreground/5',
         className,
       )}
-      style={{
-        height: `${thumb.height}px`,
-        transform: `translateY(${thumb.offset}px)`,
-      }}
-    />
+    >
+      <div
+        className="absolute inset-x-0 rounded-full bg-foreground/40"
+        style={{
+          height: `${thumb.height}px`,
+          transform: `translateY(${thumb.offset}px)`,
+        }}
+      />
+    </div>
   );
 }
