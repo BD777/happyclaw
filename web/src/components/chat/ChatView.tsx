@@ -883,11 +883,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             <h2 className="font-semibold text-foreground text-[15px] truncate">
               {workspaceDisplayName}
             </h2>
-            <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-1.5 overflow-hidden text-xs text-muted-foreground">
               <span className="truncate">{contextSummary}</span>
               {group.execution_mode && (
                 <>
-                  <span className="text-muted-foreground/40">·</span>
+                  <span className="hidden shrink-0 text-muted-foreground/40 sm:inline">
+                    ·
+                  </span>
                   <span
                     className={`hidden shrink-0 items-center rounded-full border px-2.5 py-0.5 text-[10px] font-medium sm:inline-flex ${group.execution_mode === 'host' ? 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/30 dark:text-amber-300 dark:border-amber-800' : 'bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/30 dark:text-sky-300 dark:border-sky-800'}`}
                   >
@@ -895,7 +897,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   </span>
                 </>
               )}
-              <span className="text-muted-foreground/40">·</span>
+              <span className="shrink-0 text-muted-foreground/40">·</span>
               <span
                 className={cn(
                   'inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[10px] font-medium',
@@ -920,15 +922,19 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 imStatus &&
                 Object.entries(imStatus).some(([, v]) => v) && (
                   <>
-                    <span className="text-muted-foreground/40">·</span>
+                    <span className="shrink-0 text-muted-foreground/40">·</span>
                     {Object.entries(imStatus)
                       .filter(([, connected]) => connected)
                       .map(([channel]) => (
                         <span
                           key={channel}
-                          className="inline-flex items-center gap-0.5"
+                          // `body { word-break: break-word }` drops the
+                          // min-content floor to a single character, so an
+                          // unguarded badge collapses into a vertical column on
+                          // narrow headers instead of keeping its label intact.
+                          className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap"
                         >
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
                           {CHANNEL_LABEL[channel] ?? channel}
                         </span>
                       ))}
