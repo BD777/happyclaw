@@ -159,6 +159,17 @@ import {
   WorkspaceRuntimeQuiesceError,
 } from '../agent-profile-runtime.js';
 import { notifyTaskSchedulerChanged } from '../task-scheduler.js';
+import {
+  SYSTEM_CAPABILITY_LOCK_KEY,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
+import {
+  ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+  clearAdminHostOnlyCleanupPending,
+  getPendingAdminHostOnlyCleanupFolders,
+  markAdminHostOnlyCleanupPending,
+  restorePendingAdminHostOnlyRuntimeSafetyBlocks,
+} from '../admin-host-only-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 /**
@@ -198,6 +209,7 @@ let deps: any = null;
 export function injectConfigDeps(d: any) {
   deps = d;
   restorePendingProviderRuntimeSafetyBlocks();
+  restorePendingAdminHostOnlyRuntimeSafetyBlocks(d);
 }
 
 function createTelegramApiAgent(proxyUrl?: string): HttpsAgent | ProxyAgent {
@@ -2245,201 +2257,242 @@ configRoutes.put(
       }
     }
 
-    const before = toHostIntegrationResponse(getSystemSettings());
-    const mainContextSourceChanged =
-      validation.data.mainAgentContextSource !== undefined &&
-      validation.data.mainAgentContextSource !== before.mainAgentContextSource;
-    const externalClaudeDirChanged =
-      validation.data.externalClaudeDir !== undefined &&
-      validation.data.externalClaudeDir !== before.externalClaudeDir;
-    const hostContextChanged =
-      mainContextSourceChanged || externalClaudeDirChanged;
-    const adminHostOnlyModeChanged =
-      validation.data.adminHostOnlyMode !== undefined &&
-      validation.data.adminHostOnlyMode !== before.adminHostOnlyMode;
-    const enablingAdminHostOnlyMode =
-      adminHostOnlyModeChanged && validation.data.adminHostOnlyMode === true;
-    const defaultCompactChanged =
-      (validation.data.mainAgentAutoCompactWindow !== undefined &&
-        validation.data.mainAgentAutoCompactWindow !==
-          before.mainAgentAutoCompactWindow) ||
-      (validation.data.mainAgentAutoCompactPercentage !== undefined &&
-        validation.data.mainAgentAutoCompactPercentage !==
-          before.mainAgentAutoCompactPercentage);
-    const contextMutationRequested =
-      hostContextChanged || defaultCompactChanged || enablingAdminHostOnlyMode;
-    const contextWorkspaces =
-      hostContextChanged || defaultCompactChanged
-        ? Object.entries(getAllRegisteredGroups())
-            .map(([jid, group]) => ({
-              jid,
-              group,
-              profile: group.created_by
-                ? getAgentProfileForWorkspace(group.folder, group.created_by)
-                : undefined,
-            }))
-            .filter(({ group, profile }) => {
-              if (!group.created_by || !profile) return false;
-              const isActiveAdmin =
-                getUserById(group.created_by)?.role === 'admin';
-              const currentContextSource =
-                resolveEffectiveAgentProfile(profile)?.runtime_policy.context
-                  .source ?? 'managed';
-              const nextContextSource = profile.is_default
-                ? (validation.data.mainAgentContextSource ??
-                  before.mainAgentContextSource)
-                : profile.runtime_policy.context.source;
-              return (
-                (defaultCompactChanged && profile.is_default) ||
-                (mainContextSourceChanged &&
-                  profile.is_default &&
-                  isActiveAdmin) ||
-                (externalClaudeDirChanged &&
-                  isActiveAdmin &&
-                  (currentContextSource === 'host_claude' ||
-                    nextContextSource === 'host_claude'))
-              );
-            })
-        : [];
-    const allGroups = enablingAdminHostOnlyMode ? getAllRegisteredGroups() : {};
-    const activeAdminFolders = enablingAdminHostOnlyMode
-      ? new Set(
-          Object.values(allGroups)
-            .filter((group) => {
-              const owner = group.created_by
-                ? getUserById(group.created_by)
-                : undefined;
-              return owner?.role === 'admin' && owner.status === 'active';
-            })
-            .map((group) => group.folder),
-        )
-      : new Set<string>();
-    const policyWorkspaces = Array.from(activeAdminFolders)
-      .map((folder) => {
-        const entries = Object.entries(allGroups).filter(
-          ([, group]) => group.folder === folder,
+    return withCapabilityScopeLocks([SYSTEM_CAPABILITY_LOCK_KEY], async () => {
+      const before = toHostIntegrationResponse(getSystemSettings());
+      const mainContextSourceChanged =
+        validation.data.mainAgentContextSource !== undefined &&
+        validation.data.mainAgentContextSource !==
+          before.mainAgentContextSource;
+      const externalClaudeDirChanged =
+        validation.data.externalClaudeDir !== undefined &&
+        validation.data.externalClaudeDir !== before.externalClaudeDir;
+      const hostContextChanged =
+        mainContextSourceChanged || externalClaudeDirChanged;
+      const adminHostOnlyModeChanged =
+        validation.data.adminHostOnlyMode !== undefined &&
+        validation.data.adminHostOnlyMode !== before.adminHostOnlyMode;
+      const enablingAdminHostOnlyMode =
+        adminHostOnlyModeChanged && validation.data.adminHostOnlyMode === true;
+      const pendingRuntimeCleanupFolders =
+        getPendingAdminHostOnlyCleanupFolders();
+      const repairingRuntimeCleanup = pendingRuntimeCleanupFolders.length > 0;
+      const enforcingAdminHostOnlyMode =
+        enablingAdminHostOnlyMode ||
+        (repairingRuntimeCleanup &&
+          before.adminHostOnlyMode &&
+          validation.data.adminHostOnlyMode !== false);
+      const defaultCompactChanged =
+        (validation.data.mainAgentAutoCompactWindow !== undefined &&
+          validation.data.mainAgentAutoCompactWindow !==
+            before.mainAgentAutoCompactWindow) ||
+        (validation.data.mainAgentAutoCompactPercentage !== undefined &&
+          validation.data.mainAgentAutoCompactPercentage !==
+            before.mainAgentAutoCompactPercentage);
+      const contextMutationRequested =
+        hostContextChanged ||
+        defaultCompactChanged ||
+        enablingAdminHostOnlyMode ||
+        repairingRuntimeCleanup;
+      const contextWorkspaces =
+        hostContextChanged || defaultCompactChanged
+          ? Object.entries(getAllRegisteredGroups())
+              .map(([jid, group]) => ({
+                jid,
+                group,
+                profile: group.created_by
+                  ? getAgentProfileForWorkspace(group.folder, group.created_by)
+                  : undefined,
+              }))
+              .filter(({ group, profile }) => {
+                if (!group.created_by || !profile) return false;
+                const isActiveAdmin =
+                  getUserById(group.created_by)?.role === 'admin';
+                const currentContextSource =
+                  resolveEffectiveAgentProfile(profile)?.runtime_policy.context
+                    .source ?? 'managed';
+                const nextContextSource = profile.is_default
+                  ? (validation.data.mainAgentContextSource ??
+                    before.mainAgentContextSource)
+                  : profile.runtime_policy.context.source;
+                return (
+                  (defaultCompactChanged && profile.is_default) ||
+                  (mainContextSourceChanged &&
+                    profile.is_default &&
+                    isActiveAdmin) ||
+                  (externalClaudeDirChanged &&
+                    isActiveAdmin &&
+                    (currentContextSource === 'host_claude' ||
+                      nextContextSource === 'host_claude'))
+                );
+              })
+          : [];
+      const allGroups =
+        enablingAdminHostOnlyMode || repairingRuntimeCleanup
+          ? getAllRegisteredGroups()
+          : {};
+      const activeAdminFolders = enablingAdminHostOnlyMode
+        ? new Set(
+            Object.values(allGroups)
+              .filter((group) => {
+                const owner = group.created_by
+                  ? getUserById(group.created_by)
+                  : undefined;
+                return owner?.role === 'admin' && owner.status === 'active';
+              })
+              .map((group) => group.folder),
+          )
+        : new Set<string>();
+      for (const folder of pendingRuntimeCleanupFolders) {
+        activeAdminFolders.add(folder);
+      }
+      const policyWorkspaces = Array.from(activeAdminFolders)
+        .map((folder) => {
+          const entries = Object.entries(allGroups).filter(
+            ([, group]) => group.folder === folder,
+          );
+          const preferred =
+            entries.find(([jid]) => jid.startsWith('web:')) ?? entries[0];
+          if (!preferred) return null;
+          const [jid, group] = preferred;
+          return {
+            jid,
+            group,
+            profile: group.created_by
+              ? getAgentProfileForWorkspace(group.folder, group.created_by)
+              : undefined,
+          };
+        })
+        .filter(
+          (workspace): workspace is NonNullable<typeof workspace> =>
+            workspace !== null,
         );
-        const preferred =
-          entries.find(([jid]) => jid.startsWith('web:')) ?? entries[0];
-        if (!preferred) return null;
-        const [jid, group] = preferred;
-        return {
-          jid,
-          group,
-          profile: group.created_by
-            ? getAgentProfileForWorkspace(group.folder, group.created_by)
-            : undefined,
-        };
-      })
-      .filter(
-        (workspace): workspace is NonNullable<typeof workspace> =>
-          workspace !== null,
+      const workspaceByFolder = new Map<
+        string,
+        (typeof contextWorkspaces)[number] | (typeof policyWorkspaces)[number]
+      >();
+      for (const workspace of [...contextWorkspaces, ...policyWorkspaces]) {
+        workspaceByFolder.set(workspace.group.folder, workspace);
+      }
+      const workspaces = Array.from(workspaceByFolder.values());
+      const sessionResetFolders = Array.from(
+        new Set([
+          ...workspaces.map(({ group }) => group.folder),
+          ...pendingRuntimeCleanupFolders,
+        ]),
       );
-    const workspaceByFolder = new Map<
-      string,
-      (typeof contextWorkspaces)[number] | (typeof policyWorkspaces)[number]
-    >();
-    for (const workspace of [...contextWorkspaces, ...policyWorkspaces]) {
-      workspaceByFolder.set(workspace.group.folder, workspace);
-    }
-    const workspaces = Array.from(workspaceByFolder.values());
-    const sessionResetFolders = Array.from(
-      new Set(workspaces.map(({ group }) => group.folder)),
-    );
-    let hostOnlyMigration:
-      | ReturnType<typeof forceActiveAdminRuntimesToHost>
-      | undefined;
-    const commit = () => {
-      if (enablingAdminHostOnlyMode) {
-        hostOnlyMigration = forceActiveAdminRuntimesToHost();
-        if (deps) {
-          const liveGroups = deps.getRegisteredGroups();
-          for (const { jid } of hostOnlyMigration.affectedGroups) {
-            const fresh = getRegisteredGroup(jid);
-            if (fresh) liveGroups[jid] = fresh;
+      let hostOnlyMigration:
+        | ReturnType<typeof forceActiveAdminRuntimesToHost>
+        | undefined;
+      const commit = () => {
+        if (enforcingAdminHostOnlyMode) {
+          hostOnlyMigration = forceActiveAdminRuntimesToHost();
+          if (deps) {
+            const liveGroups = deps.getRegisteredGroups();
+            for (const { jid } of hostOnlyMigration.affectedGroups) {
+              const fresh = getRegisteredGroup(jid);
+              if (fresh) liveGroups[jid] = fresh;
+            }
           }
         }
-      }
-      for (const folder of sessionResetFolders) deleteWorkspaceSessions(folder);
-      if (deps?.sessions) {
-        for (const folder of sessionResetFolders) delete deps.sessions[folder];
-      }
-      const value = saveSystemSettings(validation.data);
-      if (hostOnlyMigration?.migratedTaskIds.length) {
-        notifyTaskSchedulerChanged();
-      }
-      return value;
-    };
-    let saved: ReturnType<typeof saveSystemSettings>;
-    if (contextMutationRequested && deps) {
-      const profileIds = Array.from(
-        new Set(
-          workspaces
-            .map(({ profile }) => profile)
-            .filter((profile) => !!profile)
-            .map((profile) => profile.id),
-        ),
-      );
-      try {
-        const result = await withAgentProfileLocks(profileIds, () =>
-          quiesceWorkspaceRunnersAroundCommit(
-            deps,
-            workspaces.map(({ jid, group }) => ({
-              folder: group.folder,
-              primaryJid: jid,
-            })),
-            { reason: 'Host integration context updated' },
-            commit,
+        for (const folder of sessionResetFolders)
+          deleteWorkspaceSessions(folder);
+        if (deps?.sessions) {
+          for (const folder of sessionResetFolders)
+            delete deps.sessions[folder];
+        }
+        const value = saveSystemSettings(validation.data);
+        if (hostOnlyMigration?.migratedTaskIds.length) {
+          notifyTaskSchedulerChanged();
+        }
+        return value;
+      };
+      let saved: ReturnType<typeof saveSystemSettings>;
+      if (contextMutationRequested && deps) {
+        const profileIds = Array.from(
+          new Set(
+            workspaces
+              .map(({ profile }) => profile)
+              .filter((profile) => !!profile)
+              .map((profile) => profile.id),
           ),
         );
-        saved = result.value;
-      } catch (err) {
-        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
-        return c.json(
-          {
-            error: err.persisted
-              ? 'Host integration was updated, but runtime cleanup failed; retry the same request'
-              : 'Failed to quiesce active workspaces; host integration was not updated',
-            persisted: err.persisted,
-            retryable: true,
-          },
-          503,
-        );
+        try {
+          const targets = workspaces.map(({ jid, group }) => ({
+            folder: group.folder,
+            primaryJid: jid,
+          }));
+          const result = await withAgentProfileLocks(profileIds, () =>
+            quiesceWorkspaceRunnersAroundCommit(
+              deps,
+              targets,
+              {
+                reason: 'Host integration context updated',
+                onPostCommitFailure: (runtimeJids) => {
+                  markAdminHostOnlyCleanupPending(sessionResetFolders);
+                  deps.queue.blockGroupsForRuntimeSafety?.(
+                    runtimeJids,
+                    'Host integration runtime cleanup failed after settings commit',
+                    ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+                  );
+                },
+              },
+              commit,
+            ),
+          );
+          saved = result.value;
+          clearAdminHostOnlyCleanupPending(sessionResetFolders);
+          deps.queue.unblockGroupsForRuntimeSafety?.(
+            result.runtimeJids,
+            ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+          );
+        } catch (err) {
+          if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+          return c.json(
+            {
+              error: err.persisted
+                ? 'Host integration was updated, but runtime cleanup failed; retry the same request'
+                : 'Failed to quiesce active workspaces; host integration was not updated',
+              persisted: err.persisted,
+              retryable: true,
+            },
+            503,
+          );
+        }
+      } else {
+        saved = commit();
       }
-    } else {
-      saved = commit();
-    }
-    const response = toHostIntegrationResponse(saved);
-    const changedFields = changedSettingFields(
-      before,
-      response,
-      validation.data,
-    );
-    const actor = c.get('user') as AuthUser;
-    if (changedFields.length > 0) {
-      logAuthEvent({
-        event_type: 'host_integration_updated',
-        username: actor.username,
-        actor_username: actor.username,
-        ip_address: getClientIp(c),
-        user_agent: c.req.header('user-agent') ?? null,
-        // Only names and a boolean are recorded; the host path is never logged.
-        details: {
-          changed_fields: changedFields,
-          external_claude_dir_configured: Boolean(response.externalClaudeDir),
-          ...(hostOnlyMigration
-            ? {
-                host_only_migrated_groups:
-                  hostOnlyMigration.affectedGroups.length,
-                host_only_migrated_tasks:
-                  hostOnlyMigration.migratedTaskIds.length,
-              }
-            : {}),
-        },
-      });
-    }
+      const response = toHostIntegrationResponse(saved);
+      const changedFields = changedSettingFields(
+        before,
+        response,
+        validation.data,
+      );
+      const actor = c.get('user') as AuthUser;
+      if (changedFields.length > 0) {
+        logAuthEvent({
+          event_type: 'host_integration_updated',
+          username: actor.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          user_agent: c.req.header('user-agent') ?? null,
+          // Only names and a boolean are recorded; the host path is never logged.
+          details: {
+            changed_fields: changedFields,
+            external_claude_dir_configured: Boolean(response.externalClaudeDir),
+            ...(hostOnlyMigration
+              ? {
+                  host_only_migrated_groups:
+                    hostOnlyMigration.affectedGroups.length,
+                  host_only_migrated_tasks:
+                    hostOnlyMigration.migratedTaskIds.length,
+                }
+              : {}),
+          },
+        });
+      }
 
-    return c.json(response);
+      return c.json(response);
+    });
   },
 );
 

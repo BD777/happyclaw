@@ -68,6 +68,7 @@ import {
   getWorkspaceAgentProfileId,
   getWorkspaceInteractionMode,
   setWorkspaceInteractionMode,
+  getUserById,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
@@ -112,6 +113,10 @@ import {
   buildPinnedGitEnvironment,
   startPinnedHttpsProxy,
 } from '../safe-git-proxy.js';
+import {
+  SYSTEM_CAPABILITY_LOCK_KEY,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -974,54 +979,72 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   let publishedAgentProfile;
   let hostOnlyPolicyChangedDuringCreate = false;
   try {
-    publishedAgentProfile = await withAgentProfileLocks(
-      [agentProfile.id],
-      () => {
-        // The target may have been archived while the request performed its
-        // filesystem/network validation. Recheck under the same lock used by
-        // Agent DELETE/PATCH and workspace migration.
-        const lockedProfile = getAgentProfileForUser(
-          agentProfile.id,
-          authUser.id,
-        );
-        if (!lockedProfile) return undefined;
-        if (
-          group.executionMode !== 'host' &&
-          authUser.role === 'admin' &&
-          authUser.status === 'active' &&
-          getSystemSettings().adminHostOnlyMode
-        ) {
-          hostOnlyPolicyChangedDuringCreate = true;
-          return undefined;
-        }
-
-        try {
-          // Mapping first and registered-group publication immediately after
-          // it occur in one synchronous critical section. Agent PATCH cannot
-          // snapshot between them: it holds this same profile lock.
-          assignWorkspaceAgentProfile(
-            folder,
-            lockedProfile.id,
-            interactionMode,
+    publishedAgentProfile = await withCapabilityScopeLocks(
+      [SYSTEM_CAPABILITY_LOCK_KEY],
+      async () => {
+        const profile = await withAgentProfileLocks([agentProfile.id], () => {
+          // The target may have been archived while the request performed its
+          // filesystem/network validation. Recheck under the same lock used by
+          // Agent DELETE/PATCH and workspace migration.
+          const lockedProfile = getAgentProfileForUser(
+            agentProfile.id,
+            authUser.id,
           );
-          setRegisteredGroup(jid, group);
-          updateChatName(jid, name);
-          deps.getRegisteredGroups()[jid] = group;
-          return lockedProfile;
-        } catch (err) {
-          // setRegisteredGroup may fail after the mapping write. Clear both
-          // sides before releasing the profile lock so no partial membership
-          // can become visible to the next mutation.
-          try {
-            deleteRegisteredGroup(jid);
-          } catch {
-            /* best-effort cleanup continues below */
+          if (!lockedProfile) return undefined;
+          const currentOwner = getUserById(authUser.id);
+          if (
+            group.executionMode !== 'host' &&
+            currentOwner?.role === 'admin' &&
+            currentOwner.status === 'active' &&
+            getSystemSettings().adminHostOnlyMode
+          ) {
+            hostOnlyPolicyChangedDuringCreate = true;
+            return undefined;
           }
-          deleteWorkspaceAgentProfile(folder);
-          deleteChatHistory(jid);
-          delete deps.getRegisteredGroups()[jid];
-          throw err;
+
+          try {
+            // Mapping first and registered-group publication immediately after
+            // it occur in one synchronous critical section. Agent PATCH cannot
+            // snapshot between them: it holds this same profile lock.
+            assignWorkspaceAgentProfile(
+              folder,
+              lockedProfile.id,
+              interactionMode,
+            );
+            setRegisteredGroup(jid, group);
+            updateChatName(jid, name);
+            deps.getRegisteredGroups()[jid] = group;
+            return lockedProfile;
+          } catch (err) {
+            // setRegisteredGroup may fail after the mapping write. Clear both
+            // sides before releasing the profile lock so no partial membership
+            // can become visible to the next mutation.
+            try {
+              deleteRegisteredGroup(jid);
+            } catch {
+              /* best-effort cleanup continues below */
+            }
+            deleteWorkspaceAgentProfile(folder);
+            deleteChatHistory(jid);
+            delete deps.getRegisteredGroups()[jid];
+            throw err;
+          }
+        });
+        // Hold the system policy lock through container prewarm. If host-only
+        // mode is enabled concurrently, its snapshot can only run after this
+        // workspace is fully published and will therefore quiesce the new
+        // container before committing the policy.
+        if (profile && executionMode === 'container') {
+          try {
+            deps.ensureTerminalContainerStarted(jid);
+          } catch (err) {
+            logger.warn(
+              { err, jid },
+              'Workspace created but container prewarm could not be started',
+            );
+          }
         }
+        return profile;
       },
     );
   } catch (err) {
@@ -1041,11 +1064,6 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       );
     }
     return c.json({ error: '该智能体配置已失效；请选择其他智能体' }, 409);
-  }
-
-  // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
-  if (executionMode === 'container') {
-    deps.ensureTerminalContainerStarted(jid);
   }
 
   // Mirror buildGroupsPayload ACL shape so the frontend doesn't need to

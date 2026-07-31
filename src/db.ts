@@ -10487,6 +10487,57 @@ export interface AdminHostOnlyMigrationResult {
   migratedTaskIds: string[];
 }
 
+function forceRuntimesToHostForFolderQuery(
+  folderQuery: string,
+  params: unknown[] = [],
+): AdminHostOnlyMigrationResult {
+  const affectedGroups = db
+    .prepare(
+      `SELECT jid, folder
+       FROM registered_groups
+       WHERE folder IN (${folderQuery})
+         AND COALESCE(execution_mode, 'container') <> 'host'
+       ORDER BY jid`,
+    )
+    .all(...params) as Array<{ jid: string; folder: string }>;
+  const affectedTasks = db
+    .prepare(
+      `SELECT id, group_folder
+       FROM scheduled_tasks
+       WHERE group_folder IN (${folderQuery})
+         AND COALESCE(execution_mode, 'container') <> 'host'
+       ORDER BY id`,
+    )
+    .all(...params) as Array<{ id: string; group_folder: string }>;
+  const migratedTaskIds = affectedTasks.map((row) => row.id);
+  const affectedFolders = Array.from(
+    new Set([
+      ...affectedGroups.map((group) => group.folder),
+      ...affectedTasks.map((task) => task.group_folder),
+    ]),
+  ).sort();
+
+  db.prepare(
+    `UPDATE registered_groups
+     SET execution_mode = 'host'
+     WHERE folder IN (${folderQuery})
+       AND COALESCE(execution_mode, 'container') <> 'host'`,
+  ).run(...params);
+
+  if (migratedTaskIds.length > 0) {
+    db.prepare(
+      `UPDATE scheduled_tasks
+       SET execution_mode = 'host',
+           revision = revision + 1,
+           updated_at = ?
+       WHERE group_folder IN (${folderQuery})
+         AND COALESCE(execution_mode, 'container') <> 'host'`,
+    ).run(new Date().toISOString(), ...params);
+  }
+
+  return { affectedGroups, affectedFolders, migratedTaskIds };
+}
+
 /**
  * Persist the admin host-only policy across every runtime record owned by an
  * active administrator. Folder matching intentionally includes legacy IM rows
@@ -10505,51 +10556,7 @@ export function forceActiveAdminRuntimesToHost(): AdminHostOnlyMigrationResult {
         JOIN users u ON u.id = rg.created_by
         WHERE u.role = 'admin' AND u.status = 'active'
       `;
-      const affectedGroups = db
-        .prepare(
-          `SELECT jid, folder
-           FROM registered_groups
-           WHERE folder IN (${adminFolderSql})
-             AND COALESCE(execution_mode, 'container') <> 'host'
-           ORDER BY jid`,
-        )
-        .all() as Array<{ jid: string; folder: string }>;
-      const affectedTasks = db
-        .prepare(
-          `SELECT id, group_folder
-           FROM scheduled_tasks
-           WHERE group_folder IN (${adminFolderSql})
-             AND COALESCE(execution_mode, 'container') <> 'host'
-           ORDER BY id`,
-        )
-        .all() as Array<{ id: string; group_folder: string }>;
-      const migratedTaskIds = affectedTasks.map((row) => row.id);
-      const affectedFolders = Array.from(
-        new Set([
-          ...affectedGroups.map((group) => group.folder),
-          ...affectedTasks.map((task) => task.group_folder),
-        ]),
-      ).sort();
-
-      db.prepare(
-        `UPDATE registered_groups
-         SET execution_mode = 'host'
-         WHERE folder IN (${adminFolderSql})
-           AND COALESCE(execution_mode, 'container') <> 'host'`,
-      ).run();
-
-      if (migratedTaskIds.length > 0) {
-        db.prepare(
-          `UPDATE scheduled_tasks
-           SET execution_mode = 'host',
-               revision = revision + 1,
-               updated_at = ?
-           WHERE group_folder IN (${adminFolderSql})
-             AND COALESCE(execution_mode, 'container') <> 'host'`,
-        ).run(new Date().toISOString());
-      }
-
-      return { affectedGroups, affectedFolders, migratedTaskIds };
+      return forceRuntimesToHostForFolderQuery(adminFolderSql);
     })
     .immediate();
 }
@@ -11987,33 +11994,32 @@ export function getActiveAdminCount(): number {
   return row.count;
 }
 
-export function updateUserFields(
-  id: string,
-  updates: Partial<
-    Pick<
-      User,
-      | 'username'
-      | 'display_name'
-      | 'role'
-      | 'status'
-      | 'password_hash'
-      | 'last_login_at'
-      | 'permissions'
-      | 'must_change_password'
-      | 'disable_reason'
-      | 'notes'
-      | 'avatar_emoji'
-      | 'avatar_color'
-      | 'avatar_url'
-      | 'ai_name'
-      | 'ai_avatar_emoji'
-      | 'ai_avatar_color'
-      | 'ai_avatar_url'
-      | 'default_require_mention'
-      | 'deleted_at'
-    >
-  >,
-): void {
+export type UserFieldUpdates = Partial<
+  Pick<
+    User,
+    | 'username'
+    | 'display_name'
+    | 'role'
+    | 'status'
+    | 'password_hash'
+    | 'last_login_at'
+    | 'permissions'
+    | 'must_change_password'
+    | 'disable_reason'
+    | 'notes'
+    | 'avatar_emoji'
+    | 'avatar_color'
+    | 'avatar_url'
+    | 'ai_name'
+    | 'ai_avatar_emoji'
+    | 'ai_avatar_color'
+    | 'ai_avatar_url'
+    | 'default_require_mention'
+    | 'deleted_at'
+  >
+>;
+
+export function updateUserFields(id: string, updates: UserFieldUpdates): void {
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -12103,6 +12109,33 @@ export function updateUserFields(
   db.prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`).run(
     ...values,
   );
+}
+
+/**
+ * Promote/reactivate a user and enforce the admin host-only runtime projection
+ * in one SQLite transaction. The caller still owns runner quiescing and the
+ * system-settings policy check.
+ */
+export function updateUserFieldsAndForceRuntimesToHost(
+  id: string,
+  updates: UserFieldUpdates,
+): AdminHostOnlyMigrationResult {
+  return db
+    .transaction(() => {
+      updateUserFields(id, updates);
+      const folderQuery =
+        'SELECT DISTINCT folder FROM registered_groups WHERE created_by = ?';
+      const migration = forceRuntimesToHostForFolderQuery(folderQuery, [id]);
+      db.prepare(
+        `DELETE FROM sessions WHERE group_folder IN (${folderQuery})`,
+      ).run(id);
+      db.prepare(
+        `DELETE FROM workspace_runtime_sessions
+         WHERE group_folder IN (${folderQuery})`,
+      ).run(id);
+      return migration;
+    })
+    .immediate();
 }
 
 export function deleteUser(id: string): void {
