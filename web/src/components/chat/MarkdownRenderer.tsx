@@ -34,7 +34,7 @@ function MarkdownImageLightbox({
 }) {
   return createPortal(
     <div
-      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center cursor-pointer"
+      className="pointer-events-auto fixed inset-0 z-[70] bg-black/80 flex items-center justify-center cursor-pointer"
       onClick={onClose}
     >
       <img

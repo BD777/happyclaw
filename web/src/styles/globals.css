@@ -666,6 +666,16 @@ body {
   background: transparent;
 }
 
+/* Panes that draw their own indicator must suppress the native bar, or the
+ * two render side by side. */
+.hc-scroll-drawn {
+  scrollbar-width: none;
+}
+
+.hc-scroll-drawn::-webkit-scrollbar {
+  display: none;
+}
+
 /* Code highlighting theme override — GitHub light */
 pre code.hljs {
   background: #f6f8fa !important;

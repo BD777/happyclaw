@@ -224,7 +224,7 @@ function MediaOverlay({
 
   return createPortal(
     <div
-      className={`fixed inset-0 z-50 bg-black/${bgOpacity} flex items-center justify-center p-4`}
+      className={`fixed inset-0 z-[60] bg-black/${bgOpacity} flex items-center justify-center p-4 pointer-events-auto`}
       onClick={onClose}
     >
       <button
@@ -322,7 +322,7 @@ function TextEditor({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-3 lg:p-6"
+      className="pointer-events-auto fixed inset-0 z-[60] bg-black/50 flex items-center justify-center p-3 lg:p-6"
       onClick={onClose}
     >
       <div
@@ -481,7 +481,7 @@ function MarkdownFileViewer({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 bg-black/50 sm:flex sm:items-center sm:justify-center sm:p-4 lg:p-6"
+      className="pointer-events-auto fixed inset-0 z-[60] bg-black/50 sm:flex sm:items-center sm:justify-center sm:p-4 lg:p-6"
       onClick={handleBackdropClick}
       style={{ touchAction: 'none' }}
     >
@@ -562,7 +562,7 @@ function MarkdownFileViewer({
           ) : mode === 'preview' ? (
             <div
               ref={scrollRef}
-              className="absolute inset-0 overflow-y-auto overscroll-y-contain px-4 sm:px-6 py-4 [&_table_td]:!whitespace-normal [&_table_th]:!whitespace-normal"
+              className="hc-scroll-drawn absolute inset-0 overflow-y-auto overscroll-y-contain px-4 sm:px-6 py-4 [&_table_td]:!whitespace-normal [&_table_th]:!whitespace-normal"
               style={{ WebkitOverflowScrolling: 'touch', touchAction: 'pan-y' }}
             >
               <MarkdownRenderer
@@ -665,7 +665,7 @@ function AudioPreview({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
+      className="pointer-events-auto fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4"
       onClick={onClose}
     >
       <div
@@ -740,7 +740,7 @@ function GenericTextPreview({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-3 lg:p-6"
+      className="pointer-events-auto fixed inset-0 z-[60] bg-black/50 flex items-center justify-center p-3 lg:p-6"
       onClick={onClose}
     >
       <div
@@ -1064,7 +1064,10 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       {/* File List */}
       <div className="relative flex min-h-0 flex-1 flex-col">
         <ScrollIndicator containerRef={fileListRef} />
-        <div ref={fileListRef} className="flex-1 overflow-y-auto px-2 py-2">
+        <div
+          ref={fileListRef}
+          className="hc-scroll-drawn flex-1 overflow-y-auto px-2 py-2"
+        >
           {loading && fileList.length === 0 ? (
             <div className="flex items-center justify-center h-32">
               <p className="text-sm text-muted-foreground">加载中...</p>

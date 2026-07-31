@@ -100,7 +100,7 @@ export function ImageLightbox({ images, initialIndex, onClose }: ImageLightboxPr
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center"
+      className="pointer-events-auto fixed inset-0 z-[70] flex items-center justify-center"
       onClick={handleClose}
     >
       {/* Background overlay */}
