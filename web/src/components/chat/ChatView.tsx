@@ -1211,7 +1211,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       )}
 
       <Sheet open={mobileContextOpen} onOpenChange={setMobileContextOpen}>
-        <SheetContent side="bottom" className="h-[80dvh] gap-0 p-0">
+        {/* The height must carry the same `data-[side=bottom]` variant as the
+            default it replaces. An unvariated `h-[80dvh]` survives merging but
+            loses on specificity, leaving the sheet at `h-auto` — it then grows
+            with the file list, covers the viewport and cannot scroll. */}
+        <SheetContent
+          side="bottom"
+          className="gap-0 p-0 data-[side=bottom]:h-[80dvh]"
+        >
           <SheetHeader className="sr-only">
             <SheetTitle>上下文面板</SheetTitle>
             <SheetDescription>
@@ -1235,7 +1242,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         open={mobileTerminal}
         onOpenChange={(v) => !v && setMobileTerminal(false)}
       >
-        <SheetContent side="bottom" className="h-[85dvh] p-0">
+        <SheetContent
+          side="bottom"
+          className="p-0 data-[side=bottom]:h-[85dvh]"
+        >
           <SheetHeader className="px-4 pt-4 pb-2">
             <SheetTitle>终端</SheetTitle>
             <SheetDescription className="sr-only">
