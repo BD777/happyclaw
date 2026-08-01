@@ -28,6 +28,7 @@ import { useFileStore, FileEntry, toBase64Url } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useEscapeKey } from '../../hooks/useEscapeKey';
+import { useScrollIsolation } from '../../hooks/useScrollIsolation';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
 import { downloadFromUrl } from '../../utils/download';
@@ -281,7 +282,9 @@ function TextEditor({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
 
+  useScrollIsolation(overlayRef);
   useEscapeKey(onClose);
 
   useEffect(() => {
@@ -321,6 +324,7 @@ function TextEditor({
 
   return createPortal(
     <div
+      ref={overlayRef}
       className="pointer-events-auto fixed inset-0 z-[60] bg-black/50 flex items-center justify-center p-3 lg:p-6"
       onClick={onClose}
     >
@@ -405,6 +409,9 @@ function MarkdownFileViewer({
   const [dirty, setDirty] = useState(false);
   const [mode, setMode] = useState<'preview' | 'edit'>('preview');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
+
+  useScrollIsolation(overlayRef);
 
   // Lock body scroll on mount, restore on unmount (critical for iOS)
   useEffect(() => {
@@ -478,10 +485,14 @@ function MarkdownFileViewer({
   );
 
   return createPortal(
+    // No `touch-action` on the backdrop: the effective touch behaviour of an
+    // element is the intersection of its own value and every ancestor's, so
+    // `none` here silently downgraded the preview pane's `pan-y` to `none` and
+    // froze it. The page underneath is already pinned by the body scroll lock.
     <div
+      ref={overlayRef}
       className="pointer-events-auto fixed inset-0 z-[60] bg-black/50 sm:flex sm:items-center sm:justify-center sm:p-4 lg:p-6"
       onClick={handleBackdropClick}
-      style={{ touchAction: 'none' }}
     >
       <div
         className="bg-surface w-full h-full sm:rounded-xl sm:shadow-xl sm:max-w-4xl sm:h-[90vh] sm:supports-[height:100dvh]:h-[90dvh] flex flex-col sm:animate-in sm:zoom-in-95 sm:duration-200"
@@ -709,7 +720,9 @@ function GenericTextPreview({
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
 
+  useScrollIsolation(overlayRef);
   useEscapeKey(onClose);
 
   useEffect(() => {
@@ -734,11 +747,12 @@ function GenericTextPreview({
 
   return createPortal(
     <div
+      ref={overlayRef}
       className="pointer-events-auto fixed inset-0 z-[60] bg-black/50 flex items-center justify-center p-3 lg:p-6"
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-xl shadow-xl w-full max-w-4xl h-[85vh] supports-[height:100dvh]:h-[85vh] flex flex-col animate-in zoom-in-95 duration-200"
+        className="bg-surface rounded-xl shadow-xl w-full max-w-4xl h-[85vh] supports-[height:100dvh]:h-[85dvh] flex flex-col animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
