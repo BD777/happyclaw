@@ -835,17 +835,18 @@ export function trySelectPoolProvider(
   if (selectedModelConfigId) {
     // Agent/default selection is authoritative. Workspace credentials must
     // never move a Workspace away from the model configuration selected for
-    // its top-level Agent.
-    const enabledProviders = getEnabledProviders();
-    const selected = getProviders().find(
+    // its top-level Agent. `enabled` only controls the global automatic pool;
+    // an Agent may explicitly bind any saved model configuration.
+    const providers = getProviders();
+    const selected = providers.find(
       (provider) => provider.id === selectedModelConfigId,
     );
-    if (!selected || !selected.enabled) {
+    if (!selected) {
       throw new Error(
-        `agent_model_unavailable: model configuration ${selectedModelConfigId} is missing or disabled`,
+        `agent_model_unavailable: model configuration ${selectedModelConfigId} is missing`,
       );
     }
-    providerPool.refreshFromConfig(enabledProviders, getBalancingConfig());
+    providerPool.refreshFromConfig(providers, getBalancingConfig());
     const resolved = resolveProviderById(selected.id);
     providerPool.acquireSession(selected.id);
     setSessionProviderId(groupFolder, agentId, selected.id);

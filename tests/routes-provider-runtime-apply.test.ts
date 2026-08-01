@@ -194,7 +194,7 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     expect(runtimeConfig.getDefaultProviderId()).toBe(replacement.id);
   });
 
-  test('cannot disable or delete a model configuration referenced by an Agent', async () => {
+  test('allows disabling an Agent model but still blocks deleting it', async () => {
     bindDeps(
       {},
       {
@@ -224,9 +224,9 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     });
 
     const disableResponse = await setProviderEnabled(target.id, false);
-    expect(disableResponse.status).toBe(400);
+    expect(disableResponse.status).toBe(200);
     expect(await disableResponse.json()).toMatchObject({
-      error: expect.stringContaining('智能体'),
+      provider: { id: target.id, enabled: false },
     });
     const deleteResponse = await deleteProvider(target.id);
     expect(deleteResponse.status).toBe(400);
@@ -237,7 +237,7 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       runtimeConfig
         .getProviders()
         .find((provider) => provider.id === target.id),
-    ).toMatchObject({ enabled: true });
+    ).toMatchObject({ enabled: false });
 
     expect(db.archiveAgentProfile(profile.id, 'provider-runtime-admin')).toBe(
       'ok',

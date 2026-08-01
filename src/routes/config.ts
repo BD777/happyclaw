@@ -1314,14 +1314,6 @@ configRoutes.post(
 
     try {
       return await withClaudeConfigMutationLock(async () => {
-        if (!body.enabled) {
-          const referencedAgentCount = countAgentProfilesByModelConfigId(id);
-          if (referencedAgentCount > 0) {
-            throw new Error(
-              `该模型配置仍被 ${referencedAgentCount} 个智能体使用，不能禁用`,
-            );
-          }
-        }
         const mutation = await mutateClaudeConfigForAllGroups(
           actor,
           { trigger: 'provider_toggle', providerId: id },

@@ -71,9 +71,15 @@ describe('default model configuration', () => {
   });
 
   test('Agent selection overrides a legacy Workspace Provider environment', () => {
-    const selected = runtimeConfig
-      .getProviders()
-      .find((provider) => provider.name === 'Model gateway')!;
+    const selected = runtimeConfig.createProvider({
+      name: 'Agent-only model gateway',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://agent-only.example.test',
+      anthropicAuthToken: 'agent-only-token',
+      anthropicModel: 'agent-only-model',
+      customEnv: { ANTHROPIC_CUSTOM_HEADERS: 'x-tenant: agent-only' },
+      enabled: false,
+    });
     runtimeConfig.saveContainerEnvConfig('model-workspace', {
       anthropicBaseUrl: 'https://workspace-override.example.test',
       anthropicAuthToken: 'workspace-token',
@@ -85,10 +91,11 @@ describe('default model configuration', () => {
       profileId: selected.id,
       resolved: {
         config: {
-          anthropicBaseUrl: 'https://gateway.example.test',
-          anthropicAuthToken: 'gateway-token',
-          anthropicModel: 'gateway-model',
+          anthropicBaseUrl: 'https://agent-only.example.test',
+          anthropicAuthToken: 'agent-only-token',
+          anthropicModel: 'agent-only-model',
         },
+        customEnv: { ANTHROPIC_CUSTOM_HEADERS: 'x-tenant: agent-only' },
       },
     });
     expect(db.getSessionProviderId('model-workspace')).toBe(selected.id);

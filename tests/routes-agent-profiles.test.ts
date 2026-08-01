@@ -163,7 +163,7 @@ describe('/api/agent-profiles routes', () => {
       anthropicBaseUrl: 'https://models.example.test',
       anthropicAuthToken: 'research-test-token',
       anthropicModel: 'research-model',
-      enabled: true,
+      enabled: false,
     });
     runtimeConfig.setDefaultProvider(inheritedDefault.id);
 
@@ -180,6 +180,7 @@ describe('/api/agent-profiles routes', () => {
         expect.objectContaining({
           id: selectedModel.id,
           name: 'Research model config',
+          enabled: false,
           is_default: false,
         }),
       ]),

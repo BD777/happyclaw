@@ -130,10 +130,8 @@ agentProfileRoutes.get('/', authMiddleware, (c) => {
   });
 });
 
-function isSelectableModelConfig(modelConfigId: string): boolean {
-  return getProviders().some(
-    (provider) => provider.id === modelConfigId && provider.enabled,
-  );
+function modelConfigExists(modelConfigId: string): boolean {
+  return getProviders().some((provider) => provider.id === modelConfigId);
 }
 
 agentProfileRoutes.post('/', authMiddleware, async (c) => {
@@ -151,9 +149,9 @@ agentProfileRoutes.post('/', authMiddleware, async (c) => {
   }
   if (
     parsed.data.model_config_id &&
-    !isSelectableModelConfig(parsed.data.model_config_id)
+    !modelConfigExists(parsed.data.model_config_id)
   ) {
-    return c.json({ error: '所选模型配置不存在或已被禁用' }, 400);
+    return c.json({ error: '所选模型配置不存在' }, 400);
   }
   const runtimePolicy = normalizeAgentProfileRuntimePolicy(
     parsed.data.runtime_policy,
@@ -485,9 +483,9 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
         if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
         if (
           parsed.data.model_config_id &&
-          !isSelectableModelConfig(parsed.data.model_config_id)
+          !modelConfigExists(parsed.data.model_config_id)
         ) {
-          return c.json({ error: '所选模型配置不存在或已被禁用' }, 400);
+          return c.json({ error: '所选模型配置不存在' }, 400);
         }
 
         const effectiveRuntimePolicy =

@@ -259,20 +259,17 @@ export function MainAgentCapabilitiesSection() {
                 : '（尚未配置）'}
             </SelectItem>
             {modelConfigs.map((model) => (
-              <SelectItem
-                key={model.id}
-                value={model.id}
-                disabled={!model.enabled}
-              >
+              <SelectItem key={model.id} value={model.id}>
                 {model.name}
                 {model.anthropic_model ? ` · ${model.anthropic_model}` : ''}
-                {!model.enabled ? '（已禁用）' : ''}
+                {!model.enabled ? '（仅显式使用）' : ''}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
         <p className="text-[11px] leading-5 text-muted-foreground">
-          Home 工作区、主会话、独立会话与定时任务都会继承该选择。
+          Home
+          工作区、主会话、独立会话与定时任务都会继承该选择。未启用的配置仍可在这里显式使用。
         </p>
       </div>
 
