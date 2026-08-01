@@ -629,7 +629,11 @@ body {
 /* Scroll affordance. Overlay scrollbars stay invisible until a scroll is
  * already in flight, so long panes (file list, message list) give no hint that
  * more content exists. Render a thin themed track instead, and keep it wide
- * enough to remain a usable drag target with a mouse. */
+ * enough to remain a usable drag target with a mouse.
+ *
+ * This must stay the ONLY scrollbar a pane shows. A previous attempt drew an
+ * overlay thumb on top of this one: it was `pointer-events-none`, so panes ended
+ * up with two bars and the visible one could not be dragged. */
 * {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--muted-foreground) 40%, transparent)
@@ -664,16 +668,6 @@ body {
 
 ::-webkit-scrollbar-corner {
   background: transparent;
-}
-
-/* Panes that draw their own indicator must suppress the native bar, or the
- * two render side by side. */
-.hc-scroll-drawn {
-  scrollbar-width: none;
-}
-
-.hc-scroll-drawn::-webkit-scrollbar {
-  display: none;
 }
 
 /* Code highlighting theme override — GitHub light */
@@ -936,6 +930,21 @@ pre code.hljs {
 .terminal-panel .xterm-viewport {
   padding-bottom: 8px;
   box-sizing: border-box;
+}
+
+/* The terminal keeps its own dark palette regardless of the app theme, so the
+ * `--muted-foreground` thumb from the global rule renders dark-on-dark and looks
+ * like there is no scrollbar at all. Pin it to the xterm foreground instead. */
+.terminal-panel .xterm-viewport {
+  scrollbar-color: rgb(169 177 214 / 0.45) transparent;
+}
+
+.terminal-panel .xterm-viewport::-webkit-scrollbar-thumb {
+  background-color: rgb(169 177 214 / 0.45);
+}
+
+.terminal-panel .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(169 177 214 / 0.7);
 }
 
 @layer base {

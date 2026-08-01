@@ -45,7 +45,6 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
-import { ScrollIndicator } from '@/components/ui/ScrollIndicator';
 import { FileUploadZone } from './FileUploadZone';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
@@ -406,7 +405,6 @@ function MarkdownFileViewer({
   const [dirty, setDirty] = useState(false);
   const [mode, setMode] = useState<'preview' | 'edit'>('preview');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Lock body scroll on mount, restore on unmount (critical for iOS)
   useEffect(() => {
@@ -552,17 +550,13 @@ function MarkdownFileViewer({
 
         {/* Content — explicit overflow container with touch-action for iOS */}
         <div className="flex-1 min-h-0 relative">
-          {mode === 'preview' && !loading && (
-            <ScrollIndicator containerRef={scrollRef} />
-          )}
           {loading ? (
             <div className="absolute inset-0 flex items-center justify-center">
               <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
             </div>
           ) : mode === 'preview' ? (
             <div
-              ref={scrollRef}
-              className="hc-scroll-drawn absolute inset-0 overflow-y-auto overscroll-y-contain px-4 sm:px-6 py-4 [&_table_td]:!whitespace-normal [&_table_th]:!whitespace-normal"
+              className="absolute inset-0 overflow-y-auto overscroll-y-contain px-4 sm:px-6 py-4 [&_table_td]:!whitespace-normal [&_table_th]:!whitespace-normal"
               style={{ WebkitOverflowScrolling: 'touch', touchAction: 'pan-y' }}
             >
               <MarkdownRenderer
@@ -825,7 +819,6 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   const isStreaming = useChatStore((s) => !!s.streaming[groupJid]);
   const canOpenLocalFolder = useAuthStore((s) => s.user?.role === 'admin');
   const prevStreamingRef = useRef(false);
-  const fileListRef = useRef<HTMLDivElement>(null);
 
   const fileList = files[groupJid] || [];
   const currentDir = currentPath[groupJid] || '';
@@ -1062,135 +1055,129 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       )}
 
       {/* File List */}
-      <div className="relative flex min-h-0 flex-1 flex-col">
-        <ScrollIndicator containerRef={fileListRef} />
-        <div
-          ref={fileListRef}
-          className="hc-scroll-drawn flex-1 overflow-y-auto px-2 py-2"
-        >
-          {loading && fileList.length === 0 ? (
-            <div className="flex items-center justify-center h-32">
-              <p className="text-sm text-muted-foreground">加载中...</p>
-            </div>
-          ) : sortedFiles.length === 0 ? (
-            <div className="flex items-center justify-center h-32">
-              <p className="text-sm text-muted-foreground">暂无文件</p>
-            </div>
-          ) : (
-            <div className="space-y-0.5">
-              {sortedFiles.map((item) => {
-                const clickable =
-                  item.type === 'directory' ||
-                  isPreviewableFile(item.name, !!item.isSystem);
-                return (
-                  <div
-                    key={item.path}
-                    className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
-                      clickable
-                        ? 'hover:bg-muted cursor-pointer'
-                        : item.isSystem
-                          ? 'bg-muted/60'
-                          : 'hover:bg-muted/50'
-                    }`}
-                    onClick={() => handleItemClick(item)}
-                  >
-                    {/* Icon */}
-                    <div className="flex-shrink-0 w-5 flex items-center justify-center">
-                      {item.type === 'directory' ? (
-                        <Folder className="w-4.5 h-4.5 text-primary" />
-                      ) : (
-                        <FileIcon name={item.name} />
-                      )}
-                    </div>
+      <div className="flex-1 overflow-y-auto px-2 py-2">
+        {loading && fileList.length === 0 ? (
+          <div className="flex items-center justify-center h-32">
+            <p className="text-sm text-muted-foreground">加载中...</p>
+          </div>
+        ) : sortedFiles.length === 0 ? (
+          <div className="flex items-center justify-center h-32">
+            <p className="text-sm text-muted-foreground">暂无文件</p>
+          </div>
+        ) : (
+          <div className="space-y-0.5">
+            {sortedFiles.map((item) => {
+              const clickable =
+                item.type === 'directory' ||
+                isPreviewableFile(item.name, !!item.isSystem);
+              return (
+                <div
+                  key={item.path}
+                  className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
+                    clickable
+                      ? 'hover:bg-muted cursor-pointer'
+                      : item.isSystem
+                        ? 'bg-muted/60'
+                        : 'hover:bg-muted/50'
+                  }`}
+                  onClick={() => handleItemClick(item)}
+                >
+                  {/* Icon */}
+                  <div className="flex-shrink-0 w-5 flex items-center justify-center">
+                    {item.type === 'directory' ? (
+                      <Folder className="w-4.5 h-4.5 text-primary" />
+                    ) : (
+                      <FileIcon name={item.name} />
+                    )}
+                  </div>
 
-                    {/* Name + meta */}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span
-                          className={`text-sm truncate ${
-                            item.isSystem
-                              ? 'text-muted-foreground'
-                              : 'text-foreground'
-                          }`}
+                  {/* Name + meta */}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className={`text-sm truncate ${
+                          item.isSystem
+                            ? 'text-muted-foreground'
+                            : 'text-foreground'
+                        }`}
+                      >
+                        {item.name}
+                      </span>
+                      {item.isSystem && <Badge variant="neutral">系统</Badge>}
+                    </div>
+                    {item.type === 'file' && (
+                      <p className="text-[11px] text-muted-foreground leading-tight">
+                        {formatSize(item.size)}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Actions */}
+                  <div className="flex-shrink-0 flex items-center gap-0.5">
+                    {/* Copy absolute path (always available) */}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleCopyPath(item);
+                      }}
+                      className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                      title={
+                        item.absolutePath
+                          ? `复制路径：${item.absolutePath}`
+                          : '复制路径'
+                      }
+                      aria-label="复制绝对路径"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                    </button>
+                    {/* Edit button for non-system text files */}
+                    {!item.isSystem &&
+                      item.type === 'file' &&
+                      TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPreview({ kind: 'edit', file: item });
+                          }}
+                          className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
+                          title="编辑"
+                          aria-label="编辑文件"
                         >
-                          {item.name}
-                        </span>
-                        {item.isSystem && <Badge variant="neutral">系统</Badge>}
-                      </div>
-                      {item.type === 'file' && (
-                        <p className="text-[11px] text-muted-foreground leading-tight">
-                          {formatSize(item.size)}
-                        </p>
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
                       )}
-                    </div>
-
-                    {/* Actions */}
-                    <div className="flex-shrink-0 flex items-center gap-0.5">
-                      {/* Copy absolute path (always available) */}
+                    {item.type === 'file' && (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          handleCopyPath(item);
+                          handleDownload(item);
                         }}
                         className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                        title={
-                          item.absolutePath
-                            ? `复制路径：${item.absolutePath}`
-                            : '复制路径'
-                        }
-                        aria-label="复制绝对路径"
+                        title="下载"
+                        aria-label="下载文件"
                       >
-                        <Copy className="w-3.5 h-3.5" />
+                        <Download className="w-3.5 h-3.5" />
                       </button>
-                      {/* Edit button for non-system text files */}
-                      {!item.isSystem &&
-                        item.type === 'file' &&
-                        TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setPreview({ kind: 'edit', file: item });
-                            }}
-                            className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
-                            title="编辑"
-                            aria-label="编辑文件"
-                          >
-                            <Pencil className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      {item.type === 'file' && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDownload(item);
-                          }}
-                          className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                          title="下载"
-                          aria-label="下载文件"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                      {!item.isSystem && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteClick(item);
-                          }}
-                          className="p-2.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
-                          title="删除"
-                          aria-label="删除文件"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                    </div>
+                    )}
+                    {!item.isSystem && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteClick(item);
+                        }}
+                        className="p-2.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
+                        title="删除"
+                        aria-label="删除文件"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Footer */}
