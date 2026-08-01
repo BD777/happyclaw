@@ -30,6 +30,7 @@ import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { PromptDialog } from '@/components/common/PromptDialog';
 import {
   ArrowLeft,
+  ChevronDown,
   ChevronRight,
   Folder,
   Link,
@@ -97,6 +98,35 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [contextPanelView, setContextPanelView] = useState<'files' | 'env'>(
     'files',
   );
+
+  // The nav rows eat ~11rem of an 80dvh sheet — a third of the file list on a
+  // 390x844 viewport. Fold them into a single icon bar once the pane scrolls
+  // down; scrolling back up or tapping the bar restores the labels.
+  const [contextNavCollapsed, setContextNavCollapsed] = useState(false);
+  // A callback ref, not `useRef` + `useEffect([mobileContextOpen])`. Radix's
+  // `Presence` seeds its state machine from `present` and only sends MOUNT from
+  // a layout effect, so on the commit where the sheet opens it still renders
+  // null — an effect keyed on the open flag would look for the node one commit
+  // too early, find nothing, and never run again.
+  const contextPanelBodyRef = useCallback((node: HTMLDivElement | null) => {
+    if (!node) return;
+    setContextNavCollapsed(false);
+    let last = 0;
+    const onScroll = (e: Event) => {
+      const target = e.target;
+      if (!(target instanceof HTMLElement)) return;
+      const top = target.scrollTop;
+      const delta = top - last;
+      last = top;
+      if (top <= 8) setContextNavCollapsed(false);
+      else if (delta > 6) setContextNavCollapsed(true);
+      else if (delta < -6) setContextNavCollapsed(false);
+    };
+    // `scroll` does not bubble, so capture it on the way down instead of
+    // reaching into FilePanel for whichever element happens to be its scroller.
+    node.addEventListener('scroll', onScroll, true);
+    return () => node.removeEventListener('scroll', onScroll, true);
+  }, []);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [showInteractionModeDialog, setShowInteractionModeDialog] =
     useState(false);
@@ -770,68 +800,131 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     }
   };
 
-  const renderContextPanel = () => (
-    <div className="flex h-full min-h-0 w-full flex-col bg-background">
-      <div className="border-b border-border/70 p-2">
-        {canModifyWorkspaceConfig && (
-          <button
-            type="button"
-            onClick={() => setContextPanelView('env')}
-            aria-current={contextPanelView === 'env' ? 'page' : undefined}
-            className={cn(
-              'flex min-h-10 w-full items-center gap-3 rounded-md px-2.5 text-left text-xs text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer',
-              contextPanelView === 'env' && 'bg-accent/70',
-            )}
-          >
-            <Server className="h-4 w-4 shrink-0 text-muted-foreground" />
-            <span className="flex-1">工作区环境</span>
-            <span className="text-muted-foreground">
-              {group?.execution_mode === 'host' ? '宿主机' : 'Docker'}
-            </span>
-            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={() => setContextPanelView('files')}
-          aria-current={contextPanelView === 'files' ? 'page' : undefined}
-          className={cn(
-            'flex min-h-10 w-full items-center gap-3 rounded-md px-2.5 text-left text-xs text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer',
-            contextPanelView === 'files' && 'bg-accent/70',
-          )}
-        >
-          <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span className="flex-1">项目文件</span>
-          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
-        </button>
-        {canUseTerminal && (
-          <button
-            type="button"
-            onClick={() => {
+  const contextNavItems: {
+    key: string;
+    icon: typeof Server;
+    label: string;
+    value?: string;
+    current?: boolean;
+    chevron?: boolean;
+    onClick: () => void;
+  }[] = [
+    ...(canModifyWorkspaceConfig
+      ? [
+          {
+            key: 'env',
+            icon: Server,
+            label: '工作区环境',
+            value: group?.execution_mode === 'host' ? '宿主机' : 'Docker',
+            current: contextPanelView === 'env',
+            chevron: true,
+            onClick: () => setContextPanelView('env'),
+          },
+        ]
+      : []),
+    {
+      key: 'files',
+      icon: Folder,
+      label: '项目文件',
+      current: contextPanelView === 'files',
+      chevron: true,
+      onClick: () => setContextPanelView('files'),
+    },
+    ...(canUseTerminal
+      ? [
+          {
+            key: 'terminal',
+            icon: Terminal,
+            label: '终端',
+            chevron: true,
+            onClick: () => {
               setPanelOpen(false);
               setMobileContextOpen(false);
               handleTerminalToggle();
-            }}
-            className="flex min-h-10 w-full items-center gap-3 rounded-md px-2.5 text-left text-xs text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
-          >
-            <Terminal className="h-4 w-4 shrink-0 text-muted-foreground" />
-            <span className="flex-1">终端</span>
-            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={toggleDisplayMode}
-          className="flex min-h-10 w-full items-center gap-3 rounded-md px-2.5 text-left text-xs text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+            },
+          },
+        ]
+      : []),
+    {
+      key: 'display',
+      icon: SlidersHorizontal,
+      label: '显示密度',
+      value: displayMode === 'chat' ? '对话' : '紧凑',
+      onClick: toggleDisplayMode,
+    },
+  ];
+
+  const renderContextPanel = (collapsibleNav = false) => (
+    <div className="flex h-full min-h-0 w-full flex-col bg-background">
+      {/* Both bands animate on the same tick — one grows as the other shrinks —
+          so the pane below keeps a steady offset instead of bouncing. Fixed
+          max-heights rather than a `grid-rows-[0fr]` collapse: the rows are
+          `min-h-10`, so four of them plus padding never exceed 14rem, and
+          max-height interpolates on every engine we target. */}
+      {collapsibleNav && (
+        <div
+          className={cn(
+            'shrink-0 overflow-hidden transition-[max-height] duration-200 ease-out',
+            contextNavCollapsed ? 'max-h-12' : 'max-h-0',
+          )}
+          inert={!contextNavCollapsed}
         >
-          <SlidersHorizontal className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span className="flex-1">显示密度</span>
-          <span className="text-muted-foreground">
-            {displayMode === 'chat' ? '对话' : '紧凑'}
-          </span>
-        </button>
+          <button
+            type="button"
+            onClick={() => setContextNavCollapsed(false)}
+            aria-expanded={false}
+            aria-label="展开上下文操作"
+            className="flex w-full items-center gap-5 border-b border-border/70 px-4 py-3 text-muted-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+          >
+            {contextNavItems.map((item) => (
+              <item.icon
+                key={item.key}
+                className={cn(
+                  'h-4 w-4 shrink-0',
+                  item.current && 'text-foreground',
+                )}
+              />
+            ))}
+            <ChevronDown className="ml-auto h-3.5 w-3.5 shrink-0" />
+          </button>
+        </div>
+      )}
+      <div
+        className={cn(
+          'shrink-0 overflow-hidden',
+          collapsibleNav && 'transition-[max-height] duration-200 ease-out',
+          collapsibleNav && contextNavCollapsed ? 'max-h-0' : 'max-h-56',
+        )}
+        inert={collapsibleNav && contextNavCollapsed}
+      >
+        <div className="border-b border-border/70 p-2">
+          {contextNavItems.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={item.onClick}
+              aria-current={item.current ? 'page' : undefined}
+              className={cn(
+                'flex min-h-10 w-full items-center gap-3 rounded-md px-2.5 text-left text-xs text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer',
+                item.current && 'bg-accent/70',
+              )}
+            >
+              <item.icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+              <span className="flex-1">{item.label}</span>
+              {item.value && (
+                <span className="text-muted-foreground">{item.value}</span>
+              )}
+              {item.chevron && (
+                <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+              )}
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="min-h-0 flex-1 overflow-hidden">
+      <div
+        ref={collapsibleNav ? contextPanelBodyRef : undefined}
+        className="min-h-0 flex-1 overflow-hidden"
+      >
         {contextPanelView === 'env' && canModifyWorkspaceConfig ? (
           <ContainerEnvPanel groupJid={groupJid} />
         ) : (
@@ -1225,7 +1318,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               查看当前上下文的文件和运行信息。
             </SheetDescription>
           </SheetHeader>
-          {renderContextPanel()}
+          {renderContextPanel(true)}
         </SheetContent>
       </Sheet>
 
