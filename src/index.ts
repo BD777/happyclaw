@@ -1229,6 +1229,10 @@ const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 3 * 60 * 1000;
+// Absolute ceiling for IPC-owed work: a spinning tool keeps child CPU non-zero
+// indefinitely, so the CPU-active grace alone can defer restart forever while
+// the user's injected follow-ups sit unanswered (#618).
+const STUCK_RUNNER_FORCE_RESTART_MS = 10 * 60 * 1000;
 let stuckRunnerCheckCounter = 0;
 
 // OOM auto-recovery: track consecutive OOM (exit code 137) exits per folder.
@@ -17331,19 +17335,21 @@ async function hasActiveCpuDescendants(pid: number): Promise<boolean> {
 
 async function recoverStuckPendingGroups(): Promise<void> {
   const stuckGroups = queue.getStuckPendingGroups(STUCK_RUNNER_IDLE_MS);
-  for (const { jid, idleMs } of stuckGroups) {
+  for (const { jid, idleMs, reason } of stuckGroups) {
     const pid = queue.getRunnerPid(jid);
-    if (pid && (await hasActiveCpuDescendants(pid))) {
+    const cpuGraceApplies =
+      reason !== 'ipc_injected' || idleMs < STUCK_RUNNER_FORCE_RESTART_MS;
+    if (cpuGraceApplies && pid && (await hasActiveCpuDescendants(pid))) {
       logger.info(
-        { chatJid: jid, idleMs, pid },
+        { chatJid: jid, idleMs, pid, reason },
         'Runner idle but has CPU-active child processes; skipping restart',
       );
       continue;
     }
 
     logger.warn(
-      { chatJid: jid, idleMs },
-      'Runner has pending messages but no activity; restarting',
+      { chatJid: jid, idleMs, reason },
+      'Runner has owed user work but no activity; restarting',
     );
     queue.restartGroup(jid).catch((err) => {
       logger.error(

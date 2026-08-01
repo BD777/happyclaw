@@ -1001,6 +1001,11 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active) return;
     state.hasIpcInjectedMessages = true;
+    // Restart the idle window at the user's latest message: stuck detection
+    // must measure silence *after* the inject, not since the previous turn's
+    // last output — otherwise a follow-up injected into a long-idle warm
+    // runner would look instantly stuck (#618).
+    state.lastActivityAt = Date.now();
   }
 
   acknowledgeIpcDeliveries(
@@ -1139,22 +1144,38 @@ export class GroupQueue {
     return true;
   }
 
-  getStuckPendingGroups(
-    idleThresholdMs: number,
-  ): Array<{ jid: string; idleMs: number }> {
+  getStuckPendingGroups(idleThresholdMs: number): Array<{
+    jid: string;
+    idleMs: number;
+    reason: 'pending_messages' | 'ipc_injected';
+  }> {
     const now = Date.now();
-    const stuck: Array<{ jid: string; idleMs: number }> = [];
+    const stuck: Array<{
+      jid: string;
+      idleMs: number;
+      reason: 'pending_messages' | 'ipc_injected';
+    }> = [];
     for (const [jid, state] of this.groups.entries()) {
       if (!state.active) continue;
       if (state.activeRunnerIsTask) continue;
-      if (!state.pendingMessages) continue;
+      // Warm follow-ups are IPC-injected without re-arming pendingMessages, so
+      // a wedged in-flight turn with injected input was invisible here (#618).
+      // queryInFlight gates the IPC signal: once the runner reports the turn
+      // idle, a warm runner sitting between turns is not owed work and must
+      // not be restarted.
+      const hasIpcOwed = state.hasIpcInjectedMessages && state.queryInFlight;
+      if (!state.pendingMessages && !hasIpcOwed) continue;
       if (state.agentId !== null) continue;
       if (state.restarting) continue;
       const lastActivityAt = state.lastActivityAt ?? 0;
       if (lastActivityAt <= 0) continue;
       const idleMs = now - lastActivityAt;
       if (idleMs < idleThresholdMs) continue;
-      stuck.push({ jid, idleMs });
+      stuck.push({
+        jid,
+        idleMs,
+        reason: hasIpcOwed ? 'ipc_injected' : 'pending_messages',
+      });
     }
     return stuck;
   }
@@ -1595,6 +1616,8 @@ export class GroupQueue {
       // section. Mutation pause/stop cannot observe a written file without its
       // recovery metadata (the old callback→mark race window).
       state.hasIpcInjectedMessages = true;
+      // Idle window restarts at the user's latest injected message (#618).
+      state.lastActivityAt = Date.now();
       if (receipt) {
         state.pendingIpcDeliveries ??= new Map();
         state.pendingIpcDeliveries.set(receipt.deliveryId, receipt);
