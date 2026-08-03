@@ -1,4 +1,5 @@
-import { getJidsByFolder, getRegisteredGroup } from './db.js';
+import { getAgent, getJidsByFolder, getRegisteredGroup } from './db.js';
+import { resolveBoundWorkspaceJid } from './workspace-attribution.js';
 
 const allowedUserIdsCache = new Map<
   string,
@@ -21,7 +22,21 @@ export function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
 
   const group = getRegisteredGroup(baseChatJid);
   if (!group) return null;
-  let ownerId: string | null = group.created_by ?? null;
+
+  // A bound IM chat's audience is the owner of the workspace it is bound to.
+  // The IM row keeps the channel account owner's `created_by` even after the
+  // chat is bound elsewhere, so trusting it directly would deliver another
+  // workspace's conversation to the account owner. Kept consistent with
+  // normalizeHomeJid so the broadcast label and its ACL resolve the same group.
+  const boundJid = resolveBoundWorkspaceJid(baseChatJid, {
+    getRegisteredGroup,
+    getAgent,
+    getJidsByFolder,
+  });
+  const attributionGroup =
+    (boundJid ? getRegisteredGroup(boundJid) : null) ?? group;
+
+  let ownerId: string | null = attributionGroup.created_by ?? null;
   if (!ownerId && !baseChatJid.startsWith('web:')) {
     for (const siblingJid of getJidsByFolder(group.folder)) {
       if (!siblingJid.startsWith('web:')) continue;

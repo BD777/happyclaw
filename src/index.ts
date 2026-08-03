@@ -46,6 +46,7 @@ import {
   resolveHostIpcLogicalChatJid,
   routeHostIpcOutput,
 } from './host-ipc-output-router.js';
+import { resolveBoundWorkspaceJid } from './workspace-attribution.js';
 import {
   buildInterruptedReply,
   buildSteeredReply,
@@ -10056,6 +10057,20 @@ function getIpcDeliveryTargetGroup(
   );
 }
 
+/**
+ * Fold a runner-supplied IM JID to the workspace it is bound to, so IPC output
+ * is attributed to the same workspace inbound routing selected. Returns null
+ * for unbound chats; callers keep the raw JID in that case.
+ */
+function resolveIpcOutputWorkspaceJid(chatJid: string): string | null {
+  return resolveBoundWorkspaceJid(chatJid, {
+    getRegisteredGroup: (jid) =>
+      registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgent,
+    getJidsByFolder,
+  });
+}
+
 // Thin production wrapper around the pure helper in ./task-routing.ts so the
 // internal call sites keep their short signature (deps inferred from the
 // runtime IM manager + DB). Tests should import `broadcastToOwnerIMChannels`
@@ -10383,6 +10398,7 @@ function startIpcWatcher(): void {
                     : undefined,
                   taskRunId: ipcTaskId,
                   scheduledTask: data.isScheduledTask === true,
+                  resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
                 });
                 // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
                 const cardText = extractFeishuCardText(data.text);
@@ -10933,11 +10949,18 @@ function startIpcWatcher(): void {
 
                   // Conversation agents and isolated scheduled tasks store in
                   // virtual JIDs (agent/task tab), not the main conversation.
-                  const imgChatJid = ipcAgentId
-                    ? `${data.chatJid}#agent:${ipcAgentId}`
-                    : ipcTaskId && data.isScheduledTask
-                      ? `${data.chatJid}#task:${ipcTaskId}`
-                      : data.chatJid;
+                  // Shares the text path's resolver so images are attributed to
+                  // the bound workspace instead of the raw IM row.
+                  const imgChatJid = resolveHostIpcLogicalChatJid({
+                    sourceChatJid: data.chatJid,
+                    agentId: ipcAgentId,
+                    agentChatJid: ipcAgentId
+                      ? getAgent(ipcAgentId)?.chat_jid
+                      : undefined,
+                    taskRunId: ipcTaskId,
+                    scheduledTask: data.isScheduledTask === true,
+                    resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
+                  });
 
                   // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
                   const displayText = caption
