@@ -6,10 +6,9 @@ import { GroupQueue } from '../src/group-queue.js';
 import { DATA_DIR } from '../src/config.js';
 
 // Regression coverage for #618: warm-path IPC follow-ups must be visible to
-// stuck-runner recovery. Follow-ups injected into a live runner set
-// hasIpcInjectedMessages without re-arming pendingMessages, so a wedged
-// in-flight turn with injected input was invisible to getStuckPendingGroups
-// and the user got no reply until a manual kill.
+// stuck-runner recovery. Follow-ups injected into a live runner establish a
+// dedicated IPC-debt timestamp without re-arming pendingMessages, so a wedged
+// in-flight turn remains visible even when ordinary output refreshes activity.
 //
 // State is seeded directly into the internal map (same approach as
 // conversation-agent-warm-lifecycle.test.ts) so the tests stay hermetic.
@@ -20,17 +19,20 @@ interface SeedOpts {
   active?: boolean;
   groupFolder?: string;
   agentId?: string | null;
+  runnerRuntime?: 'host' | 'container' | null;
   queryInFlight?: boolean;
   activeRunnerIsTask?: boolean;
   lastActivityAt?: number | null;
   pendingMessages?: boolean;
   hasIpcInjectedMessages?: boolean;
+  ipcOwedSinceAt?: number | null;
 }
 
 function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
   const anyQ = q as unknown as { groups: Map<string, Record<string, unknown>> };
   anyQ.groups.set(jid, {
     active: opts.active ?? true,
+    runnerRuntime: opts.runnerRuntime ?? 'host',
     activeRunnerIsTask: opts.activeRunnerIsTask ?? false,
     lastActivityAt: opts.lastActivityAt ?? null,
     queryInFlight: opts.queryInFlight ?? false,
@@ -48,6 +50,7 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
     selectedProviderId: null,
     drainSentinelWritten: false,
     hasIpcInjectedMessages: opts.hasIpcInjectedMessages ?? false,
+    ipcOwedSinceAt: opts.ipcOwedSinceAt ?? null,
   });
 }
 
@@ -71,6 +74,7 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
       groupFolder: folder,
       queryInFlight: true,
       hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
       lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
     });
 
@@ -91,6 +95,7 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
       groupFolder: folder,
       queryInFlight: false,
       hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
       lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
     });
 
@@ -127,6 +132,7 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
     expect(q.sendMessage(jid, 'follow-up message')).toBe('sent');
     expect(getState(q, jid).hasIpcInjectedMessages).toBe(true);
     expect(getState(q, jid).queryInFlight).toBe(true);
+    expect(getState(q, jid).ipcOwedSinceAt).toEqual(expect.any(Number));
     expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
   });
 
@@ -145,6 +151,43 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
     const last = getState(q, jid).lastActivityAt as number;
     expect(last).toBeGreaterThanOrEqual(before);
     expect(last).toBeLessThanOrEqual(after);
+    expect(getState(q, jid).ipcOwedSinceAt).toBe(last);
+  });
+
+  test('ordinary runner output refreshes idle activity without moving the absolute IPC debt clock', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: 1,
+      lastActivityAt: 1,
+    });
+
+    q.markRunnerActivity(jid);
+
+    expect(getState(q, jid).lastActivityAt).toBeGreaterThan(1);
+    expect(getState(q, jid).ipcOwedSinceAt).toBe(1);
+  });
+
+  test('absolute IPC ceiling remains visible despite recent runner output', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    const forceRestartMs = 10 * 60 * 1000;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - forceRestartMs - 1000,
+      lastActivityAt: Date.now() - 30_000,
+    });
+
+    const stuck = q.getStuckPendingGroups(IDLE_THRESHOLD_MS, forceRestartMs);
+    expect(stuck).toHaveLength(1);
+    expect(stuck[0].reason).toBe('ipc_injected');
+    expect(stuck[0].idleMs).toBeLessThan(IDLE_THRESHOLD_MS);
+    expect(stuck[0].ipcOwedMs).toBeGreaterThanOrEqual(forceRestartMs);
   });
 
   test('in-flight injected turn below the idle threshold is not stuck', () => {
@@ -154,20 +197,23 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
       groupFolder: folder,
       queryInFlight: true,
       hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - 30_000,
       lastActivityAt: Date.now() - 30_000,
     });
 
     expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
   });
 
-  test('runtime-session (agentId) runners remain excluded from stuck recovery', () => {
+  test('conversation-agent task lanes remain explicitly owned by their task lifecycle', () => {
     const q = new GroupQueue();
     const jid = `web:${folder}#agent:sess1`;
     seedRunner(q, jid, {
       groupFolder: folder,
       agentId: 'sess1',
+      activeRunnerIsTask: true,
       queryInFlight: true,
       hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
       lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
     });
 

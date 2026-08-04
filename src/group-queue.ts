@@ -9,6 +9,7 @@ import { getTaskById } from './db.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
+import type { RunnerRuntime } from './stuck-runner-recovery.js';
 import type { ChannelTurnContext } from './types.js';
 export type SendMessageResult = 'sent' | 'no_active';
 export interface IpcMessageCursor {
@@ -123,6 +124,8 @@ interface GroupState {
    * guessing from docker-kill completion or polling child-process state. */
   teardownWaiters: Set<() => void>;
   active: boolean;
+  /** Runtime actually assigned when this runner was launched. */
+  runnerRuntime: RunnerRuntime | null;
   /** True when the active runner is executing a scheduled task (not user messages). */
   activeRunnerIsTask: boolean;
   /** Exact task currently owning this state. Mutation stops park this task so
@@ -172,6 +175,9 @@ interface GroupState {
    *  re-read those messages.  The close handler uses this flag to force pendingMessages
    *  so drainGroup triggers a fresh run. */
   hasIpcInjectedMessages: boolean;
+  /** Oldest IPC inject still owed by the current logical query. Unlike
+   * lastActivityAt, ordinary runner output must never refresh this timestamp. */
+  ipcOwedSinceAt: number | null;
   /** IPC deliveries written to this runner but not yet acknowledged by a
    * healthy agent query result. Keyed by deliveryId for out-of-order acks. */
   pendingIpcDeliveries: Map<string, IpcDeliveryReceipt>;
@@ -263,6 +269,7 @@ export class GroupQueue {
         stopRequested: false,
         teardownWaiters: new Set(),
         active: false,
+        runnerRuntime: null,
         activeRunnerIsTask: false,
         activeTask: null,
         lastActivityAt: null,
@@ -287,6 +294,7 @@ export class GroupQueue {
         feishuCliAccountId: null,
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
+        ipcOwedSinceAt: null,
         pendingIpcDeliveries: new Map(),
         acknowledgedIpcDeliveryIds: new Set(),
       };
@@ -1005,7 +1013,9 @@ export class GroupQueue {
     // must measure silence *after* the inject, not since the previous turn's
     // last output — otherwise a follow-up injected into a long-idle warm
     // runner would look instantly stuck (#618).
-    state.lastActivityAt = Date.now();
+    const injectedAt = Date.now();
+    state.lastActivityAt = injectedAt;
+    state.ipcOwedSinceAt ??= injectedAt;
   }
 
   acknowledgeIpcDeliveries(
@@ -1079,6 +1089,7 @@ export class GroupQueue {
     if (!state?.active || !state.queryInFlight) return;
     const completedQueryId = state.queryId;
     state.queryInFlight = false;
+    state.ipcOwedSinceAt = null;
     state.queryId = null;
     state.queryStartedAt = null;
     state.announcedQueryId = null;
@@ -1126,6 +1137,7 @@ export class GroupQueue {
       return false;
     }
     state.queryInFlight = false;
+    state.ipcOwedSinceAt = null;
     state.queryId = null;
     state.queryStartedAt = null;
     state.announcedQueryId = null;
@@ -1144,37 +1156,53 @@ export class GroupQueue {
     return true;
   }
 
-  getStuckPendingGroups(idleThresholdMs: number): Array<{
+  getStuckPendingGroups(
+    idleThresholdMs: number,
+    ipcForceThresholdMs = Number.POSITIVE_INFINITY,
+  ): Array<{
     jid: string;
     idleMs: number;
     reason: 'pending_messages' | 'ipc_injected';
+    runtime: RunnerRuntime;
+    ipcOwedMs: number | null;
   }> {
     const now = Date.now();
     const stuck: Array<{
       jid: string;
       idleMs: number;
       reason: 'pending_messages' | 'ipc_injected';
+      runtime: RunnerRuntime;
+      ipcOwedMs: number | null;
     }> = [];
     for (const [jid, state] of this.groups.entries()) {
       if (!state.active) continue;
       if (state.activeRunnerIsTask) continue;
       // Warm follow-ups are IPC-injected without re-arming pendingMessages, so
       // a wedged in-flight turn with injected input was invisible here (#618).
-      // queryInFlight gates the IPC signal: once the runner reports the turn
-      // idle, a warm runner sitting between turns is not owed work and must
-      // not be restarted.
-      const hasIpcOwed = state.hasIpcInjectedMessages && state.queryInFlight;
+      // The dedicated debt timestamp is cleared when the query reports idle;
+      // unlike hasIpcInjectedMessages, it does not persist for the runner's
+      // lifetime and ordinary output never refreshes it.
+      const ipcOwedSinceAt = state.ipcOwedSinceAt ?? null;
+      const hasIpcOwed = ipcOwedSinceAt !== null && state.queryInFlight;
       if (!state.pendingMessages && !hasIpcOwed) continue;
       if (state.agentId !== null) continue;
       if (state.restarting) continue;
       const lastActivityAt = state.lastActivityAt ?? 0;
       if (lastActivityAt <= 0) continue;
       const idleMs = now - lastActivityAt;
-      if (idleMs < idleThresholdMs) continue;
+      const ipcOwedMs = hasIpcOwed ? Math.max(0, now - ipcOwedSinceAt) : null;
+      const reachedIdleThreshold = idleMs >= idleThresholdMs;
+      const reachedAbsoluteIpcCeiling =
+        ipcOwedMs !== null && ipcOwedMs >= ipcForceThresholdMs;
+      if (!reachedIdleThreshold && !reachedAbsoluteIpcCeiling) continue;
       stuck.push({
         jid,
         idleMs,
         reason: hasIpcOwed ? 'ipc_injected' : 'pending_messages',
+        runtime:
+          state.runnerRuntime ??
+          (state.containerName !== null ? 'container' : 'host'),
+        ipcOwedMs,
       });
     }
     return stuck;
@@ -1424,6 +1452,7 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = opts.containerName;
+    state.runnerRuntime = opts.containerName === null ? 'host' : 'container';
     state.displayName = opts.displayName || null;
     if (opts.groupFolder) state.groupFolder = opts.groupFolder;
     state.agentId = opts.agentId || null;
@@ -1617,7 +1646,9 @@ export class GroupQueue {
       // recovery metadata (the old callback→mark race window).
       state.hasIpcInjectedMessages = true;
       // Idle window restarts at the user's latest injected message (#618).
-      state.lastActivityAt = Date.now();
+      const injectedAt = Date.now();
+      state.lastActivityAt = injectedAt;
+      state.ipcOwedSinceAt ??= injectedAt;
       if (receipt) {
         state.pendingIpcDeliveries ??= new Map();
         state.pendingIpcDeliveries.set(receipt.deliveryId, receipt);
@@ -2263,9 +2294,11 @@ export class GroupQueue {
     state.stopRequested = false;
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
+    state.runnerRuntime = isHostMode ? 'host' : 'container';
     state.activeRunnerIsTask = false;
     state.lastActivityAt = Date.now();
     state.queryInFlight = true;
+    state.ipcOwedSinceAt = null;
     state.queryId = randomUUID();
     state.queryStartedAt = Date.now();
     state.announcedQueryId = null;
@@ -2381,6 +2414,7 @@ export class GroupQueue {
       state.active = false;
       state.drainSentinelWritten = false;
       state.hasIpcInjectedMessages = false;
+      state.ipcOwedSinceAt = null;
       state.lastActivityAt = null;
       state.queryInFlight = false;
       state.queryId = null;
@@ -2399,6 +2433,7 @@ export class GroupQueue {
       state.groupFolder = null;
       state.agentId = null;
       state.taskRunId = null;
+      state.runnerRuntime = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
@@ -2417,7 +2452,12 @@ export class GroupQueue {
       }
       // Skip auto-drain when a stop was just requested — drainGroup would
       // start a fresh runForGroup if any pending* slipped through.
-      if (!isStopRequested || preserveMutationWork) {
+      if (state.restarting) {
+        logger.debug(
+          { groupJid, folder: exitFolder },
+          'Restart in progress; deferring replacement launch to restartGroup',
+        );
+      } else if (!isStopRequested || preserveMutationWork) {
         try {
           this.drainGroup(groupJid);
         } catch (err) {
@@ -2458,10 +2498,12 @@ export class GroupQueue {
     const isHostMode = this.isHostMode(groupJid);
     state.stopRequested = false;
     state.active = true;
+    state.runnerRuntime = isHostMode ? 'host' : 'container';
     state.activeRunnerIsTask = true;
     state.activeTask = task;
     state.lastActivityAt = Date.now();
     state.queryInFlight = groupJid.includes('#agent:');
+    state.ipcOwedSinceAt = null;
     state.queryId = state.queryInFlight ? randomUUID() : null;
     state.queryStartedAt = state.queryInFlight ? Date.now() : null;
     state.announcedQueryId = null;
@@ -2532,6 +2574,7 @@ export class GroupQueue {
       state.activeTask = null;
       state.drainSentinelWritten = false;
       state.lastActivityAt = null;
+      state.ipcOwedSinceAt = null;
       state.queryInFlight = false;
       state.queryId = null;
       state.queryStartedAt = null;
@@ -2549,6 +2592,7 @@ export class GroupQueue {
       state.groupFolder = null;
       state.agentId = null;
       state.taskRunId = null;
+      state.runnerRuntime = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
