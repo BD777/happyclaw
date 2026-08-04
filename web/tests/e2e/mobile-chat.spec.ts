@@ -2,6 +2,33 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const HARNESS_PATH = '/tests/e2e/mobile-chat-harness.html';
 
+function createMinimalPdf() {
+  const pageStream = 'BT\n/F1 24 Tf\n100 700 Td\n(PDF preview) Tj\nET\n';
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${Buffer.byteLength(pageStream)} >>\nstream\n${pageStream}endstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  const offsets = [0];
+  let pdf = '%PDF-1.4\n';
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefOffset = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  pdf += offsets
+    .slice(1)
+    .map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`)
+    .join('');
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(pdf);
+}
+
+const MINIMAL_PDF = createMinimalPdf();
+
 async function prepareHarness(
   page: Page,
   options: {
@@ -19,8 +46,8 @@ async function prepareHarness(
   await page.route('**/api/groups/**/files/preview/**', async (route) => {
     if (route.request().resourceType() === 'document') {
       await route.fulfill({
-        contentType: 'text/html',
-        body: '<!doctype html><title>PDF preview fixture</title><p>PDF preview</p>',
+        contentType: 'application/pdf',
+        body: MINIMAL_PDF,
       });
       return;
     }
