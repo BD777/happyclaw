@@ -863,6 +863,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           max-height interpolates on every engine we target. */}
       {collapsibleNav && (
         <div
+          data-testid="context-nav-collapsed"
+          data-state={contextNavCollapsed ? 'open' : 'closed'}
           className={cn(
             'shrink-0 overflow-hidden transition-[max-height] duration-200 ease-out',
             contextNavCollapsed ? 'max-h-12' : 'max-h-0',
@@ -890,6 +892,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         </div>
       )}
       <div
+        data-testid={collapsibleNav ? 'context-nav-expanded' : undefined}
+        data-state={contextNavCollapsed ? 'closed' : 'open'}
         className={cn(
           'shrink-0 overflow-hidden',
           collapsibleNav && 'transition-[max-height] duration-200 ease-out',
@@ -923,6 +927,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       </div>
       <div
         ref={collapsibleNav ? contextPanelBodyRef : undefined}
+        data-testid={collapsibleNav ? 'context-panel-body' : undefined}
         className="min-h-0 flex-1 overflow-hidden"
       >
         {contextPanelView === 'env' && canModifyWorkspaceConfig ? (
@@ -1310,6 +1315,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             with the file list, covers the viewport and cannot scroll. */}
         <SheetContent
           side="bottom"
+          data-testid="mobile-context-sheet"
           className="gap-0 p-0 data-[side=bottom]:h-[80dvh]"
         >
           <SheetHeader className="sr-only">
