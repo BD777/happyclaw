@@ -20,7 +20,10 @@ interface SeedOpts {
   groupFolder?: string;
   agentId?: string | null;
   runnerRuntime?: 'host' | 'container' | null;
+  runnerGeneration?: number;
+  runnerPid?: number | null;
   queryInFlight?: boolean;
+  queryId?: string | null;
   activeRunnerIsTask?: boolean;
   lastActivityAt?: number | null;
   pendingMessages?: boolean;
@@ -32,13 +35,23 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
   const anyQ = q as unknown as { groups: Map<string, Record<string, unknown>> };
   anyQ.groups.set(jid, {
     active: opts.active ?? true,
+    runnerGeneration: opts.runnerGeneration ?? 1,
     runnerRuntime: opts.runnerRuntime ?? 'host',
     activeRunnerIsTask: opts.activeRunnerIsTask ?? false,
     lastActivityAt: opts.lastActivityAt ?? null,
     queryInFlight: opts.queryInFlight ?? false,
+    queryId:
+      opts.queryId !== undefined
+        ? opts.queryId
+        : opts.queryInFlight
+          ? 'query-1'
+          : null,
     pendingMessages: opts.pendingMessages ?? false,
     pendingTasks: [],
-    process: null,
+    process:
+      opts.runnerPid === undefined || opts.runnerPid === null
+        ? null
+        : { pid: opts.runnerPid },
     containerName: null,
     displayName: null,
     groupFolder: opts.groupFolder ?? 'main',
@@ -188,6 +201,128 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
     expect(stuck[0].reason).toBe('ipc_injected');
     expect(stuck[0].idleMs).toBeLessThan(IDLE_THRESHOLD_MS);
     expect(stuck[0].ipcOwedMs).toBeGreaterThanOrEqual(forceRestartMs);
+  });
+
+  test('probe result is rejected when the old turn becomes idle', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      runnerPid: 101,
+      queryInFlight: true,
+      queryId: 'old-query',
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+      lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+    });
+    const [candidate] = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
+
+    q.markRunnerQueryIdle(jid);
+
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toBeNull();
+  });
+
+  test('probe result is rejected when fresh activity drops below the idle threshold', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      runnerPid: 106,
+      queryInFlight: true,
+      queryId: 'recovering-query',
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+      lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+    });
+    const [candidate] = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
+
+    q.markRunnerActivity(jid);
+
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toBeNull();
+  });
+
+  test('probe result cannot restart a new healthy query on the same warm runner', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      runnerPid: 102,
+      queryInFlight: true,
+      queryId: 'old-query',
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+      lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+    });
+    const [candidate] = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
+
+    q.markRunnerQueryIdle(jid);
+    expect(q.sendMessage(jid, 'new healthy turn')).toBe('sent');
+    expect(getState(q, jid).queryId).not.toBe(candidate.queryId);
+
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toBeNull();
+  });
+
+  test('probe result is rejected when the query, PID, or generation changes', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      runnerPid: 103,
+      queryInFlight: true,
+      queryId: 'same-query',
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+      lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+    });
+    const [candidate] = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
+    const state = getState(q, jid);
+
+    state.queryId = 'replacement-query';
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toBeNull();
+
+    state.queryId = 'same-query';
+    state.process = { pid: 104 };
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toBeNull();
+
+    state.process = { pid: 103 };
+    state.runnerGeneration = 2;
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toBeNull();
+  });
+
+  test('probe result is accepted only while the same IPC debt remains owed', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      runnerPid: 105,
+      queryInFlight: true,
+      queryId: 'same-query',
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 2000,
+      lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 2000,
+    });
+    const [candidate] = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
+
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toMatchObject({
+      runnerGeneration: candidate.runnerGeneration,
+      queryId: candidate.queryId,
+      runnerPid: candidate.runnerPid,
+      ipcOwedSinceAt: candidate.ipcOwedSinceAt,
+    });
+
+    getState(q, jid).ipcOwedSinceAt = Date.now() - IDLE_THRESHOLD_MS - 1000;
+    expect(
+      q.revalidateStuckRecoveryCandidate(candidate, IDLE_THRESHOLD_MS),
+    ).toBeNull();
   });
 
   test('in-flight injected turn below the idle threshold is not stuck', () => {

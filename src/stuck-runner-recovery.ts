@@ -15,6 +15,14 @@ export interface StuckRecoveryCandidate {
   idleMs: number;
   reason: 'pending_messages' | 'ipc_injected';
   runtime: RunnerRuntime;
+  /** Monotonic identity of the concrete GroupQueue runner lifecycle. */
+  runnerGeneration: number;
+  /** Exact logical query observed when the candidate was selected. */
+  queryId: string | null;
+  /** Host-side process identity used by the CPU probe, if registered. */
+  runnerPid: number | null;
+  /** Absolute debt clock used to reject a later query's fresh IPC work. */
+  ipcOwedSinceAt: number | null;
   /** Age of the oldest IPC input still owed by the current logical query. */
   ipcOwedMs: number | null;
 }
@@ -118,9 +126,9 @@ export async function probeHostRunnerCpu(
  */
 export async function resolveRunnerCpuActivity(
   candidate: StuckRecoveryCandidate,
-  pid: number | undefined,
   probe: HostRunnerCpuProbe = probeHostRunnerCpu,
 ): Promise<RunnerCpuActivity> {
+  const pid = candidate.runnerPid;
   if (candidate.runtime !== 'host' || !pid) return 'unavailable';
   return probe(pid, candidate);
 }

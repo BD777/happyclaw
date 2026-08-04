@@ -17300,11 +17300,30 @@ async function recoverStuckPendingGroups(): Promise<void> {
     STUCK_RUNNER_FORCE_RESTART_MS,
   );
   for (const candidate of stuckGroups) {
-    const { jid, idleMs, reason, runtime, ipcOwedMs } = candidate;
-    const pid = queue.getRunnerPid(jid);
-    const cpuActivity = await resolveRunnerCpuActivity(candidate, pid);
-    const decision = decideStuckRunnerRecovery(
+    const pid = candidate.runnerPid ?? undefined;
+    const cpuActivity = await resolveRunnerCpuActivity(candidate);
+    const currentCandidate = queue.revalidateStuckRecoveryCandidate(
       candidate,
+      STUCK_RUNNER_IDLE_MS,
+      STUCK_RUNNER_FORCE_RESTART_MS,
+    );
+    if (!currentCandidate) {
+      logger.info(
+        {
+          chatJid: candidate.jid,
+          queryId: candidate.queryId,
+          runnerGeneration: candidate.runnerGeneration,
+          pid,
+          reason: candidate.reason,
+          runtime: candidate.runtime,
+        },
+        'Skipping stale stuck-runner candidate after CPU probe',
+      );
+      continue;
+    }
+    const { jid, idleMs, reason, runtime, ipcOwedMs } = currentCandidate;
+    const decision = decideStuckRunnerRecovery(
+      currentCandidate,
       cpuActivity,
       STUCK_RUNNER_FORCE_RESTART_MS,
     );

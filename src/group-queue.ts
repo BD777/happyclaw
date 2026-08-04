@@ -9,7 +9,10 @@ import { getTaskById } from './db.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
-import type { RunnerRuntime } from './stuck-runner-recovery.js';
+import type {
+  RunnerRuntime,
+  StuckRecoveryCandidate,
+} from './stuck-runner-recovery.js';
 import type { ChannelTurnContext } from './types.js';
 export type SendMessageResult = 'sent' | 'no_active';
 export interface IpcMessageCursor {
@@ -124,6 +127,8 @@ interface GroupState {
    * guessing from docker-kill completion or polling child-process state. */
   teardownWaiters: Set<() => void>;
   active: boolean;
+  /** Monotonic identity for each concrete runForGroup/runTask lifecycle. */
+  runnerGeneration: number;
   /** Runtime actually assigned when this runner was launched. */
   runnerRuntime: RunnerRuntime | null;
   /** True when the active runner is executing a scheduled task (not user messages). */
@@ -269,6 +274,7 @@ export class GroupQueue {
         stopRequested: false,
         teardownWaiters: new Set(),
         active: false,
+        runnerGeneration: 0,
         runnerRuntime: null,
         activeRunnerIsTask: false,
         activeTask: null,
@@ -1156,56 +1162,100 @@ export class GroupQueue {
     return true;
   }
 
+  private snapshotStuckRecoveryCandidate(
+    jid: string,
+    state: GroupState,
+    now: number,
+    idleThresholdMs: number,
+    ipcForceThresholdMs = Number.POSITIVE_INFINITY,
+  ): StuckRecoveryCandidate | null {
+    if (!state.active) return null;
+    if (state.activeRunnerIsTask) return null;
+    // Warm follow-ups are IPC-injected without re-arming pendingMessages, so
+    // a wedged in-flight turn with injected input was invisible here (#618).
+    // The dedicated debt timestamp is cleared when the query reports idle;
+    // unlike hasIpcInjectedMessages, it does not persist for the runner's
+    // lifetime and ordinary output never refreshes it.
+    const ipcOwedSinceAt = state.ipcOwedSinceAt ?? null;
+    const hasIpcOwed = ipcOwedSinceAt !== null && state.queryInFlight;
+    if (!state.pendingMessages && !hasIpcOwed) return null;
+    if (state.agentId !== null) return null;
+    if (state.restarting) return null;
+    const lastActivityAt = state.lastActivityAt ?? 0;
+    if (lastActivityAt <= 0) return null;
+    const idleMs = now - lastActivityAt;
+    const ipcOwedMs = hasIpcOwed ? Math.max(0, now - ipcOwedSinceAt) : null;
+    const reachedIdleThreshold = idleMs >= idleThresholdMs;
+    const reachedAbsoluteIpcCeiling =
+      ipcOwedMs !== null && ipcOwedMs >= ipcForceThresholdMs;
+    if (!reachedIdleThreshold && !reachedAbsoluteIpcCeiling) return null;
+    return {
+      jid,
+      idleMs,
+      reason: hasIpcOwed ? 'ipc_injected' : 'pending_messages',
+      runtime:
+        state.runnerRuntime ??
+        (state.containerName !== null ? 'container' : 'host'),
+      runnerGeneration: state.runnerGeneration ?? 0,
+      queryId: state.queryId,
+      runnerPid: state.process?.pid ?? null,
+      ipcOwedSinceAt,
+      ipcOwedMs,
+    };
+  }
+
   getStuckPendingGroups(
     idleThresholdMs: number,
     ipcForceThresholdMs = Number.POSITIVE_INFINITY,
-  ): Array<{
-    jid: string;
-    idleMs: number;
-    reason: 'pending_messages' | 'ipc_injected';
-    runtime: RunnerRuntime;
-    ipcOwedMs: number | null;
-  }> {
+  ): StuckRecoveryCandidate[] {
     const now = Date.now();
-    const stuck: Array<{
-      jid: string;
-      idleMs: number;
-      reason: 'pending_messages' | 'ipc_injected';
-      runtime: RunnerRuntime;
-      ipcOwedMs: number | null;
-    }> = [];
+    const stuck: StuckRecoveryCandidate[] = [];
     for (const [jid, state] of this.groups.entries()) {
-      if (!state.active) continue;
-      if (state.activeRunnerIsTask) continue;
-      // Warm follow-ups are IPC-injected without re-arming pendingMessages, so
-      // a wedged in-flight turn with injected input was invisible here (#618).
-      // The dedicated debt timestamp is cleared when the query reports idle;
-      // unlike hasIpcInjectedMessages, it does not persist for the runner's
-      // lifetime and ordinary output never refreshes it.
-      const ipcOwedSinceAt = state.ipcOwedSinceAt ?? null;
-      const hasIpcOwed = ipcOwedSinceAt !== null && state.queryInFlight;
-      if (!state.pendingMessages && !hasIpcOwed) continue;
-      if (state.agentId !== null) continue;
-      if (state.restarting) continue;
-      const lastActivityAt = state.lastActivityAt ?? 0;
-      if (lastActivityAt <= 0) continue;
-      const idleMs = now - lastActivityAt;
-      const ipcOwedMs = hasIpcOwed ? Math.max(0, now - ipcOwedSinceAt) : null;
-      const reachedIdleThreshold = idleMs >= idleThresholdMs;
-      const reachedAbsoluteIpcCeiling =
-        ipcOwedMs !== null && ipcOwedMs >= ipcForceThresholdMs;
-      if (!reachedIdleThreshold && !reachedAbsoluteIpcCeiling) continue;
-      stuck.push({
+      const candidate = this.snapshotStuckRecoveryCandidate(
         jid,
-        idleMs,
-        reason: hasIpcOwed ? 'ipc_injected' : 'pending_messages',
-        runtime:
-          state.runnerRuntime ??
-          (state.containerName !== null ? 'container' : 'host'),
-        ipcOwedMs,
-      });
+        state,
+        now,
+        idleThresholdMs,
+        ipcForceThresholdMs,
+      );
+      if (candidate) stuck.push(candidate);
     }
     return stuck;
+  }
+
+  /**
+   * Re-snapshot a candidate after an asynchronous CPU probe and accept it only
+   * if the exact runner/query/debt identity is unchanged. This synchronous
+   * check closes the probe-to-restart TOCTOU window: a completed old turn or a
+   * newly-started healthy turn must never be killed by its predecessor's stale
+   * recovery decision.
+   */
+  revalidateStuckRecoveryCandidate(
+    candidate: StuckRecoveryCandidate,
+    idleThresholdMs: number,
+    ipcForceThresholdMs = Number.POSITIVE_INFINITY,
+  ): StuckRecoveryCandidate | null {
+    const state = this.groups.get(candidate.jid);
+    if (!state) return null;
+    const current = this.snapshotStuckRecoveryCandidate(
+      candidate.jid,
+      state,
+      Date.now(),
+      idleThresholdMs,
+      ipcForceThresholdMs,
+    );
+    if (!current) return null;
+    if (
+      current.runnerGeneration !== candidate.runnerGeneration ||
+      current.queryId !== candidate.queryId ||
+      current.runtime !== candidate.runtime ||
+      current.runnerPid !== candidate.runnerPid ||
+      current.reason !== candidate.reason ||
+      current.ipcOwedSinceAt !== candidate.ipcOwedSinceAt
+    ) {
+      return null;
+    }
+    return current;
   }
 
   /**
@@ -2294,6 +2344,7 @@ export class GroupQueue {
     state.stopRequested = false;
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
+    state.runnerGeneration = (state.runnerGeneration ?? 0) + 1;
     state.runnerRuntime = isHostMode ? 'host' : 'container';
     state.activeRunnerIsTask = false;
     state.lastActivityAt = Date.now();
@@ -2498,6 +2549,7 @@ export class GroupQueue {
     const isHostMode = this.isHostMode(groupJid);
     state.stopRequested = false;
     state.active = true;
+    state.runnerGeneration = (state.runnerGeneration ?? 0) + 1;
     state.runnerRuntime = isHostMode ? 'host' : 'container';
     state.activeRunnerIsTask = true;
     state.activeTask = task;

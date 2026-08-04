@@ -27,6 +27,10 @@ function ipcCandidate(overrides: Partial<Candidate> = {}): Candidate {
     idleMs: 3 * 60 * 1000,
     reason: 'ipc_injected',
     runtime: 'host',
+    runnerGeneration: 1,
+    queryId: 'query-1',
+    runnerPid: 4242,
+    ipcOwedSinceAt: 1,
     ipcOwedMs: 3 * 60 * 1000,
     ...overrides,
   };
@@ -103,8 +107,7 @@ describe('stuck runner recovery policy', () => {
 
     await expect(
       resolveRunnerCpuActivity(
-        ipcCandidate({ runtime: 'container' }),
-        4242,
+        ipcCandidate({ runtime: 'container', runnerPid: 4242 }),
         hostProbe,
       ),
     ).resolves.toBe('unavailable');
