@@ -39,6 +39,7 @@ const user: UserPublic = {
 const previewFiles: FileEntry[] = [
   { name: 'notes.md', path: 'notes.md', type: 'file', size: 4096 },
   { name: 'plain.txt', path: 'plain.txt', type: 'file', size: 2048 },
+  { name: 'sample.png', path: 'sample.png', type: 'file', size: 1024 },
   { name: 'manual.pdf', path: 'manual.pdf', type: 'file', size: 8192 },
   { name: 'sample.mp3', path: 'sample.mp3', type: 'file', size: 1024 },
   { name: 'sample.mp4', path: 'sample.mp4', type: 'file', size: 1024 },

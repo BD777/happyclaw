@@ -598,42 +598,34 @@ function PdfPreview({
   onClose: () => void;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const [viewerLoadVersion, setViewerLoadVersion] = useState(0);
 
   useEffect(() => {
     const iframe = iframeRef.current;
-    if (!iframe) return;
+    if (!iframe || viewerLoadVersion === 0) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
       onClose();
     };
-    const bindEmbeddedWindow = () => {
-      try {
-        const embeddedWindow = iframe.contentWindow;
-        embeddedWindow?.removeEventListener('keydown', handleKeyDown);
-        embeddedWindow?.addEventListener('keydown', handleKeyDown);
-        iframe.dataset.escapeBridge = 'ready';
-      } catch {
-        // Some browser PDF viewers move their controls into an extension
-        // process. The dialog close control remains available in that case.
-      }
-    };
+    const embeddedWindow = iframe.contentWindow;
 
-    // An iframe navigation replaces its Window global. Chromium's PDF viewer
-    // does not consistently fire `load` in headless mode, so periodically
-    // rebind while this one preview is open instead of relying on that event.
-    bindEmbeddedWindow();
-    const bindTimer = window.setInterval(bindEmbeddedWindow, 250);
+    try {
+      embeddedWindow?.addEventListener('keydown', handleKeyDown);
+      iframe.dataset.escapeBridge = 'ready';
+    } catch {
+      // Some browser PDF viewers move their controls into an extension
+      // process. The dialog close control remains available in that case.
+    }
     return () => {
-      window.clearInterval(bindTimer);
       try {
-        iframe.contentWindow?.removeEventListener('keydown', handleKeyDown);
+        embeddedWindow?.removeEventListener('keydown', handleKeyDown);
       } catch {
         // The embedded viewer may have navigated across origins while closing.
       }
     };
-  }, [onClose]);
+  }, [onClose, viewerLoadVersion]);
 
   return (
     <MediaOverlay onClose={onClose} fileName={file.name}>
@@ -643,6 +635,7 @@ function PdfPreview({
         title={file.name}
         className="h-[90dvh] w-[90vw] rounded-lg bg-white"
         tabIndex={0}
+        onLoad={() => setViewerLoadVersion((version) => version + 1)}
       />
     </MediaOverlay>
   );
@@ -1107,19 +1100,8 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                 const clickable =
                   item.type === 'directory' ||
                   isPreviewableFile(item.name, !!item.isSystem);
-                return (
-                  <div
-                    key={item.path}
-                    className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
-                      clickable
-                        ? 'hover:bg-muted cursor-pointer'
-                        : item.isSystem
-                          ? 'bg-muted/60'
-                          : 'hover:bg-muted/50'
-                    }`}
-                    onClick={() => handleItemClick(item)}
-                  >
-                    {/* Icon */}
+                const summary = (
+                  <>
                     <div className="flex-shrink-0 w-5 flex items-center justify-center">
                       {item.type === 'directory' ? (
                         <Folder className="w-4.5 h-4.5 text-primary" />
@@ -1127,8 +1109,6 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                         <FileIcon name={item.name} />
                       )}
                     </div>
-
-                    {/* Name + meta */}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5">
                         <span
@@ -1148,6 +1128,32 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                         </p>
                       )}
                     </div>
+                  </>
+                );
+                return (
+                  <div
+                    key={item.path}
+                    className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
+                      clickable
+                        ? 'hover:bg-muted'
+                        : item.isSystem
+                          ? 'bg-muted/60'
+                          : 'hover:bg-muted/50'
+                    }`}
+                  >
+                    {clickable ? (
+                      <button
+                        type="button"
+                        onClick={() => handleItemClick(item)}
+                        className="flex min-w-0 flex-1 items-center gap-2 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+                      >
+                        {summary}
+                      </button>
+                    ) : (
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        {summary}
+                      </div>
+                    )}
 
                     {/* Actions */}
                     <div className="flex-shrink-0 flex items-center gap-0.5">

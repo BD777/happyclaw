@@ -35,8 +35,18 @@ async function prepareHarness(
     role?: 'admin' | 'member';
     runtime?: 'container' | 'host';
     canModify?: boolean;
+    deferPdfResponse?: boolean;
   } = {},
 ) {
+  let markPdfRequestStarted!: () => void;
+  const pdfRequestStarted = new Promise<void>((resolve) => {
+    markPdfRequestStarted = resolve;
+  });
+  let releasePdfResponse!: () => void;
+  const pdfResponseGate = new Promise<void>((resolve) => {
+    releasePdfResponse = resolve;
+  });
+
   await page.route('**/test-image.svg', async (route) => {
     await route.fulfill({
       contentType: 'image/svg+xml',
@@ -45,9 +55,18 @@ async function prepareHarness(
   });
   await page.route('**/api/groups/**/files/preview/**', async (route) => {
     if (route.request().resourceType() === 'document') {
+      markPdfRequestStarted();
+      if (options.deferPdfResponse) await pdfResponseGate;
       await route.fulfill({
         contentType: 'application/pdf',
         body: MINIMAL_PDF,
+      });
+      return;
+    }
+    if (route.request().resourceType() === 'image') {
+      await route.fulfill({
+        contentType: 'image/svg+xml',
+        body: '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480"><rect width="100%" height="100%" fill="#db2777"/></svg>',
       });
       return;
     }
@@ -60,6 +79,7 @@ async function prepareHarness(
     canModify: String(options.canModify ?? true),
   });
   await page.goto(`${HARNESS_PATH}?${query}`);
+  return { pdfRequestStarted, releasePdfResponse };
 }
 
 async function openContextSheet(page: Page): Promise<Locator> {
@@ -194,14 +214,84 @@ test('markdown preview keeps focus and scroll inside nested modal layers', async
   await expect(sheet).toBeHidden();
 });
 
-test('PDF, audio, and video controls can take focus without escaping the sheet scope', async ({
+test('PDF bridge binds only after load and closes from the embedded window', async ({
+  page,
+}) => {
+  const { pdfRequestStarted, releasePdfResponse } = await prepareHarness(page, {
+    deferPdfResponse: true,
+  });
+  const sheet = await openContextSheet(page);
+  const returnTarget = sheet.getByRole('button', { name: /manual\.pdf/ });
+  await returnTarget.scrollIntoViewIfNeeded();
+  await returnTarget.click();
+
+  const preview = page.getByRole('dialog', { name: 'manual.pdf' });
+  await expect(preview).toBeVisible();
+  const iframe = preview.locator('iframe');
+
+  await pdfRequestStarted;
+  expect(await iframe.getAttribute('data-escape-bridge')).toBeNull();
+  releasePdfResponse();
+  await expect(iframe).toHaveAttribute('data-escape-bridge', 'ready');
+  await iframe.focus();
+  await expect(iframe).toBeFocused();
+
+  const eventWasNotCanceled = await iframe.evaluate((element) => {
+    const embeddedWindow = (element as HTMLIFrameElement).contentWindow;
+    if (!embeddedWindow) throw new Error('PDF iframe has no content window');
+    return embeddedWindow.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+  expect(eventWasNotCanceled).toBe(false);
+  await expect(preview).toBeHidden();
+  await expect(sheet).toBeVisible();
+  await expect(returnTarget).toBeFocused();
+});
+
+test('direct image preview opens, traps focus, and restores it on Escape', async ({
+  page,
+}) => {
+  await prepareHarness(page);
+  const sheet = await openContextSheet(page);
+  const returnTarget = sheet.getByRole('button', { name: /sample\.png/ });
+  await returnTarget.scrollIntoViewIfNeeded();
+  await returnTarget.click();
+
+  const preview = page.getByRole('dialog', { name: 'sample.png' });
+  await expect(preview).toBeVisible();
+  await expect
+    .poll(() =>
+      preview
+        .locator('img')
+        .evaluate(
+          (image: HTMLImageElement) => image.complete && image.naturalWidth > 0,
+        ),
+    )
+    .toBe(true);
+  await expect
+    .poll(() =>
+      preview.evaluate((element) => element.contains(document.activeElement)),
+    )
+    .toBe(true);
+
+  await page.keyboard.press('Escape');
+  await expect(preview).toBeHidden();
+  await expect(sheet).toBeVisible();
+  await expect(returnTarget).toBeFocused();
+});
+
+test('audio and video controls can take focus without escaping the sheet scope', async ({
   page,
 }) => {
   await prepareHarness(page);
   const sheet = await openContextSheet(page);
 
   const cases = [
-    { file: 'manual.pdf', dialog: 'manual.pdf', selector: 'iframe' },
     { file: 'sample.mp3', dialog: '播放 sample.mp3', selector: 'audio' },
     { file: 'sample.mp4', dialog: 'sample.mp4', selector: 'video' },
   ];
@@ -211,9 +301,6 @@ test('PDF, audio, and video controls can take focus without escaping the sheet s
     const preview = page.getByRole('dialog', { name: item.dialog });
     await expect(preview).toBeVisible();
     const media = preview.locator(item.selector);
-    if (item.selector === 'iframe') {
-      await expect(media).toHaveAttribute('data-escape-bridge', 'ready');
-    }
     await media.focus();
     await expect(media).toBeFocused();
     await expect

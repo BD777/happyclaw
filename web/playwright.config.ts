@@ -20,7 +20,13 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium-mobile',
-      use: { ...devices['Pixel 7'] },
+      use: {
+        ...devices['Pixel 7'],
+        // Playwright's compact headless shell does not host Chromium's native
+        // PDF viewer, so PDF iframe load/focus behaviour must run against the
+        // full browser in CI. Local callers can still supply a system binary.
+        ...(systemChromium ? {} : { channel: 'chromium' as const }),
+      },
     },
   ],
   webServer: {
