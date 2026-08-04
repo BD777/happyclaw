@@ -598,40 +598,34 @@ function PdfPreview({
   onClose: () => void;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const [viewerLoadVersion, setViewerLoadVersion] = useState(0);
 
   useEffect(() => {
     const iframe = iframeRef.current;
-    if (!iframe) return;
+    if (!iframe || viewerLoadVersion === 0) return;
 
-    let boundWindow: Window | null = null;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
       onClose();
     };
-    const bindEmbeddedWindow = () => {
-      try {
-        boundWindow?.removeEventListener('keydown', handleKeyDown);
-        boundWindow = iframe.contentWindow;
-        boundWindow?.addEventListener('keydown', handleKeyDown);
-      } catch {
-        // Some browser PDF viewers move their controls into an extension
-        // process. The dialog close control remains available in that case.
-        boundWindow = null;
-      }
-    };
+    const embeddedWindow = iframe.contentWindow;
 
-    iframe.addEventListener('load', bindEmbeddedWindow);
-    bindEmbeddedWindow();
+    try {
+      embeddedWindow?.addEventListener('keydown', handleKeyDown);
+      iframe.dataset.escapeBridge = 'ready';
+    } catch {
+      // Some browser PDF viewers move their controls into an extension
+      // process. The dialog close control remains available in that case.
+    }
     return () => {
-      iframe.removeEventListener('load', bindEmbeddedWindow);
       try {
-        boundWindow?.removeEventListener('keydown', handleKeyDown);
+        embeddedWindow?.removeEventListener('keydown', handleKeyDown);
       } catch {
         // The embedded viewer may have navigated across origins while closing.
       }
     };
-  }, [onClose]);
+  }, [onClose, viewerLoadVersion]);
 
   return (
     <MediaOverlay onClose={onClose} fileName={file.name}>
@@ -641,6 +635,7 @@ function PdfPreview({
         title={file.name}
         className="h-[90dvh] w-[90vw] rounded-lg bg-white"
         tabIndex={0}
+        onLoad={() => setViewerLoadVersion((version) => version + 1)}
       />
     </MediaOverlay>
   );

@@ -184,6 +184,9 @@ test('PDF, audio, and video controls can take focus without escaping the sheet s
     const preview = page.getByRole('dialog', { name: item.dialog });
     await expect(preview).toBeVisible();
     const media = preview.locator(item.selector);
+    if (item.selector === 'iframe') {
+      await expect(media).toHaveAttribute('data-escape-bridge', 'ready');
+    }
     await media.focus();
     await expect(media).toBeFocused();
     await expect
