@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { STORE_DIR, GROUPS_DIR } from './config.js';
+import { normalizeAgentEffort } from './agent-effort.js';
 import { logger } from './logger.js';
 import {
   AgentProfile,
@@ -102,7 +103,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 68;
+export const CURRENT_SCHEMA_VERSION = 69;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -1992,6 +1993,16 @@ export function initDatabase(): void {
       ON agent_profiles(model_config_id)
       WHERE model_config_id IS NOT NULL;
   `);
+  // v68 -> v69: make reasoning effort an explicit Agent runtime policy. The
+  // inherited default preserves every existing Provider/SDK behavior, so this
+  // migration normalizes JSON only and deliberately does not bump Agent
+  // identity/version metadata.
+  if (
+    rawSchemaVersionBeforeInit !== null &&
+    Number(rawSchemaVersionBeforeInit) < 69
+  ) {
+    migrateAgentProfileEffortPolicy();
+  }
 
   // v47 → v48: split the legacy all-in-one Agent prompt into the four
   // IDENTITY / SOUL / AGENTS / TOOLS sections. The legacy prompt represented
@@ -7920,6 +7931,7 @@ export function getSessionAgentIdentity(
 }
 
 const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
+  reasoning: { effort: 'inherit' },
   context: {
     source: 'managed',
     auto_compact_window: 0,
@@ -7930,6 +7942,7 @@ const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
 };
 
 type RuntimePolicyInput = Partial<{
+  reasoning: Partial<AgentProfileRuntimePolicy['reasoning']> | null;
   context: Partial<AgentProfileRuntimePolicy['context']> | null;
   skills:
     | (Partial<Omit<AgentProfileRuntimePolicy['skills'], 'host'>> & {
@@ -7968,6 +7981,9 @@ export function normalizeAgentProfileRuntimePolicy(
 ): AgentProfileRuntimePolicy {
   const raw = (input ?? {}) as RuntimePolicyInput | AgentProfileRuntimePolicy;
   const normalized: AgentProfileRuntimePolicy = {
+    reasoning: {
+      effort: normalizeAgentEffort(raw.reasoning?.effort),
+    },
     context: {
       source: normalizeMode(
         raw.context?.source,
@@ -8064,6 +8080,13 @@ export function mergeAgentProfileRuntimePolicy(
   };
 
   return normalizeAgentProfileRuntimePolicy({
+    reasoning: has('reasoning')
+      ? patch.reasoning === null
+        ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.reasoning
+        : {
+            effort: patch.reasoning?.effort ?? current.reasoning.effort,
+          }
+      : current.reasoning,
     context: has('context')
       ? patch.context === null
         ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context
@@ -8086,6 +8109,53 @@ export function serializeAgentProfileRuntimePolicy(
   input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
 ): string {
   return JSON.stringify(normalizeAgentProfileRuntimePolicy(input));
+}
+
+/** Persist the v69 inherited effort default into legacy runtime-policy JSON. */
+export function migrateAgentProfileEffortPolicy(): number {
+  const rows = db
+    .prepare('SELECT id, runtime_policy FROM agent_profiles')
+    .all() as Array<{ id: string; runtime_policy: unknown }>;
+  const update = db.prepare(
+    'UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?',
+  );
+  let migrated = 0;
+  db.transaction(() => {
+    for (const row of rows) {
+      let next: Record<string, unknown> | AgentProfileRuntimePolicy;
+      try {
+        const parsed =
+          typeof row.runtime_policy === 'string'
+            ? JSON.parse(row.runtime_policy)
+            : row.runtime_policy;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('Legacy Agent runtime policy is not an object');
+        }
+        const raw = parsed as Record<string, unknown>;
+        const rawReasoning =
+          raw.reasoning &&
+          typeof raw.reasoning === 'object' &&
+          !Array.isArray(raw.reasoning)
+            ? (raw.reasoning as Record<string, unknown>)
+            : {};
+        next = {
+          ...raw,
+          reasoning: {
+            ...rawReasoning,
+            effort: normalizeAgentEffort(rawReasoning.effort),
+          },
+        };
+      } catch {
+        // Invalid legacy JSON is normalized to the safe inherited default.
+        next = normalizeAgentProfileRuntimePolicy();
+      }
+      const serialized = JSON.stringify(next);
+      if (serialized === row.runtime_policy) continue;
+      update.run(serialized, row.id);
+      migrated += 1;
+    }
+  })();
+  return migrated;
 }
 
 /**
@@ -8266,11 +8336,13 @@ export function computeAgentProfileIdentityHash(
     name?: string;
   } = { prompts };
   const identityPolicy = {
+    reasoning: normalizedPolicy.reasoning,
     context: { source: normalizedPolicy.context.source },
     skills: normalizedPolicy.skills,
     mcp: normalizedPolicy.mcp,
   };
   const defaultIdentityPolicy = {
+    reasoning: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.reasoning,
     context: { source: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context.source },
     skills: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.skills,
     mcp: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.mcp,

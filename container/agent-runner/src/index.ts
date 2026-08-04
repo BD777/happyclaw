@@ -107,6 +107,7 @@ import {
   resolveClaudeProviderRuntime,
   resolveClaudeQueryModelRuntime,
 } from './provider-runtime.js';
+import { resolveAgentSdkEffort } from './agent-effort.js';
 import {
   decideProviderLimitAction,
   isAccountProviderAssistantError,
@@ -2619,6 +2620,14 @@ async function runQueryAttempt(
     : {};
 
   try {
+    const agentEffort = resolveAgentSdkEffort(
+      containerInput.agentProfile?.runtimePolicy,
+    );
+    log(
+      agentEffort
+        ? `Agent effort override: ${agentEffort}`
+        : 'Agent effort: inherit Provider/SDK default',
+    );
     const sdkCompat = withHappyClawSubagentContract({
       ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
       ...queryModelRuntime.queryModelOptions,
@@ -2631,6 +2640,7 @@ async function runQueryAttempt(
         disallowedTools: effectiveDisallowedTools,
       }),
       thinking: { type: 'adaptive' as const, display: 'summarized' as const },
+      ...(agentEffort ? { effort: agentEffort } : {}),
       permissionMode: 'bypassPermissions' as const,
       allowDangerouslySkipPermissions: true,
       agentProgressSummaries: true,
