@@ -196,4 +196,21 @@ describe('Agent prompt and capability frontend contract', () => {
       expect(source).toContain("!model.enabled ? '（仅显式使用）' : ''");
     }
   });
+
+  test('lets the main HappyClaw read and persist its reasoning effort', () => {
+    const main = read(
+      'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
+    );
+
+    expect(main).toContain('aria-label="主 HappyClaw 推理努力档位"');
+    expect(main).toContain(
+      "setEffort(profile.runtime_policy.reasoning?.effort ?? 'inherit')",
+    );
+    expect(main).toMatch(
+      /runtime_policy:\s*\{[\s\S]*reasoning: \{ effort \}[\s\S]*skills:/,
+    );
+    for (const effort of ['inherit', 'low', 'medium', 'high', 'xhigh', 'max']) {
+      expect(main).toContain(`value: '${effort}'`);
+    }
+  });
 });

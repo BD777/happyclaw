@@ -8336,13 +8336,14 @@ export function computeAgentProfileIdentityHash(
     name?: string;
   } = { prompts };
   const identityPolicy = {
-    reasoning: normalizedPolicy.reasoning,
+    ...(normalizedPolicy.reasoning.effort === 'inherit'
+      ? {}
+      : { reasoning: normalizedPolicy.reasoning }),
     context: { source: normalizedPolicy.context.source },
     skills: normalizedPolicy.skills,
     mcp: normalizedPolicy.mcp,
   };
   const defaultIdentityPolicy = {
-    reasoning: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.reasoning,
     context: { source: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context.source },
     skills: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.skills,
     mcp: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.mcp,

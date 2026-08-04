@@ -279,6 +279,22 @@ describe('/api/agent-profiles routes', () => {
   });
 
   test('creates, patches, inherits, and validates Agent effort', async () => {
+    const defaultProfile = db
+      .listAgentProfilesForUser('routes-agent-user')
+      .find((profile) => profile.is_default);
+    expect(defaultProfile).toBeDefined();
+    const defaultPatchRes = await routes.request(`/${defaultProfile!.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'medium' } },
+      }),
+    });
+    expect(defaultPatchRes.status).toBe(200);
+    expect(
+      (await defaultPatchRes.json()).profile.runtime_policy.reasoning,
+    ).toEqual({ effort: 'medium' });
+
     const createdRes = await routes.request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -323,6 +339,15 @@ describe('/api/agent-profiles routes', () => {
       }),
     });
     expect(invalidRes.status).toBe(400);
+
+    const restoreDefaultRes = await routes.request(`/${defaultProfile!.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'inherit' } },
+      }),
+    });
+    expect(restoreDefaultRes.status).toBe(200);
   });
 
   test('keeps legacy all-in-one prompt payloads compatible while complete payloads use IDENTITY', async () => {
