@@ -190,6 +190,21 @@ const DANGEROUS_ENV_VARS = new Set([
   'HAPPYCLAW_WORKSPACE_IPC',
   'CLAUDE_CONFIG_DIR',
 ]);
+
+function isDangerousEnvKey(key: string): boolean {
+  return (
+    DANGEROUS_ENV_VARS.has(key) ||
+    key.startsWith('HAPPYCLAW_SESSION_') ||
+    key.startsWith('HAPPYCLAW_INTERNAL_') ||
+    key === 'HAPPYCLAW_HOST_IDENTITY_MODE' ||
+    key === 'HAPPYCLAW_HOST_UID' ||
+    key === 'HAPPYCLAW_HOST_GID' ||
+    key === 'HAPPYCLAW_PASSWD_FILE' ||
+    key === 'HAPPYCLAW_RECONCILE_SESSION_PERMISSIONS' ||
+    key === 'HAPPYCLAW_MOUNT_PREPARE_MODE' ||
+    key === 'HAPPYCLAW_RUNTIME_USER'
+  );
+}
 const MAX_CUSTOM_ENV_ENTRIES = 50;
 const MAX_THIRD_PARTY_PROFILES = 20;
 
@@ -631,6 +646,7 @@ function sanitizeCustomEnvMap(
     if (options?.skipReservedClaudeKeys && RESERVED_CLAUDE_ENV_KEYS.has(key)) {
       continue;
     }
+    if (isDangerousEnvKey(key)) continue;
     out[key] = sanitizeCustomEnvValue(
       key,
       typeof rawValue === 'string' ? rawValue : String(rawValue),
@@ -2606,7 +2622,7 @@ export function buildClaudeEnvLines(
   }
 
   for (const [key, value] of Object.entries(customEnv)) {
-    if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
+    if (RESERVED_CLAUDE_ENV_KEYS.has(key) || isDangerousEnvKey(key)) continue;
     if (config.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key)) {
       continue;
     }
@@ -2874,7 +2890,7 @@ export function saveContainerEnvConfig(
   if (sanitized.customEnv) {
     const cleanEnv: Record<string, string> = {};
     for (const [k, v] of Object.entries(sanitized.customEnv)) {
-      if (DANGEROUS_ENV_VARS.has(k)) {
+      if (isDangerousEnvKey(k)) {
         logger.warn(
           { key: k },
           'Rejected dangerous env variable in saveContainerEnvConfig',
@@ -3038,7 +3054,7 @@ export function buildContainerEnvLines(
         continue;
       }
       // Block dangerous environment variables
-      if (DANGEROUS_ENV_VARS.has(key)) {
+      if (isDangerousEnvKey(key)) {
         logger.warn(
           { key },
           'Blocked dangerous env variable in buildContainerEnvLines',

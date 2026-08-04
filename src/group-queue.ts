@@ -2058,7 +2058,7 @@ export class GroupQueue {
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       try {
-        fs.chmodSync(inputDir, 0o777);
+        fs.chmodSync(inputDir, 0o700);
       } catch {
         /* ignore */
       }

@@ -505,21 +505,21 @@ function applyKnownProviderFailureDisposition(
   output.inputTurnCompleted = terminal;
 }
 
-interface VolumeMount {
+export interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
 }
 
 /**
- * Create directory with 0o777 permissions for container volume mounts.
- * Fixes uid mismatch between host user and container node user (uid 1000),
- * especially in rootless podman where uid remapping causes permission denied.
+ * Create an owner-only directory for a writable container mount. The container
+ * entrypoint applies the selected identity bridge; host code must never make
+ * these data roots world-accessible as a uid-mismatch workaround.
  */
 function mkdirForContainer(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true });
   try {
-    fs.chmodSync(dirPath, 0o777);
+    fs.chmodSync(dirPath, 0o700);
   } catch {
     // Ignore — may fail on read-only filesystem or special mounts
   }
@@ -1333,7 +1333,7 @@ export function buildVolumeMounts(
   // Per-group IPC namespace: each group gets its own IPC directory
   // Sub-agents get their own IPC subdirectory under agents/{agentId}/
   // Isolated tasks get their own IPC subdirectory under tasks-run/{taskRunId}/
-  // Use 0o777 so container (node/1000) and host (agent/1002) can both read/write.
+  // Keep host IPC roots owner-only; the entrypoint applies the selected bridge.
   const groupIpcDir = ipcAgentId
     ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', ipcAgentId)
     : taskRunId
@@ -1341,12 +1341,11 @@ export function buildVolumeMounts(
       : path.join(DATA_DIR, 'ipc', group.folder);
   mkdirForContainer(groupIpcDir);
   // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  // Use chmod 777 so both host (agent/1002) and container (node/1000) can write
   for (const sub of ['messages', 'tasks', 'input', 'agents'] as const) {
     const subDir = path.join(groupIpcDir, sub);
     fs.mkdirSync(subDir, { recursive: true });
     try {
-      fs.chmodSync(subDir, 0o777);
+      fs.chmodSync(subDir, 0o700);
     } catch {
       /* ignore if already correct */
     }
@@ -1534,15 +1533,126 @@ export function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(
+export type ContainerHostIdentityMode =
+  | 'direct'
+  | 'rootless'
+  | 'userns'
+  | 'virtualized'
+  | 'host-root'
+  | 'unknown';
+
+export interface ContainerHostIdentity {
+  mode: ContainerHostIdentityMode;
+  uid?: number;
+  gid?: number;
+}
+
+export interface ContainerHostIdentityProbe {
+  platform: NodeJS.Platform;
+  uid?: number;
+  gid?: number;
+  securityOptions: readonly string[] | null;
+}
+
+function isPositiveUnixId(value: number | undefined): value is number {
+  return Number.isSafeInteger(value) && value !== undefined && value > 0;
+}
+
+/**
+ * Decide whether container ids share the host's numeric id namespace.
+ *
+ * Numeric remapping is safe only for a rootful Linux daemon without userns.
+ * Rootless Docker/Podman and userns-remap deliberately translate ids, while
+ * Docker Desktop virtualizes bind-mount ownership. Unknown probes fail closed
+ * to the entrypoint's permission reconciler instead of guessing.
+ */
+export function resolveContainerHostIdentity(
+  probe: ContainerHostIdentityProbe,
+): ContainerHostIdentity {
+  if (probe.platform === 'darwin' || probe.platform === 'win32') {
+    return { mode: 'virtualized' };
+  }
+  if (probe.platform !== 'linux') return { mode: 'unknown' };
+
+  if (probe.securityOptions === null) return { mode: 'unknown' };
+
+  const normalizedSecurityOptions = probe.securityOptions.map((option) =>
+    option.toLowerCase(),
+  );
+  if (normalizedSecurityOptions.some((option) => option.includes('rootless'))) {
+    return { mode: 'rootless' };
+  }
+  if (normalizedSecurityOptions.some((option) => option.includes('userns'))) {
+    return { mode: 'userns' };
+  }
+
+  if (probe.uid === 0) return { mode: 'host-root' };
+  if (!isPositiveUnixId(probe.uid)) return { mode: 'unknown' };
+
+  return {
+    mode: 'direct',
+    uid: probe.uid,
+    ...(isPositiveUnixId(probe.gid) ? { gid: probe.gid } : {}),
+  };
+}
+
+function probeContainerSecurityOptions(): readonly string[] | null {
+  let securityOptions: readonly string[] | null = null;
+  try {
+    const raw = execFileSync(
+      'docker',
+      ['info', '--format', '{{json .SecurityOptions}}'],
+      { encoding: 'utf8', timeout: 3_000 },
+    ).trim();
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      Array.isArray(parsed) &&
+      parsed.every((option) => typeof option === 'string')
+    ) {
+      securityOptions = parsed;
+    }
+  } catch {
+    // A missing/unsupported probe must not enable numeric id remapping.
+  }
+  return securityOptions;
+}
+
+export function detectContainerHostIdentity(
+  readSecurityOptions: () =>
+    | readonly string[]
+    | null = probeContainerSecurityOptions,
+): ContainerHostIdentity {
+  // Probe every launch. Docker context/daemon security options can change
+  // while HappyClaw is running; reusing an earlier direct result could bypass
+  // rootless/userns fail-closed handling, while caching unknown blocks recovery.
+  const securityOptions = readSecurityOptions();
+  return resolveContainerHostIdentity({
+    platform: process.platform,
+    uid: process.getuid?.(),
+    gid: process.getgid?.(),
+    securityOptions,
+  });
+}
+
+export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   tz: string,
+  hostIdentity: ContainerHostIdentity = detectContainerHostIdentity(),
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
+  args.push('-e', `HAPPYCLAW_HOST_IDENTITY_MODE=${hostIdentity.mode}`);
+  if (hostIdentity.mode === 'direct') {
+    if (isPositiveUnixId(hostIdentity.uid)) {
+      args.push('-e', `HAPPYCLAW_HOST_UID=${hostIdentity.uid}`);
+    }
+    if (isPositiveUnixId(hostIdentity.gid)) {
+      args.push('-e', `HAPPYCLAW_HOST_GID=${hostIdentity.gid}`);
+    }
+  }
 
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
