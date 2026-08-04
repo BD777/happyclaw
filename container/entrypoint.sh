@@ -6,23 +6,21 @@ set -e
 umask 0077
 
 # This root-owned helper accepts no runtime-configurable path.
+# shellcheck source=session-permissions.sh
 source /app/session-permissions.sh
 happyclaw_configure_node_identity
 
 # Prepare only explicit writable roots. Direct mode touches roots and performs
 # a separate one-time legacy migration below; rootless defers to its verified
 # bridge; host-root/Desktop preserve owner-only modes.
-happyclaw_prepare_mounted_path /home/node/.claude
-happyclaw_prepare_mounted_path /home/node/.feishu-cli
-happyclaw_prepare_mounted_path /workspace/group
-happyclaw_prepare_mounted_path /workspace/ipc
-happyclaw_prepare_mounted_path /workspace/extra
+happyclaw_prepare_mounted_paths
 happyclaw_migrate_direct_managed_paths
 
 # Mark mounted directories as safe for git (CVE-2022-24765 ownership check).
 # Host uid may differ from container node user, causing git to refuse operations.
 # 使用通配符 '*' 因为挂载路径动态（extra mounts、customCwd），无法枚举具体目录。
-git config --global --add safe.directory '*' 2>/dev/null || true
+runuser -u node -- env HOME=/home/node /usr/bin/git \
+  config --global --add safe.directory '*'
 
 # Source ordinary runtime variables while locally shadowing every root-control
 # variable, including stale values persisted before the host-side denylist.
@@ -54,8 +52,8 @@ export IS_SANDBOX=1
 # 把 npm prefix 指向已挂载的 /workspace/extra/.npm-global（host 端
 # data/extra/{folder}/.npm-global/，per-user 隔离）即可让全局包持久化。
 NPM_GLOBAL_DIR=/workspace/extra/.npm-global
-mkdir -p "$NPM_GLOBAL_DIR/bin" "$NPM_GLOBAL_DIR/lib"
-happyclaw_prepare_generated_path "$NPM_GLOBAL_DIR"
+/usr/local/bin/node /app/session-generated-paths.mjs --ensure-npm-global
+happyclaw_prepare_generated_path npm-global
 # 写到 node user 的 ~/.npmrc 让 npm 全局命令默认走该 prefix。
 # 镜像每次启动重置 /home/node，所以 entrypoint 每次都重写一遍是稳妥做法。
 cat > /home/node/.npmrc <<EOF
@@ -69,26 +67,25 @@ export PATH="$PATH:$NPM_GLOBAL_DIR/bin"
 # Skill is mounted read-only below /workspace/effective-skills. Completely
 # rebuilding the directory prevents a real Skill directory created by an
 # earlier Agent run from surviving a container restart.
-mkdir -p /home/node/.claude/skills
-find /home/node/.claude/skills -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+/usr/local/bin/node /app/session-generated-paths.mjs --reset-skills
 if [ -d /workspace/effective-skills ]; then
   for skill in /workspace/effective-skills/*/; do
     if [ -f "${skill}SKILL.md" ]; then
       name=$(basename "$skill")
-      ln -sfn "$skill" "/home/node/.claude/skills/$name"
+      /usr/local/bin/node /app/session-generated-paths.mjs \
+        "--link-skill=$name"
     fi
   done
 fi
-happyclaw_prepare_generated_path /home/node/.claude/skills
+happyclaw_prepare_generated_path skills
 
 # Compile TypeScript (agent-runner source may be hot-mounted from host). The
 # image build leaves /app/dist/.tsbuildinfo behind; disable incremental mode so
 # changing only outDir cannot incorrectly reuse that cache and emit no files.
 cd /app && npx tsc --outDir /tmp/dist --incremental false 2>&1 >&2
-chown -R node:node /tmp/dist
+happyclaw_prepare_generated_path dist
 ln -s /app/node_modules /tmp/dist/node_modules
-ln -s /app/prompts /tmp/prompts
-chmod -R a-w /tmp/dist
+/usr/local/bin/node /app/session-prompts-copy.mjs
 
 # Fix permissions on exit: Claude Code creates some files with mode 0600
 # (e.g. settings.json), which the host backend (agent user) cannot read.
@@ -129,7 +126,7 @@ HAPPYCLAW_CHROMIUM_CDP_PORT="${HAPPYCLAW_CHROMIUM_CDP_PORT:-9222}"
 CHROMIUM_PROFILE_DIR=/tmp/happyclaw-chromium-profile
 CHROMIUM_LOG=/tmp/happyclaw-chromium.log
 mkdir -p "$CHROMIUM_PROFILE_DIR"
-chown -R node:node "$CHROMIUM_PROFILE_DIR"
+happyclaw_prepare_generated_path chromium
 
 # agent-browser reads this value when its daemon starts, so it attaches to the
 # managed browser instead of creating another Chromium with a random CDP port.

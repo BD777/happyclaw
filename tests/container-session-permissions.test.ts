@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, test, vi } from 'vitest';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -30,8 +31,11 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
-const { buildContainerArgs, resolveContainerHostIdentity } =
-  await import('../src/container-runner.js');
+const {
+  buildContainerArgs,
+  detectContainerHostIdentity,
+  resolveContainerHostIdentity,
+} = await import('../src/container-runner.js');
 
 const mounts = [
   {
@@ -126,6 +130,25 @@ describe('container host identity resolution', () => {
       }),
     ).toEqual({ mode: 'unknown' });
   });
+
+  test('re-probes daemon security options for every launch', () => {
+    if (process.platform !== 'linux' || process.getuid?.() === 0) return;
+    expect(detectContainerHostIdentity(() => [])).toMatchObject({
+      mode: 'direct',
+    });
+    expect(detectContainerHostIdentity(() => ['name=userns'])).toEqual({
+      mode: 'userns',
+    });
+    expect(detectContainerHostIdentity(() => ['name=rootless'])).toEqual({
+      mode: 'rootless',
+    });
+    expect(detectContainerHostIdentity(() => null)).toEqual({
+      mode: 'unknown',
+    });
+    expect(detectContainerHostIdentity(() => [])).toMatchObject({
+      mode: 'direct',
+    });
+  });
 });
 
 describe('buildContainerArgs identity contract', () => {
@@ -183,6 +206,12 @@ describe('entrypoint permission contract', () => {
     path.join(repoRoot, 'container', 'session-permissions-watcher.mjs'),
     'utf8',
   );
+  const mountBoundaryPath = path.join(
+    repoRoot,
+    'container',
+    'session-permissions-mount.mjs',
+  );
+  const mountBoundary = fs.readFileSync(mountBoundaryPath, 'utf8');
   const fileManager = fs.readFileSync(
     path.join(repoRoot, 'src', 'file-manager.ts'),
     'utf8',
@@ -199,13 +228,21 @@ describe('entrypoint permission contract', () => {
       '/usr/local/bin/node /app/session-permissions-watcher.mjs',
     );
     expect(helper).not.toContain('HAPPYCLAW_SESSION_PERMISSION_HELPER:-');
+    expect(helper).not.toContain('groupmod --non-unique');
     expect(helper).toContain('local HAPPYCLAW_SESSION_ROOT=');
     expect(helper).toContain('local HAPPYCLAW_INTERNAL_WATCHER_PID=');
     expect(entrypoint).toContain(
       'npx tsc --outDir /tmp/dist --incremental false',
     );
-    expect(entrypoint.indexOf('chown -R node:node /tmp/dist')).toBeLessThan(
+    expect(
+      entrypoint.indexOf('happyclaw_prepare_generated_path dist'),
+    ).toBeLessThan(
       entrypoint.indexOf('ln -s /app/node_modules /tmp/dist/node_modules'),
+    );
+    expect(entrypoint).toContain('/app/session-prompts-copy.mjs');
+    expect(entrypoint).not.toContain('ln -s /app/prompts /tmp/prompts');
+    expect(entrypoint).toContain(
+      'runuser -u node -- env HOME=/home/node /usr/bin/git',
     );
     expect(dockerfile).toContain('chown -R root:root /app/prompts');
     expect(dockerfile).toContain('find /app/prompts -type d -exec chmod 0555');
@@ -222,6 +259,8 @@ describe('entrypoint permission contract', () => {
     expect(watcher).not.toMatch(/fchmodSync\([^,\n]+,\s*0o(?:666|777)\b/);
     expect(fileManager).not.toContain('0o777');
     expect(groupQueue).not.toContain('0o777');
+    expect(entrypoint).not.toMatch(/(?:chown|chmod)\s+-R/);
+    expect(helper).not.toMatch(/(?:chown|chmod)\s+-R/);
   });
 
   test('watcher has fixed roots, descriptor-safe paths and bounded rescans', () => {
@@ -230,12 +269,38 @@ describe('entrypoint permission contract', () => {
     expect(watcher).toContain("encoding: 'buffer'");
     expect(watcher).toContain('fs.constants.O_NOFOLLOW');
     expect(watcher).toContain('/proc/self/fd/');
+    expect(watcher).toContain('readDescriptorMountId(root.fd)');
+    expect(watcher).toContain('mountId !== root.mountId');
+    expect(watcher).toContain('stat.nlink > 1');
     expect(watcher).toContain('fs.fchownSync(fd');
     expect(watcher).toContain('fs.fchmodSync(fd');
     expect(watcher).not.toMatch(/fs\.(?:chown|chmod)Sync\(/);
     expect(watcher).not.toContain('lstatSync');
     expect(watcher).toContain('RESCAN_INTERVAL_MS = 30_000');
-    expect(watcher).not.toContain('500');
+    expect(watcher).not.toContain('RESCAN_INTERVAL_MS = 500');
+    expect(mountBoundary).not.toMatch(/catch\s*\{/);
+  });
+
+  test('mount metadata parser fails closed without a unique valid mnt_id', () => {
+    const moduleUrl = pathToFileURL(mountBoundaryPath).href;
+    execFileSync(process.execPath, [
+      '--input-type=module',
+      '-e',
+      `
+        import assert from 'node:assert/strict';
+        import {
+          parseDescriptorMountId,
+          readDescriptorMountId,
+        } from ${JSON.stringify(moduleUrl)};
+        assert.equal(parseDescriptorMountId('pos:\\t0\\nmnt_id:\\t1725\\n'), 1725);
+        assert.throws(() => parseDescriptorMountId('pos:\\t0\\n'));
+        assert.throws(() => parseDescriptorMountId('mnt_id:\\t1\\nmnt_id:\\t2\\n'));
+        assert.throws(() => parseDescriptorMountId('mnt_id:\\tinvalid\\n'));
+        assert.throws(() => readDescriptorMountId(99, () => {
+          throw new Error('fdinfo unavailable');
+        }));
+      `,
+    ]);
   });
 });
 
@@ -265,6 +330,28 @@ describe.skipIf(!integrationImageAvailable)(
       'container',
       'session-permissions-watcher.mjs',
     );
+    const mountBoundaryPath = path.join(
+      repoRoot,
+      'container',
+      'session-permissions-mount.mjs',
+    );
+
+    function runImageScript(script: string, extraArgs: string[] = []): string {
+      return execFileSync(
+        'docker',
+        [
+          'run',
+          '--rm',
+          '--entrypoint',
+          '/bin/bash',
+          ...extraArgs,
+          integrationImage,
+          '-ceu',
+          script,
+        ],
+        { encoding: 'utf8' },
+      ).trim();
+    }
 
     function runHelper(script: string, extraArgs: string[] = []): string {
       return execFileSync(
@@ -278,6 +365,8 @@ describe.skipIf(!integrationImageAvailable)(
           `${helperPath}:/tmp/session-permissions.sh:ro`,
           '-v',
           `${watcherPath}:/app/session-permissions-watcher.mjs:ro`,
+          '-v',
+          `${mountBoundaryPath}:/app/session-permissions-mount.mjs:ro`,
           ...extraArgs,
           integrationImage,
           '-ceu',
@@ -286,6 +375,61 @@ describe.skipIf(!integrationImageAvailable)(
         { encoding: 'utf8' },
       ).trim();
     }
+
+    function fileSnapshot(filePath: string) {
+      const stat = fs.statSync(filePath);
+      return {
+        uid: stat.uid,
+        gid: stat.gid,
+        mode: stat.mode & 0o7777,
+        nlink: stat.nlink,
+        content: fs.readFileSync(filePath, 'utf8'),
+      };
+    }
+
+    test('direct mode safely falls back from an image group gid collision', () => {
+      expect(
+        runHelper(`
+          shadow_gid=$(getent group shadow | cut -d: -f3)
+          original_gid=$(id -g node)
+          test -n "$shadow_gid"
+          HAPPYCLAW_HOST_IDENTITY_MODE=direct
+          HAPPYCLAW_HOST_UID=12346
+          HAPPYCLAW_HOST_GID="$shadow_gid"
+          happyclaw_configure_node_identity
+          install -o 12346 -g "$shadow_gid" -m 0600 /dev/null /tmp/host-owned
+          setpriv --reuid=12346 --regid="$original_gid" --clear-groups -- \
+            test -r /tmp/host-owned
+          setpriv --reuid=12346 --regid="$original_gid" --clear-groups -- \
+            test ! -r /etc/shadow
+          test "$(id -u node)" = 12346
+          test "$(id -g node)" = "$original_gid"
+          printf uid-aligned
+        `),
+      ).toBe('uid-aligned');
+    });
+
+    test('exact image aligns uid without granting the shadow group', () => {
+      expect(
+        runImageScript(`
+          source /app/session-permissions.sh
+          shadow_gid=$(getent group shadow | cut -d: -f3)
+          original_gid=$(id -g node)
+          HAPPYCLAW_HOST_IDENTITY_MODE=direct
+          HAPPYCLAW_HOST_UID=12346
+          HAPPYCLAW_HOST_GID="$shadow_gid"
+          happyclaw_configure_node_identity
+          test "$(id -u node)" = 12346
+          test "$(id -g node)" = "$original_gid"
+          install -o 12346 -g "$shadow_gid" -m 0600 /dev/null /tmp/host-owned
+          setpriv --reuid=12346 --regid="$original_gid" \
+            --clear-groups -- test -r /tmp/host-owned
+          setpriv --reuid=12346 --regid="$original_gid" \
+            --clear-groups -- test ! -r /etc/shadow
+          printf 'uid-aligned:shadow-unreadable'
+        `),
+      ).toBe('uid-aligned:shadow-unreadable');
+    });
 
     test('fails closed for rootful userns-remap and unknown probes', () => {
       for (const mode of ['userns', 'unknown']) {
@@ -316,7 +460,250 @@ describe.skipIf(!integrationImageAvailable)(
             "$(stat -c '%u:%g' /workspace/group/canary)" \
             "$(find /home/node/.claude -maxdepth 1 -name '.happyclaw-owner-v2-*' | wc -l)"
         `),
-      ).toBe('12346:12347:600|1000:1000|1');
+      ).toBe('12346:12347:600|1000:1000|0');
+    });
+
+    test('fake legacy migration marker cannot preserve unsafe credentials', () => {
+      expect(
+        runImageScript(`
+          source /app/session-permissions.sh
+          mkdir -p /home/node/.claude /workspace/{group,ipc,extra}
+          touch /home/node/.claude/.happyclaw-owner-v2-12346-12347
+          touch /home/node/.claude/credential
+          chown -R 1000:1000 /home/node/.claude
+          chmod 0600 /home/node/.claude/.happyclaw-owner-v2-12346-12347
+          chmod 0666 /home/node/.claude/credential
+          HAPPYCLAW_HOST_IDENTITY_MODE=direct
+          HAPPYCLAW_HOST_UID=12346
+          HAPPYCLAW_HOST_GID=12347
+          happyclaw_configure_node_identity
+          happyclaw_migrate_direct_managed_paths
+          stat -c '%u:%g:%a' /home/node/.claude/credential
+        `),
+      ).toBe('12346:12347:600');
+    });
+
+    test('concurrent direct migrations are idempotent without markers', () => {
+      expect(
+        runImageScript(`
+          source /app/session-permissions.sh
+          mkdir -p /home/node/.claude /home/node/.feishu-cli \
+            /workspace/{group,ipc,extra}
+          node -e "const fs=require('fs'); for(let i=0;i<2000;i++) fs.writeFileSync('/home/node/.feishu-cli/f'+i,'',{mode:0o666})"
+          chown -R 1000:1000 /home/node/.claude /home/node/.feishu-cli
+          HAPPYCLAW_HOST_IDENTITY_MODE=direct
+          HAPPYCLAW_HOST_UID=12346
+          HAPPYCLAW_HOST_GID=12347
+          happyclaw_configure_node_identity
+          for round in $(seq 1 5); do
+            node /app/session-permissions-watcher.mjs --migrate-direct &
+            first=$!
+            node /app/session-permissions-watcher.mjs --migrate-direct &
+            second=$!
+            wait "$first"
+            wait "$second"
+          done
+          test "$(find /home/node/.feishu-cli -name '.happyclaw-owner-v2-*' | wc -l)" = 0
+          stat -c '%u:%g:%a' /home/node/.feishu-cli/f1
+        `),
+      ).toBe('12346:12347:600');
+    }, 30_000);
+
+    test('direct cleanup tightens files changed during the container run', () => {
+      expect(
+        runImageScript(`
+          source /app/session-permissions.sh
+          mkdir -p /home/node/.claude /workspace/{group,ipc,extra}
+          HAPPYCLAW_HOST_IDENTITY_MODE=direct
+          HAPPYCLAW_HOST_UID=12346
+          HAPPYCLAW_HOST_GID=12347
+          happyclaw_configure_node_identity
+          happyclaw_migrate_direct_managed_paths
+          install -o 12346 -g 12347 -m 0666 /dev/null \
+            /home/node/.claude/runtime-created
+          happyclaw_stop_session_permission_watcher
+          stat -c '%u:%g:%a' /home/node/.claude/runtime-created
+        `),
+      ).toBe('12346:12347:600');
+    });
+
+    test.each(['rw', 'ro'] as const)(
+      'exact image skips a same-filesystem %s nested bind',
+      (access) => {
+        const outer = fs.mkdtempSync(path.join(testRoot, 'nested-outer-'));
+        const outside = fs.mkdtempSync(path.join(testRoot, 'nested-outside-'));
+        fs.mkdirSync(path.join(outer, 'nested'));
+        const canary = path.join(outside, 'canary');
+        fs.writeFileSync(canary, 'nested-bind-canary', { mode: 0o640 });
+        fs.chmodSync(canary, 0o640);
+        expect(fs.statSync(outer).dev).toBe(fs.statSync(outside).dev);
+        const before = fileSnapshot(canary);
+
+        expect(
+          runImageScript(
+            `
+              mkdir -p /workspace/{group,ipc,extra}
+              node /app/session-permissions-watcher.mjs \
+                --normalize-node-owned-mounts
+              printf safe
+            `,
+            [
+              '-v',
+              `${outer}:/home/node/.claude`,
+              '-v',
+              `${outside}:/home/node/.claude/nested${
+                access === 'ro' ? ':ro' : ''
+              }`,
+            ],
+          ),
+        ).toBe('safe');
+        expect(fileSnapshot(canary)).toEqual(before);
+      },
+    );
+
+    test('managed hardlinks fail closed without changing the outside inode', () => {
+      const session = fs.mkdtempSync(path.join(testRoot, 'hardlink-session-'));
+      const outside = fs.mkdtempSync(path.join(testRoot, 'hardlink-outside-'));
+      const canary = path.join(outside, 'canary');
+      const inside = path.join(session, 'inside-link');
+      fs.writeFileSync(canary, 'hardlink-canary', { mode: 0o640 });
+      fs.chmodSync(canary, 0o640);
+      fs.linkSync(canary, inside);
+      const before = fileSnapshot(canary);
+
+      expect(() =>
+        runImageScript(
+          `
+            mkdir -p /workspace/{group,ipc,extra}
+            node /app/session-permissions-watcher.mjs --once
+          `,
+          ['-v', `${session}:/home/node/.claude`],
+        ),
+      ).toThrow();
+      expect(fileSnapshot(canary)).toEqual(before);
+    });
+
+    test('mirror-root hardlinks are logged and skipped without mutation', () => {
+      const group = fs.mkdtempSync(path.join(testRoot, 'hardlink-group-'));
+      const outside = fs.mkdtempSync(path.join(testRoot, 'hardlink-mirror-'));
+      const canary = path.join(outside, 'canary');
+      fs.writeFileSync(canary, 'mirror-hardlink-canary', { mode: 0o640 });
+      fs.chmodSync(canary, 0o640);
+      fs.linkSync(canary, path.join(group, 'inside-link'));
+      const before = fileSnapshot(canary);
+
+      expect(
+        runImageScript(
+          `
+            mkdir -p /home/node/.claude /workspace/{ipc,extra}
+            message=$(node /app/session-permissions-watcher.mjs --once 2>&1)
+            printf '%s' "$message"
+          `,
+          ['-v', `${group}:/workspace/group`],
+        ),
+      ).toContain('skipping multiply-linked inode');
+      expect(fileSnapshot(canary)).toEqual(before);
+    });
+
+    test('host-root live watcher repairs new root-owned entries privately', () => {
+      expect(
+        runImageScript(`
+          source /app/session-permissions.sh
+          mkdir -p /home/node/.claude /workspace/{group,ipc,extra}
+          HAPPYCLAW_HOST_IDENTITY_MODE=host-root
+          happyclaw_configure_node_identity
+          happyclaw_prepare_mounted_paths
+          happyclaw_start_session_permission_watcher
+          install -d -o 0 -g 0 -m 0700 /workspace/group/live
+          install -o 0 -g 0 -m 0600 /dev/null /workspace/group/live/file
+          for attempt in $(seq 1 200); do
+            [ "$(stat -c '%u:%g:%a' /workspace/group/live/file)" = \
+              "$(id -u node):$(id -g node):600" ] && break
+            sleep 0.02
+          done
+          setpriv --reuid="$(id -u node)" --regid="$(id -g node)" \
+            --clear-groups -- test -r /workspace/group/live/file
+          test "$(stat -c %a /workspace/group/live)" = 700
+          test "$(stat -c %a /workspace/group/live/file)" = 600
+          happyclaw_stop_session_permission_watcher
+          printf repaired
+        `),
+      ).toBe('repaired');
+    });
+
+    test('fixed generated roots reject persistent symlink traversal', () => {
+      const extra = fs.mkdtempSync(path.join(testRoot, 'generated-extra-'));
+      const session = fs.mkdtempSync(path.join(testRoot, 'generated-session-'));
+      const outside = fs.mkdtempSync(path.join(testRoot, 'generated-outside-'));
+      const canary = path.join(outside, 'canary');
+      fs.writeFileSync(canary, 'generated-path-canary', { mode: 0o640 });
+      fs.symlinkSync('/tmp/generated-outside', path.join(extra, '.npm-global'));
+      fs.symlinkSync('/tmp/generated-outside', path.join(session, 'skills'));
+      const before = fileSnapshot(canary);
+
+      for (const operation of ['--ensure-npm-global', '--reset-skills']) {
+        expect(() =>
+          runImageScript(`node /app/session-generated-paths.mjs ${operation}`, [
+            '-v',
+            `${extra}:/workspace/extra`,
+            '-v',
+            `${session}:/home/node/.claude`,
+            '-v',
+            `${outside}:/tmp/generated-outside`,
+          ]),
+        ).toThrow();
+        expect(fileSnapshot(canary)).toEqual(before);
+        expect(fs.existsSync(path.join(outside, 'bin'))).toBe(false);
+        expect(fs.existsSync(path.join(outside, 'lib'))).toBe(false);
+      }
+    });
+
+    test('restrictive prompt bind is copied read-only without touching source', () => {
+      const prompts = fs.mkdtempSync(path.join(testRoot, 'runtime-prompts-'));
+      const prompt = path.join(prompts, 'identity.happyclaw.md');
+      fs.writeFileSync(prompt, 'runtime prompt', { mode: 0o600 });
+      fs.chmodSync(prompts, 0o700);
+      fs.chmodSync(prompt, 0o600);
+      const before = fileSnapshot(prompt);
+
+      expect(
+        runImageScript(
+          `
+            node /app/session-prompts-copy.mjs
+            test "$(stat -c '%u:%g:%a' /tmp/prompts)" = '0:0:555'
+            test "$(stat -c '%u:%g:%a' /tmp/prompts/identity.happyclaw.md)" = \
+              '0:0:444'
+            setpriv --reuid="$(id -u node)" --regid="$(id -g node)" \
+              --clear-groups -- sh -ceu '
+                test "$(cat /tmp/prompts/identity.happyclaw.md)" = "runtime prompt"
+                test ! -w /tmp/prompts/identity.happyclaw.md
+                test ! -w /app/prompts/identity.happyclaw.md
+              '
+            printf copied
+          `,
+          ['-v', `${prompts}:/app/prompts:ro`],
+        ),
+      ).toBe('copied');
+      expect(fileSnapshot(prompt)).toEqual(before);
+    });
+
+    test('node git config permits a root-owned group-readable repository', () => {
+      expect(
+        runImageScript(`
+          repository=$(mktemp -d)
+          git -C "$repository" init -q
+          touch "$repository/tracked"
+          chown -R 0:"$(id -g node)" "$repository"
+          find "$repository" -type d -exec chmod 2770 {} +
+          find "$repository" -type f -exec chmod 0660 {} +
+          runuser -u node -- env HOME=/home/node /usr/bin/git \
+            config --global --add safe.directory '*'
+          runuser -u node -- env HOME=/home/node /usr/bin/git \
+            -C "$repository" status --short >/dev/null
+          test -f /home/node/.gitconfig
+          printf trusted
+        `),
+      ).toBe('trusted');
     });
 
     test('runtime env cannot override root-control variables', () => {

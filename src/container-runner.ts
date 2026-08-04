@@ -1596,11 +1596,7 @@ export function resolveContainerHostIdentity(
   };
 }
 
-let cachedContainerHostIdentity: ContainerHostIdentity | null = null;
-
-function detectContainerHostIdentity(): ContainerHostIdentity {
-  if (cachedContainerHostIdentity) return cachedContainerHostIdentity;
-
+function probeContainerSecurityOptions(): readonly string[] | null {
   let securityOptions: readonly string[] | null = null;
   try {
     const raw = execFileSync(
@@ -1618,14 +1614,24 @@ function detectContainerHostIdentity(): ContainerHostIdentity {
   } catch {
     // A missing/unsupported probe must not enable numeric id remapping.
   }
+  return securityOptions;
+}
 
-  cachedContainerHostIdentity = resolveContainerHostIdentity({
+export function detectContainerHostIdentity(
+  readSecurityOptions: () =>
+    | readonly string[]
+    | null = probeContainerSecurityOptions,
+): ContainerHostIdentity {
+  // Probe every launch. Docker context/daemon security options can change
+  // while HappyClaw is running; reusing an earlier direct result could bypass
+  // rootless/userns fail-closed handling, while caching unknown blocks recovery.
+  const securityOptions = readSecurityOptions();
+  return resolveContainerHostIdentity({
     platform: process.platform,
     uid: process.getuid?.(),
     gid: process.getgid?.(),
     securityOptions,
   });
-  return cachedContainerHostIdentity;
 }
 
 export function buildContainerArgs(

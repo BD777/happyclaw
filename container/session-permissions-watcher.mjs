@@ -3,6 +3,8 @@
 import fs from 'node:fs';
 import process from 'node:process';
 
+import { readDescriptorMountId } from './session-permissions-mount.mjs';
+
 const READY_FILE = '/run/happyclaw-session-watcher.ready';
 const FAILED_FILE = '/run/happyclaw-session-watcher.failed';
 const RESCAN_INTERVAL_MS = 30_000;
@@ -27,11 +29,34 @@ if (
   throw new Error('node uid or primary gid is invalid');
 }
 const directMigration = process.argv.includes('--migrate-direct');
+const directMountRoots = process.argv.includes(
+  '--normalize-direct-mount-roots',
+);
+const nodeOwnedMounts = process.argv.includes('--normalize-node-owned-mounts');
+const nodeOwnedWatch = process.argv.includes('--watch-node-owned-mounts');
+const generatedOption = process.argv.find((argument) =>
+  argument.startsWith('--normalize-generated='),
+);
+const generatedKey = generatedOption?.slice('--normalize-generated='.length);
+const oneShotOperationCount = [
+  directMigration,
+  directMountRoots,
+  nodeOwnedMounts,
+  generatedKey !== undefined,
+].filter(Boolean).length;
+if (oneShotOperationCount > 1) {
+  throw new Error(
+    'multiple permission normalization operations were requested',
+  );
+}
+if (nodeOwnedWatch && oneShotOperationCount > 0) {
+  throw new Error('live and one-shot permission operations cannot be combined');
+}
 
 // These are the only writable bind roots the root watcher may touch. Session,
 // CLI state and IPC use fixed data modes. Workspace and durable extra files
 // mirror their owner's rwx bits to the node group so executable intent survives.
-const roots = [
+const mountedRoots = [
   {
     path: '/home/node/.claude',
     policy: 'managed',
@@ -47,6 +72,60 @@ const roots = [
   { path: '/workspace/group', policy: 'mirror' },
   { path: '/workspace/extra', policy: 'mirror' },
 ];
+
+const generatedRoots = new Map([
+  [
+    'npm-global',
+    {
+      path: '/workspace/extra/.npm-global',
+      policy: 'mirror',
+      normalization: 'node-owned',
+    },
+  ],
+  [
+    'skills',
+    {
+      path: '/home/node/.claude/skills',
+      policy: 'managed',
+      normalization: 'node-owned',
+    },
+  ],
+  [
+    'dist',
+    {
+      path: '/tmp/dist',
+      policy: 'managed',
+      normalization: 'node-readonly',
+    },
+  ],
+  [
+    'chromium',
+    {
+      path: '/tmp/happyclaw-chromium-profile',
+      policy: 'managed',
+      normalization: 'node-owned',
+    },
+  ],
+]);
+
+let roots;
+if (generatedKey !== undefined) {
+  const generatedRoot = generatedRoots.get(generatedKey);
+  if (!generatedRoot) {
+    throw new Error(`unknown generated permission root: ${generatedKey}`);
+  }
+  roots = [{ ...generatedRoot }];
+} else {
+  roots = mountedRoots.map((root) => ({
+    ...root,
+    normalization: directMigration
+      ? 'direct-migration'
+      : directMountRoots || nodeOwnedMounts || nodeOwnedWatch
+        ? 'node-owned'
+        : 'shared',
+    rootOnly: directMountRoots,
+  }));
+}
 
 const watchers = new Map();
 const recoveryFailures = new Map();
@@ -117,48 +196,88 @@ function mirrorMode(stat, directory) {
   return directory ? 0o2000 | shared : shared;
 }
 
-function secureMode(stat, policy) {
-  if (directMigration) {
+function secureMode(stat, root) {
+  if (root.normalization === 'direct-migration') {
     if (stat.isDirectory()) return 0o700;
     if (stat.isFile() || stat.isFIFO()) {
       return (stat.mode & 0o111) === 0 ? 0o600 : 0o700;
     }
     return null;
   }
+  if (root.normalization === 'node-owned') {
+    if (stat.isDirectory()) return 0o700;
+    if (stat.isFile() || stat.isFIFO()) return stat.mode & 0o700;
+    return null;
+  }
+  if (root.normalization === 'node-readonly') {
+    if (stat.isDirectory()) return 0o500;
+    if (stat.isFile()) return stat.mode & 0o500;
+    return null;
+  }
   if (stat.isDirectory()) {
-    return policy === 'managed' ? 0o2770 : mirrorMode(stat, true);
+    return root.policy === 'managed' ? 0o2770 : mirrorMode(stat, true);
   }
   if (stat.isFile() || stat.isFIFO()) {
-    return policy === 'managed' ? 0o660 : mirrorMode(stat, false);
+    return root.policy === 'managed' ? 0o660 : mirrorMode(stat, false);
   }
   return null;
 }
 
-function normalizeDescriptor(fd, root, required = false) {
+function inspectDescriptorBoundary(fd, root) {
   const stat = fs.fstatSync(fd);
-  if (stat.dev !== root.device) return { stat, foreignDevice: true };
-  const mode = secureMode(stat, root.policy);
-  if (mode === null) return { stat, foreignDevice: false };
+  const mountId = readDescriptorMountId(fd);
+  return {
+    stat,
+    outsideRootMount: stat.dev !== root.device || mountId !== root.mountId,
+  };
+}
 
-  const desiredUid =
-    directMigration && stat.uid !== 1000
-      ? stat.uid
-      : directMigration
-        ? nodeUid
-        : 0;
-  const desiredGid = directMigration && stat.uid !== 1000 ? stat.gid : nodeGid;
+function normalizeDescriptor(fd, root, required = false) {
+  const { stat, outsideRootMount } = inspectDescriptorBoundary(fd, root);
+  if (outsideRootMount) return { stat, outsideRootMount: true };
+  const mode = secureMode(stat, root);
+  if (mode === null) return { stat, outsideRootMount: false };
+
+  let desiredUid;
+  let desiredGid;
+  if (root.normalization === 'direct-migration' && stat.uid !== 1000) {
+    desiredUid = stat.uid;
+    desiredGid = stat.gid;
+  } else if (root.normalization === 'shared') {
+    desiredUid = 0;
+    desiredGid = nodeGid;
+  } else {
+    desiredUid = nodeUid;
+    desiredGid = nodeGid;
+  }
   const ownershipChanged = stat.uid !== desiredUid || stat.gid !== desiredGid;
+  const modeChanged = (stat.mode & 0o7777) !== mode;
+  if (
+    !stat.isDirectory() &&
+    stat.nlink > 1 &&
+    (ownershipChanged || modeChanged)
+  ) {
+    const description =
+      `multiply-linked inode ${stat.ino} under ${root.path} requires ` +
+      'an ownership or mode change';
+    if (
+      root.policy === 'managed' ||
+      root.normalization === 'direct-migration'
+    ) {
+      throw new Error(`refusing ${description}`);
+    }
+    process.stderr.write(`happyclaw: skipping ${description}\n`);
+    return { stat, outsideRootMount: false };
+  }
   try {
     // Every mutation is descriptor-based. An Agent may rename or replace the
     // directory entry, but it cannot redirect fchown/fchmod outside this fd.
     if (ownershipChanged) fs.fchownSync(fd, desiredUid, desiredGid);
-    if (ownershipChanged || (stat.mode & 0o7777) !== mode) {
-      fs.fchmodSync(fd, mode);
-    }
+    if (ownershipChanged || modeChanged) fs.fchmodSync(fd, mode);
   } catch (error) {
     if (!isReadonlyError(error) || required) throw error;
   }
-  return { stat, foreignDevice: false };
+  return { stat, outsideRootMount: false };
 }
 
 function readDirectory(fd) {
@@ -193,7 +312,7 @@ function normalizeTreeFromDescriptor(
       if (!frame.entered) {
         const result = normalizeDescriptor(frame.fd, root, frame.required);
         frame.entered = true;
-        if (!result.stat.isDirectory() || result.foreignDevice) {
+        if (!result.stat.isDirectory() || result.outsideRootMount) {
           if (frame.closeWhenDone) fs.closeSync(frame.fd);
           stack.pop();
           continue;
@@ -248,6 +367,7 @@ function initializeRoots() {
       if (!stat.isDirectory())
         throw new Error(`${root.path} is not a directory`);
       root.device = stat.dev;
+      root.mountId = readDescriptorMountId(root.fd);
       root.active = true;
     } catch (error) {
       if (root.optional && error?.code === 'ENOENT') {
@@ -272,56 +392,10 @@ function closeRoots() {
 
 function normalizeRoot(root) {
   if (!root.active) return;
-  if (directMigration && migrationMarkerExists(root)) return;
-  normalizeTreeFromDescriptor(root, root.fd, false, true);
-  if (directMigration) createMigrationMarker(root);
-}
-
-function migrationMarkerName() {
-  return Buffer.from(`.happyclaw-owner-v2-${nodeUid}-${nodeGid}`);
-}
-
-function migrationMarkerExists(root) {
-  let markerFd;
-  try {
-    markerFd = fs.openSync(
-      procFdChildPath(root.fd, migrationMarkerName()),
-      OPEN_FLAGS,
-    );
-  } catch (error) {
-    if (error?.code === 'ENOENT') return false;
-    throw new Error(`unsafe direct-migration marker at ${root.path}: ${error}`);
-  }
-  try {
-    const stat = fs.fstatSync(markerFd);
-    if (
-      !stat.isFile() ||
-      stat.uid !== nodeUid ||
-      stat.gid !== nodeGid ||
-      (stat.mode & 0o777) !== 0o600
-    ) {
-      throw new Error(`invalid direct-migration marker at ${root.path}`);
-    }
-    return true;
-  } finally {
-    fs.closeSync(markerFd);
-  }
-}
-
-function createMigrationMarker(root) {
-  const markerFd = fs.openSync(
-    procFdChildPath(root.fd, migrationMarkerName()),
-    fs.constants.O_WRONLY |
-      fs.constants.O_CREAT |
-      fs.constants.O_EXCL |
-      fs.constants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    fs.fchownSync(markerFd, nodeUid, nodeGid);
-    fs.fchmodSync(markerFd, 0o600);
-  } finally {
-    fs.closeSync(markerFd);
+  if (root.rootOnly) {
+    normalizeDescriptor(root.fd, root, true);
+  } else {
+    normalizeTreeFromDescriptor(root, root.fd, false, true);
   }
 }
 
@@ -338,8 +412,8 @@ function openEventTarget(root, components) {
       if (parentOwned) fs.closeSync(parentFd);
       parentOwned = false;
       if (childFd === null) return null;
-      const stat = fs.fstatSync(childFd);
-      if (stat.dev !== root.device) {
+      const { outsideRootMount } = inspectDescriptorBoundary(childFd, root);
+      if (outsideRootMount) {
         fs.closeSync(childFd);
         return null;
       }
@@ -474,7 +548,7 @@ function stop() {
 try {
   initializeRoots();
   normalizeAll();
-  if (process.argv.includes('--once') || directMigration) {
+  if (process.argv.includes('--once') || oneShotOperationCount > 0) {
     closeRoots();
     process.exit(0);
   }
