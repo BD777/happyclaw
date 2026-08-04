@@ -6,7 +6,7 @@ import { api } from '../../api/client';
 import { useAgentProfilesStore } from '../../stores/agent-profiles';
 import { useMcpServersStore } from '../../stores/mcp-servers';
 import { useSkillsStore } from '../../stores/skills';
-import type { AgentProfileRuntimePolicy } from '../../types';
+import type { AgentEffortLevel, AgentProfileRuntimePolicy } from '../../types';
 import {
   buildMcpPolicyOptions,
   normalizeMcpPolicyReferences,
@@ -29,6 +29,18 @@ import {
 } from '../../utils/agent-runtime-policy';
 
 type CapabilityMode = 'inherit' | 'custom' | 'disabled';
+
+const AGENT_EFFORT_OPTIONS: Array<{
+  value: AgentEffortLevel;
+  label: string;
+}> = [
+  { value: 'inherit', label: '跟随模型配置' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'XHigh' },
+  { value: 'max', label: 'Max' },
+];
 
 export function MainAgentCapabilitiesSection() {
   const profiles = useAgentProfilesStore((state) => state.profiles);
@@ -64,6 +76,7 @@ export function MainAgentCapabilitiesSection() {
   const [mcpMode, setMcpMode] = useState<CapabilityMode>('inherit');
   const [mcpIds, setMcpIds] = useState<string[]>([]);
   const [modelConfigId, setModelConfigId] = useState('inherit');
+  const [effort, setEffort] = useState<AgentEffortLevel>('inherit');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -80,6 +93,7 @@ export function MainAgentCapabilitiesSection() {
     setMcpMode(profile.runtime_policy.mcp.mode);
     setMcpIds(normalizeMcpPolicyReferences(profile.runtime_policy.mcp.ids));
     setModelConfigId(profile.model_config_id ?? 'inherit');
+    setEffort(profile.runtime_policy.reasoning?.effort ?? 'inherit');
   }, [profile?.id, profile?.updated_at]);
 
   useEffect(() => {
@@ -155,6 +169,7 @@ export function MainAgentCapabilitiesSection() {
     !!profile &&
     ((modelConfigId === 'inherit' ? null : modelConfigId) !==
       profile.model_config_id ||
+      effort !== (profile.runtime_policy.reasoning?.effort ?? 'inherit') ||
       skillsMode !== profile.runtime_policy.skills.mode ||
       JSON.stringify(skillIds) !==
         JSON.stringify(profile.runtime_policy.skills.ids) ||
@@ -172,6 +187,7 @@ export function MainAgentCapabilitiesSection() {
       profile
         ? {
             ...profile.runtime_policy,
+            reasoning: { effort },
             skills: {
               mode: skillsMode,
               ids: skillIds,
@@ -181,6 +197,7 @@ export function MainAgentCapabilitiesSection() {
           }
         : null,
     [
+      effort,
       hostSkillIds,
       hostSkillsMode,
       mcpIds,
@@ -198,6 +215,7 @@ export function MainAgentCapabilitiesSection() {
       await api.patch(`/api/agent-profiles/${encodeURIComponent(profile.id)}`, {
         model_config_id: modelConfigId === 'inherit' ? null : modelConfigId,
         runtime_policy: {
+          reasoning: { effort },
           skills: {
             mode: skillsMode,
             ids: skillIds,
@@ -207,7 +225,7 @@ export function MainAgentCapabilitiesSection() {
         } satisfies Partial<AgentProfileRuntimePolicy>,
       });
       await loadProfiles();
-      toast.success('主 HappyClaw 模型与能力已保存');
+      toast.success('主 HappyClaw 模型、推理档位与能力已保存');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '保存能力失败');
     } finally {
@@ -270,6 +288,31 @@ export function MainAgentCapabilitiesSection() {
         <p className="text-[11px] leading-5 text-muted-foreground">
           Home
           工作区、主会话、独立会话与定时任务都会继承该选择。未启用的配置仍可在这里显式使用。
+        </p>
+      </div>
+
+      <div className="max-w-xl space-y-2">
+        <label className="text-xs font-medium text-muted-foreground">
+          推理努力档位
+        </label>
+        <Select
+          value={effort}
+          onValueChange={(next) => setEffort(next as AgentEffortLevel)}
+        >
+          <SelectTrigger aria-label="主 HappyClaw 推理努力档位">
+            <SelectValue placeholder="选择推理努力档位" />
+          </SelectTrigger>
+          <SelectContent>
+            {AGENT_EFFORT_OPTIONS.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-[11px] leading-5 text-muted-foreground">
+          跟随模型配置时保留 Provider 环境或 SDK
+          默认值；显式档位会覆盖该默认值。
         </p>
       </div>
 

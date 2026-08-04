@@ -117,6 +117,10 @@ import {
 } from './feishu-cli-runtime.js';
 import { assertValidWorkspaceFolderName } from './workspace-folder.js';
 import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
+import {
+  removeProviderEffortEnv,
+  resolveAgentSdkEffort,
+} from './agent-effort.js';
 
 /**
  * 宿主机的 ~/.claude.json 路径。
@@ -1374,6 +1378,8 @@ export function buildVolumeMounts(
     effectiveContainerOverride,
     resolvedProvider?.customEnv,
   );
+  const agentEffort = resolveAgentSdkEffort(agentProfile?.runtimePolicy);
+  removeProviderEffortEnv(envLines, agentEffort);
   // Agent policy is authoritative; do not inherit global/custom runtime env.
   for (let index = envLines.length - 1; index >= 0; index -= 1) {
     if (
@@ -2457,6 +2463,10 @@ export async function runHostAgent(
         : containerOverride,
       hostPoolResult?.resolved.customEnv,
     );
+    const agentEffort = resolveAgentSdkEffort(
+      input.agentProfile?.runtimePolicy,
+    );
+    removeProviderEffortEnv(envLines, agentEffort);
     const injectsAnthropicAuthToken = envLines.some((line) =>
       line.startsWith('ANTHROPIC_AUTH_TOKEN='),
     );

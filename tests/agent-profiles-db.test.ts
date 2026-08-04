@@ -75,6 +75,7 @@ describe('AgentProfile DB model', () => {
     expect(profiles[0].include_claude_preset).toBe(true);
     expect(profiles[0].model_config_id).toBeNull();
     expect(profiles[0].runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -179,6 +180,7 @@ describe('AgentProfile DB model', () => {
         tools: { mode: 'readonly' },
       } as any),
     ).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -379,6 +381,7 @@ describe('AgentProfile DB model', () => {
     });
 
     expect(profile.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -418,6 +421,7 @@ describe('AgentProfile DB model', () => {
     );
     expect(updated?.version).toBe(profile.version + 1);
     expect(updated?.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'host_claude',
         auto_compact_window: 0,
@@ -507,6 +511,7 @@ describe('AgentProfile DB model', () => {
     );
 
     expect(updated?.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'host_claude',
         auto_compact_window: 0,

@@ -1,6 +1,7 @@
 // Zod schemas and validation types for API requests
 
 import { z } from 'zod';
+import { AGENT_EFFORT_LEVELS } from './agent-effort.js';
 import { ALL_PERMISSIONS } from './permissions.js';
 import type { Permission } from './types.js';
 import { MAX_GROUP_NAME_LEN } from './web-context.js';
@@ -303,6 +304,11 @@ const AgentProfileRuntimePolicyModeSchema = z.enum([
 
 export const AgentProfileRuntimePolicySchema = z
   .object({
+    reasoning: z
+      .object({
+        effort: z.enum(AGENT_EFFORT_LEVELS).optional(),
+      })
+      .optional(),
     context: z
       .object({
         source: z.enum(['managed', 'host_claude']).optional(),

@@ -90,6 +90,14 @@ export interface ModelConfigOption {
 
 export type AgentProfilePromptMode = 'append' | 'replace';
 
+export type AgentEffortLevel =
+  | 'inherit'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max';
+
 export interface AgentProfilePrompts {
   identity_prompt: string;
   soul_prompt: string;
@@ -110,6 +118,9 @@ export interface AgentProfilePromptVersion extends AgentProfilePrompts {
 }
 
 export interface AgentProfileRuntimePolicy {
+  reasoning: {
+    effort: AgentEffortLevel;
+  };
   context?: {
     source: 'managed' | 'host_claude';
     auto_compact_window?: number;
@@ -130,6 +141,7 @@ export interface AgentProfileRuntimePolicy {
 }
 
 export interface AgentProfileRuntimePolicyPatch {
+  reasoning?: Partial<AgentProfileRuntimePolicy['reasoning']>;
   context?: Partial<NonNullable<AgentProfileRuntimePolicy['context']>>;
   skills?: {
     mode?: AgentProfileRuntimePolicy['skills']['mode'];
