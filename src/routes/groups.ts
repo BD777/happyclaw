@@ -2,6 +2,10 @@ import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
+  hasBoundWorkspaceReference,
+  resolveBoundWorkspaceJid,
+} from '../workspace-attribution.js';
+import {
   GroupAgentProfilePatchSchema,
   GroupCreateSchema,
   GroupPatchSchema,
@@ -33,6 +37,7 @@ import {
   getAllRegisteredGroups,
   getAllChats,
   getJidsByFolder,
+  getChannelMount,
   updateChatName,
   deleteSession,
   deleteWorkspaceSessions,
@@ -2364,6 +2369,9 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   }
 
   // is_home 群组合并查询：将同一 owner、同 folder 下的 Web 与 IM 消息合并展示。
+  // 已绑定到其它工作区的 IM 会话必须排除：它的 folder/created_by 仍停留在渠道
+  // 账号归属人，若只按 folder + owner 合并，别的工作区的对话会出现在账号归属人
+  // 的 Home 历史里。
   const queryJids = [jid];
   if (group.is_home) {
     const siblingJids = getJidsByFolder(group.folder);
@@ -2373,9 +2381,21 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
       if (!siblingGroup) continue;
       const ownerMatch =
         group.created_by && siblingGroup.created_by === group.created_by;
-      if (ownerMatch) {
-        queryJids.push(siblingJid);
+      if (!ownerMatch) continue;
+      const attributionDeps = {
+        getRegisteredGroup,
+        getAgent,
+        getJidsByFolder,
+        getChannelMount,
+      };
+      const boundJid = resolveBoundWorkspaceJid(siblingJid, attributionDeps);
+      if (
+        (boundJid && boundJid !== jid) ||
+        (!boundJid && hasBoundWorkspaceReference(siblingJid, attributionDeps))
+      ) {
+        continue;
       }
+      queryJids.push(siblingJid);
     }
   }
 

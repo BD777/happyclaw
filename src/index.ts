@@ -46,6 +46,7 @@ import {
   resolveHostIpcLogicalChatJid,
   routeHostIpcOutput,
 } from './host-ipc-output-router.js';
+import { resolveBoundWorkspaceJid } from './workspace-attribution.js';
 import {
   buildInterruptedReply,
   buildSteeredReply,
@@ -2519,6 +2520,7 @@ function bindChannelOutboxScope(
     chatId: string;
     rootId?: string | null;
     threadId?: string | null;
+    logicalBaseChatJid?: string;
   },
   inputTurnId: string | undefined = runtime.inputTurnId,
 ): ActiveChannelOutboxScope {
@@ -6614,6 +6616,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             chatId: nextAddress.externalChatId,
             rootId: nextAddress.rootMessageId,
             threadId: nextAddress.threadId,
+            logicalBaseChatJid: chatJid,
           },
           // The runtime keys durable idempotency off the native message id,
           // but the runner correlates its MCP output with this deliveryId.
@@ -7096,6 +7099,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               chatId: streamingAddress.externalChatId,
               rootId: streamingAddress.rootMessageId,
               threadId: streamingAddress.threadId,
+              logicalBaseChatJid: chatJid,
             },
           )
         : undefined;
@@ -10056,6 +10060,44 @@ function getIpcDeliveryTargetGroup(
   );
 }
 
+/**
+ * Fold a runner-supplied IM JID to the workspace it is bound to, so IPC output
+ * is attributed to the same workspace inbound routing selected. Returns null
+ * for unbound chats; callers keep the raw JID in that case.
+ */
+function resolveIpcOutputWorkspaceJid(chatJid: string): string | null {
+  return resolveBoundWorkspaceJid(chatJid, {
+    getRegisteredGroup: (jid) =>
+      registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgent,
+    getJidsByFolder,
+    getChannelMount,
+  });
+}
+
+/**
+ * Recover the logical workspace captured for the exact input turn. Binding
+ * rows are mutable while a runner is working, so reading them only when IPC
+ * output arrives can attribute workspace A's delayed output to a newly-bound
+ * workspace B. The outbox scope already freezes the physical route; carry the
+ * logical base beside it without changing provider delivery.
+ */
+function resolveIpcOutputRuntimeChatJid(
+  sourceGroup: string,
+  ipcAgentId: string | null | undefined,
+  inputTurnId: unknown,
+  targetJid: string,
+): string | null {
+  if (typeof inputTurnId !== 'string' || !inputTurnId) return null;
+  return (
+    activeChannelOutboxScopes.resolveInput(
+      channelTurnScope(sourceGroup, ipcAgentId),
+      inputTurnId,
+      targetJid,
+    )?.logicalBaseChatJid ?? null
+  );
+}
+
 // Thin production wrapper around the pure helper in ./task-routing.ts so the
 // internal call sites keep their short signature (deps inferred from the
 // runtime IM manager + DB). Tests should import `broadcastToOwnerIMChannels`
@@ -10383,6 +10425,13 @@ function startIpcWatcher(): void {
                     : undefined,
                   taskRunId: ipcTaskId,
                   scheduledTask: data.isScheduledTask === true,
+                  runtimeChatJid: resolveIpcOutputRuntimeChatJid(
+                    sourceGroup,
+                    ipcAgentId,
+                    data.inputTurnId,
+                    data.chatJid,
+                  ),
+                  resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
                 });
                 // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
                 const cardText = extractFeishuCardText(data.text);
@@ -10933,11 +10982,24 @@ function startIpcWatcher(): void {
 
                   // Conversation agents and isolated scheduled tasks store in
                   // virtual JIDs (agent/task tab), not the main conversation.
-                  const imgChatJid = ipcAgentId
-                    ? `${data.chatJid}#agent:${ipcAgentId}`
-                    : ipcTaskId && data.isScheduledTask
-                      ? `${data.chatJid}#task:${ipcTaskId}`
-                      : data.chatJid;
+                  // Shares the text path's resolver so images are attributed to
+                  // the bound workspace instead of the raw IM row.
+                  const imgChatJid = resolveHostIpcLogicalChatJid({
+                    sourceChatJid: data.chatJid,
+                    agentId: ipcAgentId,
+                    agentChatJid: ipcAgentId
+                      ? getAgent(ipcAgentId)?.chat_jid
+                      : undefined,
+                    taskRunId: ipcTaskId,
+                    scheduledTask: data.isScheduledTask === true,
+                    runtimeChatJid: resolveIpcOutputRuntimeChatJid(
+                      sourceGroup,
+                      ipcAgentId,
+                      data.inputTurnId,
+                      data.chatJid,
+                    ),
+                    resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
+                  });
 
                   // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
                   const displayText = caption
