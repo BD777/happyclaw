@@ -442,6 +442,70 @@ describe.skipIf(!integrationImageAvailable)(
       }
     });
 
+    test('rootless watcher upgrades legacy node-owned roots before readiness', () => {
+      expect(
+        runImageScript(`
+          source /app/session-permissions.sh
+          mkdir -p /home/node/.claude /home/node/.feishu-cli \
+            /workspace/{group,ipc,extra}
+          for root in /home/node/.claude /home/node/.feishu-cli \
+            /workspace/group /workspace/ipc /workspace/extra; do
+            touch "$root/legacy-file"
+            chown -R 1000:1000 "$root"
+            chmod 0700 "$root"
+            chmod 0600 "$root/legacy-file"
+          done
+          HAPPYCLAW_HOST_IDENTITY_MODE=rootless
+          happyclaw_configure_node_identity
+          happyclaw_start_session_permission_watcher
+          for root in /home/node/.claude /home/node/.feishu-cli \
+            /workspace/group /workspace/ipc /workspace/extra; do
+            test "$(stat -c '%u:%g:%a' "$root")" = '0:1000:2770'
+            test "$(stat -c '%u:%g:%a' "$root/legacy-file")" = \
+              '0:1000:660'
+          done
+          happyclaw_stop_session_permission_watcher
+          printf upgraded-before-ready
+        `),
+      ).toBe('upgraded-before-ready');
+    });
+
+    test('rootless watcher accepts mixed mapped and legacy roots including Feishu state', () => {
+      expect(
+        runImageScript(`
+          source /app/session-permissions.sh
+          mkdir -p /home/node/.claude /home/node/.feishu-cli \
+            /workspace/{group,ipc,extra}
+          chown 0:1000 /home/node/.claude /workspace/ipc
+          chown 1000:1000 /home/node/.feishu-cli /workspace/group /workspace/extra
+          chmod 0700 /home/node/.claude /home/node/.feishu-cli \
+            /workspace/group /workspace/ipc /workspace/extra
+          HAPPYCLAW_HOST_IDENTITY_MODE=rootless
+          happyclaw_configure_node_identity
+          happyclaw_start_session_permission_watcher
+          for root in /home/node/.claude /home/node/.feishu-cli \
+            /workspace/group /workspace/ipc /workspace/extra; do
+            test "$(stat -c '%u:%g:%a' "$root")" = '0:1000:2770'
+          done
+          happyclaw_stop_session_permission_watcher
+          printf mixed-upgraded
+        `),
+      ).toBe('mixed-upgraded');
+    });
+
+    test('rootless verifier still rejects arbitrary bind-root ownership', () => {
+      expect(() =>
+        runImageScript(`
+          source /app/session-permissions.sh
+          mkdir -p /home/node/.claude /workspace/{group,ipc,extra}
+          chown 1234:1234 /workspace/group
+          HAPPYCLAW_HOST_IDENTITY_MODE=rootless
+          happyclaw_configure_node_identity
+          happyclaw_start_session_permission_watcher
+        `),
+      ).toThrow();
+    });
+
     test('direct migration changes only legacy uid 1000 in fixed managed roots', () => {
       expect(
         runHelper(`

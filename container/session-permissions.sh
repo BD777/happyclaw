@@ -223,15 +223,17 @@ happyclaw_migrate_direct_managed_paths() {
 }
 
 happyclaw_verify_rootless_bridge() {
-  local mounted_path current_uid
+  local mounted_path current_uid legacy_uid
   [ "$HAPPYCLAW_INTERNAL_IDENTITY_MODE" = rootless ] || return 0
+  legacy_uid="$HAPPYCLAW_INTERNAL_RUNTIME_UID"
   for mounted_path in \
-    /home/node/.claude /workspace/group /workspace/ipc /workspace/extra; do
+    /home/node/.claude /home/node/.feishu-cli \
+    /workspace/group /workspace/ipc /workspace/extra; do
     [ -e "$mounted_path" ] || continue
     current_uid=$(stat -c %u "$mounted_path") || return 1
-    if [ "$current_uid" != 0 ]; then
+    if [ "$current_uid" != 0 ] && [ "$current_uid" != "$legacy_uid" ]; then
       happyclaw_permission_fatal \
-        "rootless bind root $mounted_path is not mapped to container root (saw uid $current_uid)"
+        "rootless bind root $mounted_path has unexpected uid $current_uid (allowed: 0 or legacy node uid $legacy_uid)"
       return 1
     fi
   done
