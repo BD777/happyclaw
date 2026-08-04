@@ -2520,6 +2520,7 @@ function bindChannelOutboxScope(
     chatId: string;
     rootId?: string | null;
     threadId?: string | null;
+    logicalBaseChatJid?: string;
   },
   inputTurnId: string | undefined = runtime.inputTurnId,
 ): ActiveChannelOutboxScope {
@@ -6615,6 +6616,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             chatId: nextAddress.externalChatId,
             rootId: nextAddress.rootMessageId,
             threadId: nextAddress.threadId,
+            logicalBaseChatJid: chatJid,
           },
           // The runtime keys durable idempotency off the native message id,
           // but the runner correlates its MCP output with this deliveryId.
@@ -7097,6 +7099,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               chatId: streamingAddress.externalChatId,
               rootId: streamingAddress.rootMessageId,
               threadId: streamingAddress.threadId,
+              logicalBaseChatJid: chatJid,
             },
           )
         : undefined;
@@ -10068,7 +10071,31 @@ function resolveIpcOutputWorkspaceJid(chatJid: string): string | null {
       registeredGroups[jid] ?? getRegisteredGroup(jid),
     getAgent,
     getJidsByFolder,
+    getChannelMount,
   });
+}
+
+/**
+ * Recover the logical workspace captured for the exact input turn. Binding
+ * rows are mutable while a runner is working, so reading them only when IPC
+ * output arrives can attribute workspace A's delayed output to a newly-bound
+ * workspace B. The outbox scope already freezes the physical route; carry the
+ * logical base beside it without changing provider delivery.
+ */
+function resolveIpcOutputRuntimeChatJid(
+  sourceGroup: string,
+  ipcAgentId: string | null | undefined,
+  inputTurnId: unknown,
+  targetJid: string,
+): string | null {
+  if (typeof inputTurnId !== 'string' || !inputTurnId) return null;
+  return (
+    activeChannelOutboxScopes.resolveInput(
+      channelTurnScope(sourceGroup, ipcAgentId),
+      inputTurnId,
+      targetJid,
+    )?.logicalBaseChatJid ?? null
+  );
 }
 
 // Thin production wrapper around the pure helper in ./task-routing.ts so the
@@ -10398,6 +10425,12 @@ function startIpcWatcher(): void {
                     : undefined,
                   taskRunId: ipcTaskId,
                   scheduledTask: data.isScheduledTask === true,
+                  runtimeChatJid: resolveIpcOutputRuntimeChatJid(
+                    sourceGroup,
+                    ipcAgentId,
+                    data.inputTurnId,
+                    data.chatJid,
+                  ),
                   resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
                 });
                 // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
@@ -10959,6 +10992,12 @@ function startIpcWatcher(): void {
                       : undefined,
                     taskRunId: ipcTaskId,
                     scheduledTask: data.isScheduledTask === true,
+                    runtimeChatJid: resolveIpcOutputRuntimeChatJid(
+                      sourceGroup,
+                      ipcAgentId,
+                      data.inputTurnId,
+                      data.chatJid,
+                    ),
                     resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
                   });
 

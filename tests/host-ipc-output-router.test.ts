@@ -79,6 +79,28 @@ describe('host IPC primary output routing', () => {
     ).toBe('qq:c2c:CHAT_UNBOUND');
   });
 
+  test('keeps delayed text and image output in the workspace frozen for the turn', () => {
+    // The chat was admitted under ws-a, then rebound to ws-b while the model
+    // was still working. Both IPC paths call this helper and must prefer the
+    // immutable runtime scope over the output-time binding lookup.
+    const reboundWorkspace = () => 'web:ws-b';
+    const delayedTextJid = resolveHostIpcLogicalChatJid({
+      sourceChatJid: 'qq:c2c:CHAT_A',
+      scheduledTask: false,
+      runtimeChatJid: 'web:ws-a',
+      resolveWorkspaceJid: reboundWorkspace,
+    });
+    const delayedImageJid = resolveHostIpcLogicalChatJid({
+      sourceChatJid: 'qq:c2c:CHAT_A',
+      scheduledTask: false,
+      runtimeChatJid: 'web:ws-a',
+      resolveWorkspaceJid: reboundWorkspace,
+    });
+
+    expect(delayedTextJid).toBe('web:ws-a');
+    expect(delayedImageJid).toBe('web:ws-a');
+  });
+
   test('stages a custom-agent final in its exact scope without a separate provider send', async () => {
     const activeTurnOutputs = new ActiveTurnOutputRegistry();
     const projectedFinal = vi.fn(() => true);

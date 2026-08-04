@@ -114,6 +114,47 @@ describe('resolveBoundWorkspaceJid', () => {
     expect(resolveBoundWorkspaceJid(IM_JID, deps)).toBe('web:ws-c');
   });
 
+  test('normalized channel mount takes precedence over legacy target columns', () => {
+    const deps = makeDeps({
+      groups: {
+        [WORKSPACE_JID]: group({ jid: WORKSPACE_JID, folder: 'flow-x' }),
+        'web:ws-c': group({ jid: 'web:ws-c', folder: 'flow-y' }),
+        [IM_JID]: group({
+          jid: IM_JID,
+          target_main_jid: WORKSPACE_JID,
+        }),
+      },
+    });
+    expect(
+      resolveBoundWorkspaceJid(IM_JID, {
+        ...deps,
+        getChannelMount: (jid) =>
+          jid === IM_JID
+            ? { workspace_jid: 'web:ws-c', session_id: null }
+            : null,
+      }),
+    ).toBe('web:ws-c');
+  });
+
+  test('normalized-only session mount resolves through the session owner workspace', () => {
+    const deps = makeDeps({
+      groups: {
+        [WORKSPACE_JID]: group({ jid: WORKSPACE_JID, folder: 'flow-x' }),
+        [IM_JID]: group({ jid: IM_JID, folder: 'channel-owner-home' }),
+      },
+      agents: { 'agent-1': { chat_jid: WORKSPACE_JID } },
+    });
+    expect(
+      resolveBoundWorkspaceJid(IM_JID, {
+        ...deps,
+        getChannelMount: (jid) =>
+          jid === IM_JID
+            ? { workspace_jid: WORKSPACE_JID, session_id: 'agent-1' }
+            : null,
+      }),
+    ).toBe(WORKSPACE_JID);
+  });
+
   test('returns null when the bound session no longer exists', () => {
     const deps = makeDeps({
       groups: {

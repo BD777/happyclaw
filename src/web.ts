@@ -77,6 +77,7 @@ import {
 import {
   ensureChatExists,
   getRegisteredGroup,
+  getChannelMount,
   getJidsByFolder,
   storeMessageDirect,
   deleteUserSession,
@@ -89,7 +90,10 @@ import {
   setMessageFollowUp,
 } from './db.js';
 import { getGroupAllowedUserIds } from './group-broadcast-acl.js';
-import { resolveBoundWorkspaceJid } from './workspace-attribution.js';
+import {
+  hasBoundWorkspaceReference,
+  resolveBoundWorkspaceJid,
+} from './workspace-attribution.js';
 import { markdownToPlainText } from './im-utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
@@ -2228,12 +2232,15 @@ function normalizeHomeJid(chatJid: string): string {
   const group = getRegisteredGroup(chatJid);
   if (!group) return chatJid;
 
-  const boundJid = resolveBoundWorkspaceJid(chatJid, {
+  const attributionDeps = {
     getRegisteredGroup,
     getAgent,
     getJidsByFolder,
-  });
+    getChannelMount,
+  };
+  const boundJid = resolveBoundWorkspaceJid(chatJid, attributionDeps);
   if (boundJid) return boundJid;
+  if (hasBoundWorkspaceReference(chatJid, attributionDeps)) return chatJid;
 
   // Unbound IM chat: fall back to the web: JID sharing this folder (typically
   // the is_home group), which is where its messages are still attributed.

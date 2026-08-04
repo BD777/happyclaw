@@ -1,4 +1,4 @@
-import type { RegisteredGroup } from './types.js';
+import type { ChannelMount, RegisteredGroup } from './types.js';
 
 /**
  * Dependencies for resolving where a channel chat's output belongs.
@@ -8,6 +8,9 @@ export interface WorkspaceAttributionDeps {
   getRegisteredGroup: (jid: string) => RegisteredGroup | null | undefined;
   getAgent: (agentId: string) => { chat_jid: string } | null | undefined;
   getJidsByFolder: (folder: string) => string[];
+  getChannelMount?: (
+    jid: string,
+  ) => Pick<ChannelMount, 'workspace_jid' | 'session_id'> | null | undefined;
 }
 
 /**
@@ -39,9 +42,9 @@ function foldLegacyWorkspaceJid(
  * owner. Unlike the inbound resolver this one never creates native-context
  * mounts or thread sessions — attribution must not mutate routing state.
  *
- * Reads the legacy `target_*` columns rather than `channel_mounts` because both
- * sides are dual-written during the mount migration and the columns are present
- * on the already-loaded group row.
+ * Normalized `channel_mounts` rows take precedence, matching inbound routing.
+ * The legacy `target_*` columns remain as a compatibility fallback while both
+ * projections are dual-written during the mount migration.
  *
  * Returns null when the chat has no binding, so callers keep their own fallback.
  */
@@ -53,6 +56,19 @@ export function resolveBoundWorkspaceJid(
 
   const group = deps.getRegisteredGroup(chatJid);
   if (!group) return null;
+
+  const mount = deps.getChannelMount?.(chatJid);
+  if (mount) {
+    if (mount.session_id) {
+      const session = deps.getAgent(mount.session_id);
+      return session?.chat_jid && deps.getRegisteredGroup(session.chat_jid)
+        ? session.chat_jid
+        : null;
+    }
+    return deps.getRegisteredGroup(mount.workspace_jid)
+      ? mount.workspace_jid
+      : null;
+  }
 
   // Session binding takes priority, matching resolveEffectiveChatJid. The
   // agent's chat_jid is its parent workspace JID; the `#agent:` suffix is
@@ -67,4 +83,15 @@ export function resolveBoundWorkspaceJid(
   }
 
   return null;
+}
+
+/** Whether a chat declares a binding even when its target is currently stale. */
+export function hasBoundWorkspaceReference(
+  chatJid: string,
+  deps: WorkspaceAttributionDeps,
+): boolean {
+  if (chatJid.startsWith('web:')) return false;
+  if (deps.getChannelMount?.(chatJid)) return true;
+  const group = deps.getRegisteredGroup(chatJid);
+  return !!(group?.target_agent_id || group?.target_main_jid);
 }

@@ -1,7 +1,10 @@
 import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { resolveBoundWorkspaceJid } from '../workspace-attribution.js';
+import {
+  hasBoundWorkspaceReference,
+  resolveBoundWorkspaceJid,
+} from '../workspace-attribution.js';
 import {
   GroupAgentProfilePatchSchema,
   GroupCreateSchema,
@@ -34,6 +37,7 @@ import {
   getAllRegisteredGroups,
   getAllChats,
   getJidsByFolder,
+  getChannelMount,
   updateChatName,
   deleteSession,
   deleteWorkspaceSessions,
@@ -2378,12 +2382,19 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
       const ownerMatch =
         group.created_by && siblingGroup.created_by === group.created_by;
       if (!ownerMatch) continue;
-      const boundJid = resolveBoundWorkspaceJid(siblingJid, {
+      const attributionDeps = {
         getRegisteredGroup,
         getAgent,
         getJidsByFolder,
-      });
-      if (boundJid && boundJid !== jid) continue;
+        getChannelMount,
+      };
+      const boundJid = resolveBoundWorkspaceJid(siblingJid, attributionDeps);
+      if (
+        (boundJid && boundJid !== jid) ||
+        (!boundJid && hasBoundWorkspaceReference(siblingJid, attributionDeps))
+      ) {
+        continue;
+      }
       queryJids.push(siblingJid);
     }
   }

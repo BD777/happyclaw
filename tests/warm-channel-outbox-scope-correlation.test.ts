@@ -88,6 +88,7 @@ describe('warm channel outbox scope correlation', () => {
         turnRunId: runtime.runId,
         // What the fixed warm call sites pass explicitly.
         inputTurnId: ipcDeliveryId,
+        logicalBaseChatJid: 'web:workspace-at-admission',
         owner: 'owner-warm',
       });
 
@@ -97,6 +98,10 @@ describe('warm channel outbox scope correlation', () => {
       expect(registry.resolveToken('workspace', scope.token, c2cJid)).toEqual(
         scope,
       );
+      expect(
+        registry.resolveInput('workspace', ipcDeliveryId, c2cJid)
+          ?.logicalBaseChatJid,
+      ).toBe('web:workspace-at-admission');
     } finally {
       runtime.dispose();
     }
@@ -174,6 +179,7 @@ describe('warm channel outbox scope wiring contract', () => {
     expect(mainAdmission).toMatch(
       /bindChannelOutboxScope\(\s*mainAdmissionKey,[\s\S]*?\n\s*inputTurnId,\n\s*\);/,
     );
+    expect(mainAdmission).toMatch(/logicalBaseChatJid:\s*chatJid/);
     // The runtime itself stays on the native message id (durable idempotency).
     expect(mainAdmission).toMatch(
       /externalMessageId:\s*inputCursor\?\.id \?\? inputTurnId/,
@@ -230,5 +236,15 @@ describe('warm channel outbox scope wiring contract', () => {
     // `missing:<inputTurnId>` is the token shape that makes a correlation-key
     // mismatch distinguishable from a genuinely expired scope.
     expect(host).toMatch(/scopeToken:\s*scope\?\.token \?\? `missing:\$\{/);
+  });
+
+  test('text and image IPC projection both recover the frozen logical base', () => {
+    const host = read('src/index.ts');
+    expect(
+      host.match(/runtimeChatJid:\s*resolveIpcOutputRuntimeChatJid\(/g),
+    ).toHaveLength(2);
+    expect(host).toMatch(
+      /logicalBaseChatJid:\s*chatJid[\s\S]*?function resolveIpcOutputRuntimeChatJid/,
+    );
   });
 });

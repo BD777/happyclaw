@@ -35,10 +35,14 @@ export function resolveHostIpcLogicalChatJid(input: {
   agentChatJid?: string | null;
   taskRunId?: string | null;
   scheduledTask: boolean;
+  /** Immutable logical base captured when the input turn was admitted. */
+  runtimeChatJid?: string | null;
   resolveWorkspaceJid?: (chatJid: string) => string | null;
 }): string {
   const baseChatJid =
-    input.resolveWorkspaceJid?.(input.sourceChatJid) || input.sourceChatJid;
+    input.runtimeChatJid ||
+    input.resolveWorkspaceJid?.(input.sourceChatJid) ||
+    input.sourceChatJid;
   if (input.agentId) {
     return `${input.agentChatJid || baseChatJid}#agent:${input.agentId}`;
   }
