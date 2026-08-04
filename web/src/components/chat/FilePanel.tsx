@@ -598,34 +598,42 @@ function PdfPreview({
   onClose: () => void;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const [viewerLoadVersion, setViewerLoadVersion] = useState(0);
 
   useEffect(() => {
     const iframe = iframeRef.current;
-    if (!iframe || viewerLoadVersion === 0) return;
+    if (!iframe) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
       onClose();
     };
-    const embeddedWindow = iframe.contentWindow;
-
-    try {
-      embeddedWindow?.addEventListener('keydown', handleKeyDown);
-      iframe.dataset.escapeBridge = 'ready';
-    } catch {
-      // Some browser PDF viewers move their controls into an extension
-      // process. The dialog close control remains available in that case.
-    }
-    return () => {
+    const bindEmbeddedWindow = () => {
       try {
+        const embeddedWindow = iframe.contentWindow;
         embeddedWindow?.removeEventListener('keydown', handleKeyDown);
+        embeddedWindow?.addEventListener('keydown', handleKeyDown);
+        iframe.dataset.escapeBridge = 'ready';
+      } catch {
+        // Some browser PDF viewers move their controls into an extension
+        // process. The dialog close control remains available in that case.
+      }
+    };
+
+    // An iframe navigation replaces its Window global. Chromium's PDF viewer
+    // does not consistently fire `load` in headless mode, so periodically
+    // rebind while this one preview is open instead of relying on that event.
+    bindEmbeddedWindow();
+    const bindTimer = window.setInterval(bindEmbeddedWindow, 250);
+    return () => {
+      window.clearInterval(bindTimer);
+      try {
+        iframe.contentWindow?.removeEventListener('keydown', handleKeyDown);
       } catch {
         // The embedded viewer may have navigated across origins while closing.
       }
     };
-  }, [onClose, viewerLoadVersion]);
+  }, [onClose]);
 
   return (
     <MediaOverlay onClose={onClose} fileName={file.name}>
@@ -635,7 +643,6 @@ function PdfPreview({
         title={file.name}
         className="h-[90dvh] w-[90vw] rounded-lg bg-white"
         tabIndex={0}
-        onLoad={() => setViewerLoadVersion((version) => version + 1)}
       />
     </MediaOverlay>
   );
