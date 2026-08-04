@@ -78,6 +78,10 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
+import {
+  decideStuckRunnerRecovery,
+  resolveRunnerCpuActivity,
+} from './stuck-runner-recovery.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
@@ -1229,6 +1233,10 @@ const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 3 * 60 * 1000;
+// Recovery grace is bounded at 10 minutes. IPC-injected work measures this
+// against its dedicated debt clock so ordinary runner output cannot postpone
+// the ceiling; other candidates use their uninterrupted idle age (#618).
+const STUCK_RUNNER_FORCE_RESTART_MS = 10 * 60 * 1000;
 let stuckRunnerCheckCounter = 0;
 
 // OOM auto-recovery: track consecutive OOM (exit code 137) exits per folder.
@@ -17324,64 +17332,67 @@ async function startMessageLoop(): Promise<void> {
   }
 }
 
-/**
- * Check if a process tree has actively working descendant processes.
- * Returns true if any descendant (not just direct children) is consuming
- * CPU (> 0.5%), indicating real work rather than a network-blocked hang.
- */
-async function hasActiveCpuDescendants(pid: number): Promise<boolean> {
-  const execFileAsync = promisify(execFile);
-  try {
-    const { stdout } = await execFileAsync('ps', ['-eo', 'pid=,ppid=,pcpu='], {
-      timeout: 3000,
-    });
-
-    const children = new Map<number, number[]>();
-    const cpuByPid = new Map<number, number>();
-    for (const line of stdout.trim().split('\n')) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 3) continue;
-      const p = parseInt(parts[0], 10);
-      const pp = parseInt(parts[1], 10);
-      const cpu = parseFloat(parts[2]);
-      if (isNaN(p) || isNaN(pp)) continue;
-      if (!children.has(pp)) children.set(pp, []);
-      children.get(pp)!.push(p);
-      cpuByPid.set(p, cpu);
-    }
-
-    // Walk the full descendant tree (not just direct children)
-    const stack = [pid];
-    while (stack.length > 0) {
-      const current = stack.pop()!;
-      const kids = children.get(current);
-      if (!kids) continue;
-      for (const kid of kids) {
-        if ((cpuByPid.get(kid) ?? 0) > 0.5) return true;
-        stack.push(kid);
-      }
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
 async function recoverStuckPendingGroups(): Promise<void> {
-  const stuckGroups = queue.getStuckPendingGroups(STUCK_RUNNER_IDLE_MS);
-  for (const { jid, idleMs } of stuckGroups) {
-    const pid = queue.getRunnerPid(jid);
-    if (pid && (await hasActiveCpuDescendants(pid))) {
+  const stuckGroups = queue.getStuckPendingGroups(
+    STUCK_RUNNER_IDLE_MS,
+    STUCK_RUNNER_FORCE_RESTART_MS,
+  );
+  for (const candidate of stuckGroups) {
+    const pid = candidate.runnerPid ?? undefined;
+    const cpuActivity = await resolveRunnerCpuActivity(candidate);
+    const currentCandidate = queue.revalidateStuckRecoveryCandidate(
+      candidate,
+      STUCK_RUNNER_IDLE_MS,
+      STUCK_RUNNER_FORCE_RESTART_MS,
+    );
+    if (!currentCandidate) {
       logger.info(
-        { chatJid: jid, idleMs, pid },
-        'Runner idle but has CPU-active child processes; skipping restart',
+        {
+          chatJid: candidate.jid,
+          queryId: candidate.queryId,
+          runnerGeneration: candidate.runnerGeneration,
+          pid,
+          reason: candidate.reason,
+          runtime: candidate.runtime,
+        },
+        'Skipping stale stuck-runner candidate after CPU probe',
+      );
+      continue;
+    }
+    const { jid, idleMs, reason, runtime, ipcOwedMs } = currentCandidate;
+    const decision = decideStuckRunnerRecovery(
+      currentCandidate,
+      cpuActivity,
+      STUCK_RUNNER_FORCE_RESTART_MS,
+    );
+    if (decision.action === 'defer') {
+      logger.info(
+        {
+          chatJid: jid,
+          idleMs,
+          ipcOwedMs,
+          pid,
+          reason,
+          runtime,
+          cpuActivity,
+          deferReason: decision.reason,
+        },
+        'Runner recovery deferred while owed work remains within its grace policy',
       );
       continue;
     }
 
     logger.warn(
-      { chatJid: jid, idleMs },
-      'Runner has pending messages but no activity; restarting',
+      {
+        chatJid: jid,
+        idleMs,
+        ipcOwedMs,
+        reason,
+        runtime,
+        cpuActivity,
+        restartReason: decision.reason,
+      },
+      'Runner has owed user work but no activity; restarting',
     );
     queue.restartGroup(jid).catch((err) => {
       logger.error(
