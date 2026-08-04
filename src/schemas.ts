@@ -391,6 +391,7 @@ export const AgentProfileCreateSchema = z
       .regex(/^#[0-9a-fA-F]{6}$/)
       .nullable()
       .optional(),
+    model_config_id: z.string().trim().min(1).max(128).nullable().optional(),
     runtime_policy: AgentProfileRuntimePolicySchema.optional(),
   })
   .superRefine(validatePromptModeCompatibility);
@@ -412,6 +413,7 @@ export const AgentProfilePatchSchema = z
       .regex(/^#[0-9a-fA-F]{6}$/)
       .nullable()
       .optional(),
+    model_config_id: z.string().trim().min(1).max(128).nullable().optional(),
     runtime_policy: AgentProfileRuntimePolicySchema.optional(),
   })
   .superRefine(validatePromptModeCompatibility);

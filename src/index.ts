@@ -2188,6 +2188,7 @@ function toContainerAgentProfile(
     identityHash: profile.identity_hash,
     identityPrompt: buildAgentProfilePrompt(profile),
     includeClaudePreset: profile.prompt_mode === 'append',
+    modelConfigId: profile.model_config_id,
     runtimePolicy: profile.runtime_policy,
   };
 }
@@ -2489,6 +2490,17 @@ interface ChannelOutboxDeliveryRef {
   ordinalSlot?: string;
 }
 
+/**
+ * `inputTurnId` is the correlation key runner-side MCP output resolves against,
+ * so it must be the id the runner actually reports — its IPC deliveryId for a
+ * warm turn, or ContainerInput.turnId for the cold startup turn.
+ *
+ * The runtime's own `inputTurnId` only matches on the cold path, where the
+ * durable message id and the runner turn id are the same value. Warm admission
+ * starts the runtime from the native message id (durable turn idempotency) but
+ * hands the runner a random deliveryId, so those callers must pass the
+ * deliveryId explicitly or every MCP-sent output would fail closed.
+ */
 function bindChannelOutboxScope(
   key: string,
   runtime: ChannelTurnRuntime,
@@ -2500,13 +2512,14 @@ function bindChannelOutboxScope(
     rootId?: string | null;
     threadId?: string | null;
   },
+  inputTurnId: string | undefined = runtime.inputTurnId,
 ): ActiveChannelOutboxScope {
   return activeChannelOutboxScopes.bind(key, {
     ...route,
     rootId: route.rootId ?? null,
     threadId: route.threadId ?? null,
     turnRunId: runtime.runId,
-    inputTurnId: runtime.inputTurnId,
+    inputTurnId,
     owner: `happyclaw-outbox:${process.pid}:${runtime.runId}`,
   });
 }
@@ -2553,6 +2566,10 @@ async function deliverScopedChannelOutput(
         targetJid,
         scopeKey: ref.scopeKey,
         operationKey: ref.operationKey,
+        // Carries the unresolved correlation id as `missing:<inputTurnId>` when
+        // the lookup failed, which is what distinguishes a genuinely expired
+        // scope from a correlation-key mismatch.
+        scopeToken: ref.scopeToken,
       },
       'Suppressed channel side effect because its exact outbox scope is unavailable',
     );
@@ -5802,7 +5819,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   } else if (
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, undefined)
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      undefined,
+      agentProfile?.model_config_id,
+    )
   ) {
     // Proactive provider switch (sticky binding unhealthy/disabled) will clear
     // the SDK session inside the runner. Inject history so the new provider's
@@ -6575,14 +6596,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           nextRuntime.dispose();
           return false;
         }
-        nextScope = bindChannelOutboxScope(mainAdmissionKey, nextRuntime, {
-          provider: nextAddress.provider,
-          accountId: nextAccountId,
-          sourceJid: newImJid,
-          chatId: nextAddress.externalChatId,
-          rootId: nextAddress.rootMessageId,
-          threadId: nextAddress.threadId,
-        });
+        nextScope = bindChannelOutboxScope(
+          mainAdmissionKey,
+          nextRuntime,
+          {
+            provider: nextAddress.provider,
+            accountId: nextAccountId,
+            sourceJid: newImJid,
+            chatId: nextAddress.externalChatId,
+            rootId: nextAddress.rootMessageId,
+            threadId: nextAddress.threadId,
+          },
+          // The runtime keys durable idempotency off the native message id,
+          // but the runner correlates its MCP output with this deliveryId.
+          inputTurnId,
+        );
         channelTurnRuntimes.set(inputTurnId, nextRuntime);
         channelOutboxScopesByInput.set(inputTurnId, nextScope);
       }
@@ -14140,7 +14168,11 @@ async function processAgentConversation(
   const startsFreshSession =
     !sessionId ||
     resetForAgentProfile ||
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId);
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      agentId,
+      agentProfile?.model_config_id,
+    );
   let historyContext: ReturnType<typeof buildRecentConversationHistoryContext> =
     null;
   if (startsFreshSession) {
@@ -14815,14 +14847,20 @@ async function processAgentConversation(
           nextRuntime.dispose();
           return false;
         }
-        nextScope = bindChannelOutboxScope(agentAdmissionKey, nextRuntime, {
-          provider: nextAddress.provider,
-          accountId: nextAccountId,
-          sourceJid: targetSourceJid,
-          chatId: nextAddress.externalChatId,
-          rootId: nextAddress.rootMessageId,
-          threadId: nextAddress.threadId,
-        });
+        nextScope = bindChannelOutboxScope(
+          agentAdmissionKey,
+          nextRuntime,
+          {
+            provider: nextAddress.provider,
+            accountId: nextAccountId,
+            sourceJid: targetSourceJid,
+            chatId: nextAddress.externalChatId,
+            rootId: nextAddress.rootMessageId,
+            threadId: nextAddress.threadId,
+          },
+          // Same warm-path correlation split as the main workspace admission.
+          inputTurnId,
+        );
         agentChannelTurnRuntimes.set(inputTurnId, nextRuntime);
         agentChannelOutboxScopesByInput.set(inputTurnId, nextScope);
       }

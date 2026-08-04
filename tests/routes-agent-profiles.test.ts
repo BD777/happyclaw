@@ -53,6 +53,7 @@ vi.mock('../src/middleware/auth.ts', () => ({
 }));
 
 const db = await import('../src/db.js');
+const runtimeConfig = await import('../src/runtime-config.js');
 const webContext = await import('../src/web-context.js');
 const agentProfileRuntime = await import('../src/agent-profile-runtime.js');
 const routeModule = await import('../src/routes/agent-profiles.js');
@@ -146,6 +147,74 @@ describe('/api/agent-profiles routes', () => {
     expect(body.profiles[0].effective_runtime_policy).toEqual(
       body.profiles[0].runtime_policy,
     );
+  });
+
+  test('lists model configurations and persists an Agent selection', async () => {
+    const inheritedDefault = runtimeConfig.createProvider({
+      name: 'Default model config',
+      type: 'official',
+      anthropicApiKey: 'default-test-key',
+      anthropicModel: 'claude-default-test',
+      enabled: true,
+    });
+    const selectedModel = runtimeConfig.createProvider({
+      name: 'Research model config',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://models.example.test',
+      anthropicAuthToken: 'research-test-token',
+      anthropicModel: 'research-model',
+      enabled: false,
+    });
+    runtimeConfig.setDefaultProvider(inheritedDefault.id);
+
+    const listRes = await routes.request('/', { method: 'GET' });
+    const listBody = await listRes.json();
+    expect(listBody.default_model_config_id).toBe(inheritedDefault.id);
+    expect(listBody.model_configs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: inheritedDefault.id,
+          name: 'Default model config',
+          is_default: true,
+        }),
+        expect.objectContaining({
+          id: selectedModel.id,
+          name: 'Research model config',
+          enabled: false,
+          is_default: false,
+        }),
+      ]),
+    );
+
+    const createRes = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Pinned Research Agent',
+        model_config_id: selectedModel.id,
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    const created = (await createRes.json()).profile;
+    expect(created.model_config_id).toBe(selectedModel.id);
+
+    const inheritRes = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model_config_id: null }),
+    });
+    expect(inheritRes.status).toBe(200);
+    expect((await inheritRes.json()).profile).toMatchObject({
+      model_config_id: null,
+      version: created.version + 1,
+    });
+
+    const invalidRes = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model_config_id: 'missing-model-config' }),
+    });
+    expect(invalidRes.status).toBe(400);
   });
 
   test('POST creates and PATCH updates an AgentProfile', async () => {

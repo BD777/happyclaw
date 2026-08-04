@@ -184,4 +184,16 @@ describe('Agent prompt and capability frontend contract', () => {
     expect(card).toContain('skillConflictLabel');
     expect(store).toContain('effective?: boolean');
   });
+
+  test('allows every saved model configuration to be selected by an Agent', () => {
+    const profiles = read('web/src/pages/AgentProfilesPage.tsx');
+    const main = read(
+      'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
+    );
+
+    for (const source of [profiles, main]) {
+      expect(source).not.toContain('disabled={!model.enabled}');
+      expect(source).toContain("!model.enabled ? '（仅显式使用）' : ''");
+    }
+  });
 });

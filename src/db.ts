@@ -102,7 +102,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 67;
+export const CURRENT_SCHEMA_VERSION = 68;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -928,6 +928,7 @@ export function initDatabase(): void {
       avatar_emoji TEXT,
       avatar_color TEXT,
       avatar_url TEXT,
+      model_config_id TEXT,
       runtime_policy TEXT NOT NULL DEFAULT '{}',
       identity_hash TEXT NOT NULL DEFAULT '',
       version INTEGER NOT NULL DEFAULT 1,
@@ -1983,6 +1984,14 @@ export function initDatabase(): void {
   ensureColumn('agent_profiles', 'avatar_emoji', 'TEXT');
   ensureColumn('agent_profiles', 'avatar_color', 'TEXT');
   ensureColumn('agent_profiles', 'avatar_url', 'TEXT');
+  // v67 -> v68: a top-level Agent can pin one complete model/Provider
+  // configuration. Null deliberately means "follow the system default".
+  ensureColumn('agent_profiles', 'model_config_id', 'TEXT');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_agent_profiles_model_config
+      ON agent_profiles(model_config_id)
+      WHERE model_config_id IS NOT NULL;
+  `);
 
   // v47 → v48: split the legacy all-in-one Agent prompt into the four
   // IDENTITY / SOUL / AGENTS / TOOLS sections. The legacy prompt represented
@@ -8397,6 +8406,10 @@ function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
     avatar_color:
       typeof row.avatar_color === 'string' ? row.avatar_color : null,
     avatar_url: typeof row.avatar_url === 'string' ? row.avatar_url : null,
+    model_config_id:
+      typeof row.model_config_id === 'string' && row.model_config_id
+        ? row.model_config_id
+        : null,
     runtime_policy: runtimePolicy,
     identity_hash: String(
       row.identity_hash ??
@@ -8746,6 +8759,7 @@ export function createAgentProfile(input: {
   includeClaudePreset?: boolean;
   avatarEmoji?: string | null;
   avatarColor?: string | null;
+  modelConfigId?: string | null;
   runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
 }): AgentProfile {
   const now = new Date().toISOString();
@@ -8771,9 +8785,9 @@ export function createAgentProfile(input: {
       `INSERT INTO agent_profiles (
         id, owner_user_id, name,
         identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
-        include_claude_preset, avatar_emoji, avatar_color, runtime_policy, identity_hash, version,
+        include_claude_preset, avatar_emoji, avatar_color, model_config_id, runtime_policy, identity_hash, version,
         is_default, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
     ).run(
       id,
       input.ownerUserId,
@@ -8786,6 +8800,7 @@ export function createAgentProfile(input: {
       includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
       input.avatarEmoji ?? null,
       input.avatarColor ?? null,
+      input.modelConfigId ?? null,
       runtimePolicyJson,
       identityHash,
       now,
@@ -8818,6 +8833,7 @@ export function updateAgentProfile(
     avatarEmoji?: string | null;
     avatarColor?: string | null;
     avatarUrl?: string | null;
+    modelConfigId?: string | null;
     runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
     changeSource?: AgentProfilePromptVersion['change_source'];
     restoredFromVersion?: number | null;
@@ -8855,6 +8871,11 @@ export function updateAgentProfile(
       : updates.avatarColor;
   const nextAvatarUrl =
     updates.avatarUrl === undefined ? existing.avatar_url : updates.avatarUrl;
+  const nextModelConfigId =
+    updates.modelConfigId === undefined
+      ? existing.model_config_id
+      : updates.modelConfigId;
+  const modelConfigChanged = nextModelConfigId !== existing.model_config_id;
   const nextHash = computeAgentProfileIdentityHash(
     nextPrompts,
     nextRuntimePolicy,
@@ -8867,13 +8888,16 @@ export function updateAgentProfile(
     nextPrompts.agents_prompt !== existing.agents_prompt ||
     nextPrompts.tools_prompt !== existing.tools_prompt ||
     nextPrompts.prompt_mode !== existing.prompt_mode;
-  const nextVersion = identityChanged ? existing.version + 1 : existing.version;
+  const nextVersion =
+    identityChanged || modelConfigChanged
+      ? existing.version + 1
+      : existing.version;
   const now = new Date().toISOString();
   db.transaction(() => {
     db.prepare(
       `UPDATE agent_profiles
        SET name = ?, identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
-           prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?,
+           prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?, model_config_id = ?,
            runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
        WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
     ).run(
@@ -8887,6 +8911,7 @@ export function updateAgentProfile(
       nextAvatarEmoji,
       nextAvatarColor,
       nextAvatarUrl,
+      nextModelConfigId,
       serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
       nextHash,
       nextVersion,
@@ -8913,6 +8938,19 @@ export function updateAgentProfile(
     }
   })();
   return getAgentProfile(profileId);
+}
+
+export function countAgentProfilesByModelConfigId(
+  modelConfigId: string,
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM agent_profiles
+       WHERE model_config_id = ? AND status = 'active'`,
+    )
+    .get(modelConfigId) as { count: number };
+  return Number(row.count ?? 0);
 }
 
 export function archiveAgentProfile(

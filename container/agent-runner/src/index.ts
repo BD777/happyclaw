@@ -801,6 +801,7 @@ const OUTPUT_START_MARKER = '---HAPPYCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---HAPPYCLAW_OUTPUT_END---';
 const SDK_CONTEXT_USAGE_TIMEOUT_MS = 5_000;
 const SDK_FIRST_RESPONSE_TIMEOUT_MS = 60_000;
+const SDK_COMPACTION_RESPONSE_TIMEOUT_MS = 10 * 60_000;
 const SDK_PROVIDER_FAILURE_EXIT_GRACE_MS = 250;
 
 function writeOutput(output: ContainerOutput): void {
@@ -1029,6 +1030,7 @@ function createPreCompactHook(deps: {
   emit: (output: ContainerOutput) => void;
   getFullText: () => string;
   resetFullText: () => void;
+  onCompactionStart?: () => void;
 }): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
@@ -1043,6 +1045,12 @@ function createPreCompactHook(deps: {
       );
       return {};
     }
+
+    // Compaction is a legitimate long model round-trip. Replace the short
+    // first-response watchdog with a longer hard deadline before summarization
+    // starts; the deadline remains bounded if compaction or the response after
+    // it stalls permanently.
+    deps.onCompactionStart?.();
 
     // ── Flush accumulated streaming text as compact_partial ──
     // This ensures users see the partial response even after compaction.
@@ -2660,6 +2668,10 @@ async function runQueryAttempt(
                 emit,
                 getFullText: () => processor.getFullText(),
                 resetFullText: () => processor.resetFullTextAccumulator(),
+                onCompactionStart: () =>
+                  firstResponseWatchdog?.beginCompaction(
+                    SDK_COMPACTION_RESPONSE_TIMEOUT_MS,
+                  ),
               }),
             ],
           },
@@ -2676,9 +2688,9 @@ async function runQueryAttempt(
     queryRef = q;
     firstResponseWatchdog = new SdkFirstResponseWatchdog(
       SDK_FIRST_RESPONSE_TIMEOUT_MS,
-      () => {
+      (phase, timeoutMs) => {
         log(
-          `No model response event within ${SDK_FIRST_RESPONSE_TIMEOUT_MS}ms; marking provider unhealthy`,
+          `No model response event within ${timeoutMs}ms (${phase}); marking provider unhealthy`,
         );
         publishProviderAccountFailure('server_error');
         processor.discardPendingTextOutput();

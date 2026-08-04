@@ -32,6 +32,12 @@ type CapabilityMode = 'inherit' | 'custom' | 'disabled';
 
 export function MainAgentCapabilitiesSection() {
   const profiles = useAgentProfilesStore((state) => state.profiles);
+  const modelConfigs = useAgentProfilesStore(
+    (state) => state.modelConfigs ?? [],
+  );
+  const defaultModelConfigId = useAgentProfilesStore(
+    (state) => state.defaultModelConfigId ?? null,
+  );
   const profilesLoading = useAgentProfilesStore((state) => state.loading);
   const loadProfiles = useAgentProfilesStore((state) => state.loadProfiles);
   const governance = useAgentProfilesStore((state) =>
@@ -57,6 +63,7 @@ export function MainAgentCapabilitiesSection() {
   const [hostSkillIds, setHostSkillIds] = useState<string[]>([]);
   const [mcpMode, setMcpMode] = useState<CapabilityMode>('inherit');
   const [mcpIds, setMcpIds] = useState<string[]>([]);
+  const [modelConfigId, setModelConfigId] = useState('inherit');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -72,6 +79,7 @@ export function MainAgentCapabilitiesSection() {
     setHostSkillIds(hostPolicy.ids);
     setMcpMode(profile.runtime_policy.mcp.mode);
     setMcpIds(normalizeMcpPolicyReferences(profile.runtime_policy.mcp.ids));
+    setModelConfigId(profile.model_config_id ?? 'inherit');
   }, [profile?.id, profile?.updated_at]);
 
   useEffect(() => {
@@ -145,7 +153,9 @@ export function MainAgentCapabilitiesSection() {
 
   const dirty =
     !!profile &&
-    (skillsMode !== profile.runtime_policy.skills.mode ||
+    ((modelConfigId === 'inherit' ? null : modelConfigId) !==
+      profile.model_config_id ||
+      skillsMode !== profile.runtime_policy.skills.mode ||
       JSON.stringify(skillIds) !==
         JSON.stringify(profile.runtime_policy.skills.ids) ||
       hostSkillsMode !== persistedHostPolicy?.mode ||
@@ -186,6 +196,7 @@ export function MainAgentCapabilitiesSection() {
     setSaving(true);
     try {
       await api.patch(`/api/agent-profiles/${encodeURIComponent(profile.id)}`, {
+        model_config_id: modelConfigId === 'inherit' ? null : modelConfigId,
         runtime_policy: {
           skills: {
             mode: skillsMode,
@@ -196,7 +207,7 @@ export function MainAgentCapabilitiesSection() {
         } satisfies Partial<AgentProfileRuntimePolicy>,
       });
       await loadProfiles();
-      toast.success('主 HappyClaw 能力已保存');
+      toast.success('主 HappyClaw 模型与能力已保存');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '保存能力失败');
     } finally {
@@ -223,10 +234,42 @@ export function MainAgentCapabilitiesSection() {
   return (
     <section className="space-y-5 border-b border-border py-6">
       <div>
-        <h3 className="text-sm font-semibold text-foreground">系统附加能力</h3>
+        <h3 className="text-sm font-semibold text-foreground">
+          模型与系统附加能力
+        </h3>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          按来源控制主智能体的 Skills，并管理 HappyClaw 附加的 MCP。 宿主机
-          Skills 可独立于宿主机 Prompt 与 Rules 启用。
+          为主智能体选择完整模型网关环境，并按来源控制 Skills 与 HappyClaw
+          附加的 MCP。宿主机 Skills 可独立于宿主机 Prompt 与 Rules 启用。
+        </p>
+      </div>
+
+      <div className="max-w-xl space-y-2">
+        <label className="text-xs font-medium text-muted-foreground">
+          模型配置
+        </label>
+        <Select value={modelConfigId} onValueChange={setModelConfigId}>
+          <SelectTrigger aria-label="主 HappyClaw 模型配置">
+            <SelectValue placeholder="选择模型配置" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="inherit">
+              跟随系统默认
+              {defaultModelConfigId
+                ? `（${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}）`
+                : '（尚未配置）'}
+            </SelectItem>
+            {modelConfigs.map((model) => (
+              <SelectItem key={model.id} value={model.id}>
+                {model.name}
+                {model.anthropic_model ? ` · ${model.anthropic_model}` : ''}
+                {!model.enabled ? '（仅显式使用）' : ''}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-[11px] leading-5 text-muted-foreground">
+          Home
+          工作区、主会话、独立会话与定时任务都会继承该选择。未启用的配置仍可在这里显式使用。
         </p>
       </div>
 
@@ -275,7 +318,7 @@ export function MainAgentCapabilitiesSection() {
           className="min-h-11"
         >
           {saving && <Loader2 className="size-4 animate-spin" />}
-          保存附加能力
+          保存模型与能力
         </Button>
       </div>
       {currentRuntimePolicy && (
