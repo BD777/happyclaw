@@ -2329,9 +2329,9 @@ async function runQueryAttempt(
     emit({
       status: 'success',
       // Proactive SDK text is control-plane only; user-visible speech must
-      // normally have crossed the send_message delivery boundary. Preserve a
-      // completed non-empty candidate for host-side, ACK-aware recovery rather
-      // than silently discarding it when the model violates that contract.
+      // cross the send_message delivery boundary. Preserve the completed text
+      // only for internal diagnostics and scheduled-result extraction. Public
+      // interactive hosts must never project it as a fallback message.
       result: proactiveInteractiveContract ? null : candidate.finalText,
       ...(proactiveInteractiveContract &&
       inputTurnCompleted &&

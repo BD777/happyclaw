@@ -435,8 +435,8 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error' | 'stream' | 'closed';
   result: string | null;
-  /** Hidden SDK final text from an interactive Proactive turn. The host may
-   * publish it only after reconciling acknowledged `send_message` deliveries. */
+  /** Hidden SDK final text from a Proactive runner. Public interactive turns
+   * must never publish it; scheduled-result extraction may consume it. */
   proactiveFinalCandidate?: string;
   newSessionId?: string;
   error?: string;

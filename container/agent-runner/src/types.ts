@@ -292,10 +292,9 @@ export interface ContainerOutput {
   /**
    * Non-empty SDK final text produced under the interactive Proactive contract.
    *
-   * Proactive mode still keeps `result` null so ordinary SDK text is never
-   * published blindly. The host reconciles this candidate against physically
-   * acknowledged `send_message` deliveries and only publishes it when the
-   * model failed to send a final utterance.
+   * Proactive mode keeps `result` null and public interactive hosts must never
+   * publish this candidate. It crosses the runner boundary only for internal
+   * diagnostics and scheduled-result extraction.
    */
   proactiveFinalCandidate?: string;
   newSessionId?: string;

@@ -37,11 +37,7 @@ import {
   TurnOutputCoordinator,
   type TurnMessageDeliveryRole,
 } from './turn-output-coordinator.js';
-import {
-  preserveUnacknowledgedProactiveFinal,
-  recoverProactiveFinalCandidate,
-  type ProactiveFinalFallbackDelivery,
-} from './proactive-final-recovery.js';
+import { preserveUnacknowledgedProactiveFinal } from './proactive-final-recovery.js';
 import {
   resolveHostIpcLogicalChatJid,
   routeHostIpcOutput,
@@ -3031,89 +3027,6 @@ async function deliverProactiveTailInterruptionNotice(input: {
     PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   );
   return true;
-}
-
-/**
- * Recover non-empty SDK final text that a Proactive model forgot to send.
- *
- * Native delivery gets a fresh, durable Outbox turn because the original turn
- * may already be finalizing. A failed/unavailable native route still projects
- * the exact answer into the canonical Web session so the result is never
- * silently lost; it deliberately does not claim a physical provider ACK.
- */
-async function deliverProactiveFinalFallback(input: {
-  logicalChatJid: string;
-  scopeKey: string;
-  inputTurnId: string;
-  text: string;
-  sessionId?: string;
-  agentId?: string | null;
-  targetJid?: string | null;
-  scope?: ActiveChannelOutboxScope;
-}): Promise<ProactiveFinalFallbackDelivery> {
-  const scopeRoute = input.scope?.chatId
-    ? {
-        provider: input.scope.provider,
-        accountId: input.scope.accountId,
-        sourceJid: input.scope.sourceJid,
-        chatId: input.scope.chatId,
-        rootId: input.scope.rootId,
-        threadId: input.scope.threadId,
-      }
-    : null;
-  const route =
-    scopeRoute ??
-    (input.targetJid ? resolveDurableChannelRoute(input.targetJid) : null);
-  if (input.targetJid && route) {
-    const delivered = await deliverIndependentChannelSystemNotice({
-      logicalChatJid: input.logicalChatJid,
-      scopeKey: input.scopeKey,
-      targetJid: input.targetJid,
-      originalInputTurnId: input.inputTurnId,
-      originalRunId: input.scope?.turnRunId ?? `proactive:${input.inputTurnId}`,
-      noticeKey: 'proactive-final-fallback',
-      text: input.text,
-      sender: 'happyclaw-agent',
-      senderName: ASSISTANT_NAME,
-      agentId: input.agentId,
-      presentation: 'native',
-      messageMeta: {
-        turnId: input.inputTurnId,
-        sessionId: input.sessionId,
-        sourceKind: 'proactive_sdk_fallback',
-        finalizationReason: 'completed',
-      },
-      route,
-    });
-    if (delivered) {
-      return { projected: true, targetDelivered: true, path: 'native' };
-    }
-  }
-
-  const messageId = `proactive_final_${crypto
-    .createHash('sha256')
-    .update(`${input.logicalChatJid}\0${input.inputTurnId}\0${input.text}`)
-    .digest('hex')
-    .slice(0, 32)}`;
-  const webDelivery = await sendMessageWithOutcome(
-    input.logicalChatJid,
-    input.text,
-    {
-      sendToIM: false,
-      messageId,
-      messageMeta: {
-        turnId: input.inputTurnId,
-        sessionId: input.sessionId,
-        sourceKind: 'proactive_sdk_fallback',
-        finalizationReason: 'completed',
-      },
-    },
-  );
-  return {
-    projected: webDelivery.targetDelivered,
-    targetDelivered: !input.targetJid && webDelivery.targetDelivered,
-    path: input.targetJid ? 'web_after_native_failure' : 'web',
-  };
 }
 
 function resolveDurableChannelRoute(targetJid: string): {
@@ -7797,49 +7710,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 );
               }
             } else if (result.proactiveFinalCandidate?.trim()) {
-              const outputScope =
-                channelOutboxScopesByInput.get(proactiveInputId);
-              const recovery = await recoverProactiveFinalCandidate({
-                registry: activeTurnOutputs,
-                scopeKey: mainAdmissionKey,
-                inputTurnId: proactiveInputId,
-                inputTurnCompleted: result.inputTurnCompleted,
-                candidate: result.proactiveFinalCandidate,
-                canDeliver: () =>
-                  canDeliverTurnUtterance(
-                    effectiveGroup.folder,
-                    null,
-                    proactiveInputId,
-                  ),
-                deliver: (text) =>
-                  deliverProactiveFinalFallback({
-                    logicalChatJid: chatJid,
-                    scopeKey: mainAdmissionKey,
-                    inputTurnId: proactiveInputId,
-                    text,
-                    sessionId: activeSessionId,
-                    targetJid: outputScope?.sourceJid ?? replySourceImJid,
-                    scope: outputScope,
-                  }),
-              });
-              if (recovery.projected) {
-                sentReplyByInput.set(proactiveInputId, true);
-              }
-              if (recovery.targetDelivered) {
-                channelPhysicalDeliveryAckByInput.set(proactiveInputId, true);
-                genuineReplyDeliveredByInput.set(proactiveInputId, true);
-              }
-              logger[recovery.projected ? 'warn' : 'info'](
+              // Proactive SDK text is control-plane output, never speech. A
+              // model that ends without send_message intentionally produces no
+              // user-visible message; do not turn its Assistant final into a
+              // framework-authored fallback.
+              logger.warn(
                 {
                   group: effectiveGroup.folder,
                   inputTurnId: proactiveInputId,
-                  recoveryReason: recovery.reason,
-                  deliveryPath: recovery.path,
-                  targetDelivered: recovery.targetDelivered,
+                  inputTurnCompleted: result.inputTurnCompleted === true,
                 },
-                recovery.projected
-                  ? 'Recovered Proactive SDK final that was not sent through send_message'
-                  : 'Proactive SDK final recovery not required',
+                'Suppressed Proactive SDK final without send_message delivery',
               );
             }
             // In Proactive mode the SDK Result is an internal control-plane
@@ -15631,52 +15512,16 @@ async function processAgentConversation(
         lastProcessed.id,
       );
       if (output.proactiveFinalCandidate?.trim()) {
-        const outputScope =
-          agentChannelOutboxScopesByInput.get(proactiveInputId);
-        const recovery = await recoverProactiveFinalCandidate({
-          registry: activeTurnOutputs,
-          scopeKey: agentAdmissionKey,
-          inputTurnId: proactiveInputId,
-          inputTurnCompleted: output.inputTurnCompleted,
-          candidate: output.proactiveFinalCandidate,
-          canDeliver: () =>
-            canDeliverTurnUtterance(
-              effectiveGroup.folder,
-              agentId,
-              proactiveInputId,
-            ),
-          deliver: (text) =>
-            deliverProactiveFinalFallback({
-              logicalChatJid: virtualChatJid,
-              scopeKey: agentAdmissionKey,
-              inputTurnId: proactiveInputId,
-              text,
-              sessionId: currentAgentSessionId,
-              agentId,
-              targetJid: outputScope?.sourceJid ?? replySourceImJid,
-              scope: outputScope,
-            }),
-        });
-        if (recovery.projected) {
-          agentReplySentByInput.set(proactiveInputId, true);
-          agentAnyReplyProjectedByInput.set(proactiveInputId, true);
-        }
-        if (recovery.targetDelivered) {
-          agentPhysicalDeliveryAckByInput.set(proactiveInputId, true);
-          agentGenuineReplyDeliveredByInput.set(proactiveInputId, true);
-        }
-        logger[recovery.projected ? 'warn' : 'info'](
+        // Conversation Agents obey the same strict delivery boundary as the
+        // main Agent: only send_message may create a user-visible utterance.
+        logger.warn(
           {
             chatJid,
             agentId,
             inputTurnId: proactiveInputId,
-            recoveryReason: recovery.reason,
-            deliveryPath: recovery.path,
-            targetDelivered: recovery.targetDelivered,
+            inputTurnCompleted: output.inputTurnCompleted === true,
           },
-          recovery.projected
-            ? 'Recovered Proactive agent SDK final that was not sent through send_message'
-            : 'Proactive agent SDK final recovery not required',
+          'Suppressed Proactive agent SDK final without send_message delivery',
         );
       }
       output.result = null;
