@@ -79,6 +79,19 @@ export type StreamingSession =
   | DiscordStreamingEditController
   | QQStreamingController;
 
+/**
+ * Whether a streaming session has settled into a terminal presentation state
+ * and may be rotated out. The Feishu controller reports `isActive() === false`
+ * while still `'idle'` (lazily-created card waiting for its first stream
+ * event); rotating it out at that point orphans the durable card reservation
+ * and the provider card never publishes. Controllers without a `currentState`
+ * accessor treat `'idle'` as active inside `isActive()` already.
+ */
+export function isStreamingSessionSettled(session: StreamingSession): boolean {
+  if (session.isActive()) return false;
+  return (session as { currentState?: string }).currentState !== 'idle';
+}
+
 // ─── Unified Interface ──────────────────────────────────────────
 
 export interface IMChannelConnectOpts {

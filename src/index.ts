@@ -270,6 +270,7 @@ import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
   getChannelType,
   extractChatId,
+  isStreamingSessionSettled,
   type StreamingSession,
   type ChannelMessageDeliveryOptions,
 } from './im-channel.js';
@@ -6798,7 +6799,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // event activates B after A has reached its own terminal output.
       if (acceptedNewInput) return;
       if (newImJid === replySourceImJid) {
-        if (streamingSession && !streamingSession.isActive()) {
+        // 'idle' session 尚未发布任何 provider 卡片，保留给新 turn 懒创建；
+        // 只有已定稿（completed/aborted/error）的 session 才在此轮换（#629）。
+        if (streamingSession && isStreamingSessionSettled(streamingSession)) {
           streamingSession.dispose();
           unregisterStreamingSession(streamingSessionJid);
           streamingSession = undefined;
@@ -7299,9 +7302,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               streamingSession &&
               (streamingSession as { currentState?: string }).currentState ===
                 'error';
+            // isStreamingSessionSettled（而非裸 !isActive()）：飞书控制器在
+            // 'idle'（懒创建卡等待首个流事件）时 isActive() 也为 false，用裸
+            // 判断会在首个事件到达时就丢弃 session——beginCreation() 永远不会
+            // 执行，预留记录停在 creating 并在重启时被 fence（#629）。
             if (
               streamingSession &&
-              !streamingSession.isActive() &&
+              isStreamingSessionSettled(streamingSession) &&
               !sessionErrored &&
               !runEnded
             ) {
