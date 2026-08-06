@@ -754,6 +754,34 @@ function getAgentProfileMcpPolicyMode(
 }
 
 /**
+ * Resolve the model configuration that *pins* provider selection, or null when
+ * selection should go through the balancing pool.
+ *
+ * An explicit Agent-level `modelConfigId` is authoritative: a top-level Agent
+ * owns exactly one complete model configuration and must never be rerouted to a
+ * different gateway or subscription.
+ *
+ * An auto-resolved `defaultProviderId` is NOT the same thing.
+ * `resolveDefaultProviderId()` always falls back to the first enabled provider,
+ * so every installation has one — treating that as a pin silently disables the
+ * pool for everyone, including multi-account setups that rely on round-robin to
+ * spread quota and to route around an account that hit its limit. When no Agent
+ * asked for a specific configuration and more than one provider is enabled,
+ * fall through to the pool.
+ *
+ * Every decision derived from "is selection pinned?" must call this, or the
+ * sites disagree: selection would rotate while failure handling still treats
+ * the provider as pinned (and therefore terminal).
+ */
+function resolvePinnedModelConfigId(
+  modelConfigId?: string | null,
+): string | null {
+  if (modelConfigId) return modelConfigId;
+  if (getEnabledProviders().length > 1) return null;
+  return getDefaultProviderId();
+}
+
+/**
  * Read-only prediction of whether the next provider selection will *clear* the
  * resumable Claude session because it has to switch away from the bound
  * provider (the binding is unhealthy or no longer enabled). Mirrors the
@@ -773,7 +801,7 @@ export function willClearSessionOnProviderSwitch(
   agentId?: string | null,
   modelConfigId?: string | null,
 ): boolean {
-  const selectedModelConfigId = modelConfigId ?? getDefaultProviderId();
+  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
   const boundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
     return !!boundId && boundId !== selectedModelConfigId;
@@ -834,7 +862,7 @@ export function trySelectPoolProvider(
   previousProviderId?: string;
   resetSession?: boolean;
 } | null {
-  const selectedModelConfigId = modelConfigId ?? getDefaultProviderId();
+  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
     // Agent/default selection is authoritative. Workspace credentials must
@@ -1693,8 +1721,8 @@ export async function runContainerAgent(
   );
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
-  const modelSelectionPinned = !!(
-    input.agentProfile?.modelConfigId ?? getDefaultProviderId()
+  const modelSelectionPinned = !!resolvePinnedModelConfigId(
+    input.agentProfile?.modelConfigId,
   );
   let providerFailureReported = false;
   let providerFailureTerminal: boolean | undefined;
@@ -2523,8 +2551,8 @@ export async function runHostAgent(
     input.agentProfile?.modelConfigId,
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
-  const hostModelSelectionPinned = !!(
-    input.agentProfile?.modelConfigId ?? getDefaultProviderId()
+  const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
+    input.agentProfile?.modelConfigId,
   );
   const globalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
@@ -3146,10 +3174,12 @@ export async function runAgentWithModelFallback(
 ): Promise<ContainerOutput> {
   // A top-level Agent owns exactly one complete model configuration. Retrying
   // through other enabled configurations would violate that contract and can
-  // send a Workspace to a different gateway or official subscription. Keep
-  // the old pool fallback only for an unmigrated/no-model installation.
-  const selectedModelConfigId =
-    input.agentProfile?.modelConfigId ?? getDefaultProviderId();
+  // send a Workspace to a different gateway or official subscription. An
+  // auto-resolved default is not such a contract, so a multi-provider pool
+  // still retries across its members (see resolvePinnedModelConfigId).
+  const selectedModelConfigId = resolvePinnedModelConfigId(
+    input.agentProfile?.modelConfigId,
+  );
   const maxAttempts = selectedModelConfigId
     ? 1
     : Math.max(1, getEnabledProviders().length);
