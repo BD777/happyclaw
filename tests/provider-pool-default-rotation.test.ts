@@ -19,6 +19,7 @@ vi.mock('../src/logger.js', () => ({
 const runtimeConfig = await import('../src/runtime-config.js');
 const db = await import('../src/db.js');
 const { trySelectPoolProvider } = await import('../src/container-runner.js');
+const { providerPool } = await import('../src/provider-pool.js');
 
 beforeAll(() => {
   fs.mkdirSync(path.join(root, 'db'), { recursive: true });
@@ -91,5 +92,46 @@ describe('default model configuration vs. balancing pool', () => {
     expect(result?.profileId).toBe(created[0]);
     runtimeConfig.setProviderEnabled(created[1], true);
     runtimeConfig.setProviderEnabled(created[2], true);
+  });
+
+  /**
+   * A sticky binding quarantined long ago must be reused once the recovery
+   * interval has elapsed. selectProvider() applies the time-based recovery
+   * rule internally, but the sticky-health read happens before that call, so
+   * without an explicit refresh a long-idle group keeps switching away from a
+   * provider that recovered ages ago — clearing the session and reinjecting
+   * history for nothing.
+   */
+  test('sticky binding is reused after the recovery interval expires', () => {
+    vi.useFakeTimers();
+    try {
+      // failover makes the no-sticky fallback deterministic: it would always
+      // pick created[0], so reuse of created[2] can only come from stickiness.
+      runtimeConfig.saveBalancingConfig({
+        strategy: 'failover',
+        recoveryIntervalMs: 300_000,
+      });
+
+      db.setSessionProviderId('sticky-quarantine-group', null, created[2]);
+      providerPool.reportFailure(created[2], true);
+
+      const during = trySelectPoolProvider(
+        'sticky-quarantine-group',
+        null,
+        null,
+      );
+      expect(during?.profileId).toBe(created[0]);
+      expect(during?.resetSession).toBe(true);
+
+      db.setSessionProviderId('sticky-recovered-group', null, created[2]);
+      vi.setSystemTime(Date.now() + 300_000 + 1);
+
+      const after = trySelectPoolProvider('sticky-recovered-group', null, null);
+      expect(after?.profileId).toBe(created[2]);
+      expect(after?.resetSession ?? false).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      runtimeConfig.saveBalancingConfig({ strategy: 'round-robin' });
+    }
   });
 });

@@ -837,6 +837,10 @@ export function willClearSessionOnProviderSwitch(
   // different healthy provider → reset.
   const balancing = getBalancingConfig();
   providerPool.refreshFromConfig(enabledProviders, balancing);
+  // Keep the prediction in lockstep with trySelectPoolProvider: apply the
+  // time-based recovery rule before reading health, or an expired quarantine
+  // predicts a switch that the actual selection no longer performs.
+  providerPool.refreshRecoveryState();
   return !providerPool.getHealthStatus(boundId).healthy;
 }
 
@@ -903,6 +907,11 @@ export function trySelectPoolProvider(
   if (enabledProviders.length === 0) return null;
   const balancing = getBalancingConfig();
   providerPool.refreshFromConfig(enabledProviders, balancing);
+  // The sticky-health read below must see the same time-based recovery that
+  // selectProvider() applies internally. Without this, a binding quarantined
+  // long ago (idle group, no intervening selections) still reads as unhealthy
+  // and forces a needless provider switch + session reset + history reinjection.
+  providerPool.refreshRecoveryState();
   const boundId = existingBoundId;
 
   // Sticky path: respect previous session→provider binding when the bound

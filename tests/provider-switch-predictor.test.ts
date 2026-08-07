@@ -155,4 +155,22 @@ describe('willClearSessionOnProviderSwitch', () => {
     providerPool.reportFailure('A', true);
     expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
   });
+
+  test('a quarantine that outlived the recovery interval no longer predicts a switch', () => {
+    // Incident shape (2026-08-07 14:06): binding quarantined at 12:39, group
+    // idle for 87 minutes, next turn still read the stale unhealthy flag and
+    // cleared the session even though the 5-minute recovery had long expired.
+    vi.useFakeTimers();
+    try {
+      setProviders('A', 'B');
+      mocks.boundId = 'A';
+      providerPool.reportFailure('A', true);
+      expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
+
+      vi.setSystemTime(Date.now() + 300_000 + 1);
+      expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
