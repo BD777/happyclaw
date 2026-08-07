@@ -309,6 +309,12 @@ export interface ContainerOutput {
    */
   providerRateLimitResetsAt?: number;
   /**
+   * Upstream limit text captured when a provider failure was raised by a model
+   * wall. The host shows it instead of the generic pool notice, but only after
+   * every account is exhausted.
+   */
+  providerFailureNotice?: string;
+  /**
    * Set by the host after it quarantines the failed provider and checks the
    * remaining pool. The agent runner itself only emits providerFailure.
    */

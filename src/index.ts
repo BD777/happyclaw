@@ -7705,18 +7705,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               resetIdleTimer();
               return;
             }
+            // A model wall carries the upstream limit text; it is only
+            // shown once no account in the pool can serve the turn.
+            const terminalNotice =
+              result.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE;
             const terminalGroupFailureDurable =
               await projectCurrentScheduledGroupTerminal(
                 'failed',
-                PROVIDER_FAILURE_USER_NOTICE,
+                terminalNotice,
               );
             // The dedicated scheduled-task failure projection is richer and
             // stable across replay. Suppress the generic provider notice only
             // when that exact run has been durably projected or queued for
             // workspace retry.
-            result.result = terminalGroupFailureDurable
-              ? null
-              : PROVIDER_FAILURE_USER_NOTICE;
+            result.result = terminalGroupFailureDurable ? null : terminalNotice;
             logger.warn(
               {
                 group: group.name,
@@ -15732,7 +15734,8 @@ async function processAgentConversation(
         resetIdleTimer();
         return;
       }
-      output.result = PROVIDER_FAILURE_USER_NOTICE;
+      output.result =
+        output.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE;
       logger.warn(
         {
           chatJid,

@@ -54,7 +54,18 @@ describe('provider fallback source contracts', () => {
       'PROVIDER_FALLBACK_MODELS.activeModelOverride',
     );
     expect(agentRunner).toContain('providerFailureRetrying: true');
-    expect(agentRunner).toContain('terminalModelLimitFailure: true');
+    // Per-model quotas are per account: a walled model tier says nothing about
+    // the other accounts' budget for the same model. Exhausting every tier on
+    // this profile must hand it back to the host pool for failover rather than
+    // dead-ending the turn inside the runner.
+    expect(agentRunner).not.toContain('terminalModelLimitFailure');
+    expect(agentRunner).not.toContain('publishTerminalModelLimitFailure');
+    expect(agentRunner).toContain(
+      'Model tiers exhausted on this account; quarantining profile for failover',
+    );
+    expect(agentRunner).toMatch(
+      /publishProviderAccountFailure\(\s*'rate_limit',\s*info\.resetsAt,\s*MODEL_LIMIT_EXHAUSTED_NOTICE,/,
+    );
     expect(agentRunner).not.toContain('pendingRejectedRateLimit');
   });
 
@@ -149,7 +160,14 @@ describe('provider fallback source contracts', () => {
     expect(taskScheduler).toContain(
       'streamedOutput.providerFailureTerminal === true',
     );
-    expect(taskScheduler).toContain('error = PROVIDER_FAILURE_USER_NOTICE');
+    // The upstream limit text, when the runner captured one, replaces the
+    // generic pool notice — but only on the terminal projection.
+    expect(taskScheduler).toContain(
+      'error = output.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE',
+    );
+    expect(taskScheduler).toMatch(
+      /streamedOutput\.providerFailureNotice \|\|\s*PROVIDER_FAILURE_USER_NOTICE/,
+    );
     expect(hostRunner).toContain(
       'Scheduled task provider failed; retrying the same prompt on another provider',
     );
