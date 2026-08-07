@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   },
   boundId: undefined as string | undefined,
   defaultProviderId: null as string | null,
+  strategy: 'failover' as 'round-robin' | 'weighted-round-robin' | 'failover',
 }));
 
 vi.mock('../src/logger.js', () => ({
@@ -35,7 +36,7 @@ vi.mock('../src/runtime-config.js', async () => {
     getDefaultProviderId: () => mocks.defaultProviderId,
     getContainerEnvConfig: () => mocks.envOverride,
     getBalancingConfig: () => ({
-      strategy: 'round-robin' as const,
+      strategy: mocks.strategy,
       unhealthyThreshold: 3,
       recoveryIntervalMs: 300_000,
     }),
@@ -58,7 +59,7 @@ const { providerPool } = await import('../src/provider-pool.ts');
 function setProviders(...ids: string[]) {
   mocks.enabledProviders = ids.map((id) => ({ id, enabled: true, weight: 1 }));
   providerPool.refreshFromConfig(mocks.enabledProviders, {
-    strategy: 'round-robin',
+    strategy: mocks.strategy,
     unhealthyThreshold: 3,
     recoveryIntervalMs: 300_000,
   });
@@ -70,6 +71,9 @@ beforeEach(() => {
   mocks.envOverride = {};
   mocks.boundId = undefined;
   mocks.defaultProviderId = null;
+  // Stickiness is a property of the failover strategy. The round-robin
+  // strategies rotate on every request, so they are asserted separately.
+  mocks.strategy = 'failover';
 });
 
 /**
@@ -89,6 +93,17 @@ describe('willClearSessionOnProviderSwitch', () => {
     setProviders('A', 'B');
     mocks.boundId = 'A';
     expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
+  });
+
+  test('rotating strategies predict a switch even on a healthy binding', () => {
+    // round-robin/weighted-round-robin move accounts on every request, so the
+    // bound session will be cleared next turn and needs its history injected.
+    for (const strategy of ['round-robin', 'weighted-round-robin'] as const) {
+      mocks.strategy = strategy;
+      setProviders('A', 'B');
+      mocks.boundId = 'A';
+      expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
+    }
   });
 
   test('true when the bound provider is unhealthy (will switch away)', () => {

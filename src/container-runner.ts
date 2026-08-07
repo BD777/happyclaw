@@ -45,7 +45,7 @@ import {
   writeCredentialsFile,
 } from './runtime-config.js';
 import { providerPool } from './provider-pool.js';
-import { resolveProviderFailureDisposition } from './provider-failure.js';
+import type { ProviderTier } from './provider-pool.js';
 import {
   issueWorkspaceMemoryWriteCapability,
   revokeWorkspaceMemoryWriteCapability,
@@ -454,6 +454,14 @@ export interface ContainerOutput {
    */
   providerFailureNotice?: string;
   /**
+   * Whether the rejection walled the whole account or just one model tier.
+   * Model-scope walls quarantine the (account, model) pair only: the account's
+   * other tiers and every other account's budget for this model stay usable.
+   */
+  providerRateLimitScope?: 'account' | 'model';
+  /** The model that was actually in use when the limit was reported. */
+  providerRateLimitModel?: string;
+  /**
    * Host-derived terminal boundary. False means the durable input must be
    * replayed on another healthy provider; true means the pool is exhausted.
    */
@@ -489,6 +497,57 @@ export interface ContainerOutput {
   }>;
 }
 
+/**
+ * Record one provider failure at the right granularity.
+ *
+ * A model-scope wall must not take the whole account out of rotation: its
+ * other tiers, and every other account's budget for the same model, are
+ * independent quotas. Only account-scope failures quarantine the profile.
+ */
+function quarantineFromOutput(
+  profileId: string,
+  output: Pick<
+    ContainerOutput,
+    | 'providerRateLimitScope'
+    | 'providerRateLimitModel'
+    | 'providerRateLimitResetsAt'
+  >,
+): void {
+  // Fail safe: a model-scope report with no model name cannot be recorded as a
+  // tier quarantine, and silently dropping it would let the same failing pair
+  // be selected forever. Degrade to an account-scope quarantine instead.
+  if (
+    output.providerRateLimitScope === 'model' &&
+    output.providerRateLimitModel?.trim()
+  ) {
+    providerPool.reportModelFailure(
+      profileId,
+      output.providerRateLimitModel,
+      output.providerRateLimitResetsAt,
+    );
+    return;
+  }
+  providerPool.reportFailure(profileId, true, output.providerRateLimitResetsAt);
+}
+
+/**
+ * Whether any (account, model tier) pair can still serve a turn.
+ *
+ * This is the terminal boundary for the whole pool. Account health alone is no
+ * longer sufficient: an account can be healthy yet quarantined on every tier
+ * it could run, and a failing account can still serve its fallback tier.
+ */
+function poolCanStillServe(): boolean {
+  const enabled = getEnabledProviders();
+  if (enabled.length === 0) return false;
+  const primaryTier = new Map(
+    enabled.map((p) => [p.id, p.anthropicModel || '']),
+  );
+  if (providerPool.hasCandidateForTier(primaryTier)) return true;
+  const fallbackModel = getSystemSettings().fallbackModel?.trim();
+  return !!fallbackModel && providerPool.hasCandidateForTier(fallbackModel);
+}
+
 function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
@@ -496,11 +555,12 @@ function applyProviderFailureDisposition(
 ): boolean {
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
+  // Ask the pool across both dimensions. A model wall leaves the account
+  // healthy but unable to serve that tier, and an account wall leaves other
+  // accounts' tiers untouched — neither is expressible in account health
+  // alone, which is all resolveProviderFailureDisposition() can see.
   const disposition = allowFailover
-    ? resolveProviderFailureDisposition(
-        selectedProfileId,
-        providerPool.getHealthStatuses(),
-      )
+    ? { terminal: !(selectedProfileId !== null && poolCanStillServe()) }
     : { terminal: true };
   applyKnownProviderFailureDisposition(output, disposition.terminal);
   return disposition.terminal;
@@ -785,6 +845,35 @@ function getAgentProfileMcpPolicyMode(
  * sites disagree: selection would rotate while failure handling still treats
  * the provider as pinned (and therefore terminal).
  */
+/**
+ * Pick the model tier this turn should run on.
+ *
+ * Per-model quotas are per account, so the pool drains the primary tier —
+ * each account's own configured model — across *every* account before any
+ * account escalates to the system fallback tier. Returns the model to force
+ * for the escalated tier, or null to keep each provider's configured model.
+ */
+function resolvePoolTierModel(
+  enabledProviders: Array<{ id: string; anthropicModel: string }>,
+): string | null {
+  const primaryTier = new Map(
+    enabledProviders.map((p) => [p.id, p.anthropicModel || '']),
+  );
+  if (providerPool.hasCandidateForTier(primaryTier)) return null;
+
+  const fallbackModel = getSystemSettings().fallbackModel?.trim();
+  if (fallbackModel && providerPool.hasCandidateForTier(fallbackModel)) {
+    logger.info(
+      { fallbackModel },
+      'Primary model tier exhausted across every account; escalating the pool to the fallback tier',
+    );
+    return fallbackModel;
+  }
+  // Nothing left anywhere — keep the primary tier so the failure surfaces
+  // against the configured model rather than a surprise substitute.
+  return null;
+}
+
 function resolvePinnedModelConfigId(
   modelConfigId?: string | null,
 ): string | null {
@@ -849,6 +938,11 @@ export function willClearSessionOnProviderSwitch(
   // different healthy provider → reset.
   const balancing = getBalancingConfig();
   providerPool.refreshFromConfig(enabledProviders, balancing);
+  // The round-robin strategies rotate on every request, so a bound session is
+  // very likely to move to a different account next turn. Predicting a switch
+  // is the conservative side of this call: a false positive only injects
+  // recent history the fresh session would otherwise be missing.
+  if (providerPool.rotatesPerRequest) return true;
   // Keep the prediction in lockstep with trySelectPoolProvider: apply the
   // time-based recovery rule before reading health, or an expired quarantine
   // predicts a switch that the actual selection no longer performs.
@@ -877,6 +971,11 @@ export function trySelectPoolProvider(
   resolved: ResolvedProvider;
   previousProviderId?: string;
   resetSession?: boolean;
+  /**
+   * Set when the pool escalated past the primary tier: every account had its
+   * configured model walled, so this turn must run on the fallback model.
+   */
+  modelOverride?: string;
 } | null {
   const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
@@ -926,10 +1025,19 @@ export function trySelectPoolProvider(
   providerPool.refreshRecoveryState();
   const boundId = existingBoundId;
 
+  // Which model tier this turn should run on. Every account holds an
+  // independent per-model quota, so the pool drains the primary tier across
+  // *all* accounts before any account escalates to the system fallback tier.
+  const tierModel = resolvePoolTierModel(enabledProviders);
+  const tier: ProviderTier =
+    tierModel ??
+    new Map(enabledProviders.map((p) => [p.id, p.anthropicModel || '']));
+
   // Sticky path: respect previous session→provider binding when the bound
-  // provider is still enabled. Skip when only one provider exists (single
-  // provider already gives stickiness implicitly).
-  if (enabledProviders.length > 1) {
+  // provider is still enabled. Only the failover strategy is sticky — the
+  // round-robin strategies are expected to rotate on every request, so a
+  // binding must not pin them to one account.
+  if (enabledProviders.length > 1 && !providerPool.rotatesPerRequest) {
     if (boundId && enabledProviders.some((p) => p.id === boundId)) {
       const boundHealth = providerPool.getHealthStatus(boundId);
       if (!boundHealth.healthy) {
@@ -979,6 +1087,7 @@ export function trySelectPoolProvider(
         resolved: { config: resolved.config, customEnv: resolved.customEnv },
         previousProviderId: boundId,
         resetSession: !!boundId && boundId !== enabledProviders[0].id,
+        ...(tierModel ? { modelOverride: tierModel } : {}),
       };
     } catch {
       return null;
@@ -986,7 +1095,7 @@ export function trySelectPoolProvider(
   }
 
   try {
-    const profileId = providerPool.selectProvider();
+    const profileId = providerPool.selectProvider(tier);
     const resolved = resolveProviderById(profileId);
     providerPool.acquireSession(profileId);
     setSessionProviderId(groupFolder, agentId, profileId);
@@ -995,6 +1104,7 @@ export function trySelectPoolProvider(
       resolved: { config: resolved.config, customEnv: resolved.customEnv },
       previousProviderId: boundId,
       resetSession: !!boundId && boundId !== profileId,
+      ...(tierModel ? { modelOverride: tierModel } : {}),
     };
   } catch (err) {
     logger.warn(
@@ -1032,6 +1142,29 @@ export function prepareHostPlugins(
   // failure paths: a partial materialize still wants the cache rebuilt.
   invalidateUserCommandIndex(ownerId);
   return loadUserPlugins(ownerId, { runtime: 'host' });
+}
+
+/**
+ * Apply the pool's chosen model tier to a runner environment.
+ *
+ * With more than one account enabled the *pool* owns tier escalation: the
+ * primary tier must be drained across every account before anything moves to
+ * the fallback model. The runner's own in-process fallback would short-circuit
+ * that by jumping to the fallback tier on the current account first, so it is
+ * only handed over for single-account installs.
+ */
+export function resolvePoolTierEnv(
+  modelOverride: string | undefined,
+  enabledProviderCount: number,
+  configuredFallbackModel = getSystemSettings().fallbackModel,
+): { model?: string; runnerFallbackModel?: string } {
+  const fallbackModel = configuredFallbackModel?.trim();
+  return {
+    ...(modelOverride ? { model: modelOverride } : {}),
+    ...(enabledProviderCount <= 1 && fallbackModel
+      ? { runnerFallbackModel: fallbackModel }
+      : {}),
+  };
 }
 
 /** Inject the globally configured same-turn fallback into the agent runner. */
@@ -1149,6 +1282,8 @@ export function buildVolumeMounts(
   ipcAgentId?: string,
   agentProfile?: RunnerAgentProfile,
   channelContext?: ChannelTurnContext,
+  /** Set when the pool escalated past the primary model tier for this turn. */
+  poolModelOverride?: string,
 ): VolumeMount[] {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -1451,7 +1586,17 @@ export function buildVolumeMounts(
   if (mcpPolicyMode !== 'inherit') {
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
-  applyFallbackModelToEnvLines(envLines);
+  const containerTierEnv = resolvePoolTierEnv(
+    poolModelOverride,
+    getEnabledProviders().length,
+  );
+  applyFallbackModelToEnvLines(envLines, containerTierEnv.runnerFallbackModel);
+  if (containerTierEnv.model) {
+    for (let i = envLines.length - 1; i >= 0; i--) {
+      if (envLines[i].startsWith('ANTHROPIC_MODEL=')) envLines.splice(i, 1);
+    }
+    envLines.push(`ANTHROPIC_MODEL=${containerTierEnv.model}`);
+  }
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
@@ -1797,6 +1942,7 @@ export async function runContainerAgent(
       input.agentId,
       input.agentProfile,
       input.channelContext,
+      poolResult?.modelOverride,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
@@ -2004,11 +2150,7 @@ export async function runContainerAgent(
               if (output.providerFailure && selectedProfileId) {
                 if (!providerFailureReported) {
                   providerFailureReported = true;
-                  providerPool.reportFailure(
-                    selectedProfileId,
-                    true,
-                    output.providerRateLimitResetsAt,
-                  );
+                  quarantineFromOutput(selectedProfileId, output);
                   logger.warn(
                     {
                       group: group.name,
@@ -2025,11 +2167,7 @@ export async function runContainerAgent(
             if (output.providerFailure && selectedProfileId) {
               if (!providerFailureReported) {
                 providerFailureReported = true;
-                providerPool.reportFailure(
-                  selectedProfileId,
-                  true,
-                  output.providerRateLimitResetsAt,
-                );
+                quarantineFromOutput(selectedProfileId, output);
                 logger.warn(
                   {
                     group: group.name,
@@ -2190,18 +2328,17 @@ export async function runContainerAgent(
     if (selectedProfileId) {
       if (result.providerFailure) {
         if (!providerFailureReported) {
-          providerPool.reportFailure(
-            selectedProfileId,
-            true,
-            result.providerRateLimitResetsAt,
-          );
+          quarantineFromOutput(selectedProfileId, result);
           providerFailureReported = true;
         }
       } else if (
         !providerFailureReported &&
         (result.status === 'success' || result.status === 'closed')
       ) {
-        providerPool.reportSuccess(selectedProfileId);
+        providerPool.reportSuccess(
+          selectedProfileId,
+          result.providerRateLimitModel,
+        );
       } else if (result.status === 'error' && isApiError(result.error || '')) {
         providerPool.reportFailure(selectedProfileId);
       }
@@ -2647,12 +2784,16 @@ export async function runHostAgent(
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }
-    const fallbackModel = getSystemSettings().fallbackModel?.trim();
-    if (fallbackModel) {
-      hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = fallbackModel;
+    const tierEnv = resolvePoolTierEnv(
+      hostPoolResult?.modelOverride,
+      getEnabledProviders().length,
+    );
+    if (tierEnv.runnerFallbackModel) {
+      hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = tierEnv.runnerFallbackModel;
     } else {
       delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
     }
+    if (tierEnv.model) hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
 
     // Third-party provider: unless this provider explicitly injects
     // ANTHROPIC_AUTH_TOKEN (Bearer proxy mode), remove any inherited host token
@@ -2965,11 +3106,7 @@ export async function runHostAgent(
               if (output.providerFailure && hostSelectedProfileId) {
                 if (!hostProviderFailureReported) {
                   hostProviderFailureReported = true;
-                  providerPool.reportFailure(
-                    hostSelectedProfileId,
-                    true,
-                    output.providerRateLimitResetsAt,
-                  );
+                  quarantineFromOutput(hostSelectedProfileId, output);
                   logger.warn(
                     {
                       group: group.name,
@@ -2986,11 +3123,7 @@ export async function runHostAgent(
             if (output.providerFailure && hostSelectedProfileId) {
               if (!hostProviderFailureReported) {
                 hostProviderFailureReported = true;
-                providerPool.reportFailure(
-                  hostSelectedProfileId,
-                  true,
-                  output.providerRateLimitResetsAt,
-                );
+                quarantineFromOutput(hostSelectedProfileId, output);
                 logger.warn(
                   {
                     group: group.name,
@@ -3129,18 +3262,17 @@ export async function runHostAgent(
     if (hostSelectedProfileId) {
       if (hostResult.providerFailure) {
         if (!hostProviderFailureReported) {
-          providerPool.reportFailure(
-            hostSelectedProfileId,
-            true,
-            hostResult.providerRateLimitResetsAt,
-          );
+          quarantineFromOutput(hostSelectedProfileId, hostResult);
           hostProviderFailureReported = true;
         }
       } else if (
         !hostProviderFailureReported &&
         (hostResult.status === 'success' || hostResult.status === 'closed')
       ) {
-        providerPool.reportSuccess(hostSelectedProfileId);
+        providerPool.reportSuccess(
+          hostSelectedProfileId,
+          hostResult.providerRateLimitModel,
+        );
       } else if (
         hostResult.status === 'error' &&
         isApiError(hostResult.error || '')

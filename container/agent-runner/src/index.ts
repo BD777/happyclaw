@@ -1882,6 +1882,7 @@ async function runQueryAttempt(
     error: SDKAssistantMessageError,
     rateLimitResetsAt?: number,
     failureNotice?: string,
+    rateLimitScope: 'account' | 'model' = 'account',
   ): void => {
     if (providerFailurePublished) return;
     providerFailurePublished = true;
@@ -1899,6 +1900,10 @@ async function runQueryAttempt(
         ? { providerRateLimitResetsAt: rateLimitResetsAt }
         : {}),
       ...(failureNotice ? { providerFailureNotice: failureNotice } : {}),
+      providerRateLimitScope: rateLimitScope,
+      providerRateLimitModel:
+        PROVIDER_FALLBACK_MODELS.activeModelOverride ||
+        CLAUDE_PROVIDER_RUNTIME.model,
       ...(!emitOutput ? { providerFailureMaintenance: true } : {}),
       finalizationReason: 'error',
       ...(emitOutput && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
@@ -2854,6 +2859,7 @@ async function runQueryAttempt(
             'rate_limit',
             info.resetsAt,
             MODEL_LIMIT_EXHAUSTED_NOTICE,
+            'model',
           );
           processor.discardPendingTextOutput();
           processor.cleanup();
@@ -3328,6 +3334,7 @@ async function runQueryAttempt(
             'rate_limit',
             undefined,
             textResult?.trim() || MODEL_LIMIT_EXHAUSTED_NOTICE,
+            'model',
           );
           emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           assistantBatchFlushedSinceLastResult = false;

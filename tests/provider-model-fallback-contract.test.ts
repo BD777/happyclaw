@@ -105,15 +105,23 @@ describe('provider fallback source contracts', () => {
       hostRunner.match(/applyProviderFailureDisposition\(/g)?.length,
     ).toBeGreaterThanOrEqual(5);
     expect(hostRunner).toMatch(
-      /providerPool\.reportFailure\(\s*selectedProfileId,\s*true,[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
+      /quarantineFromOutput\(selectedProfileId, output\);[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
     );
     expect(hostRunner).toMatch(
-      /providerPool\.reportFailure\(\s*hostSelectedProfileId,\s*true,[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
+      /quarantineFromOutput\(hostSelectedProfileId, output\);[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
     );
-    // The upstream reset stamp must reach the pool, or an account-scope limit
-    // re-enters rotation after recoveryIntervalMs and burns a turn per cycle.
+    // Quarantine granularity must follow the reported scope: a model wall may
+    // never take the whole account out of rotation, and the upstream reset
+    // stamp must reach the pool so the pair is not resurrected early.
+    expect(hostRunner).toContain("output.providerRateLimitScope === 'model'");
+    expect(hostRunner).toContain('providerPool.reportModelFailure(');
     expect(hostRunner).toMatch(
-      /providerPool\.reportFailure\(\s*hostSelectedProfileId,\s*true,\s*output\.providerRateLimitResetsAt,/,
+      /providerPool\.reportFailure\(profileId, true, output\.providerRateLimitResetsAt\)/,
+    );
+    // The terminal boundary spans both dimensions, not account health alone.
+    expect(hostRunner).toContain('poolCanStillServe()');
+    expect(hostRunner).toMatch(
+      /hasCandidateForTier\(primaryTier\)[\s\S]*?hasCandidateForTier\(fallbackModel\)/,
     );
     expect(agentRunner).toContain(
       "publishProviderAccountFailure('rate_limit', info.resetsAt)",
