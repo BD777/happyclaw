@@ -189,6 +189,85 @@ describe('buildContainerArgs identity contract', () => {
   });
 });
 
+describe('buildContainerArgs proxy forwarding', () => {
+  const identity = { mode: 'unknown' } as const;
+  const noProxy = { httpsProxy: '', httpProxy: '', noProxy: '' };
+
+  test('forwards nothing when no proxy is configured', () => {
+    const args = buildContainerArgs(
+      mounts,
+      'proxy-test',
+      'UTC',
+      identity,
+      noProxy,
+    );
+    expect(
+      envArgs(args).some(
+        (arg) =>
+          arg.startsWith('HTTPS_PROXY=') ||
+          arg.startsWith('HTTP_PROXY=') ||
+          arg.startsWith('NO_PROXY='),
+      ),
+    ).toBe(false);
+    expect(args).not.toContain('--add-host');
+  });
+
+  test('rewrites a 127.0.0.1 proxy to host.docker.internal and adds host-gateway', () => {
+    const args = buildContainerArgs(mounts, 'proxy-test', 'UTC', identity, {
+      httpsProxy: 'http://127.0.0.1:20174',
+      httpProxy: 'http://127.0.0.1:20174',
+      noProxy: '',
+    });
+    expect(envArgs(args)).toEqual(
+      expect.arrayContaining([
+        'HTTPS_PROXY=http://host.docker.internal:20174/',
+        'HTTP_PROXY=http://host.docker.internal:20174/',
+      ]),
+    );
+    const addHostIndex = args.indexOf('--add-host');
+    expect(addHostIndex).toBeGreaterThan(-1);
+    expect(args[addHostIndex + 1]).toBe('host.docker.internal:host-gateway');
+  });
+
+  test('rewrites a localhost proxy to host.docker.internal', () => {
+    const args = buildContainerArgs(mounts, 'proxy-test', 'UTC', identity, {
+      httpsProxy: 'http://localhost:8080',
+      httpProxy: 'http://localhost:8080',
+      noProxy: '',
+    });
+    expect(envArgs(args)).toEqual(
+      expect.arrayContaining([
+        'HTTPS_PROXY=http://host.docker.internal:8080/',
+        'HTTP_PROXY=http://host.docker.internal:8080/',
+      ]),
+    );
+  });
+
+  test('passes a non-loopback proxy through unchanged without host-gateway', () => {
+    const args = buildContainerArgs(mounts, 'proxy-test', 'UTC', identity, {
+      httpsProxy: 'http://10.0.0.5:8080',
+      httpProxy: 'http://10.0.0.5:8080',
+      noProxy: '',
+    });
+    expect(envArgs(args)).toEqual(
+      expect.arrayContaining([
+        'HTTPS_PROXY=http://10.0.0.5:8080',
+        'HTTP_PROXY=http://10.0.0.5:8080',
+      ]),
+    );
+    expect(args).not.toContain('--add-host');
+  });
+
+  test('forwards NO_PROXY verbatim alongside a configured proxy', () => {
+    const args = buildContainerArgs(mounts, 'proxy-test', 'UTC', identity, {
+      httpsProxy: 'http://127.0.0.1:20174',
+      httpProxy: 'http://127.0.0.1:20174',
+      noProxy: 'localhost,127.0.0.1',
+    });
+    expect(envArgs(args)).toContain('NO_PROXY=localhost,127.0.0.1');
+  });
+});
+
 describe('entrypoint permission contract', () => {
   const dockerfile = fs.readFileSync(
     path.join(repoRoot, 'container', 'Dockerfile'),

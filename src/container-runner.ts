@@ -1655,11 +1655,26 @@ function rewriteLoopbackProxyForContainer(url: string): string {
   }
 }
 
+export interface ContainerProxyConfig {
+  httpsProxy: string;
+  httpProxy: string;
+  noProxy: string;
+}
+
+function defaultContainerProxyConfig(): ContainerProxyConfig {
+  return {
+    httpsProxy: CONTAINER_HTTPS_PROXY,
+    httpProxy: CONTAINER_HTTP_PROXY,
+    noProxy: CONTAINER_NO_PROXY,
+  };
+}
+
 export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   tz: string,
   hostIdentity: ContainerHostIdentity = detectContainerHostIdentity(),
+  proxyConfig: ContainerProxyConfig = defaultContainerProxyConfig(),
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -1680,9 +1695,9 @@ export function buildContainerArgs(
   // agent-runner changes needed. A loopback proxy address is rewritten to
   // host.docker.internal: the container has its own network namespace, so
   // 127.0.0.1 inside it refers to the container itself, not the host.
-  if (CONTAINER_HTTPS_PROXY) {
-    const httpsProxy = rewriteLoopbackProxyForContainer(CONTAINER_HTTPS_PROXY);
-    const httpProxy = rewriteLoopbackProxyForContainer(CONTAINER_HTTP_PROXY);
+  if (proxyConfig.httpsProxy) {
+    const httpsProxy = rewriteLoopbackProxyForContainer(proxyConfig.httpsProxy);
+    const httpProxy = rewriteLoopbackProxyForContainer(proxyConfig.httpProxy);
     if (
       httpsProxy.includes('host.docker.internal') ||
       httpProxy.includes('host.docker.internal')
@@ -1691,8 +1706,8 @@ export function buildContainerArgs(
     }
     args.push('-e', `HTTPS_PROXY=${httpsProxy}`);
     args.push('-e', `HTTP_PROXY=${httpProxy}`);
-    if (CONTAINER_NO_PROXY) {
-      args.push('-e', `NO_PROXY=${CONTAINER_NO_PROXY}`);
+    if (proxyConfig.noProxy) {
+      args.push('-e', `NO_PROXY=${proxyConfig.noProxy}`);
     }
   }
 
