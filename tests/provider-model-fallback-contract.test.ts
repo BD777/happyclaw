@@ -94,10 +94,18 @@ describe('provider fallback source contracts', () => {
       hostRunner.match(/applyProviderFailureDisposition\(/g)?.length,
     ).toBeGreaterThanOrEqual(5);
     expect(hostRunner).toMatch(
-      /providerPool\.reportFailure\(selectedProfileId, true\);[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
+      /providerPool\.reportFailure\(\s*selectedProfileId,\s*true,[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
     );
     expect(hostRunner).toMatch(
-      /providerPool\.reportFailure\(hostSelectedProfileId, true\);[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
+      /providerPool\.reportFailure\(\s*hostSelectedProfileId,\s*true,[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
+    );
+    // The upstream reset stamp must reach the pool, or an account-scope limit
+    // re-enters rotation after recoveryIntervalMs and burns a turn per cycle.
+    expect(hostRunner).toMatch(
+      /providerPool\.reportFailure\(\s*hostSelectedProfileId,\s*true,\s*output\.providerRateLimitResetsAt,/,
+    );
+    expect(agentRunner).toContain(
+      "publishProviderAccountFailure('rate_limit', info.resetsAt)",
     );
     expect(hostRunner).toMatch(
       /providerPool\.refreshFromConfig\([\s\S]*?providerPool\.refreshRecoveryState\(\)/,

@@ -1871,6 +1871,7 @@ async function runQueryAttempt(
   let providerFailurePublished = false;
   const publishProviderAccountFailure = (
     error: SDKAssistantMessageError,
+    rateLimitResetsAt?: number,
   ): void => {
     if (providerFailurePublished) return;
     providerFailurePublished = true;
@@ -1883,6 +1884,10 @@ async function runQueryAttempt(
       result: null,
       newSessionId,
       providerFailure: true,
+      ...(typeof rateLimitResetsAt === 'number' &&
+      Number.isFinite(rateLimitResetsAt)
+        ? { providerRateLimitResetsAt: rateLimitResetsAt }
+        : {}),
       ...(!emitOutput ? { providerFailureMaintenance: true } : {}),
       finalizationReason: 'error',
       ...(emitOutput && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
@@ -2773,9 +2778,11 @@ async function runQueryAttempt(
           });
           if (limitDecision.action === 'provider_failure') {
             log(
-              `Account rate limit rejected (${info.rateLimitType ?? 'unknown'}); marking provider unhealthy immediately`,
+              `Account rate limit rejected (${info.rateLimitType ?? 'unknown'}, resetsAt=${
+                info.resetsAt ?? 'none'
+              }); marking provider unhealthy immediately`,
             );
-            publishProviderAccountFailure('rate_limit');
+            publishProviderAccountFailure('rate_limit', info.resetsAt);
             processor.discardPendingTextOutput();
             processor.cleanup();
             assistantTextTracker.reset();

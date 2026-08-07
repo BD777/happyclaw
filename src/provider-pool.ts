@@ -22,6 +22,13 @@ export interface ProviderHealthStatus {
   lastErrorAt: number | null;
   lastSuccessAt: number | null;
   unhealthySince: number | null;
+  /**
+   * Upstream-reported end of the quarantine (epoch ms), taken from the SDK
+   * `rate_limit_event.resetsAt`. An account-scope limit can last hours, so the
+   * flat `recoveryIntervalMs` must not resurrect the provider before this.
+   * Null means "no upstream signal — use the configured interval".
+   */
+  quarantinedUntil: number | null;
   activeSessionCount: number;
 }
 
@@ -29,6 +36,8 @@ export interface ProviderHealthStatus {
 
 const DEFAULT_UNHEALTHY_THRESHOLD = 3;
 const DEFAULT_RECOVERY_INTERVAL_MS = 300_000; // 5 minutes
+/** Upper bound for an upstream-reported quarantine window. */
+const MAX_QUARANTINE_MS = 24 * 60 * 60 * 1000;
 
 function makeHealthStatus(profileId: string): ProviderHealthStatus {
   return {
@@ -38,8 +47,26 @@ function makeHealthStatus(profileId: string): ProviderHealthStatus {
     lastErrorAt: null,
     lastSuccessAt: null,
     unhealthySince: null,
+    quarantinedUntil: null,
     activeSessionCount: 0,
   };
+}
+
+/**
+ * Upstream reset stamps arrive as epoch seconds on some Claude Code builds and
+ * epoch milliseconds on others. Normalize to ms and reject values that are not
+ * a usable future instant, so a malformed stamp degrades to the interval rule
+ * instead of pinning a provider out of rotation forever.
+ */
+function normalizeResetStamp(
+  resetsAt: number | null | undefined,
+  now: number,
+): number | null {
+  if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt)) return null;
+  const ms = resetsAt < 1e11 ? resetsAt * 1000 : resetsAt;
+  if (ms <= now) return null;
+  // Guard against absurd stamps (>24h) quarantining an account for days.
+  return Math.min(ms, now + MAX_QUARANTINE_MS);
 }
 
 // ─── ProviderPool 类 ──────────────────────────────────────
@@ -166,25 +193,43 @@ export class ProviderPool {
     if (!health.healthy) {
       health.healthy = true;
       health.unhealthySince = null;
+      health.quarantinedUntil = null;
       logger.info({ profileId }, 'Provider recovered after success report');
     }
   }
 
-  reportFailure(profileId: string, immediate = false): void {
+  /**
+   * @param quarantineUntil Upstream `rate_limit_event.resetsAt`, when the
+   * failure was an account-scope rejection that reports its own reset time.
+   */
+  reportFailure(
+    profileId: string,
+    immediate = false,
+    quarantineUntil?: number | null,
+  ): void {
+    const now = Date.now();
     const health = this.getOrCreateHealth(profileId);
     health.consecutiveErrors = immediate
       ? Math.max(health.consecutiveErrors + 1, this.unhealthyThreshold)
       : health.consecutiveErrors + 1;
-    health.lastErrorAt = Date.now();
+    health.lastErrorAt = now;
+
+    // Always take the latest upstream signal: a repeated rejection carries a
+    // fresher reset stamp than the one recorded when the provider first failed.
+    const reportedUntil = normalizeResetStamp(quarantineUntil, now);
+    if (reportedUntil !== null) health.quarantinedUntil = reportedUntil;
 
     if (health.healthy && health.consecutiveErrors >= this.unhealthyThreshold) {
       health.healthy = false;
-      health.unhealthySince = Date.now();
+      health.unhealthySince = now;
       logger.warn(
         {
           profileId,
           consecutiveErrors: health.consecutiveErrors,
           threshold: this.unhealthyThreshold,
+          quarantinedUntil: health.quarantinedUntil
+            ? new Date(health.quarantinedUntil).toISOString()
+            : null,
         },
         'Provider marked unhealthy after consecutive failures',
       );
@@ -214,15 +259,18 @@ export class ProviderPool {
     for (const member of this.members) {
       if (!member.enabled) continue;
       const health = this.healthMap.get(member.profileId);
-      if (
-        health &&
-        !health.healthy &&
-        health.unhealthySince !== null &&
-        now - health.unhealthySince >= this.recoveryIntervalMs
-      ) {
+      if (!health || health.healthy || health.unhealthySince === null) continue;
+      // An upstream-reported reset is authoritative over the local interval:
+      // account-scope limits routinely outlast recoveryIntervalMs, and
+      // resurrecting the provider early burns one whole turn per cycle.
+      const recoverAt =
+        health.quarantinedUntil ??
+        health.unhealthySince + this.recoveryIntervalMs;
+      if (now >= recoverAt) {
         health.healthy = true;
         health.consecutiveErrors = 0;
         health.unhealthySince = null;
+        health.quarantinedUntil = null;
         logger.info(
           { profileId: member.profileId },
           'Provider auto-recovered after recovery interval',

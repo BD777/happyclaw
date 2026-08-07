@@ -442,6 +442,12 @@ export interface ContainerOutput {
   error?: string;
   providerFailure?: boolean;
   /**
+   * Upstream `rate_limit_event.resetsAt` for an account-scope rejection, used
+   * to quarantine the provider until the limit actually resets instead of the
+   * flat recovery interval.
+   */
+  providerRateLimitResetsAt?: number;
+  /**
    * Host-derived terminal boundary. False means the durable input must be
    * replayed on another healthy provider; true means the pool is exhausted.
    */
@@ -1992,7 +1998,11 @@ export async function runContainerAgent(
               if (output.providerFailure && selectedProfileId) {
                 if (!providerFailureReported) {
                   providerFailureReported = true;
-                  providerPool.reportFailure(selectedProfileId, true);
+                  providerPool.reportFailure(
+                    selectedProfileId,
+                    true,
+                    output.providerRateLimitResetsAt,
+                  );
                   logger.warn(
                     {
                       group: group.name,
@@ -2009,7 +2019,11 @@ export async function runContainerAgent(
             if (output.providerFailure && selectedProfileId) {
               if (!providerFailureReported) {
                 providerFailureReported = true;
-                providerPool.reportFailure(selectedProfileId, true);
+                providerPool.reportFailure(
+                  selectedProfileId,
+                  true,
+                  output.providerRateLimitResetsAt,
+                );
                 logger.warn(
                   {
                     group: group.name,
@@ -2170,7 +2184,11 @@ export async function runContainerAgent(
     if (selectedProfileId) {
       if (result.providerFailure) {
         if (!providerFailureReported) {
-          providerPool.reportFailure(selectedProfileId, true);
+          providerPool.reportFailure(
+            selectedProfileId,
+            true,
+            result.providerRateLimitResetsAt,
+          );
           providerFailureReported = true;
         }
       } else if (
@@ -2941,7 +2959,11 @@ export async function runHostAgent(
               if (output.providerFailure && hostSelectedProfileId) {
                 if (!hostProviderFailureReported) {
                   hostProviderFailureReported = true;
-                  providerPool.reportFailure(hostSelectedProfileId, true);
+                  providerPool.reportFailure(
+                    hostSelectedProfileId,
+                    true,
+                    output.providerRateLimitResetsAt,
+                  );
                   logger.warn(
                     {
                       group: group.name,
@@ -2958,7 +2980,11 @@ export async function runHostAgent(
             if (output.providerFailure && hostSelectedProfileId) {
               if (!hostProviderFailureReported) {
                 hostProviderFailureReported = true;
-                providerPool.reportFailure(hostSelectedProfileId, true);
+                providerPool.reportFailure(
+                  hostSelectedProfileId,
+                  true,
+                  output.providerRateLimitResetsAt,
+                );
                 logger.warn(
                   {
                     group: group.name,
@@ -3097,7 +3123,11 @@ export async function runHostAgent(
     if (hostSelectedProfileId) {
       if (hostResult.providerFailure) {
         if (!hostProviderFailureReported) {
-          providerPool.reportFailure(hostSelectedProfileId, true);
+          providerPool.reportFailure(
+            hostSelectedProfileId,
+            true,
+            hostResult.providerRateLimitResetsAt,
+          );
           hostProviderFailureReported = true;
         }
       } else if (

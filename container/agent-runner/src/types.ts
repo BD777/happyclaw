@@ -302,6 +302,13 @@ export interface ContainerOutput {
   error?: string;
   providerFailure?: boolean;
   /**
+   * Upstream `rate_limit_event.resetsAt` for an account-scope rejection. The
+   * host quarantines the provider until this instant instead of the flat
+   * recovery interval, so a five-hour account limit cannot re-enter rotation
+   * every few minutes and burn one turn per cycle.
+   */
+  providerRateLimitResetsAt?: number;
+  /**
    * Set by the host after it quarantines the failed provider and checks the
    * remaining pool. The agent runner itself only emits providerFailure.
    */
