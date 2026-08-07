@@ -139,11 +139,20 @@ describe('willClearSessionOnProviderSwitch', () => {
     expect(willClearSessionOnProviderSwitch('grp', null, 'B')).toBe(true);
   });
 
-  test('uses the system default when the Agent inherits its model', () => {
+  test('an auto-resolved default does not force a switch off a healthy binding', () => {
     setProviders('A', 'B');
     mocks.boundId = 'A';
     mocks.defaultProviderId = 'B';
 
+    // The default is auto-resolved for every install (first enabled provider),
+    // so treating it as a pin would clear sessions — and disable the balancing
+    // pool — everywhere. With multiple enabled providers and no Agent-level
+    // modelConfigId, selection goes through the pool, which keeps a healthy
+    // sticky binding (see resolvePinnedModelConfigId).
+    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
+
+    // The pool still switches away — and clears — once the binding is unhealthy.
+    providerPool.reportFailure('A', true);
     expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
   });
 });
