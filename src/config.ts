@@ -36,6 +36,18 @@ export const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'riba2534/happyclaw-agent:latest';
+
+// Forwarded into every spawned container as HTTPS_PROXY/HTTP_PROXY/NO_PROXY so
+// the claude CLI (which natively honors these) routes Anthropic API traffic
+// through the proxy. Empty when unset — buildContainerArgs() then pushes no
+// proxy flags and container behavior is unchanged.
+export const CONTAINER_HTTPS_PROXY =
+  process.env.HTTPS_PROXY || process.env.https_proxy || '';
+export const CONTAINER_HTTP_PROXY =
+  process.env.HTTP_PROXY || process.env.http_proxy || CONTAINER_HTTPS_PROXY;
+export const CONTAINER_NO_PROXY =
+  process.env.NO_PROXY || process.env.no_proxy || '';
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses TZ env var with Asia/Shanghai fallback
 export const TIMEZONE =

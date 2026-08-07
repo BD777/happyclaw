@@ -14,7 +14,15 @@ import os from 'os';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
+import {
+  CONTAINER_HTTP_PROXY,
+  CONTAINER_HTTPS_PROXY,
+  CONTAINER_IMAGE,
+  CONTAINER_NO_PROXY,
+  DATA_DIR,
+  GROUPS_DIR,
+  TIMEZONE,
+} from './config.js';
 import { logger } from './logger.js';
 import {
   buildEffectiveMcpManifest,
@@ -1654,6 +1662,17 @@ export function buildContainerArgs(
     }
   }
 
+  // claude CLI natively honors HTTPS_PROXY/HTTP_PROXY/NO_PROXY, so forwarding
+  // them is enough to route Anthropic API traffic through a proxy — no
+  // agent-runner changes needed.
+  if (CONTAINER_HTTPS_PROXY) {
+    args.push('-e', `HTTPS_PROXY=${CONTAINER_HTTPS_PROXY}`);
+    args.push('-e', `HTTP_PROXY=${CONTAINER_HTTP_PROXY}`);
+    if (CONTAINER_NO_PROXY) {
+      args.push('-e', `NO_PROXY=${CONTAINER_NO_PROXY}`);
+    }
+  }
+
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
     if (mount.readonly) {
@@ -1666,6 +1685,11 @@ export function buildContainerArgs(
   args.push(CONTAINER_IMAGE);
 
   return args;
+}
+
+/** Masks userinfo (user:pass@) in proxy URLs before logging container args. */
+function redactContainerArgsForLog(containerArgs: string[]): string {
+  return containerArgs.join(' ').replace(/\/\/[^/@\s]*@/g, '//***@');
 }
 
 export async function runContainerAgent(
@@ -1764,7 +1788,7 @@ export async function runContainerAgent(
           (m) =>
             `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
         ),
-        containerArgs: containerArgs.join(' '),
+        containerArgs: redactContainerArgsForLog(containerArgs),
       },
       'Container mount configuration',
     );
@@ -2096,7 +2120,7 @@ export async function runContainerAgent(
           ],
           extraVerboseLines: [
             `=== Container Args ===`,
-            containerArgs.join(' '),
+            redactContainerArgsForLog(containerArgs),
             ``,
             `=== Mounts (detailed) ===`,
             mounts
