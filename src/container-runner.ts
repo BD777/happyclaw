@@ -1642,6 +1642,19 @@ export function detectContainerHostIdentity(
   });
 }
 
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+function rewriteLoopbackProxyForContainer(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!LOOPBACK_HOSTNAMES.has(parsed.hostname)) return url;
+    parsed.hostname = 'host.docker.internal';
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
 export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -1664,10 +1677,20 @@ export function buildContainerArgs(
 
   // claude CLI natively honors HTTPS_PROXY/HTTP_PROXY/NO_PROXY, so forwarding
   // them is enough to route Anthropic API traffic through a proxy — no
-  // agent-runner changes needed.
+  // agent-runner changes needed. A loopback proxy address is rewritten to
+  // host.docker.internal: the container has its own network namespace, so
+  // 127.0.0.1 inside it refers to the container itself, not the host.
   if (CONTAINER_HTTPS_PROXY) {
-    args.push('-e', `HTTPS_PROXY=${CONTAINER_HTTPS_PROXY}`);
-    args.push('-e', `HTTP_PROXY=${CONTAINER_HTTP_PROXY}`);
+    const httpsProxy = rewriteLoopbackProxyForContainer(CONTAINER_HTTPS_PROXY);
+    const httpProxy = rewriteLoopbackProxyForContainer(CONTAINER_HTTP_PROXY);
+    if (
+      httpsProxy.includes('host.docker.internal') ||
+      httpProxy.includes('host.docker.internal')
+    ) {
+      args.push('--add-host', 'host.docker.internal:host-gateway');
+    }
+    args.push('-e', `HTTPS_PROXY=${httpsProxy}`);
+    args.push('-e', `HTTP_PROXY=${httpProxy}`);
     if (CONTAINER_NO_PROXY) {
       args.push('-e', `NO_PROXY=${CONTAINER_NO_PROXY}`);
     }
