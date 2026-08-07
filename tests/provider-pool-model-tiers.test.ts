@@ -98,6 +98,40 @@ describe('per-account model tier quarantine', () => {
     pool.reportSuccess('acct-1', 'fable');
     expect(pool.isModelQuarantined('acct-1', 'fable')).toBe(false);
   });
+
+  /**
+   * Every selection re-reads config first, so a refresh that drops live
+   * quarantines erases the whole tier dimension between two turns — the pool
+   * would hand the same walled (account, model) pair back forever.
+   */
+  test('a config refresh keeps quarantines for members that still exist', () => {
+    const pool = makePool();
+    pool.reportModelFailure('acct-1', 'fable');
+
+    pool.refreshFromConfig(ACCOUNTS, BALANCING);
+    expect(pool.isModelQuarantined('acct-1', 'fable')).toBe(true);
+    expect(pool.selectProvider(primaryTier())).not.toBe('acct-1');
+  });
+
+  test('a config refresh drops quarantines for removed members', () => {
+    const pool = makePool();
+    pool.reportModelFailure('acct-3', 'fable');
+
+    pool.refreshFromConfig(ACCOUNTS.slice(0, 2), BALANCING);
+    // acct-3 is gone; re-adding it must not inherit the stale wall.
+    pool.refreshFromConfig(ACCOUNTS, BALANCING);
+    expect(pool.isModelQuarantined('acct-3', 'fable')).toBe(false);
+  });
+
+  test('resetModelQuarantine only clears the named account', () => {
+    const pool = makePool();
+    pool.reportModelFailure('acct-1', 'fable');
+    pool.reportModelFailure('acct-2', 'fable');
+
+    pool.resetModelQuarantine('acct-1');
+    expect(pool.isModelQuarantined('acct-1', 'fable')).toBe(false);
+    expect(pool.isModelQuarantined('acct-2', 'fable')).toBe(true);
+  });
 });
 
 describe('rotation strategy', () => {
@@ -123,5 +157,30 @@ describe('rotation strategy', () => {
 
     pool.reportFailure('acct-1', true);
     expect(pool.selectProvider()).toBe('acct-2');
+  });
+
+  /**
+   * trySelectPoolProvider re-reads config before every selection, so the two
+   * strategies must stay distinguishable *across* refreshes: rotation state
+   * cannot be reset by a refresh, and failover cannot start drifting.
+   */
+  test('the strategies stay distinct across config refreshes', () => {
+    const rotating = makePool();
+    const sticky = makePool({ strategy: 'failover' });
+    const rotatingPicks: string[] = [];
+    const stickyPicks: string[] = [];
+
+    for (let i = 0; i < ACCOUNTS.length; i += 1) {
+      rotating.refreshFromConfig(ACCOUNTS, BALANCING);
+      sticky.refreshFromConfig(ACCOUNTS, {
+        ...BALANCING,
+        strategy: 'failover',
+      });
+      rotatingPicks.push(rotating.selectProvider(primaryTier()));
+      stickyPicks.push(sticky.selectProvider(primaryTier()));
+    }
+
+    expect(new Set(rotatingPicks).size).toBe(ACCOUNTS.length);
+    expect(new Set(stickyPicks)).toEqual(new Set(['acct-1']));
   });
 });

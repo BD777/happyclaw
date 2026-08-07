@@ -874,6 +874,29 @@ function resolvePoolTierModel(
   return null;
 }
 
+/**
+ * Whether a sticky binding can still serve the tier this turn runs on.
+ *
+ * Account health and model-tier quarantine are orthogonal: an account stays
+ * healthy while one of its model budgets is walled. `failover` means "stay on
+ * this account until it can no longer serve us", and a walled tier is exactly
+ * that — so the sticky fast-path must consult both dimensions, or it hands the
+ * turn straight back to the walled (account, model) pair every time.
+ *
+ * Shared by trySelectPoolProvider and willClearSessionOnProviderSwitch so the
+ * prediction cannot drift from the selection it mirrors.
+ */
+function stickyBindingCanServeTier(
+  boundId: string,
+  enabledProviders: Array<{ id: string; anthropicModel: string }>,
+  tierModel: string | null,
+): boolean {
+  const model =
+    tierModel ??
+    (enabledProviders.find((p) => p.id === boundId)?.anthropicModel || '');
+  return !model || !providerPool.isModelQuarantined(boundId, model);
+}
+
 function resolvePinnedModelConfigId(
   modelConfigId?: string | null,
 ): string | null {
@@ -947,7 +970,15 @@ export function willClearSessionOnProviderSwitch(
   // time-based recovery rule before reading health, or an expired quarantine
   // predicts a switch that the actual selection no longer performs.
   providerPool.refreshRecoveryState();
-  return !providerPool.getHealthStatus(boundId).healthy;
+  if (!providerPool.getHealthStatus(boundId).healthy) return true;
+  // Same second dimension the sticky path checks: a walled model tier moves
+  // the session off a still-healthy account, and that switch must inject
+  // history like any other.
+  return !stickyBindingCanServeTier(
+    boundId,
+    enabledProviders,
+    resolvePoolTierModel(enabledProviders),
+  );
 }
 
 /**
@@ -1045,6 +1076,21 @@ export function trySelectPoolProvider(
           { groupFolder, agentId: agentId || null, providerId: boundId },
           'Sticky provider is unhealthy, falling back to pool selection',
         );
+      } else if (
+        !stickyBindingCanServeTier(boundId, enabledProviders, tierModel)
+      ) {
+        // The account is fine but its budget for this turn's model is walled.
+        // Failing over is the whole point of the strategy; reusing the binding
+        // here would replay the same rejection until the quarantine expires.
+        logger.info(
+          {
+            groupFolder,
+            agentId: agentId || null,
+            providerId: boundId,
+            tierModel,
+          },
+          'Sticky provider cannot serve this model tier, falling back to pool selection',
+        );
       } else {
         try {
           const resolved = resolveProviderById(boundId);
@@ -1059,6 +1105,9 @@ export function trySelectPoolProvider(
               config: resolved.config,
               customEnv: resolved.customEnv,
             },
+            // The pool may have escalated past the primary tier while this
+            // session stayed bound; the turn must run on the escalated model.
+            ...(tierModel ? { modelOverride: tierModel } : {}),
           };
         } catch (err) {
           logger.warn(
