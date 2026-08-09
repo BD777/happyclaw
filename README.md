@@ -305,23 +305,25 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 
 ### 可选环境变量
 
-| 变量                         | 默认值                            | 说明                                                                                                                                                                                                         |
-| ---------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `WEB_PORT`                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                                                                                                                                              |
-| `WEB_SESSION_SECRET`         | 自动生成并持久化                  | Web 登录会话签名密钥                                                                                                                                                                                         |
-| `CONTAINER_IMAGE`            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                                                                                                                                               |
-| `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                                                                                                                                             |
-| `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                                                                                                                                                       |
-| `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                                                                                                                                             |
-| `MAX_CONCURRENT_CONTAINERS`  | `20`                              | 最大并发容器数                                                                                                                                                                                               |
-| `MAX_FILE_SIZE_MB`           | `50`                              | Web 和 IM 入站文件大小上限                                                                                                                                                                                   |
-| `CORS_ALLOWED_ORIGINS`       | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                                                                                                                                           |
-| `TRUST_PROXY`                | `false`                           | 位于可信反向代理后时设为 `true`                                                                                                                                                                              |
-| `TZ`                         | 系统时区                          | 日志与定时任务时区                                                                                                                                                                                           |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 未设置                            | 出站代理；主进程与每个智能体容器都会使用，容器内 `claude` CLI 原生识别这两个变量。回环地址（`127.0.0.1`/`localhost`）会在透传进容器时自动改写为 `host.docker.internal` 并附加对应的 Docker host-gateway 映射 |
-| `NO_PROXY`                   | 未设置                            | 不走代理的地址列表，随 `HTTPS_PROXY`/`HTTP_PROXY` 一起原样透传进容器                                                                                                                                         |
+| 变量                         | 默认值                            | 说明                                                                               |
+| ---------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
+| `WEB_PORT`                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
+| `WEB_SESSION_SECRET`         | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
+| `CONTAINER_IMAGE`            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
+| `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                   |
+| `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
+| `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
+| `MAX_CONCURRENT_CONTAINERS`  | `20`                              | 最大并发容器数                                                                     |
+| `MAX_FILE_SIZE_MB`           | `50`                              | Web 和 IM 入站文件大小上限                                                         |
+| `CORS_ALLOWED_ORIGINS`       | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
+| `TRUST_PROXY`                | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
+| `TZ`                         | 系统时区                          | 日志与定时任务时区                                                                 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
+| `NO_PROXY`                   | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
 
 Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-GCM 加密存储，相关 API 只返回是否已配置，不返回密钥明文。
+
+容器代理值（包括 URL 中的用户名和密码）通过权限为 `0600` 的每容器运行时环境文件注入，不会出现在 `docker run` 参数或容器参数调试日志中。macOS 的 Docker Desktop/OrbStack 与 Windows Docker Desktop 会把代理 URL 中的 `localhost`、`127.0.0.1`、`::1` 改写为 `host.docker.internal`。Linux bridge 容器无法访问宿主机仅绑定在回环地址的代理；请将代理绑定到 Docker bridge 可达接口，并在代理变量中使用该接口的 IP 或 DNS 名称，否则容器会在启动前给出错误。
 
 ### 运行数据
 
