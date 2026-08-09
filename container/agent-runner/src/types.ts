@@ -301,6 +301,27 @@ export interface ContainerOutput {
   error?: string;
   providerFailure?: boolean;
   /**
+   * Upstream `rate_limit_event.resetsAt` for an account-scope rejection. The
+   * host quarantines the provider until this instant instead of the flat
+   * recovery interval, so a five-hour account limit cannot re-enter rotation
+   * every few minutes and burn one turn per cycle.
+   */
+  providerRateLimitResetsAt?: number;
+  /**
+   * Upstream limit text captured when a provider failure was raised by a model
+   * wall. The host shows it instead of the generic pool notice, but only after
+   * every account is exhausted.
+   */
+  providerFailureNotice?: string;
+  /**
+   * Whether the rejection walled the whole account or just one model tier.
+   * Model-scope walls quarantine the (account, model) pair only: the account's
+   * other tiers and every other account's budget for this model stay usable.
+   */
+  providerRateLimitScope?: 'account' | 'model';
+  /** The model that was actually in use when the limit was reported. */
+  providerRateLimitModel?: string;
+  /**
    * Set by the host after it quarantines the failed provider and checks the
    * remaining pool. The agent runner itself only emits providerFailure.
    */

@@ -4,6 +4,7 @@ import { Loader2 } from 'lucide-react';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { api } from '../../api/client';
 import type {
+  BalancingConfig,
   ProviderWithHealth,
   ProvidersListResponse,
   ProviderHealthStatus,
@@ -11,6 +12,7 @@ import type {
 import { getErrorMessage } from './types';
 import { ProviderList } from './ProviderList';
 import { ProviderEditor } from './ProviderEditor';
+import { BalancingSettings } from './BalancingSettings';
 
 interface ClaudeProviderSectionProps {
   setNotice: (msg: string | null) => void;
@@ -26,6 +28,7 @@ export function ClaudeProviderSection({
   const [defaultProviderId, setDefaultProviderId] = useState<string | null>(
     null,
   );
+  const [balancing, setBalancing] = useState<BalancingConfig | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [togglingId, setTogglingId] = useState<string | null>(null);
@@ -51,6 +54,7 @@ export function ClaudeProviderSection({
       );
       setProviders(data.providers);
       setDefaultProviderId(data.defaultProviderId);
+      setBalancing(data.balancing);
     } catch (err) {
       setError(getErrorMessage(err, '加载模型配置列表失败'));
     } finally {
@@ -200,6 +204,27 @@ export function ClaudeProviderSection({
     [loadProviders, setNotice, setError],
   );
 
+  // ─── 更新负载均衡设置 ─────────────────────────────────────────
+  const handleBalancingChange = useCallback(
+    async (updates: Partial<BalancingConfig>) => {
+      if (!balancing) return;
+      const next = { ...balancing, ...updates };
+      setBalancing(next); // 乐观更新；失败时 loadProviders 会拉回真实值
+      try {
+        const saved = await api.put<BalancingConfig>(
+          '/api/config/claude/balancing',
+          next,
+        );
+        setBalancing(saved);
+        setNotice('负载均衡设置已更新');
+      } catch (err) {
+        await loadProviders().catch(() => {});
+        setError(getErrorMessage(err, '更新负载均衡设置失败'));
+      }
+    },
+    [balancing, loadProviders, setNotice, setError],
+  );
+
   // ─── 编辑器回调 ───────────────────────────────────────────────
   const handleEditorSave = useCallback(() => {
     setEditorOpen(false);
@@ -245,6 +270,15 @@ export function ClaudeProviderSection({
         deletingId={deletingId}
         disabled={busy}
       />
+
+      {/* 负载均衡设置：配置了多个模型时展示（池只在 >=2 启用时生效） */}
+      {balancing && providers.length >= 2 && (
+        <BalancingSettings
+          balancing={balancing}
+          onChange={handleBalancingChange}
+          disabled={busy}
+        />
+      )}
 
       {/* 编辑器弹窗 */}
       <ProviderEditor

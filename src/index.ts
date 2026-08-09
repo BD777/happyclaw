@@ -67,9 +67,11 @@ import {
   ContainerInput,
   ContainerOutput,
   cleanupContainerTaskRuntimeEnvDirs,
+  closeRunnerAfterRotatingProviderTurn,
   runContainerAgent,
   runHostAgent,
   runAgentWithModelFallback,
+  shouldRotatePoolProviderAfterTurn,
   willClearSessionOnProviderSwitch,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -131,6 +133,7 @@ import {
   setRouterStateBatch,
   setSessionChannelOwnerOnce,
   setSession,
+  setSessionProviderId,
   deleteSession,
   deleteMessagesForChatJid,
   storeMessageDirect,
@@ -2332,6 +2335,28 @@ function resetConversationSessionForAgentProfileMismatch(
     'Cleared conversation agent Claude session after AgentProfile identity changed',
   );
   return true;
+}
+
+/**
+ * Drop the resumable SDK session after a rotating-strategy turn while keeping
+ * enough host metadata for the next cold run to predict the provider switch,
+ * inject persisted history, and preserve AgentProfile identity.
+ */
+function resetSessionAfterProviderRotation(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  selectedProviderId: string | null,
+  profile: AgentProfile | undefined,
+): void {
+  deleteSession(groupFolder, agentId);
+  setSession(groupFolder, '', agentId, {
+    agentProfileId: profile?.id,
+    agentProfileVersion: profile?.version,
+    identityHash: profile?.identity_hash,
+  });
+  if (selectedProviderId) {
+    setSessionProviderId(groupFolder, agentId, selectedProviderId);
+  }
 }
 
 /**
@@ -7618,18 +7643,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               resetIdleTimer();
               return;
             }
+            // A model wall carries the upstream limit text; it is only
+            // shown once no account in the pool can serve the turn.
+            const terminalNotice =
+              result.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE;
             const terminalGroupFailureDurable =
               await projectCurrentScheduledGroupTerminal(
                 'failed',
-                PROVIDER_FAILURE_USER_NOTICE,
+                terminalNotice,
               );
             // The dedicated scheduled-task failure projection is richer and
             // stable across replay. Suppress the generic provider notice only
             // when that exact run has been durably projected or queued for
             // workspace retry.
-            result.result = terminalGroupFailureDurable
-              ? null
-              : PROVIDER_FAILURE_USER_NOTICE;
+            result.result = terminalGroupFailureDurable ? null : terminalNotice;
             logger.warn(
               {
                 group: group.name,
@@ -9369,6 +9396,12 @@ async function runAgent(
   }
   const sessionId = sessions[group.folder];
   const containerAgentProfile = toContainerAgentProfile(resolvedAgentProfile);
+  const rotateProviderAfterTurn = shouldRotatePoolProviderAfterTurn(
+    group.folder,
+    resolvedAgentProfile?.model_config_id,
+  );
+  let rotatingTurnCompleted = false;
+  let selectedProviderIdForRun: string | null = null;
   const happyClawOwnerProfile = resolveHappyClawOwnerProfileForTurn({
     group,
     profile: resolvedAgentProfile,
@@ -9411,44 +9444,59 @@ async function runAgent(
   );
 
   // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        queue.markRunnerActivity(chatJid);
-        if (
-          output.ipcReceipts?.length &&
-          (!output.providerFailure || output.providerFailureTerminal === true)
-        ) {
-          queue.acknowledgeIpcDeliveries(
-            chatJid,
-            output.ipcReceipts,
-            commitIpcDeliveryReceipts,
-          );
-        }
-        if (
-          output.queryIdle === true ||
-          (output.status === 'stream' &&
-            output.streamEvent?.eventType === 'status' &&
-            output.streamEvent.statusText === 'interrupted')
-        ) {
-          queue.markRunnerQueryIdle(chatJid);
-        }
-        // 仅从成功的输出中更新 session ID；
-        // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
-        if (
-          output.newSessionId &&
-          output.status !== 'error' &&
-          !output.providerFailure
-        ) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId, undefined, {
-            agentProfileId: resolvedAgentProfile?.id,
-            agentProfileVersion: resolvedAgentProfile?.version,
-            identityHash: resolvedAgentProfile?.identity_hash,
-          });
-        }
-        await onOutput(output);
-      }
-    : undefined;
+  const wrappedOnOutput = async (output: ContainerOutput) => {
+    queue.markRunnerActivity(chatJid);
+    if (
+      output.ipcReceipts?.length &&
+      (!output.providerFailure || output.providerFailureTerminal === true)
+    ) {
+      queue.acknowledgeIpcDeliveries(
+        chatJid,
+        output.ipcReceipts,
+        commitIpcDeliveryReceipts,
+      );
+    }
+    if (
+      output.queryIdle === true ||
+      (output.status === 'stream' &&
+        output.streamEvent?.eventType === 'status' &&
+        output.streamEvent.statusText === 'interrupted')
+    ) {
+      queue.markRunnerQueryIdle(chatJid);
+    }
+    // 仅从成功的输出中更新 session ID；
+    // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
+      sessions[group.folder] = output.newSessionId;
+      setSession(group.folder, output.newSessionId, undefined, {
+        agentProfileId: resolvedAgentProfile?.id,
+        agentProfileVersion: resolvedAgentProfile?.version,
+        identityHash: resolvedAgentProfile?.identity_hash,
+      });
+    }
+    await onOutput?.(output);
+    if (
+      closeRunnerAfterRotatingProviderTurn(
+        rotateProviderAfterTurn,
+        rotatingTurnCompleted,
+        output,
+        () => queue.closeStdin(chatJid),
+      )
+    ) {
+      rotatingTurnCompleted = true;
+      logger.info(
+        {
+          groupFolder: group.folder,
+          providerId: selectedProviderIdForRun,
+        },
+        'Rotating provider turn completed; closing runner before the next request',
+      );
+    }
+  };
 
   ipcWatcherManager?.watchGroup(group.folder);
   try {
@@ -9466,6 +9514,7 @@ async function runAgent(
       identifier: string,
       selectedProviderId: string | null,
     ) => {
+      selectedProviderIdForRun = selectedProviderId;
       // 宿主机模式：containerName 传 null，走 process.kill() 路径
       const containerName = executionMode === 'container' ? identifier : null;
       queue.registerProcess(chatJid, proc, {
@@ -9567,6 +9616,16 @@ async function runAgent(
         agentProfileVersion: resolvedAgentProfile?.version,
         identityHash: resolvedAgentProfile?.identity_hash,
       });
+    }
+
+    if (rotatingTurnCompleted) {
+      delete sessions[group.folder];
+      resetSessionAfterProviderRotation(
+        group.folder,
+        null,
+        selectedProviderIdForRun,
+        resolvedAgentProfile,
+      );
     }
 
     // Agent was interrupted by _close sentinel (home folder drain).
@@ -15047,6 +15106,12 @@ async function processAgentConversation(
   const cursorCommittedInputTurns = new Set<string>();
   let retryUnfinishedTurn = false;
   let agentProviderFailoverPending = false;
+  const rotateProviderAfterAgentTurn = shouldRotatePoolProviderAfterTurn(
+    effectiveGroup.folder,
+    agentProfile?.model_config_id,
+  );
+  let rotatingAgentTurnCompleted = false;
+  let selectedAgentProviderIdForRun: string | null = null;
   let agentDeliveryNeedsManualReconciliation = false;
   let agentDeterministicTerminalError: string | null = null;
   let hadError = false;
@@ -15577,7 +15642,8 @@ async function processAgentConversation(
         resetIdleTimer();
         return;
       }
-      output.result = PROVIDER_FAILURE_USER_NOTICE;
+      output.result =
+        output.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE;
       logger.warn(
         {
           chatJid,
@@ -16145,6 +16211,24 @@ async function processAgentConversation(
       hadError = true;
       if (output.error) lastError = output.error;
     }
+    if (
+      closeRunnerAfterRotatingProviderTurn(
+        rotateProviderAfterAgentTurn,
+        rotatingAgentTurnCompleted,
+        output,
+        () => queue.closeStdin(virtualJid),
+      )
+    ) {
+      rotatingAgentTurnCompleted = true;
+      logger.info(
+        {
+          chatJid,
+          agentId,
+          providerId: selectedAgentProviderIdForRun,
+        },
+        'Rotating agent provider turn completed; closing runner before the next request',
+      );
+    }
   };
 
   ipcWatcherManager?.watchGroup(effectiveGroup.folder);
@@ -16186,6 +16270,7 @@ async function processAgentConversation(
       identifier: string,
       selectedProviderId: string | null,
     ) => {
+      selectedAgentProviderIdForRun = selectedProviderId;
       const containerName = executionMode === 'container' ? identifier : null;
       queue.registerProcess(virtualJid, proc, {
         containerName,
@@ -16313,6 +16398,16 @@ async function processAgentConversation(
         agentProfileVersion: agentProfile?.version,
         identityHash: agentProfile?.identity_hash,
       });
+    }
+
+    if (rotatingAgentTurnCompleted) {
+      resetSessionAfterProviderRotation(
+        effectiveGroup.folder,
+        agentId,
+        selectedAgentProviderIdForRun,
+        agentProfile,
+      );
+      currentAgentSessionId = undefined;
     }
 
     // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）

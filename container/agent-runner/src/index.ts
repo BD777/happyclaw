@@ -106,6 +106,7 @@ import {
 import {
   resolveClaudeProviderRuntime,
   resolveClaudeQueryModelRuntime,
+  resolveProviderReportedModelTier,
 } from './provider-runtime.js';
 import { resolveAgentSdkEffort } from './agent-effort.js';
 import {
@@ -160,6 +161,16 @@ const PROVIDER_FALLBACK_MODELS = new ProviderFallbackModelState(
   CLAUDE_PROVIDER_RUNTIME.model,
   process.env.HAPPYCLAW_FALLBACK_MODEL,
 );
+
+/**
+ * Shown only when the whole provider pool has run out of model tiers. Every
+ * OAuth account carries independent per-model quotas (a walled Fable 5 budget
+ * says nothing about that account's Opus budget, nor about any other account),
+ * so a model wall is first handed back to the host as a provider failure and
+ * only becomes user-visible once no account can serve the turn.
+ */
+const MODEL_LIMIT_EXHAUSTED_NOTICE =
+  '⚠️ 当前模型额度已用尽，本次处理已停止。请稍后重试，或联系管理员配置回退模型。';
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
@@ -1695,7 +1706,6 @@ async function runQueryAttempt(
   durableInputTurnCompleted?: boolean;
   providerFailureTurn?: ProviderFallbackRetryTurn;
   providerAccountFailure?: boolean;
-  terminalModelLimitFailure?: boolean;
 }> {
   const queryModelRuntime = resolveClaudeQueryModelRuntime(
     CLAUDE_PROVIDER_RUNTIME,
@@ -1871,6 +1881,9 @@ async function runQueryAttempt(
   let providerFailurePublished = false;
   const publishProviderAccountFailure = (
     error: SDKAssistantMessageError,
+    rateLimitResetsAt?: number,
+    failureNotice?: string,
+    rateLimitScope: 'account' | 'model' = 'account',
   ): void => {
     if (providerFailurePublished) return;
     providerFailurePublished = true;
@@ -1883,6 +1896,16 @@ async function runQueryAttempt(
       result: null,
       newSessionId,
       providerFailure: true,
+      ...(typeof rateLimitResetsAt === 'number' &&
+      Number.isFinite(rateLimitResetsAt)
+        ? { providerRateLimitResetsAt: rateLimitResetsAt }
+        : {}),
+      ...(failureNotice ? { providerFailureNotice: failureNotice } : {}),
+      providerRateLimitScope: rateLimitScope,
+      providerRateLimitModel: resolveProviderReportedModelTier(
+        CLAUDE_PROVIDER_RUNTIME,
+        PROVIDER_FALLBACK_MODELS.activeModelOverride,
+      ),
       ...(!emitOutput ? { providerFailureMaintenance: true } : {}),
       finalizationReason: 'error',
       ...(emitOutput && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
@@ -1894,20 +1917,6 @@ async function runQueryAttempt(
     } else {
       writeOutput(outputCorrelation.correlate(output));
     }
-  };
-  const publishTerminalModelLimitFailure = (): void => {
-    if (!emitOutput) return;
-    const ipcReceipts = ipcDeliveryTracker.completeNextTurn();
-    emit({
-      status: 'error',
-      result:
-        '⚠️ 当前模型额度已用尽，本次处理已停止。请稍后重试，或联系管理员配置回退模型。',
-      error: 'model_limit_exhausted',
-      finalizationReason: 'error',
-      inputTurnCompleted: true,
-      ...(ipcReceipts.length > 0 ? { ipcReceipts } : {}),
-      ...(sourceKindOverride ? { sourceKind: sourceKindOverride } : {}),
-    });
   };
   let firstResponseWatchdog: SdkFirstResponseWatchdog | undefined;
 
@@ -2773,9 +2782,11 @@ async function runQueryAttempt(
           });
           if (limitDecision.action === 'provider_failure') {
             log(
-              `Account rate limit rejected (${info.rateLimitType ?? 'unknown'}); marking provider unhealthy immediately`,
+              `Account rate limit rejected (${info.rateLimitType ?? 'unknown'}, resetsAt=${
+                info.resetsAt ?? 'none'
+              }); marking provider unhealthy immediately`,
             );
-            publishProviderAccountFailure('rate_limit');
+            publishProviderAccountFailure('rate_limit', info.resetsAt);
             processor.discardPendingTextOutput();
             processor.cleanup();
             assistantTextTracker.reset();
@@ -2836,10 +2847,22 @@ async function runQueryAttempt(
             };
           }
 
+          // No model tier left on this account. Per-model quotas are per
+          // account, so another account still has an untouched budget for the
+          // primary model — hand this one back to the host pool instead of
+          // dead-ending the turn. The host only surfaces the notice below once
+          // every account is exhausted.
           log(
-            `Model-specific rate limit rejected without a fallback (${info.rateLimitType ?? 'unknown'}); surfacing terminal error`,
+            `Model tiers exhausted on this account (${info.rateLimitType ?? 'unknown'}, resetsAt=${
+              info.resetsAt ?? 'none'
+            }); quarantining profile for failover`,
           );
-          publishTerminalModelLimitFailure();
+          publishProviderAccountFailure(
+            'rate_limit',
+            info.resetsAt,
+            MODEL_LIMIT_EXHAUSTED_NOTICE,
+            'model',
+          );
           processor.discardPendingTextOutput();
           processor.cleanup();
           assistantTextTracker.reset();
@@ -2855,8 +2878,7 @@ async function runQueryAttempt(
             interruptedDuringQuery,
             cancelledIpcReceipts,
             pipedMessagesDuringQuery,
-            terminalModelLimitFailure: true,
-            providerAccountFailure: false,
+            providerAccountFailure: true,
           };
         } else if (info.status === 'allowed_warning') {
           processor.emitStatus(`接近 API 限流阈值`);
@@ -3300,6 +3322,38 @@ async function runQueryAttempt(
           ipcQueryWatcher.close();
           // Do not process or emit the limit notice as an assistant result.
           continue;
+        }
+
+        // Model wall with no tier left. Per-model quotas are per account, so
+        // the pool — not this runner — decides whether the turn is really
+        // over. Quarantine the profile and let the host replay elsewhere; the
+        // original limit text rides along for the terminal projection.
+        if (limitDecision.scope === 'model') {
+          log(
+            'Model tiers exhausted on this account; quarantining profile for failover',
+          );
+          publishProviderAccountFailure(
+            'rate_limit',
+            undefined,
+            textResult?.trim() || MODEL_LIMIT_EXHAUSTED_NOTICE,
+            'model',
+          );
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
+          assistantBatchFlushedSinceLastResult = false;
+          processor.discardPendingTextOutput();
+          processor.cleanup();
+          assistantTextTracker.reset();
+          canonicalAssistantUuid = undefined;
+          stream.end();
+          return {
+            newSessionId,
+            lastAssistantUuid,
+            closedDuringQuery,
+            interruptedDuringQuery,
+            cancelledIpcReceipts,
+            pipedMessagesDuringQuery,
+            providerAccountFailure: true,
+          };
         }
 
         // SDK 在某些失败场景会返回 error_* subtype 且不抛异常。
@@ -4079,11 +4133,6 @@ async function main(): Promise<void> {
         forceExitWithSafetyNet(0);
         return;
       }
-      if (queryResult.terminalModelLimitFailure) {
-        log('Model limit failure emitted; exiting runner');
-        forceExitWithSafetyNet(0);
-        return;
-      }
 
       // A startup-context hard limit is a deterministic configuration error,
       // not a transient provider/context-overflow failure. Surface the stable
@@ -4325,11 +4374,6 @@ async function main(): Promise<void> {
             forceExitWithSafetyNet(0);
             return;
           }
-          if (autoContResult.terminalModelLimitFailure) {
-            log('Model limit failure during auto-continue; exiting runner');
-            forceExitWithSafetyNet(0);
-            return;
-          }
           if (autoContResult.closedDuringQuery) {
             log('Close sentinel during auto-continue, exiting');
             writeOutput({ status: 'closed', result: null });
@@ -4474,11 +4518,6 @@ async function main(): Promise<void> {
           log(
             'Account provider failure during truncation-continue; exiting runner',
           );
-          forceExitWithSafetyNet(0);
-          return;
-        }
-        if (contResult.terminalModelLimitFailure) {
-          log('Model limit failure during truncation-continue; exiting runner');
           forceExitWithSafetyNet(0);
           return;
         }
