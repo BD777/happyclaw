@@ -1,8 +1,11 @@
 import fs from 'node:fs';
 
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 
-import { isStreamingSessionSettled } from '../src/im-channel.js';
+import {
+  appendStreamingSessionAnswer,
+  isStreamingSessionSettled,
+} from '../src/im-channel.js';
 import { StreamingCardController } from '../src/feishu-streaming-card.js';
 
 // Regression coverage for issue #629: a freshly-created Feishu streaming
@@ -47,6 +50,108 @@ describe('isStreamingSessionSettled', () => {
   });
 });
 
+describe('appendStreamingSessionAnswer', () => {
+  test('a first main text delta starts an idle Feishu card and persists provider identity', async () => {
+    const lifecycleEvents: Array<{
+      status: string;
+      messageId: string | null;
+      cardId: string | null;
+      version: number;
+      snapshot: { state: string };
+    }> = [];
+    const cardCreate = vi.fn().mockResolvedValue({
+      code: 0,
+      data: { card_id: 'card_idle_main_text' },
+    });
+    const messageCreate = vi.fn().mockResolvedValue({
+      data: { message_id: 'om_idle_main_text' },
+    });
+    const controller = new StreamingCardController({
+      client: {
+        cardkit: {
+          v1: {
+            card: {
+              create: cardCreate,
+              batchUpdate: vi.fn().mockResolvedValue({ code: 0 }),
+              settings: vi.fn().mockResolvedValue({ code: 0 }),
+              update: vi.fn().mockResolvedValue({ code: 0 }),
+            },
+            cardElement: {
+              content: vi.fn().mockResolvedValue({ code: 0 }),
+              update: vi.fn().mockResolvedValue({ code: 0 }),
+            },
+          },
+        },
+        im: {
+          message: {
+            reply: vi.fn().mockResolvedValue({
+              data: { message_id: 'om_idle_main_text' },
+            }),
+          },
+          v1: {
+            message: {
+              create: messageCreate,
+              patch: vi.fn().mockResolvedValue({}),
+            },
+          },
+        },
+      } as any,
+      chatId: 'oc_idle_main_text',
+      lifecycle: {
+        onEvent: (event) => lifecycleEvents.push(event),
+      },
+    });
+
+    expect(controller.currentState).toBe('idle');
+    expect(controller.isActive()).toBe(false);
+
+    expect(
+      appendStreamingSessionAnswer(controller, 'first visible answer'),
+    ).toBe(true);
+    expect(controller.currentState).toBe('creating');
+
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+    expect(cardCreate).toHaveBeenCalledTimes(1);
+    expect(messageCreate).toHaveBeenCalledTimes(1);
+    expect(lifecycleEvents[0]).toMatchObject({
+      status: 'creating',
+      messageId: null,
+      cardId: null,
+      version: 0,
+    });
+    expect(lifecycleEvents).toContainEqual(
+      expect.objectContaining({
+        status: 'streaming',
+        messageId: 'om_idle_main_text',
+        cardId: 'card_idle_main_text',
+        version: 1,
+        snapshot: expect.objectContaining({ state: 'streaming' }),
+      }),
+    );
+    controller.dispose();
+  });
+
+  test('terminal sessions are not reactivated', () => {
+    for (const currentState of ['completed', 'aborted', 'error']) {
+      const append = vi.fn();
+      const session = { isActive: () => false, currentState, append };
+      expect(appendStreamingSessionAnswer(session as any, 'late text')).toBe(
+        false,
+      );
+      expect(append).not.toHaveBeenCalled();
+    }
+  });
+
+  test('other active controllers keep their previous append behavior', () => {
+    const append = vi.fn();
+    const session = { isActive: () => true, append };
+    expect(appendStreamingSessionAnswer(session as any, 'visible text')).toBe(
+      true,
+    );
+    expect(append).toHaveBeenCalledWith('visible text');
+  });
+});
+
 describe('main-runner rotation guards use the settled predicate', () => {
   const main = fs.readFileSync('src/index.ts', 'utf8');
 
@@ -65,6 +170,15 @@ describe('main-runner rotation guards use the settled predicate', () => {
     );
     expect(main).toMatch(
       /if \(streamingSession && isStreamingSessionSettled\(streamingSession\)\) \{\s*streamingSession\.dispose\(\);/,
+    );
+  });
+
+  test('main text projection uses the idle-aware append helper', () => {
+    expect(main).toMatch(
+      /if \(answerProjection\?\.visibleAnswerChanged\) \{\s*appendStreamingSessionAnswer\(\s*streamingSession,/,
+    );
+    expect(main).not.toMatch(
+      /answerProjection\?\.visibleAnswerChanged &&\s*streamingSession\.isActive\(\)/,
     );
   });
 });

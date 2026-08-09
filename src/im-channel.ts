@@ -92,6 +92,21 @@ export function isStreamingSessionSettled(session: StreamingSession): boolean {
   return (session as { currentState?: string }).currentState !== 'idle';
 }
 
+/**
+ * Append the current main-answer projection while the provider session can
+ * still accept output. Feishu is intentionally inactive while `idle`, so an
+ * `isActive()` guard alone would drop a text-only turn's first visible delta
+ * before `append()` can lazily create the provider card.
+ */
+export function appendStreamingSessionAnswer(
+  session: StreamingSession,
+  text: string,
+): boolean {
+  if (isStreamingSessionSettled(session)) return false;
+  session.append(text);
+  return true;
+}
+
 // ─── Unified Interface ──────────────────────────────────────────
 
 export interface IMChannelConnectOpts {

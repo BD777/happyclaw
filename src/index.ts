@@ -268,6 +268,7 @@ import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
+  appendStreamingSessionAnswer,
   getChannelType,
   extractChatId,
   isStreamingSessionSettled,
@@ -7329,11 +7330,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
             if (streamingSession) {
               const se = result.streamEvent;
-              if (
-                answerProjection?.visibleAnswerChanged &&
-                streamingSession.isActive()
-              ) {
-                streamingSession.append(
+              if (answerProjection?.visibleAnswerChanged) {
+                appendStreamingSessionAnswer(
+                  streamingSession,
                   heldCardBaseText() + answerProjection.visibleAnswerText,
                 );
               }
