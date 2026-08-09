@@ -606,9 +606,19 @@ function assertFeishuApiSuccess(operation: string, response: unknown): void {
     throw new Error(`${operation} returned no acknowledgement`);
   }
   const result = response as { code?: number; msg?: string };
-  if (result.code !== 0) {
+  // Some @larksuiteoapi/node-sdk endpoints (observed on im.v1.file.create)
+  // resolve with the unwrapped `data` payload instead of the {code,msg,data}
+  // envelope, so a missing `code` field is not itself a failure signal.
+  // Only a `code` that is explicitly present and non-zero is a reliable
+  // failure — log the raw response alongside it so a real failure is
+  // diagnosable instead of surfacing as "code=unknown".
+  if (result.code !== undefined && result.code !== 0) {
+    logger.error(
+      { operation, response },
+      'Feishu API call returned a non-zero code',
+    );
     throw new FeishuApiRejectedError(
-      `${operation} failed (code=${result.code ?? 'unknown'}, msg=${result.msg || 'unknown'})`,
+      `${operation} failed (code=${result.code}, msg=${result.msg || 'unknown'})`,
     );
   }
 }
