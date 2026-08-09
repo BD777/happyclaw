@@ -37,11 +37,7 @@ import {
   TurnOutputCoordinator,
   type TurnMessageDeliveryRole,
 } from './turn-output-coordinator.js';
-import {
-  preserveUnacknowledgedProactiveFinal,
-  recoverProactiveFinalCandidate,
-  type ProactiveFinalFallbackDelivery,
-} from './proactive-final-recovery.js';
+import { preserveUnacknowledgedProactiveFinal } from './proactive-final-recovery.js';
 import {
   resolveHostIpcLogicalChatJid,
   routeHostIpcOutput,
@@ -71,9 +67,11 @@ import {
   ContainerInput,
   ContainerOutput,
   cleanupContainerTaskRuntimeEnvDirs,
+  closeRunnerAfterRotatingProviderTurn,
   runContainerAgent,
   runHostAgent,
   runAgentWithModelFallback,
+  shouldRotatePoolProviderAfterTurn,
   willClearSessionOnProviderSwitch,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -135,6 +133,7 @@ import {
   setRouterStateBatch,
   setSessionChannelOwnerOnce,
   setSession,
+  setSessionProviderId,
   deleteSession,
   deleteMessagesForChatJid,
   storeMessageDirect,
@@ -268,8 +267,10 @@ import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
+  appendStreamingSessionAnswer,
   getChannelType,
   extractChatId,
+  isStreamingSessionSettled,
   type StreamingSession,
   type ChannelMessageDeliveryOptions,
 } from './im-channel.js';
@@ -2339,6 +2340,28 @@ function resetConversationSessionForAgentProfileMismatch(
 }
 
 /**
+ * Drop the resumable SDK session after a rotating-strategy turn while keeping
+ * enough host metadata for the next cold run to predict the provider switch,
+ * inject persisted history, and preserve AgentProfile identity.
+ */
+function resetSessionAfterProviderRotation(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  selectedProviderId: string | null,
+  profile: AgentProfile | undefined,
+): void {
+  deleteSession(groupFolder, agentId);
+  setSession(groupFolder, '', agentId, {
+    agentProfileId: profile?.id,
+    agentProfileVersion: profile?.version,
+    identityHash: profile?.identity_hash,
+  });
+  if (selectedProviderId) {
+    setSessionProviderId(groupFolder, agentId, selectedProviderId);
+  }
+}
+
+/**
  * Write usage records from a usage event to the database.
  * Handles both modelUsage (per-model breakdown) and legacy flat format.
  * When modelUsage is present, per-model cache tokens are read directly from each model entry.
@@ -3031,89 +3054,6 @@ async function deliverProactiveTailInterruptionNotice(input: {
     PROACTIVE_TAIL_INTERRUPTION_NOTICE,
   );
   return true;
-}
-
-/**
- * Recover non-empty SDK final text that a Proactive model forgot to send.
- *
- * Native delivery gets a fresh, durable Outbox turn because the original turn
- * may already be finalizing. A failed/unavailable native route still projects
- * the exact answer into the canonical Web session so the result is never
- * silently lost; it deliberately does not claim a physical provider ACK.
- */
-async function deliverProactiveFinalFallback(input: {
-  logicalChatJid: string;
-  scopeKey: string;
-  inputTurnId: string;
-  text: string;
-  sessionId?: string;
-  agentId?: string | null;
-  targetJid?: string | null;
-  scope?: ActiveChannelOutboxScope;
-}): Promise<ProactiveFinalFallbackDelivery> {
-  const scopeRoute = input.scope?.chatId
-    ? {
-        provider: input.scope.provider,
-        accountId: input.scope.accountId,
-        sourceJid: input.scope.sourceJid,
-        chatId: input.scope.chatId,
-        rootId: input.scope.rootId,
-        threadId: input.scope.threadId,
-      }
-    : null;
-  const route =
-    scopeRoute ??
-    (input.targetJid ? resolveDurableChannelRoute(input.targetJid) : null);
-  if (input.targetJid && route) {
-    const delivered = await deliverIndependentChannelSystemNotice({
-      logicalChatJid: input.logicalChatJid,
-      scopeKey: input.scopeKey,
-      targetJid: input.targetJid,
-      originalInputTurnId: input.inputTurnId,
-      originalRunId: input.scope?.turnRunId ?? `proactive:${input.inputTurnId}`,
-      noticeKey: 'proactive-final-fallback',
-      text: input.text,
-      sender: 'happyclaw-agent',
-      senderName: ASSISTANT_NAME,
-      agentId: input.agentId,
-      presentation: 'native',
-      messageMeta: {
-        turnId: input.inputTurnId,
-        sessionId: input.sessionId,
-        sourceKind: 'proactive_sdk_fallback',
-        finalizationReason: 'completed',
-      },
-      route,
-    });
-    if (delivered) {
-      return { projected: true, targetDelivered: true, path: 'native' };
-    }
-  }
-
-  const messageId = `proactive_final_${crypto
-    .createHash('sha256')
-    .update(`${input.logicalChatJid}\0${input.inputTurnId}\0${input.text}`)
-    .digest('hex')
-    .slice(0, 32)}`;
-  const webDelivery = await sendMessageWithOutcome(
-    input.logicalChatJid,
-    input.text,
-    {
-      sendToIM: false,
-      messageId,
-      messageMeta: {
-        turnId: input.inputTurnId,
-        sessionId: input.sessionId,
-        sourceKind: 'proactive_sdk_fallback',
-        finalizationReason: 'completed',
-      },
-    },
-  );
-  return {
-    projected: webDelivery.targetDelivered,
-    targetDelivered: !input.targetJid && webDelivery.targetDelivered,
-    path: input.targetJid ? 'web_after_native_failure' : 'web',
-  };
 }
 
 function resolveDurableChannelRoute(targetJid: string): {
@@ -6798,7 +6738,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // event activates B after A has reached its own terminal output.
       if (acceptedNewInput) return;
       if (newImJid === replySourceImJid) {
-        if (streamingSession && !streamingSession.isActive()) {
+        // 'idle' session 尚未发布任何 provider 卡片，保留给新 turn 懒创建；
+        // 只有已定稿（completed/aborted/error）的 session 才在此轮换（#629）。
+        if (streamingSession && isStreamingSessionSettled(streamingSession)) {
           streamingSession.dispose();
           unregisterStreamingSession(streamingSessionJid);
           streamingSession = undefined;
@@ -7299,9 +7241,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               streamingSession &&
               (streamingSession as { currentState?: string }).currentState ===
                 'error';
+            // isStreamingSessionSettled（而非裸 !isActive()）：飞书控制器在
+            // 'idle'（懒创建卡等待首个流事件）时 isActive() 也为 false，用裸
+            // 判断会在首个事件到达时就丢弃 session——beginCreation() 永远不会
+            // 执行，预留记录停在 creating 并在重启时被 fence（#629）。
             if (
               streamingSession &&
-              !streamingSession.isActive() &&
+              isStreamingSessionSettled(streamingSession) &&
               !sessionErrored &&
               !runEnded
             ) {
@@ -7322,11 +7268,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
             if (streamingSession) {
               const se = result.streamEvent;
-              if (
-                answerProjection?.visibleAnswerChanged &&
-                streamingSession.isActive()
-              ) {
-                streamingSession.append(
+              if (answerProjection?.visibleAnswerChanged) {
+                appendStreamingSessionAnswer(
+                  streamingSession,
                   heldCardBaseText() + answerProjection.visibleAnswerText,
                 );
               }
@@ -7705,18 +7649,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               resetIdleTimer();
               return;
             }
+            // A model wall carries the upstream limit text; it is only
+            // shown once no account in the pool can serve the turn.
+            const terminalNotice =
+              result.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE;
             const terminalGroupFailureDurable =
               await projectCurrentScheduledGroupTerminal(
                 'failed',
-                PROVIDER_FAILURE_USER_NOTICE,
+                terminalNotice,
               );
             // The dedicated scheduled-task failure projection is richer and
             // stable across replay. Suppress the generic provider notice only
             // when that exact run has been durably projected or queued for
             // workspace retry.
-            result.result = terminalGroupFailureDurable
-              ? null
-              : PROVIDER_FAILURE_USER_NOTICE;
+            result.result = terminalGroupFailureDurable ? null : terminalNotice;
             logger.warn(
               {
                 group: group.name,
@@ -7797,49 +7743,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 );
               }
             } else if (result.proactiveFinalCandidate?.trim()) {
-              const outputScope =
-                channelOutboxScopesByInput.get(proactiveInputId);
-              const recovery = await recoverProactiveFinalCandidate({
-                registry: activeTurnOutputs,
-                scopeKey: mainAdmissionKey,
-                inputTurnId: proactiveInputId,
-                inputTurnCompleted: result.inputTurnCompleted,
-                candidate: result.proactiveFinalCandidate,
-                canDeliver: () =>
-                  canDeliverTurnUtterance(
-                    effectiveGroup.folder,
-                    null,
-                    proactiveInputId,
-                  ),
-                deliver: (text) =>
-                  deliverProactiveFinalFallback({
-                    logicalChatJid: chatJid,
-                    scopeKey: mainAdmissionKey,
-                    inputTurnId: proactiveInputId,
-                    text,
-                    sessionId: activeSessionId,
-                    targetJid: outputScope?.sourceJid ?? replySourceImJid,
-                    scope: outputScope,
-                  }),
-              });
-              if (recovery.projected) {
-                sentReplyByInput.set(proactiveInputId, true);
-              }
-              if (recovery.targetDelivered) {
-                channelPhysicalDeliveryAckByInput.set(proactiveInputId, true);
-                genuineReplyDeliveredByInput.set(proactiveInputId, true);
-              }
-              logger[recovery.projected ? 'warn' : 'info'](
+              // Proactive SDK text is control-plane output, never speech. A
+              // model that ends without send_message intentionally produces no
+              // user-visible message; do not turn its Assistant final into a
+              // framework-authored fallback.
+              logger.warn(
                 {
                   group: effectiveGroup.folder,
                   inputTurnId: proactiveInputId,
-                  recoveryReason: recovery.reason,
-                  deliveryPath: recovery.path,
-                  targetDelivered: recovery.targetDelivered,
+                  inputTurnCompleted: result.inputTurnCompleted === true,
                 },
-                recovery.projected
-                  ? 'Recovered Proactive SDK final that was not sent through send_message'
-                  : 'Proactive SDK final recovery not required',
+                'Suppressed Proactive SDK final without send_message delivery',
               );
             }
             // In Proactive mode the SDK Result is an internal control-plane
@@ -9488,6 +9402,12 @@ async function runAgent(
   }
   const sessionId = sessions[group.folder];
   const containerAgentProfile = toContainerAgentProfile(resolvedAgentProfile);
+  const rotateProviderAfterTurn = shouldRotatePoolProviderAfterTurn(
+    group.folder,
+    resolvedAgentProfile?.model_config_id,
+  );
+  let rotatingTurnCompleted = false;
+  let selectedProviderIdForRun: string | null = null;
   const happyClawOwnerProfile = resolveHappyClawOwnerProfileForTurn({
     group,
     profile: resolvedAgentProfile,
@@ -9530,44 +9450,59 @@ async function runAgent(
   );
 
   // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        queue.markRunnerActivity(chatJid);
-        if (
-          output.ipcReceipts?.length &&
-          (!output.providerFailure || output.providerFailureTerminal === true)
-        ) {
-          queue.acknowledgeIpcDeliveries(
-            chatJid,
-            output.ipcReceipts,
-            commitIpcDeliveryReceipts,
-          );
-        }
-        if (
-          output.queryIdle === true ||
-          (output.status === 'stream' &&
-            output.streamEvent?.eventType === 'status' &&
-            output.streamEvent.statusText === 'interrupted')
-        ) {
-          queue.markRunnerQueryIdle(chatJid);
-        }
-        // 仅从成功的输出中更新 session ID；
-        // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
-        if (
-          output.newSessionId &&
-          output.status !== 'error' &&
-          !output.providerFailure
-        ) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId, undefined, {
-            agentProfileId: resolvedAgentProfile?.id,
-            agentProfileVersion: resolvedAgentProfile?.version,
-            identityHash: resolvedAgentProfile?.identity_hash,
-          });
-        }
-        await onOutput(output);
-      }
-    : undefined;
+  const wrappedOnOutput = async (output: ContainerOutput) => {
+    queue.markRunnerActivity(chatJid);
+    if (
+      output.ipcReceipts?.length &&
+      (!output.providerFailure || output.providerFailureTerminal === true)
+    ) {
+      queue.acknowledgeIpcDeliveries(
+        chatJid,
+        output.ipcReceipts,
+        commitIpcDeliveryReceipts,
+      );
+    }
+    if (
+      output.queryIdle === true ||
+      (output.status === 'stream' &&
+        output.streamEvent?.eventType === 'status' &&
+        output.streamEvent.statusText === 'interrupted')
+    ) {
+      queue.markRunnerQueryIdle(chatJid);
+    }
+    // 仅从成功的输出中更新 session ID；
+    // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
+      sessions[group.folder] = output.newSessionId;
+      setSession(group.folder, output.newSessionId, undefined, {
+        agentProfileId: resolvedAgentProfile?.id,
+        agentProfileVersion: resolvedAgentProfile?.version,
+        identityHash: resolvedAgentProfile?.identity_hash,
+      });
+    }
+    await onOutput?.(output);
+    if (
+      closeRunnerAfterRotatingProviderTurn(
+        rotateProviderAfterTurn,
+        rotatingTurnCompleted,
+        output,
+        () => queue.closeStdin(chatJid),
+      )
+    ) {
+      rotatingTurnCompleted = true;
+      logger.info(
+        {
+          groupFolder: group.folder,
+          providerId: selectedProviderIdForRun,
+        },
+        'Rotating provider turn completed; closing runner before the next request',
+      );
+    }
+  };
 
   ipcWatcherManager?.watchGroup(group.folder);
   try {
@@ -9585,6 +9520,7 @@ async function runAgent(
       identifier: string,
       selectedProviderId: string | null,
     ) => {
+      selectedProviderIdForRun = selectedProviderId;
       // 宿主机模式：containerName 传 null，走 process.kill() 路径
       const containerName = executionMode === 'container' ? identifier : null;
       queue.registerProcess(chatJid, proc, {
@@ -9686,6 +9622,16 @@ async function runAgent(
         agentProfileVersion: resolvedAgentProfile?.version,
         identityHash: resolvedAgentProfile?.identity_hash,
       });
+    }
+
+    if (rotatingTurnCompleted) {
+      delete sessions[group.folder];
+      resetSessionAfterProviderRotation(
+        group.folder,
+        null,
+        selectedProviderIdForRun,
+        resolvedAgentProfile,
+      );
     }
 
     // Agent was interrupted by _close sentinel (home folder drain).
@@ -15166,6 +15112,12 @@ async function processAgentConversation(
   const cursorCommittedInputTurns = new Set<string>();
   let retryUnfinishedTurn = false;
   let agentProviderFailoverPending = false;
+  const rotateProviderAfterAgentTurn = shouldRotatePoolProviderAfterTurn(
+    effectiveGroup.folder,
+    agentProfile?.model_config_id,
+  );
+  let rotatingAgentTurnCompleted = false;
+  let selectedAgentProviderIdForRun: string | null = null;
   let agentDeliveryNeedsManualReconciliation = false;
   let agentDeterministicTerminalError: string | null = null;
   let hadError = false;
@@ -15631,52 +15583,16 @@ async function processAgentConversation(
         lastProcessed.id,
       );
       if (output.proactiveFinalCandidate?.trim()) {
-        const outputScope =
-          agentChannelOutboxScopesByInput.get(proactiveInputId);
-        const recovery = await recoverProactiveFinalCandidate({
-          registry: activeTurnOutputs,
-          scopeKey: agentAdmissionKey,
-          inputTurnId: proactiveInputId,
-          inputTurnCompleted: output.inputTurnCompleted,
-          candidate: output.proactiveFinalCandidate,
-          canDeliver: () =>
-            canDeliverTurnUtterance(
-              effectiveGroup.folder,
-              agentId,
-              proactiveInputId,
-            ),
-          deliver: (text) =>
-            deliverProactiveFinalFallback({
-              logicalChatJid: virtualChatJid,
-              scopeKey: agentAdmissionKey,
-              inputTurnId: proactiveInputId,
-              text,
-              sessionId: currentAgentSessionId,
-              agentId,
-              targetJid: outputScope?.sourceJid ?? replySourceImJid,
-              scope: outputScope,
-            }),
-        });
-        if (recovery.projected) {
-          agentReplySentByInput.set(proactiveInputId, true);
-          agentAnyReplyProjectedByInput.set(proactiveInputId, true);
-        }
-        if (recovery.targetDelivered) {
-          agentPhysicalDeliveryAckByInput.set(proactiveInputId, true);
-          agentGenuineReplyDeliveredByInput.set(proactiveInputId, true);
-        }
-        logger[recovery.projected ? 'warn' : 'info'](
+        // Conversation Agents obey the same strict delivery boundary as the
+        // main Agent: only send_message may create a user-visible utterance.
+        logger.warn(
           {
             chatJid,
             agentId,
             inputTurnId: proactiveInputId,
-            recoveryReason: recovery.reason,
-            deliveryPath: recovery.path,
-            targetDelivered: recovery.targetDelivered,
+            inputTurnCompleted: output.inputTurnCompleted === true,
           },
-          recovery.projected
-            ? 'Recovered Proactive agent SDK final that was not sent through send_message'
-            : 'Proactive agent SDK final recovery not required',
+          'Suppressed Proactive agent SDK final without send_message delivery',
         );
       }
       output.result = null;
@@ -15732,7 +15648,8 @@ async function processAgentConversation(
         resetIdleTimer();
         return;
       }
-      output.result = PROVIDER_FAILURE_USER_NOTICE;
+      output.result =
+        output.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE;
       logger.warn(
         {
           chatJid,
@@ -16300,6 +16217,24 @@ async function processAgentConversation(
       hadError = true;
       if (output.error) lastError = output.error;
     }
+    if (
+      closeRunnerAfterRotatingProviderTurn(
+        rotateProviderAfterAgentTurn,
+        rotatingAgentTurnCompleted,
+        output,
+        () => queue.closeStdin(virtualJid),
+      )
+    ) {
+      rotatingAgentTurnCompleted = true;
+      logger.info(
+        {
+          chatJid,
+          agentId,
+          providerId: selectedAgentProviderIdForRun,
+        },
+        'Rotating agent provider turn completed; closing runner before the next request',
+      );
+    }
   };
 
   ipcWatcherManager?.watchGroup(effectiveGroup.folder);
@@ -16341,6 +16276,7 @@ async function processAgentConversation(
       identifier: string,
       selectedProviderId: string | null,
     ) => {
+      selectedAgentProviderIdForRun = selectedProviderId;
       const containerName = executionMode === 'container' ? identifier : null;
       queue.registerProcess(virtualJid, proc, {
         containerName,
@@ -16468,6 +16404,16 @@ async function processAgentConversation(
         agentProfileVersion: agentProfile?.version,
         identityHash: agentProfile?.identity_hash,
       });
+    }
+
+    if (rotatingAgentTurnCompleted) {
+      resetSessionAfterProviderRotation(
+        effectiveGroup.folder,
+        agentId,
+        selectedAgentProviderIdForRun,
+        agentProfile,
+      );
+      currentAgentSessionId = undefined;
     }
 
     // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）

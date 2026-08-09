@@ -1311,7 +1311,9 @@ async function runTaskInner(
         }
         if (streamedOutput.providerFailure) {
           if (streamedOutput.providerFailureTerminal === true) {
-            error = PROVIDER_FAILURE_USER_NOTICE;
+            error =
+              streamedOutput.providerFailureNotice ||
+              PROVIDER_FAILURE_USER_NOTICE;
             lastOutputTime = Date.now();
           }
         } else if (streamedOutput.result) {
@@ -1378,7 +1380,7 @@ async function runTaskInner(
       scheduledInputCompleted = true;
     }
     if (output.providerFailure) {
-      error = PROVIDER_FAILURE_USER_NOTICE;
+      error = output.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE;
       lastOutputTime = Date.now();
     } else if (output.status === 'closed' && !scheduledInputCompleted) {
       error = 'Agent closed before completing the scheduled task input';

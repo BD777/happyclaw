@@ -196,6 +196,8 @@ RUN set -eu && \
       > "$DOWNLOAD_TMP/checksum.txt" && \
     (cd "$DOWNLOAD_TMP" && sha256sum -c checksum.txt) && \
     tar -xzf "$DOWNLOAD_TMP/$ARCHIVE" --strip-components=1 -C /usr/local/bin && \
+    chown root:root /usr/local/bin/feishu-cli && \
+    chmod 755 /usr/local/bin/feishu-cli && \
     feishu-cli --version && \
     printf '%s\n' "$RELEASE_TAG" > /usr/local/share/feishu-cli-version && \
     rm -rf "$DOWNLOAD_TMP"
