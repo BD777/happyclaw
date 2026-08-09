@@ -606,16 +606,14 @@ function assertFeishuApiSuccess(operation: string, response: unknown): void {
     throw new Error(`${operation} returned no acknowledgement`);
   }
   const result = response as { code?: number; msg?: string };
-  // Some @larksuiteoapi/node-sdk endpoints (observed on im.v1.file.create)
-  // resolve with the unwrapped `data` payload instead of the {code,msg,data}
-  // envelope, so a missing `code` field is not itself a failure signal.
-  // Only a `code` that is explicitly present and non-zero is a reliable
-  // failure — log the raw response alongside it so a real failure is
-  // diagnosable instead of surfacing as "code=unknown".
-  if (result.code !== undefined && result.code !== 0) {
+  // Message create/reply use the regular Feishu response envelope. Require an
+  // explicit success code so malformed or partial acknowledgements can never
+  // make the durable outbox believe an unsent message was delivered. Upload
+  // endpoints have a separate unwrapped-payload contract below.
+  if (result.code !== 0) {
     logger.error(
       { operation, response },
-      'Feishu API call returned a non-zero code',
+      'Feishu API acknowledgement did not contain an explicit success code',
     );
     throw new FeishuApiRejectedError(
       `${operation} failed (code=${result.code}, msg=${result.msg || 'unknown'})`,
@@ -3304,30 +3302,6 @@ export function createFeishuConnection(
             logger.error(
               { err },
               'Error handling bot removed from group event',
-            );
-          }
-        },
-        // 用户点开与 bot 的单聊窗口时触发，早于第一条消息。趁这个事件预注册
-        // chat + owner，第一条 DM 到达时 resolveEffectiveChatJid 就已能正常
-        // 解析，不必再依赖 handleIncomingMessage 里的 P2P bootstrap 兜底
-        // （事件可能因权限未开通/漏投而不触发，bootstrap 兜底仍然保留）。
-        'im.chat.access_event.bot_p2p_chat_entered_v1': async (data) => {
-          try {
-            const chatId = data.chat_id;
-            if (!chatId) return;
-            const rawJid = `feishu:${chatId}`;
-            const chatJid =
-              connectOptions?.normalizeIncomingJid?.(rawJid) ?? rawJid;
-            logger.info({ chatJid }, 'User entered Feishu P2P chat with bot');
-            connectOptions?.onNewChat?.(chatJid, '飞书私聊');
-            const operatorOpenId = data.operator_id?.open_id;
-            if (operatorOpenId && connectOptions?.onP2pSender) {
-              connectOptions.onP2pSender(operatorOpenId);
-            }
-          } catch (err) {
-            logger.error(
-              { err },
-              'Error handling P2P chat entered event',
             );
           }
         },

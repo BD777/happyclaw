@@ -18913,7 +18913,11 @@ function isGroupOwnerMessage(chatJid: string, senderImId?: string): boolean {
  * sender_allowlist 为 null/undefined 时不限制（默认），为空数组时无人可触发，
  * 为字符串数组时仅列表中的 open_id 可触发。
  */
-function isSenderAllowedInGroup(chatJid: string, senderImId?: string): boolean {
+function isSenderAllowedInGroup(
+  chatJid: string,
+  senderImId?: string,
+  getCurrentFeishuOwner?: () => string | undefined,
+): boolean {
   const conversationJid = channelConversationJid(
     stripVirtualJidSuffix(chatJid),
   );
@@ -18926,9 +18930,14 @@ function isSenderAllowedInGroup(chatJid: string, senderImId?: string): boolean {
     if (getChannelType(conversationJid) !== 'feishu') return false;
     const accountId = parseChannelAddress(conversationJid)?.channelAccountId;
     const account = accountId ? getChannelAccount(accountId) : undefined;
-    const knownOwner = account
-      ? getUserFeishuConfig(account.owner_user_id)?.ownerOpenId
-      : undefined;
+    // First-class and legacy connections pass the live account-local owner
+    // resolver. Falling back to a user-level owner for every Bot lets one
+    // account's identity leak into another account's first-DM admission.
+    const knownOwner = getCurrentFeishuOwner
+      ? getCurrentFeishuOwner()
+      : account?.is_legacy_default
+        ? getUserFeishuConfig(account.owner_user_id)?.ownerOpenId
+        : undefined;
     return isUnknownFeishuSenderAllowed(knownOwner, senderImId);
   }
 
@@ -19155,7 +19164,12 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           resolveFeishuConversationPlan:
             resolveFeishuConversationPlanForMessage,
           isGroupOwnerMessage,
-          isSenderAllowedInGroup,
+          isSenderAllowedInGroup: (jid: string, sender?: string) =>
+            isSenderAllowedInGroup(
+              jid,
+              sender,
+              () => secret.ownerOpenId || undefined,
+            ),
           onFollowUpMessage: handleIncomingFollowUp,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
@@ -20017,7 +20031,8 @@ async function main(): Promise<void> {
             resolveFeishuConversationPlan:
               resolveFeishuConversationPlanForMessage,
             isGroupOwnerMessage,
-            isSenderAllowedInGroup,
+            isSenderAllowedInGroup: (jid: string, sender?: string) =>
+              isSenderAllowedInGroup(jid, sender, getReloadOwnerOpenId),
             onFollowUpMessage: handleIncomingFollowUp,
             onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
