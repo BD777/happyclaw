@@ -35,7 +35,10 @@ import {
   stripLeadingBotMention,
   type MentionGateMention,
 } from './feishu-mention-gate.js';
-import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import {
+  resolveAdmittedChannelRoute,
+  ChannelRouteRejectedError,
+} from './channel-admission.js';
 import {
   extractProviderTarget,
   parseChannelAddress,
@@ -603,9 +606,17 @@ function assertFeishuApiSuccess(operation: string, response: unknown): void {
     throw new Error(`${operation} returned no acknowledgement`);
   }
   const result = response as { code?: number; msg?: string };
+  // Message create/reply use the regular Feishu response envelope. Require an
+  // explicit success code so malformed or partial acknowledgements can never
+  // make the durable outbox believe an unsent message was delivered. Upload
+  // endpoints have a separate unwrapped-payload contract below.
   if (result.code !== 0) {
+    logger.error(
+      { operation, response },
+      'Feishu API acknowledgement did not contain an explicit success code',
+    );
     throw new FeishuApiRejectedError(
-      `${operation} failed (code=${result.code ?? 'unknown'}, msg=${result.msg || 'unknown'})`,
+      `${operation} failed (code=${result.code}, msg=${result.msg || 'unknown'})`,
     );
   }
 }
@@ -2332,14 +2343,25 @@ export function createFeishuConnection(
       // onNewChat/onP2pSender are idempotent no-ops once already
       // registered, so calling them again in their normal position below
       // is safe and keeps this bootstrap narrowly scoped to P2P.
-      if (
-        chatType === 'p2p' &&
-        resolveEffectiveChatJid &&
-        !resolveEffectiveChatJid(chatJid)
-      ) {
-        onNewChat?.(chatJid, resolvedChatName);
-        if (senderOpenId && onP2pSender) {
-          onP2pSender(senderOpenId);
+      //
+      // resolveEffectiveChatJid is wrapped per-account by im-manager, which
+      // throws ChannelRouteRejectedError instead of returning null for an
+      // unbound chat (see im-manager.ts). A bare `!resolveEffectiveChatJid(...)`
+      // check never observes that falsy case — the throw unwinds straight to
+      // the outer catch below, onNewChat never runs, and the chat can never
+      // register. Treat that specific rejection the same as a null return.
+      if (chatType === 'p2p' && resolveEffectiveChatJid) {
+        let alreadyBound = false;
+        try {
+          alreadyBound = !!resolveEffectiveChatJid(chatJid);
+        } catch (err) {
+          if (!(err instanceof ChannelRouteRejectedError)) throw err;
+        }
+        if (!alreadyBound) {
+          onNewChat?.(chatJid, resolvedChatName);
+          if (senderOpenId && onP2pSender) {
+            onP2pSender(senderOpenId);
+          }
         }
       }
 

@@ -91,6 +91,8 @@ vi.mock('../src/logger.js', () => ({
 
 const db = await import('../src/db.js');
 const { createFeishuConnection } = await import('../src/feishu.js');
+const { ChannelRouteRejectedError } =
+  await import('../src/channel-admission.js');
 const { getChannelCursor, recordChannelInbox } =
   await import('../src/channel-reliability-store.js');
 
@@ -211,10 +213,115 @@ async function connect(
   const handler =
     controls.dispatchers[dispatcherIndex]?.['im.message.receive_v1'];
   expect(handler).toBeTypeOf('function');
-  return { connection, handler };
+  return {
+    connection,
+    handler,
+    handlers: controls.dispatchers[dispatcherIndex]!,
+  };
 }
 
 describe('Feishu durable Inbox and cursor integration', () => {
+  test('bootstraps the first P2P DM after an account-scoped route rejection', async () => {
+    const accountId = `account-first-dm-${Date.now()}`;
+    const executed = vi.fn();
+    const onNewChat = vi.fn();
+    const onP2pSender = vi.fn();
+    let registered = false;
+    onNewChat.mockImplementation(() => {
+      registered = true;
+    });
+    const resolveEffectiveChatJid = vi.fn((jid: string) => {
+      if (!registered) throw new ChannelRouteRejectedError(jid);
+      return {
+        effectiveJid: 'web:durable-feishu-test',
+        agentId: null,
+        sourceJid: jid,
+      };
+    });
+    const connected = await connect(accountId, executed, {
+      normalizeIncomingJid: (jid) => `${jid}#account:${accountId}`,
+      resolveEffectiveChatJid,
+      isSenderAllowedInGroup: () => true,
+      onNewChat,
+      onP2pSender,
+    });
+
+    await connected.handler(event('om_first_dm', Date.now(), 'hello'));
+
+    expect(resolveEffectiveChatJid).toHaveBeenCalledTimes(2);
+    expect(resolveEffectiveChatJid).toHaveBeenNthCalledWith(
+      1,
+      `feishu:ou_durable_user#account:${accountId}`,
+    );
+    expect(onNewChat).toHaveBeenCalledWith(
+      `feishu:ou_durable_user#account:${accountId}`,
+      '飞书私聊',
+    );
+    expect(onP2pSender).toHaveBeenCalledWith('ou_durable_user');
+    expect(executed).toHaveBeenCalledWith('om_first_dm');
+  });
+
+  test('rejects a known-owner mismatch before P2P registration or routing', async () => {
+    const accountId = `account-owner-gate-${Date.now()}`;
+    const executed = vi.fn();
+    const onNewChat = vi.fn();
+    const onP2pSender = vi.fn();
+    const resolveEffectiveChatJid = vi.fn();
+    const connected = await connect(accountId, executed, {
+      normalizeIncomingJid: (jid) => `${jid}#account:${accountId}`,
+      resolveEffectiveChatJid,
+      isSenderAllowedInGroup: (_jid, sender) => sender === 'ou_owner',
+      onNewChat,
+      onP2pSender,
+    });
+
+    await connected.handler(
+      event('om_non_owner_first_dm', Date.now(), 'not the owner'),
+    );
+
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(onP2pSender).not.toHaveBeenCalled();
+    expect(resolveEffectiveChatJid).not.toHaveBeenCalled();
+    expect(executed).not.toHaveBeenCalled();
+  });
+
+  test('does not bootstrap P2P registration after an unrelated route failure', async () => {
+    const accountId = `account-route-error-${Date.now()}`;
+    const executed = vi.fn();
+    const onNewChat = vi.fn();
+    const onP2pSender = vi.fn();
+    const resolveEffectiveChatJid = vi.fn(() => {
+      throw new Error('route storage unavailable');
+    });
+    const connected = await connect(accountId, executed, {
+      resolveEffectiveChatJid,
+      isSenderAllowedInGroup: () => true,
+      onNewChat,
+      onP2pSender,
+    });
+
+    await connected.handler(
+      event('om_route_error', Date.now(), 'do not register'),
+    );
+
+    expect(resolveEffectiveChatJid).toHaveBeenCalledTimes(1);
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(onP2pSender).not.toHaveBeenCalled();
+    expect(executed).not.toHaveBeenCalled();
+  });
+
+  test('does not register an owner merely because a user opens the P2P chat', async () => {
+    const accountId = `account-no-enter-claim-${Date.now()}`;
+    const connected = await connect(accountId, vi.fn(), {
+      onNewChat: vi.fn(),
+      onP2pSender: vi.fn(),
+    });
+
+    expect(
+      connected.handlers['im.chat.access_event.bot_p2p_chat_entered_v1'],
+    ).toBeUndefined();
+  });
+
   test('recovery gate queues a live event and executes it only after the gate opens', async () => {
     const accountId = `account-recovery-gate-${Date.now()}`;
     const executed = vi.fn();
