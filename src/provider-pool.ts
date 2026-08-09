@@ -37,6 +37,20 @@ interface ModelQuarantine {
 export type ProviderTier = string | ReadonlyMap<string, string>;
 
 /**
+ * Stable identity for the model selected implicitly by the official SDK.
+ *
+ * Official OAuth providers are allowed to leave `anthropicModel` empty. An
+ * empty tier means "ignore model quarantine" to the pool, so using the raw
+ * config value would collapse a real model wall into an account wall. Keep a
+ * distinct internal key while still leaving ANTHROPIC_MODEL unset at runtime.
+ */
+export const SDK_DEFAULT_MODEL_TIER = '__happyclaw_sdk_default_model__';
+
+export function providerModelTier(model: string | null | undefined): string {
+  return model?.trim() || SDK_DEFAULT_MODEL_TIER;
+}
+
+/**
  * Composite-key separator. NUL cannot occur in a profile id or a model name,
  * so the key is unambiguous — but it is invisible in editors and diffs, which
  * is exactly how the readers below once drifted to parsing a space. Encode and
@@ -236,6 +250,37 @@ export class ProviderPool {
     for (const key of this.modelQuarantine.keys()) {
       if (modelKeyOwner(key) === profileId) this.modelQuarantine.delete(key);
     }
+  }
+
+  /**
+   * Candidate-affecting quarantine state, used by bounded replay loops to
+   * prove that a non-terminal provider failure actually made progress.
+   */
+  getAvailabilityStateKey(now = Date.now()): string {
+    this.refreshRecoveryState(now);
+    const accountWalls = this.members
+      .filter((member) => {
+        if (!member.enabled) return false;
+        const health = this.healthMap.get(member.profileId);
+        return !!health && !health.healthy;
+      })
+      .map((member) => member.profileId)
+      .sort();
+    const modelWalls: string[] = [];
+    for (const [key, entry] of this.modelQuarantine) {
+      const recoverAt = entry.until ?? entry.since + this.recoveryIntervalMs;
+      if (now >= recoverAt) {
+        this.modelQuarantine.delete(key);
+      } else if (
+        this.members.some(
+          (member) => member.profileId === modelKeyOwner(key) && member.enabled,
+        )
+      ) {
+        modelWalls.push(key);
+      }
+    }
+    modelWalls.sort();
+    return JSON.stringify({ accountWalls, modelWalls });
   }
 
   /** How many enabled members are currently configured */

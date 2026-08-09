@@ -18,7 +18,11 @@ vi.mock('../src/logger.js', () => ({
 
 const runtimeConfig = await import('../src/runtime-config.js');
 const db = await import('../src/db.js');
-const { trySelectPoolProvider } = await import('../src/container-runner.js');
+const {
+  closeRunnerAfterRotatingProviderTurn,
+  trySelectPoolProvider,
+  willClearSessionOnProviderSwitch,
+} = await import('../src/container-runner.js');
 const { providerPool } = await import('../src/provider-pool.js');
 
 beforeAll(() => {
@@ -72,6 +76,37 @@ describe('default model configuration vs. balancing pool', () => {
       picked.add(result!.profileId);
     }
     expect(picked.size).toBeGreaterThan(1);
+  });
+
+  test('a completed warm turn closes before the next request and reselects with history reset', () => {
+    runtimeConfig.saveBalancingConfig({ strategy: 'round-robin' });
+    const groupFolder = 'warm-turn-rotation';
+    const first = trySelectPoolProvider(groupFolder, null, null);
+    expect(first).not.toBeNull();
+
+    const closeRunner = vi.fn();
+    expect(
+      closeRunnerAfterRotatingProviderTurn(
+        true,
+        false,
+        { providerFailure: false, inputTurnCompleted: true },
+        closeRunner,
+      ),
+    ).toBe(true);
+    expect(closeRunner).toHaveBeenCalledOnce();
+    // Host shutdown drops the resumable SDK session but retains the previous
+    // provider binding, so prompt construction predicts the switch and injects
+    // persisted history before the next cold runner starts.
+    db.deleteSession(groupFolder, null);
+    db.setSessionProviderId(groupFolder, null, first!.profileId);
+    expect(willClearSessionOnProviderSwitch(groupFolder, null, null)).toBe(
+      true,
+    );
+
+    const second = trySelectPoolProvider(groupFolder, null, null);
+    expect(second).not.toBeNull();
+    expect(second!.profileId).not.toBe(first!.profileId);
+    expect(second!.resetSession).toBe(true);
   });
 
   test('an explicit Agent model configuration still pins selection', () => {

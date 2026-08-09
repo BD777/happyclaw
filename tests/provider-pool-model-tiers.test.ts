@@ -1,6 +1,10 @@
 import { describe, expect, test, vi } from 'vitest';
 
-import { ProviderPool } from '../src/provider-pool.js';
+import {
+  providerModelTier,
+  ProviderPool,
+  SDK_DEFAULT_MODEL_TIER,
+} from '../src/provider-pool.js';
 
 const ACCOUNTS = [
   { id: 'acct-1', enabled: true, weight: 1 },
@@ -32,6 +36,21 @@ describe('per-account model tier quarantine', () => {
     // The account itself is untouched: its other tiers still work.
     expect(pool.getHealthStatus('acct-1').healthy).toBe(true);
     expect(pool.isModelQuarantined('acct-1', 'fable')).toBe(true);
+    expect(pool.isModelQuarantined('acct-1', 'claude-opus-5')).toBe(false);
+    expect(pool.hasCandidateForTier('claude-opus-5')).toBe(true);
+  });
+
+  test('an empty official OAuth model remains a model tier, not an account wall', () => {
+    const pool = makePool();
+    const defaultTier = providerModelTier('');
+    expect(defaultTier).toBe(SDK_DEFAULT_MODEL_TIER);
+
+    pool.reportModelFailure('acct-1', defaultTier);
+
+    expect(pool.getHealthStatus('acct-1').healthy).toBe(true);
+    expect(pool.isModelQuarantined('acct-1', defaultTier)).toBe(true);
+    expect(pool.selectProvider(primaryTier(defaultTier))).not.toBe('acct-1');
+    // The same OAuth account remains eligible for a configured fallback model.
     expect(pool.isModelQuarantined('acct-1', 'claude-opus-5')).toBe(false);
     expect(pool.hasCandidateForTier('claude-opus-5')).toBe(true);
   });

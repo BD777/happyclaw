@@ -44,7 +44,7 @@ import {
   shellQuoteEnvLines,
   writeCredentialsFile,
 } from './runtime-config.js';
-import { providerPool } from './provider-pool.js';
+import { providerModelTier, providerPool } from './provider-pool.js';
 import type { ProviderTier } from './provider-pool.js';
 import {
   issueWorkspaceMemoryWriteCapability,
@@ -541,7 +541,7 @@ function poolCanStillServe(): boolean {
   const enabled = getEnabledProviders();
   if (enabled.length === 0) return false;
   const primaryTier = new Map(
-    enabled.map((p) => [p.id, p.anthropicModel || '']),
+    enabled.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
   );
   if (providerPool.hasCandidateForTier(primaryTier)) return true;
   const fallbackModel = getSystemSettings().fallbackModel?.trim();
@@ -857,7 +857,7 @@ function resolvePoolTierModel(
   enabledProviders: Array<{ id: string; anthropicModel: string }>,
 ): string | null {
   const primaryTier = new Map(
-    enabledProviders.map((p) => [p.id, p.anthropicModel || '']),
+    enabledProviders.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
   );
   if (providerPool.hasCandidateForTier(primaryTier)) return null;
 
@@ -893,8 +893,10 @@ function stickyBindingCanServeTier(
 ): boolean {
   const model =
     tierModel ??
-    (enabledProviders.find((p) => p.id === boundId)?.anthropicModel || '');
-  return !model || !providerPool.isModelQuarantined(boundId, model);
+    providerModelTier(
+      enabledProviders.find((p) => p.id === boundId)?.anthropicModel,
+    );
+  return !providerPool.isModelQuarantined(boundId, model);
 }
 
 function resolvePinnedModelConfigId(
@@ -903,6 +905,45 @@ function resolvePinnedModelConfigId(
   if (modelConfigId) return modelConfigId;
   if (getEnabledProviders().length > 1) return null;
   return getDefaultProviderId();
+}
+
+/** Whether a completed user turn must release its runner for the next pick. */
+export function shouldRotatePoolProviderAfterTurn(
+  groupFolder: string,
+  modelConfigId?: string | null,
+): boolean {
+  if (resolvePinnedModelConfigId(modelConfigId)) return false;
+  const override = getContainerEnvConfig(groupFolder);
+  if (
+    override.anthropicApiKey ||
+    override.anthropicAuthToken ||
+    override.anthropicBaseUrl
+  ) {
+    return false;
+  }
+  return (
+    getEnabledProviders().length > 1 &&
+    getBalancingConfig().strategy !== 'failover'
+  );
+}
+
+/** Schedule one runner shutdown after a healthy logical turn under rotation. */
+export function closeRunnerAfterRotatingProviderTurn(
+  rotationEnabled: boolean,
+  rotationAlreadyScheduled: boolean,
+  output: Pick<ContainerOutput, 'providerFailure' | 'inputTurnCompleted'>,
+  closeRunner: () => void,
+): boolean {
+  if (
+    !rotationEnabled ||
+    rotationAlreadyScheduled ||
+    output.providerFailure ||
+    output.inputTurnCompleted !== true
+  ) {
+    return false;
+  }
+  closeRunner();
+  return true;
 }
 
 /**
@@ -1062,7 +1103,9 @@ export function trySelectPoolProvider(
   const tierModel = resolvePoolTierModel(enabledProviders);
   const tier: ProviderTier =
     tierModel ??
-    new Map(enabledProviders.map((p) => [p.id, p.anthropicModel || '']));
+    new Map(
+      enabledProviders.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
+    );
 
   // Sticky path: respect previous session→provider binding when the bound
   // provider is still enabled. Only the failover strategy is sticky — the
@@ -1206,11 +1249,12 @@ export function resolvePoolTierEnv(
   modelOverride: string | undefined,
   enabledProviderCount: number,
   configuredFallbackModel = getSystemSettings().fallbackModel,
+  modelSelectionPinned = false,
 ): { model?: string; runnerFallbackModel?: string } {
   const fallbackModel = configuredFallbackModel?.trim();
   return {
     ...(modelOverride ? { model: modelOverride } : {}),
-    ...(enabledProviderCount <= 1 && fallbackModel
+    ...((enabledProviderCount <= 1 || modelSelectionPinned) && fallbackModel
       ? { runnerFallbackModel: fallbackModel }
       : {}),
   };
@@ -1333,6 +1377,8 @@ export function buildVolumeMounts(
   channelContext?: ChannelTurnContext,
   /** Set when the pool escalated past the primary model tier for this turn. */
   poolModelOverride?: string,
+  /** Explicit Agent model selection keeps fallback inside the pinned account. */
+  modelSelectionPinned = false,
 ): VolumeMount[] {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -1638,6 +1684,8 @@ export function buildVolumeMounts(
   const containerTierEnv = resolvePoolTierEnv(
     poolModelOverride,
     getEnabledProviders().length,
+    undefined,
+    modelSelectionPinned,
   );
   applyFallbackModelToEnvLines(envLines, containerTierEnv.runnerFallbackModel);
   if (containerTierEnv.model) {
@@ -1992,6 +2040,7 @@ export async function runContainerAgent(
       input.agentProfile,
       input.channelContext,
       poolResult?.modelOverride,
+      modelSelectionPinned,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
@@ -2836,6 +2885,8 @@ export async function runHostAgent(
     const tierEnv = resolvePoolTierEnv(
       hostPoolResult?.modelOverride,
       getEnabledProviders().length,
+      undefined,
+      hostModelSelectionPinned,
     );
     if (tierEnv.runnerFallbackModel) {
       hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = tierEnv.runnerFallbackModel;
@@ -3406,13 +3457,27 @@ export async function runAgentWithModelFallback(
   const selectedModelConfigId = resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
   );
+  const enabledProviders = getEnabledProviders();
+  const fallbackTier = getSystemSettings().fallbackModel?.trim();
+  const fallbackOnlyCombinations = fallbackTier
+    ? enabledProviders.filter(
+        (provider) =>
+          providerModelTier(provider.anthropicModel) !==
+          providerModelTier(fallbackTier),
+      ).length
+    : 0;
+  // Account failures remove every tier at once; model failures remove one
+  // (account, tier) pair. This bound covers every distinct reachable pair
+  // without allowing a malformed non-terminal signal to loop forever.
   const maxAttempts = selectedModelConfigId
     ? 1
-    : Math.max(1, getEnabledProviders().length);
+    : Math.max(1, enabledProviders.length + fallbackOnlyCombinations);
   let lastOutput: ContainerOutput | undefined;
+  let availabilityState = providerPool.getAvailabilityStateKey();
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     let completedInputBeforeProviderFailure = false;
+    let attemptedProviderId: string | null = null;
     const gatedOnOutput = onOutput
       ? async (output: ContainerOutput): Promise<void> => {
           if (!output.providerFailure && output.inputTurnCompleted) {
@@ -3433,7 +3498,10 @@ export async function runAgentWithModelFallback(
     lastOutput = await runFn(
       group,
       input,
-      onProcess,
+      (proc, identifier, selectedProviderId) => {
+        attemptedProviderId = selectedProviderId;
+        onProcess(proc, identifier, selectedProviderId);
+      },
       gatedOnOutput,
       ownerHomeFolder,
     );
@@ -3466,6 +3534,24 @@ export async function runAgentWithModelFallback(
       return lastOutput;
     }
 
+    const nextAvailabilityState = providerPool.getAvailabilityStateKey();
+    if (
+      attemptedProviderId !== null &&
+      nextAvailabilityState === availabilityState
+    ) {
+      logger.error(
+        {
+          group: group.name,
+          attempt: attempt + 1,
+          providerId: attemptedProviderId,
+        },
+        'Scheduled provider retry made no availability progress; stopping replay',
+      );
+      applyKnownProviderFailureDisposition(lastOutput, true);
+      return lastOutput;
+    }
+    availabilityState = nextAvailabilityState;
+
     logger.warn(
       {
         group: group.name,
@@ -3476,6 +3562,14 @@ export async function runAgentWithModelFallback(
     );
   }
 
+  if (lastOutput?.providerFailure) {
+    logger.error(
+      { group: group.name, maxAttempts },
+      'Scheduled provider retry reached its distinct-combination safety bound',
+    );
+    applyKnownProviderFailureDisposition(lastOutput, true);
+    return lastOutput;
+  }
   return (
     lastOutput ?? {
       status: 'error',

@@ -106,6 +106,7 @@ import {
 import {
   resolveClaudeProviderRuntime,
   resolveClaudeQueryModelRuntime,
+  resolveProviderReportedModelTier,
 } from './provider-runtime.js';
 import { resolveAgentSdkEffort } from './agent-effort.js';
 import {
@@ -1901,9 +1902,10 @@ async function runQueryAttempt(
         : {}),
       ...(failureNotice ? { providerFailureNotice: failureNotice } : {}),
       providerRateLimitScope: rateLimitScope,
-      providerRateLimitModel:
-        PROVIDER_FALLBACK_MODELS.activeModelOverride ||
-        CLAUDE_PROVIDER_RUNTIME.model,
+      providerRateLimitModel: resolveProviderReportedModelTier(
+        CLAUDE_PROVIDER_RUNTIME,
+        PROVIDER_FALLBACK_MODELS.activeModelOverride,
+      ),
       ...(!emitOutput ? { providerFailureMaintenance: true } : {}),
       finalizationReason: 'error',
       ...(emitOutput && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
