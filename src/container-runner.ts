@@ -14,7 +14,16 @@ import os from 'os';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
+import {
+  CONTAINER_HTTP_PROXY,
+  CONTAINER_HTTPS_PROXY,
+  CONTAINER_IMAGE,
+  CONTAINER_NO_PROXY,
+  DATA_DIR,
+  GROUPS_DIR,
+  TIMEZONE,
+  type ContainerProxyConfig,
+} from './config.js';
 import { logger } from './logger.js';
 import {
   buildEffectiveMcpManifest,
@@ -1379,6 +1388,10 @@ export function buildVolumeMounts(
   poolModelOverride?: string,
   /** Explicit Agent model selection keeps fallback inside the pinned account. */
   modelSelectionPinned = false,
+  containerProxy: ResolvedContainerProxyConfig = {
+    envLines: [],
+    addHostGateway: false,
+  },
 ): VolumeMount[] {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -1695,6 +1708,7 @@ export function buildVolumeMounts(
     envLines.push(`ANTHROPIC_MODEL=${containerTierEnv.model}`);
   }
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
+  applyContainerProxyEnvLines(envLines, containerProxy.envLines);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -1925,11 +1939,115 @@ export function detectContainerHostIdentity(
   });
 }
 
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+export interface ResolvedContainerProxyConfig {
+  /** Shell env assignments written to the per-container 0600 runtime file. */
+  envLines: string[];
+  /** Non-sensitive Docker networking option; proxy URLs never enter argv. */
+  addHostGateway: boolean;
+}
+
+export interface ContainerNetworkConfig {
+  addHostGateway: boolean;
+}
+
+function defaultContainerProxyConfig(): ContainerProxyConfig {
+  return {
+    httpsProxy: CONTAINER_HTTPS_PROXY,
+    httpProxy: CONTAINER_HTTP_PROXY,
+    noProxy: CONTAINER_NO_PROXY,
+  };
+}
+
+function parseContainerProxyUrl(name: string, value: string): URL {
+  try {
+    const parsed = new URL(value);
+    if (parsed.hostname) return parsed;
+  } catch {
+    // Use the deterministic error below without echoing credentials.
+  }
+  throw new Error(
+    `${name} must be an absolute proxy URL (for example, http://proxy.example:8080)`,
+  );
+}
+
+function normalizedProxyHostname(parsed: URL): string {
+  return parsed.hostname
+    .toLowerCase()
+    .replace(/^\[/, '')
+    .replace(/\]$/, '')
+    .replace(/\.$/, '');
+}
+
+export function resolveContainerProxyConfig(
+  proxyConfig: ContainerProxyConfig = defaultContainerProxyConfig(),
+  platform: NodeJS.Platform = process.platform,
+): ResolvedContainerProxyConfig {
+  const envLines: string[] = [];
+  let addHostGateway = false;
+  const supportsDesktopHost = platform === 'darwin' || platform === 'win32';
+
+  for (const [name, value] of [
+    ['HTTPS_PROXY', proxyConfig.httpsProxy],
+    ['HTTP_PROXY', proxyConfig.httpProxy],
+  ] as const) {
+    if (!value) continue;
+    const parsed = parseContainerProxyUrl(name, value);
+    const hostname = normalizedProxyHostname(parsed);
+    let containerValue = value;
+
+    if (LOOPBACK_HOSTNAMES.has(hostname)) {
+      if (!supportsDesktopHost) {
+        throw new Error(
+          `${name} points to host loopback (${hostname}), which Linux bridge containers cannot reach. Bind the proxy to an interface reachable from the Docker bridge and configure that address instead.`,
+        );
+      }
+      parsed.hostname = 'host.docker.internal';
+      containerValue = parsed.toString();
+    } else if (platform === 'linux' && hostname === 'host.docker.internal') {
+      addHostGateway = true;
+    }
+
+    envLines.push(`${name}=${containerValue}`);
+  }
+
+  if (proxyConfig.noProxy) {
+    envLines.push(`NO_PROXY=${proxyConfig.noProxy}`);
+  }
+
+  return { envLines, addHostGateway };
+}
+
+/** Apply proxy assignments last so host proxy configuration is authoritative. */
+export function applyContainerProxyEnvLines(
+  envLines: string[],
+  proxyEnvLines: readonly string[],
+): void {
+  for (const proxyLine of proxyEnvLines) {
+    const separator = proxyLine.indexOf('=');
+    if (separator <= 0) continue;
+    const key = proxyLine.slice(0, separator);
+    const lowerKey = key.toLowerCase();
+    for (let index = envLines.length - 1; index >= 0; index -= 1) {
+      const existingLine = envLines[index] ?? '';
+      const existingSeparator = existingLine.indexOf('=');
+      const existingKey =
+        existingSeparator > 0
+          ? existingLine.slice(0, existingSeparator)
+          : existingLine;
+      if (existingKey?.toLowerCase() === lowerKey) envLines.splice(index, 1);
+    }
+    envLines.push(proxyLine);
+  }
+}
+
 export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   tz: string,
   hostIdentity: ContainerHostIdentity = detectContainerHostIdentity(),
+  networkConfig: ContainerNetworkConfig = { addHostGateway: false },
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -1943,6 +2061,12 @@ export function buildContainerArgs(
     if (isPositiveUnixId(hostIdentity.gid)) {
       args.push('-e', `HAPPYCLAW_HOST_GID=${hostIdentity.gid}`);
     }
+  }
+
+  // Proxy URLs are sourced from the mounted 0600 runtime env file. Only this
+  // non-sensitive name-resolution option is allowed into docker argv/logs.
+  if (networkConfig.addHostGateway) {
+    args.push('--add-host', 'host.docker.internal:host-gateway');
   }
 
   // Docker: -v with :ro suffix for readonly
@@ -2028,6 +2152,9 @@ export async function runContainerAgent(
     const isAdminHome = !!input.isAdminHome;
     // Per-user skills: always mount if the group has an owner
     const shouldMountUserSkills = !!group.created_by;
+    // Resolve before creating mounts or spawning Docker so Linux loopback
+    // configurations fail fast with an actionable error.
+    const containerProxy = resolveContainerProxyConfig();
     const mounts = buildVolumeMounts(
       group,
       isAdminHome,
@@ -2041,13 +2168,20 @@ export async function runContainerAgent(
       input.channelContext,
       poolResult?.modelOverride,
       modelSelectionPinned,
+      containerProxy,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
       ? `-${sessionAgentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
       : '';
     const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
-    const containerArgs = buildContainerArgs(mounts, containerName, TIMEZONE);
+    const containerArgs = buildContainerArgs(
+      mounts,
+      containerName,
+      TIMEZONE,
+      detectContainerHostIdentity(),
+      { addHostGateway: containerProxy.addHostGateway },
+    );
 
     logger.debug(
       {
