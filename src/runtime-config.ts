@@ -3083,15 +3083,19 @@ export function buildContainerEnvLines(
 // ─── OAuth credentials file management ────────────────────────────
 
 /**
- * Write .credentials.json to a Claude session directory.
- * Format matches what Claude Code CLI/Agent SDK natively reads.
+ * Build the claudeAiOauth object in the exact shape Claude Code CLI reads,
+ * shared by the .credentials.json file and the macOS Keychain entry so the
+ * two credential stores can never disagree on content.
  */
-export function writeCredentialsFile(
-  sessionDir: string,
-  config: ClaudeProviderConfig,
-): void {
+export function buildClaudeAiOauthPayload(config: ClaudeProviderConfig): {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  scopes: string[];
+  subscriptionType?: string;
+} | null {
   const creds = config.claudeOAuthCredentials;
-  if (!creds) return;
+  if (!creds) return null;
 
   // Claude CLI requires scopes to recognize the token as valid.
   // Fall back to a sensible default when the stored credentials lack scopes
@@ -3100,13 +3104,7 @@ export function writeCredentialsFile(
     ? creds.scopes
     : DEFAULT_CREDENTIAL_SCOPES;
 
-  const claudeAiOauth: {
-    accessToken: string;
-    refreshToken: string;
-    expiresAt: number;
-    scopes: string[];
-    subscriptionType?: string;
-  } = {
+  const claudeAiOauth: ReturnType<typeof buildClaudeAiOauthPayload> = {
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
@@ -3115,8 +3113,21 @@ export function writeCredentialsFile(
   // Only include subscriptionType when explicitly configured — avoids
   // misleading Claude CLI when the actual subscription tier is unknown.
   if (creds.subscriptionType) {
-    claudeAiOauth.subscriptionType = creds.subscriptionType;
+    claudeAiOauth!.subscriptionType = creds.subscriptionType;
   }
+  return claudeAiOauth;
+}
+
+/**
+ * Write .credentials.json to a Claude session directory.
+ * Format matches what Claude Code CLI/Agent SDK natively reads.
+ */
+export function writeCredentialsFile(
+  sessionDir: string,
+  config: ClaudeProviderConfig,
+): void {
+  const claudeAiOauth = buildClaudeAiOauthPayload(config);
+  if (!claudeAiOauth) return;
 
   const credentialsData = { claudeAiOauth };
 
