@@ -741,6 +741,43 @@ describe('scheduled task workspace/session contract', () => {
     expect(storedPrompt).toContain('不得只回复“已完成”“已发送”');
     expect(storedPrompt).toContain('feishu-cli');
     expect(storedPrompt).toContain('工具投递不能替代上述完整最终文本');
+    // Assistant 模式（默认）：框架会把最终文本自动投递到绑定渠道，framing 必须如实声明
+    // 并禁止 agent 再用 send_message 重复发送，否则用户收到两份相同内容。
+    expect(storedPrompt).toContain('也会自动发送到该渠道');
+    expect(storedPrompt).toContain('不要再用 send_message');
+    expect(storedPrompt).not.toContain('不会自动发送到 IM 渠道');
+  });
+
+  test('proactive workspaces get the archive-only delivery framing', async () => {
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, 'profile-proactive');
+    expect(db.setWorkspaceInteractionMode(GROUP_FOLDER, 'proactive')).toBe(
+      true,
+    );
+    try {
+      const taskId = createTask({
+        id: 'task-group-proactive-framing',
+        context_mode: 'group',
+      });
+      const groups = {
+        [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+      };
+      const { deps } = makeDeps(groups);
+
+      expect(triggerTaskNow(taskId, deps).success).toBe(true);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const storedPrompt = (deps.storeGroupPromptAndDeliverRun as any).mock
+        .calls[0][0].text as string;
+      // Proactive 模式：管线只把最终文本归档（sendToIM: false），渠道投递仍由 agent 的
+      // send_message 负责；framing 不得禁止 send_message，否则用户什么都收不到。
+      expect(storedPrompt).toContain('不会自动发送到 IM 渠道');
+      expect(storedPrompt).toContain('通过 send_message 主动发送');
+      expect(storedPrompt).not.toContain('不要再用 send_message');
+      expect(storedPrompt).toContain('完整、可独立阅读的业务结果');
+      expect(storedPrompt).toContain('feishu-cli');
+    } finally {
+      db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
+    }
   });
 
   test('cancels a delivered group run and durably projects the cancellation into its workspace', async () => {

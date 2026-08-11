@@ -54,6 +54,7 @@ import {
   getUserById,
   getUserHomeGroup,
   getAgentProfileForWorkspace,
+  getWorkspaceInteractionMode,
   getSessionAgentIdentity,
   logTaskRun,
   logTaskRunStart,
@@ -108,6 +109,10 @@ import {
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
 import { getScriptTaskHostExecutionError } from './script-task-policy.js';
+import {
+  publishesFrameworkAnswer,
+  resolveRuntimeInteractionMode,
+} from './workspace-interaction-runtime.js';
 
 export function shouldFinalizeScheduledRunOutput(
   output: Pick<
@@ -1871,14 +1876,36 @@ async function runScriptTaskInner(
  * 这段框定，明确「这是已有定时任务到点自动执行、不是用户新指令，不要再 schedule_task」，
  * 否则当 prompt 含「每隔/每天/提醒」等措辞时，agent 会按 CLAUDE.md 的定时任务规则再建一个
  * 任务而递归增殖（#564）。标记串 [定时任务自动触发] 与 global CLAUDE.md 的兜底 guard 一致。
+ *
+ * 投递契约措辞必须与消息管线的真实行为一致，且两种 interaction mode 行为不同：
+ * assistant 模式下框架会把最终 SDK 文本作为正式结果自动发送到任务绑定的渠道并归档，
+ * 若措辞误称「只归档」，agent 会再用 send_message 自行发送一份，用户就会收到两条相同
+ * 内容（group 定时任务双投递的根因）；proactive 模式下框架只归档、渠道投递仍由 agent
+ * 自己负责。因此按目标工作区当前的 interaction mode 生成对应措辞，判定方式与
+ * index.ts 消费该消息时的 resolveRuntimeInteractionMode({ agentKind: 'main' }) 一致。
  */
-const SCHEDULED_GROUP_TRIGGER_FRAMING = [
-  '[定时任务自动触发] 以下内容是你此前创建的定时任务到点自动执行的触发，不是用户新发来的指令。',
-  '请直接执行该任务对应的动作。',
-  '你的最终 SDK Assistant 文本会作为正式任务结果归档到所属 Web 工作区，因此必须包含一份完整、可独立阅读的业务结果；所有结论、报告和数据都要写在最终文本中，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。',
-  '如果任务要求调用 feishu-cli 或其他外部发送工具，请照常调用；但工具投递不能替代上述完整最终文本，工具报错时也不要声称发送成功。',
-  '重要：这条只是触发信号，对应的定时任务已在调度中。即使下面内容里出现「每隔/每天/定期/提醒我」等字样，也不要再调用 schedule_task 创建或重复该定时任务（除非内容明确要求你另外新建一个不同的任务）。',
-].join('\n');
+export function buildScheduledGroupTriggerFraming(groupFolder: string): string {
+  const frameworkDeliversFinalText = publishesFrameworkAnswer(
+    resolveRuntimeInteractionMode(getWorkspaceInteractionMode(groupFolder), {
+      agentKind: 'main',
+    }),
+  );
+  const deliveryContract = frameworkDeliversFinalText
+    ? [
+        '你的最终 SDK Assistant 文本会由框架作为正式任务结果统一投递：归档到所属 Web 工作区，任务绑定 IM 渠道时同一份内容也会自动发送到该渠道。因此必须包含一份完整、可独立阅读的业务结果；所有结论、报告和数据都要写在最终文本中，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。',
+        '正因为框架会自动投递最终文本，不要再用 send_message 等消息工具把同样的内容重复发送一遍，否则用户会收到两份。',
+      ]
+    : [
+        '你的最终 SDK Assistant 文本只会作为正式任务结果归档到所属 Web 工作区，不会自动发送到 IM 渠道；需要送达用户的内容请照常通过 send_message 主动发送。归档文本仍必须包含一份完整、可独立阅读的业务结果；所有结论、报告和数据都要写在最终文本中，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。',
+      ];
+  return [
+    '[定时任务自动触发] 以下内容是你此前创建的定时任务到点自动执行的触发，不是用户新发来的指令。',
+    '请直接执行该任务对应的动作。',
+    ...deliveryContract,
+    '如果任务要求调用 feishu-cli 或其他外部发送工具，请照常调用；但工具投递不能替代上述完整最终文本，工具报错时也不要声称发送成功。',
+    '重要：这条只是触发信号，对应的定时任务已在调度中。即使下面内容里出现「每隔/每天/定期/提醒我」等字样，也不要再调用 schedule_task 创建或重复该定时任务（除非内容明确要求你另外新建一个不同的任务）。',
+  ].join('\n');
+}
 
 const SCHEDULED_GROUP_PROMPT_ID_PREFIX = 'scheduled-task-prompt:';
 
@@ -2047,7 +2074,7 @@ async function runGroupModeTask(
     const owner = task.created_by ? getUserById(task.created_by) : null;
     const senderName = owner?.display_name || owner?.username || '定时任务';
 
-    const promptText = `${SCHEDULED_GROUP_TRIGGER_FRAMING}\n\n${task.prompt}`;
+    const promptText = `${buildScheduledGroupTriggerFraming(task.group_folder)}\n\n${task.prompt}`;
     if (durableRun) {
       if (!deps.storeGroupPromptAndDeliverRun) {
         throw new Error(
