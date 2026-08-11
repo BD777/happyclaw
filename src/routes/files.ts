@@ -122,7 +122,14 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 // 不安全的扩展名（HTML/SVG 有 XSS 风险，压缩包不可预览）
-const UNSAFE_PREVIEW_EXTENSIONS = new Set(['html', 'svg', 'zip', 'tar', 'gz', '7z']);
+const UNSAFE_PREVIEW_EXTENSIONS = new Set([
+  'html',
+  'svg',
+  'zip',
+  'tar',
+  'gz',
+  '7z',
+]);
 
 // 允许 inline 预览的安全 MIME 类型（从 MIME_MAP 中排除不安全扩展名自动推导）
 const SAFE_PREVIEW_MIME_TYPES = new Set(
@@ -382,7 +389,11 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
           fs.writeFileSync(fd, data);
         } finally {
           if (fd !== null) {
-            try { fs.closeSync(fd); } catch { /* ignore */ }
+            try {
+              fs.closeSync(fd);
+            } catch {
+              /* ignore */
+            }
           }
         }
       } else {
@@ -640,8 +651,7 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
       const rangeHeader = c.req.header('range');
       if (rangeHeader) {
         const normalizedRange = rangeHeader.trim();
-        const isBytesRange =
-          normalizedRange.toLowerCase().startsWith('bytes=');
+        const isBytesRange = normalizedRange.toLowerCase().startsWith('bytes=');
         const isMultiRange = isBytesRange && normalizedRange.includes(',');
 
         if (isBytesRange && !isMultiRange) {
@@ -882,18 +892,30 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
           fs.writeFileSync(fd, body.content, 'utf-8');
         } finally {
           if (fd !== null) {
-            try { fs.closeSync(fd); } catch { /* ignore */ }
+            try {
+              fs.closeSync(fd);
+            } catch {
+              /* ignore */
+            }
           }
         }
       } else {
         // Windows fallback：用 'wx' 等价的 O_EXCL 创建避免覆写预放 symlink。
         try {
-          fs.writeFileSync(tmp, body.content, { encoding: 'utf-8', flag: 'wx', mode: 0o644 });
+          fs.writeFileSync(tmp, body.content, {
+            encoding: 'utf-8',
+            flag: 'wx',
+            mode: 0o644,
+          });
         } catch (err: any) {
           if (err && err.code === 'EEXIST') {
             // 旧 tmp 残留：删后重试一次。
             fs.unlinkSync(tmp);
-            fs.writeFileSync(tmp, body.content, { encoding: 'utf-8', flag: 'wx', mode: 0o644 });
+            fs.writeFileSync(tmp, body.content, {
+              encoding: 'utf-8',
+              flag: 'wx',
+              mode: 0o644,
+            });
           } else {
             throw err;
           }
@@ -903,7 +925,11 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
       renameOk = true;
     } finally {
       if (!renameOk) {
-        try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* ignore */
+        }
       }
     }
 
