@@ -8,6 +8,8 @@ export interface FileEntry {
   size: number;
   modifiedAt: string;
   isSystem: boolean;
+  /** 后端是否允许编辑内容。系统文件默认 false，工作区 CLAUDE.md 是例外。 */
+  editable?: boolean;
   absolutePath?: string;
 }
 

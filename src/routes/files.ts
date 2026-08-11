@@ -16,6 +16,7 @@ import {
   deleteFile,
   createDirectory,
   isSystemPath,
+  isEditLockedPath,
   MAX_FILE_SIZE,
   getGroupStorageUsage,
   invalidateGroupStorageUsage,
@@ -792,8 +793,8 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
       'utf-8',
     );
 
-    // 禁止写入系统路径
-    if (isSystemPath(relativePath)) {
+    // 禁止写入系统路径（CLAUDE.md 等例外仍可编辑内容，删除/覆盖上传照旧禁止）
+    if (isEditLockedPath(relativePath)) {
       return c.json({ error: 'Cannot edit system file' }, 403);
     }
 

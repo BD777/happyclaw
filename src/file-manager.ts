@@ -20,6 +20,12 @@ export interface FileEntry {
   size: number;
   modifiedAt: string;
   isSystem: boolean;
+  /**
+   * 是否允许通过 Web 编辑内容。系统文件默认为 false，但 EDITABLE_SYSTEM_PATHS
+   * 中的例外（工作区 CLAUDE.md）仍可编辑——它受保护是为了防删除/覆盖上传，
+   * 不是为了禁止用户维护自己的工作区指令。
+   */
+  editable: boolean;
   absolutePath?: string; // Agent 视角的绝对路径（container 模式为 /workspace/group/...，host 模式为宿主机路径）
 }
 
@@ -30,6 +36,14 @@ export { MAX_FILE_SIZE };
 const SYSTEM_PATHS = ['logs', 'CLAUDE.md', '.claude', 'conversations'];
 // 预先转小写一次，匹配大小写不敏感文件系统（macOS APFS / Windows NTFS）。
 const SYSTEM_PATHS_LOWER = SYSTEM_PATHS.map((p) => p.toLowerCase());
+
+// 系统路径中允许编辑内容的例外。工作区根部的 CLAUDE.md 是用户自己维护的项目
+// 指令文件（早期由已下线的文件式记忆模块提供编辑入口，那个入口消失后编辑能力
+// 一并丢失）。它继续留在 SYSTEM_PATHS 中以保留「禁删除、禁覆盖上传」保护。
+const EDITABLE_SYSTEM_PATHS = ['CLAUDE.md'];
+const EDITABLE_SYSTEM_PATHS_LOWER = EDITABLE_SYSTEM_PATHS.map((p) =>
+  p.toLowerCase(),
+);
 
 // 仅在大小写不敏感的平台启用 lowercased 比较。case-sensitive Linux 上
 // 'Logs/' 与 'logs/' 是不同 inode，全局 toLowerCase 会误杀合法文件名。
@@ -126,6 +140,34 @@ export function isSystemPath(relativePath: string): boolean {
 }
 
 /**
+ * 系统路径中是否属于「内容可编辑」的例外。
+ *
+ * 只承认工作区根部的单段路径：`logs/CLAUDE.md`、`.claude/CLAUDE.md` 等嵌套
+ * 同名文件必须继续锁定，否则解锁范围会顺着 SYSTEM_PATHS 的首段匹配扩散到
+ * 整个系统目录。
+ */
+export function isEditableSystemPath(relativePath: string): boolean {
+  const normalized = path.normalize(relativePath);
+  const segments = normalized.split(path.sep).filter(Boolean);
+
+  if (segments.length !== 1) return false;
+
+  return CASE_INSENSITIVE_FS
+    ? EDITABLE_SYSTEM_PATHS_LOWER.includes(segments[0].toLowerCase())
+    : EDITABLE_SYSTEM_PATHS.includes(segments[0]);
+}
+
+/**
+ * 判断路径是否禁止通过 Web 编辑内容。
+ *
+ * 与 isSystemPath 的区别：isSystemPath 管「禁删除 / 禁覆盖上传 / 禁建目录」，
+ * 本函数只管内容写入，因此 CLAUDE.md 这类例外可以编辑但依然不能删。
+ */
+export function isEditLockedPath(relativePath: string): boolean {
+  return isSystemPath(relativePath) && !isEditableSystemPath(relativePath);
+}
+
+/**
  * 列出目录内容
  * @param folder 会话流文件夹名
  * @param subPath 可选的子路径
@@ -172,13 +214,15 @@ export function listFiles(
       continue;
     }
 
+    const isDirectory = stats.isDirectory();
     files.push({
       name,
       path: entryRelativePath,
-      type: stats.isDirectory() ? 'directory' : 'file',
+      type: isDirectory ? 'directory' : 'file',
       size: stats.size,
       modifiedAt: stats.mtime.toISOString(),
       isSystem: isSystemPath(entryRelativePath),
+      editable: !isDirectory && !isEditLockedPath(entryRelativePath),
     });
   }
 
