@@ -178,6 +178,7 @@ const PROVIDER_NAMES: Record<ChannelProvider, string> = {
   telegram: 'Telegram',
   qq: 'QQ',
   wechat: '微信',
+  wecom: '企业微信',
   dingtalk: '钉钉',
   discord: 'Discord',
   whatsapp: 'WhatsApp',
@@ -231,6 +232,7 @@ function credentialsError(
     telegram: ['botToken'],
     qq: ['appId', 'appSecret'],
     wechat: [],
+    wecom: ['botId', 'secret'],
     dingtalk: ['clientId', 'clientSecret'],
     discord: ['botToken'],
     whatsapp: [],
@@ -249,6 +251,7 @@ function credentialsError(
         ? ['botToken', 'ilinkBotId', 'baseUrl', 'cdnBaseUrl', 'getUpdatesBuf']
         : []),
     ],
+    wecom: ['botId', 'secret', 'corpId'],
     dingtalk: ['clientId', 'clientSecret', 'streamingMode'],
     discord: ['botToken', 'streamingMode'],
     whatsapp: ['phoneNumber'],

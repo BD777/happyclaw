@@ -19335,6 +19335,25 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           },
         },
       );
+    } else if (account.provider === 'wecom') {
+      connected = await imManager.connectUserWeCom(
+        account.owner_user_id,
+        {
+          botId: secret.botId || '',
+          secret: secret.secret || '',
+          corpId: secret.corpId,
+          enabled: true,
+        },
+        onNewChat,
+        {
+          accountId: common.accountId,
+          scopeIncomingJids: common.scopeIncomingJids,
+          ignoreMessagesBefore: common.ignoreMessagesBefore,
+          resolveEffectiveChatJid: common.resolveEffectiveChatJid,
+          onAgentMessage: common.onAgentMessage,
+          shouldProcessGroupMessage,
+        },
+      );
     } else if (account.provider === 'dingtalk') {
       connected = await imManager.connectUserDingTalk(
         account.owner_user_id,

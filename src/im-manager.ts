@@ -14,6 +14,7 @@ import {
   createTelegramChannel,
   createQQChannel,
   createWeChatChannel,
+  createWeComChannel,
   createDingTalkChannel,
   createDiscordChannel,
   isDiscordChannel,
@@ -33,6 +34,7 @@ import type {
   WeChatConnectionConfig,
   WeChatConnectionState,
 } from './wechat.js';
+import type { WeComConnectionConfig } from './wecom.js';
 import type { DingTalkConnectionConfig } from './dingtalk.js';
 import type { DiscordConnectionConfig } from './discord.js';
 import {
@@ -106,6 +108,13 @@ export interface WeChatConnectConfig {
   cdnBaseUrl?: string;
   getUpdatesBuf?: string;
   bypassProxy?: boolean;
+  enabled?: boolean;
+}
+
+export interface WeComConnectConfig {
+  botId: string;
+  secret: string;
+  corpId?: string;
   enabled?: boolean;
 }
 
@@ -955,7 +964,8 @@ export class IMConnectionManager {
       channelType !== 'feishu' &&
       channelType !== 'dingtalk' &&
       channelType !== 'discord' &&
-      channelType !== 'qq'
+      channelType !== 'qq' &&
+      channelType !== 'wecom'
     )
       return undefined;
 
@@ -1454,6 +1464,65 @@ export class IMConnectionManager {
 
   async disconnectUserWeChat(userId: string): Promise<void> {
     await this.disconnectChannel(userId, 'wechat');
+  }
+
+  async connectUserWeCom(
+    userId: string,
+    config: WeComConnectConfig,
+    onNewChat: (chatJid: string, chatName: string) => void,
+    options?: {
+      accountId?: string;
+      scopeIncomingJids?: boolean;
+      ignoreMessagesBefore?: number;
+      resolveEffectiveChatJid?: (chatJid: string) => {
+        effectiveJid: string;
+        agentId: string | null;
+        sourceJid?: string;
+      } | null;
+      onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      shouldProcessGroupMessage?: (
+        chatJid: string,
+        senderImId?: string,
+      ) => boolean;
+    },
+  ): Promise<boolean> {
+    if (!config.botId || !config.secret) {
+      logger.info({ userId }, 'WeCom config empty, skipping connection');
+      return false;
+    }
+
+    const channel = createWeComChannel({
+      botId: config.botId,
+      secret: config.secret,
+      corpId: config.corpId,
+      channelAccountId: options?.accountId,
+    } satisfies WeComConnectionConfig);
+
+    return this.connectChannel(
+      userId,
+      'wecom',
+      channel,
+      {
+        onReady: () => {
+          logger.info(
+            { userId, accountId: options?.accountId },
+            'User WeCom long-connection started',
+          );
+        },
+        onNewChat,
+        ignoreMessagesBefore: options?.ignoreMessagesBefore,
+        resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+        onAgentMessage: options?.onAgentMessage,
+        shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
+      },
+      options?.accountId,
+      options?.scopeIncomingJids,
+      config.botId,
+    );
+  }
+
+  async disconnectUserWeCom(userId: string): Promise<void> {
+    await this.disconnectChannel(userId, 'wecom');
   }
 
   /**

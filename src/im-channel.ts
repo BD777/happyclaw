@@ -28,6 +28,11 @@ import {
   type WeChatConnectionState,
 } from './wechat.js';
 import {
+  createWeComConnection,
+  type WeComConnection,
+  type WeComConnectionConfig,
+} from './wecom.js';
+import {
   createDingTalkConnection,
   type DingTalkConnection,
   type DingTalkConnectionConfig,
@@ -70,14 +75,16 @@ import {
 import type { DingTalkStreamingCardController } from './dingtalk-streaming-card.js';
 import type { DiscordStreamingEditController } from './discord-streaming-edit.js';
 import type { QQStreamingController } from './qq-streaming-card.js';
+import type { WeComStreamingController } from './wecom-streaming.js';
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
 
-/** Union type for any streaming card controller (Feishu, DingTalk, Discord, or QQ) */
+/** Union type for any streaming card controller (Feishu, DingTalk, Discord, QQ, or WeCom) */
 export type StreamingSession =
   | StreamingCardController
   | DingTalkStreamingCardController
   | DiscordStreamingEditController
-  | QQStreamingController;
+  | QQStreamingController
+  | WeComStreamingController;
 
 /**
  * Whether a streaming session has settled into a terminal presentation state
@@ -924,6 +931,70 @@ export function createWeChatChannel(
 
     isConnected(): boolean {
       return inner?.isConnected() ?? false;
+    },
+  };
+
+  return channel;
+}
+
+// ─── WeCom (企业微信智能机器人) Adapter ──────────────────────────
+
+export function createWeComChannel(
+  config: WeComConnectionConfig,
+): IMChannel {
+  let inner: WeComConnection | null = null;
+
+  const channel: IMChannel = {
+    channelType: 'wecom',
+
+    async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      inner ??= createWeComConnection(config);
+      try {
+        await inner.connect({
+          onReady: opts.onReady,
+          onNewChat: opts.onNewChat,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
+          shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
+        });
+        return true;
+      } catch (err) {
+        logger.error({ err }, 'WeCom channel connect failed');
+        return false;
+      }
+    },
+
+    async disconnect(): Promise<void> {
+      if (inner) {
+        await inner.disconnect();
+        inner = null;
+      }
+    },
+
+    async sendMessage(chatId: string, text: string): Promise<void> {
+      if (!inner) {
+        logger.warn({ chatId }, 'WeCom channel not connected, skip sending message');
+        return;
+      }
+      await inner.sendMessage(chatId, text);
+    },
+
+    // 企微智能机器人无「正在输入」态，setTyping 为 no-op。
+    async setTyping(): Promise<void> {
+      return;
+    },
+
+    isConnected(): boolean {
+      return inner?.isConnected() ?? false;
+    },
+
+    async createStreamingSession(
+      chatId: string,
+      onCardCreated?: (messageId: string) => void,
+    ): Promise<StreamingSession | undefined> {
+      if (!inner) return undefined;
+      return inner.createStreamingSession(chatId, onCardCreated);
     },
   };
 
