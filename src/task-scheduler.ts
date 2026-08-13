@@ -1976,6 +1976,43 @@ interface ScheduledGroupPromptMessage {
 }
 
 /**
+ * Resolve the immutable native delivery route represented by scheduler-owned
+ * group prompt rows. A scheduled turn is allowed to override a workspace's
+ * sticky interactive owner, but only with the route frozen in its exact
+ * durable definition snapshot.
+ */
+export function resolveScheduledGroupDeliveryRoute(
+  messages: readonly ScheduledGroupPromptMessage[],
+  sourceFolder: string,
+  getRun: (runId: string) => TaskRun | undefined,
+  getChannelType: (jid: string) => string | null,
+): string | null {
+  const routes = new Set<string>();
+  for (const message of messages) {
+    if (message.source_kind !== 'scheduled_task_prompt' || !message.task_id) {
+      continue;
+    }
+    const runId = scheduledGroupRunIdFromPromptMessageId(message.id);
+    if (!runId) continue;
+    const run = getRun(runId);
+    if (
+      !run ||
+      run.task_id !== message.task_id ||
+      run.definition_snapshot.context_mode !== 'group' ||
+      run.definition_snapshot.group_folder !== sourceFolder ||
+      !['delivered', 'success'].includes(run.status)
+    ) {
+      continue;
+    }
+    const route =
+      run.definition_snapshot.delivery_route_jid ||
+      run.definition_snapshot.chat_jid;
+    if (route && getChannelType(route)) routes.add(route);
+  }
+  return routes.size === 1 ? [...routes][0]! : null;
+}
+
+/**
  * Resolve the immutable interaction contract carried by one scheduler prompt.
  * Historical delivered rows predate the snapshot field and deliberately
  * return null so the caller can retain the legacy live-workspace fallback.

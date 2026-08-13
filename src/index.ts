@@ -453,6 +453,7 @@ import {
   formatScheduledTaskWorkspaceResult,
   hasAuthoritativeScheduledGroupTerminal,
   resolveScheduledGroupRunsForOutput,
+  resolveScheduledGroupDeliveryRoute,
   selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
@@ -5637,11 +5638,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     incomingImOwner = chatJid;
   }
   const persistedMainOwner = getSessionChannelOwner(effectiveGroup.folder);
-  let replySourceImJid = resolveStickyChannelOwner(
-    persistedMainOwner ?? null,
-    incomingImOwner,
+  const scheduledGroupDeliveryRoute = resolveScheduledGroupDeliveryRoute(
+    missedMessages,
+    effectiveGroup.folder,
+    getTaskRunById,
+    getChannelType,
   );
-  if (!persistedMainOwner && replySourceImJid) {
+  let replySourceImJid =
+    scheduledGroupDeliveryRoute ??
+    resolveStickyChannelOwner(persistedMainOwner ?? null, incomingImOwner);
+  if (!scheduledGroupDeliveryRoute && !persistedMainOwner && replySourceImJid) {
     replySourceImJid = setSessionChannelOwnerOnce(
       effectiveGroup.folder,
       null,
@@ -6525,10 +6531,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         return false;
       }
 
-      const newImJid = resolveStickyChannelOwner(
-        replySourceImJid,
-        newSourceJid,
+      const scheduledRoute = resolveScheduledGroupDeliveryRoute(
+        (coveredInputs ?? [])
+          .map((input) =>
+            getAgentBuilderInputMessage(receipt?.chatJid ?? chatJid, input.id),
+          )
+          .filter((message): message is NonNullable<typeof message> =>
+            Boolean(message),
+          ),
+        effectiveGroup.folder,
+        getTaskRunById,
+        getChannelType,
       );
+      const newImJid =
+        scheduledRoute ??
+        resolveStickyChannelOwner(replySourceImJid, newSourceJid);
       let nextRuntime: ChannelTurnRuntime | undefined;
       let nextScope: ActiveChannelOutboxScope | undefined;
       let nextLifecycle: typeof activeDurableCardLifecycle;

@@ -131,6 +131,7 @@ const {
   hasAuthoritativeScheduledGroupTerminal,
   processClaimedTaskRunNotification,
   resolveScheduledGroupRunsForOutput,
+  resolveScheduledGroupDeliveryRoute,
   resolveScheduledTaskIpcRunId,
   selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
@@ -201,6 +202,78 @@ describe('scheduled-task IPC durable occurrence correlation', () => {
         null,
         'another-folder',
         getRun,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('scheduled group frozen delivery route', () => {
+  const message = {
+    id: scheduledGroupPromptMessageId('run-route'),
+    chat_jid: 'feishu:source-chat',
+    source_kind: 'scheduled_task_prompt',
+    task_id: 'task-route',
+  };
+  const run = {
+    id: 'run-route',
+    task_id: 'task-route',
+    status: 'delivered',
+    definition_snapshot: {
+      context_mode: 'group',
+      group_folder: GROUP_FOLDER,
+      chat_jid: 'feishu:source-chat',
+      delivery_route_jid: 'feishu:frozen-target',
+    },
+  } as never;
+
+  test('uses the exact snapshot route instead of a sticky session owner', () => {
+    expect(
+      resolveScheduledGroupDeliveryRoute(
+        [message],
+        GROUP_FOLDER,
+        (id) => (id === 'run-route' ? run : undefined),
+        (jid) => (jid.startsWith('feishu:') ? 'feishu' : null),
+      ),
+    ).toBe('feishu:frozen-target');
+  });
+
+  test('fails closed on folder mismatch or conflicting batch routes', () => {
+    const getRun = (id: string) => {
+      if (id === 'run-route') return run;
+      if (id === 'run-other') {
+        return {
+          ...run,
+          id: 'run-other',
+          task_id: 'task-other',
+          definition_snapshot: {
+            ...run.definition_snapshot,
+            delivery_route_jid: 'feishu:other-target',
+          },
+        } as never;
+      }
+      return undefined;
+    };
+    expect(
+      resolveScheduledGroupDeliveryRoute(
+        [message],
+        'another-folder',
+        getRun,
+        () => 'feishu',
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledGroupDeliveryRoute(
+        [
+          message,
+          {
+            ...message,
+            id: scheduledGroupPromptMessageId('run-other'),
+            task_id: 'task-other',
+          },
+        ],
+        GROUP_FOLDER,
+        getRun,
+        () => 'feishu',
       ),
     ).toBeNull();
   });
