@@ -455,6 +455,7 @@ import {
   selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
+  resolveScheduledTaskIpcRunId,
 } from './task-scheduler.js';
 import { getMergedTaskRunHistory } from './task-run-history.js';
 import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
@@ -10210,7 +10211,8 @@ function startIpcWatcher(): void {
       agentId: ipcAgentId,
       taskId: ipcTaskId,
     } of ipcRoots) {
-      const durableTaskRunId = extractDurableTaskRunIdFromNamespace(ipcTaskId);
+      const isolatedDurableTaskRunId =
+        extractDurableTaskRunIdFromNamespace(ipcTaskId);
       const messagesDir = path.join(ipcRoot, 'messages');
       const messageResultsDir = path.join(ipcRoot, 'message-results');
       const tasksDir = path.join(ipcRoot, 'tasks');
@@ -10228,6 +10230,12 @@ function startIpcWatcher(): void {
           try {
             const raw = await fsp.readFile(filePath, 'utf-8');
             const data = JSON.parse(raw);
+            const durableTaskRunId = resolveScheduledTaskIpcRunId(
+              data,
+              isolatedDurableTaskRunId,
+              sourceGroup,
+              getTaskRunById,
+            );
             messageRequestId =
               typeof data.requestId === 'string' ? data.requestId : undefined;
             if (
@@ -11338,7 +11346,7 @@ function startIpcWatcher(): void {
                 );
               }
               const completedDurableRunId =
-                completion.durableRunId ?? durableTaskRunId;
+                completion.durableRunId ?? isolatedDurableTaskRunId;
               if (completedDurableRunId) {
                 finalizeTaskRunNotificationIfPending(completedDurableRunId);
               }
@@ -11576,6 +11584,7 @@ async function processTaskIpc(
     before?: string;
     // Host-side Feishu capability broker
     inputTurnId?: string;
+    scheduledTaskRunId?: string;
     operation?: string;
     params?: Record<string, unknown>;
     // Workspace Memory v2. Workspace/actor/sourceType are never accepted from
@@ -11618,7 +11627,12 @@ async function processTaskIpc(
   ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
   ipcTaskId: string | null = null, // Non-null for an isolated scheduled-task run namespace
 ): Promise<void> {
-  const durableTaskRunId = extractDurableTaskRunIdFromNamespace(ipcTaskId);
+  const durableTaskRunId = resolveScheduledTaskIpcRunId(
+    data,
+    extractDurableTaskRunIdFromNamespace(ipcTaskId),
+    sourceGroup,
+    getTaskRunById,
+  );
   const ownerHomeFolderCandidate = sourceGroupEntry?.created_by
     ? getUserHomeGroup(sourceGroupEntry.created_by)?.folder
     : null;

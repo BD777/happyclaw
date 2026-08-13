@@ -1922,6 +1922,51 @@ export function scheduledGroupRunIdFromPromptMessageId(
   return runId && /^[a-zA-Z0-9-]+$/.test(runId) ? runId : null;
 }
 
+/**
+ * Resolve the durable occurrence owned by a scheduled-task IPC side effect.
+ *
+ * Isolated runs carry the durable id in their private IPC namespace. Group
+ * runs share the workspace IPC root, so they must instead correlate through
+ * the immutable scheduler prompt id stamped as inputTurnId. The task id and
+ * source folder checks prevent a forged/stale workspace message from writing
+ * a delivery receipt onto another occurrence.
+ */
+export function resolveScheduledTaskIpcRunId(
+  data: {
+    inputTurnId?: unknown;
+    taskId?: unknown;
+    scheduledTaskRunId?: unknown;
+  },
+  isolatedRunId: string | null,
+  sourceGroup: string,
+  getRun: (runId: string) => TaskRun | undefined,
+): string | null {
+  if (isolatedRunId) return isolatedRunId;
+  if (
+    typeof data.inputTurnId !== 'string' ||
+    typeof data.taskId !== 'string' ||
+    !data.taskId
+  ) {
+    return null;
+  }
+  const runId =
+    typeof data.scheduledTaskRunId === 'string' &&
+    /^[a-zA-Z0-9-]+$/.test(data.scheduledTaskRunId)
+      ? data.scheduledTaskRunId
+      : scheduledGroupRunIdFromPromptMessageId(data.inputTurnId);
+  if (!runId) return null;
+  const run = getRun(runId);
+  if (
+    !run ||
+    run.task_id !== data.taskId ||
+    run.definition_snapshot.context_mode !== 'group' ||
+    run.definition_snapshot.group_folder !== sourceGroup
+  ) {
+    return null;
+  }
+  return runId;
+}
+
 interface ScheduledGroupPromptMessage {
   id: string;
   chat_jid: string;

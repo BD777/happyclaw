@@ -131,6 +131,7 @@ const {
   hasAuthoritativeScheduledGroupTerminal,
   processClaimedTaskRunNotification,
   resolveScheduledGroupRunsForOutput,
+  resolveScheduledTaskIpcRunId,
   selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
@@ -140,6 +141,70 @@ const {
 
 const GROUP_JID = 'web:task-contract';
 const GROUP_FOLDER = 'task-contract';
+
+describe('scheduled-task IPC durable occurrence correlation', () => {
+  const run = {
+    id: 'run-abc',
+    task_id: 'task-42',
+    definition_snapshot: {
+      context_mode: 'group',
+      group_folder: GROUP_FOLDER,
+    },
+  } as never;
+
+  test('accepts cold prompt ids and warm-runner occurrence stamps', () => {
+    const getRun = (id: string) => (id === 'run-abc' ? run : undefined);
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          inputTurnId: scheduledGroupPromptMessageId('run-abc'),
+          taskId: 'task-42',
+        },
+        null,
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBe('run-abc');
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          inputTurnId: 'delivery-random',
+          taskId: 'task-42',
+          scheduledTaskRunId: 'run-abc',
+        },
+        null,
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBe('run-abc');
+  });
+
+  test('rejects mismatched task or workspace ownership', () => {
+    const getRun = (id: string) => (id === 'run-abc' ? run : undefined);
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          inputTurnId: scheduledGroupPromptMessageId('run-abc'),
+          taskId: 'another-task',
+        },
+        null,
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          scheduledTaskRunId: 'run-abc',
+          taskId: 'task-42',
+        },
+        null,
+        'another-folder',
+        getRun,
+      ),
+    ).toBeNull();
+  });
+});
 
 function makeDeps(
   groups: Record<string, any>,
