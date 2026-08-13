@@ -19,6 +19,7 @@ import {
 } from './config.js';
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
+import { imSendFailurePolicy } from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
   acknowledgeIpcReplyTurn,
@@ -2707,16 +2708,23 @@ async function retryImOperation(
   label: string,
   imJid: string,
   fn: () => Promise<void>,
+  failure?: { error?: unknown },
 ): Promise<boolean> {
   for (let attempt = 0; attempt < IM_SEND_MAX_RETRIES; attempt++) {
     try {
       await fn();
       return true;
     } catch (err) {
+      if (failure) failure.error = err;
       logger.warn(
         { imJid, attempt, label, err },
         'IM operation attempt failed',
       );
+      // A WeChat context token can only be refreshed by a new inbound user
+      // message. Retrying the identical send cannot succeed and historically
+      // contributed to the generic failure counter, eventually deleting a
+      // healthy paired chat.
+      if (!imSendFailurePolicy(err).retryable) break;
       if (attempt < IM_SEND_MAX_RETRIES - 1) {
         await new Promise((r) =>
           setTimeout(r, IM_SEND_RETRY_DELAY_MS * (attempt + 1)),
@@ -2743,8 +2751,10 @@ async function sendImWithRetry(
     inputTurnId?: string | null;
     logicalChatJid?: string | null;
   },
+  failure?: { error?: unknown },
 ): Promise<boolean> {
   let ok: boolean;
+  const sendFailure = failure ?? {};
   const durableScoped = outbox !== undefined;
   if (durableScoped) {
     ok = true;
@@ -2804,8 +2814,12 @@ async function sendImWithRetry(
       if (delivered !== true) ok = false;
     }
   } else {
-    ok = await retryImOperation('send_message', imJid, () =>
-      imManager.sendMessage(imJid, text, localImagePaths, deliveryOptions),
+    ok = await retryImOperation(
+      'send_message',
+      imJid,
+      () =>
+        imManager.sendMessage(imJid, text, localImagePaths, deliveryOptions),
+      sendFailure,
     );
   }
   if (ok) {
@@ -2815,6 +2829,11 @@ async function sendImWithRetry(
   // `uncertain` is not evidence that the channel is unhealthy. In particular,
   // do not auto-unbind a Bot merely because its ACK was lost after acceptance.
   if (durableScoped) return false;
+  // Missing/expired/quota-exhausted WeChat context is a user-refreshable
+  // delivery prerequisite, not evidence that the chat itself is dead.
+  if (!imSendFailurePolicy(sendFailure.error).countsTowardChannelRemoval) {
+    return false;
+  }
   // All retries exhausted — track cumulative failures
   const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
   imSendFailCounts.set(imJid, count);
@@ -10109,8 +10128,8 @@ function broadcastToOwnerIMChannels(
   alreadySentJids: Set<string>,
   sendFn: (jid: string) => void,
   notifyChannels?: string[] | null,
-): void {
-  broadcastToOwnerIMChannelsPure(
+): string[] {
+  return broadcastToOwnerIMChannelsPure(
     userId,
     sourceFolder,
     alreadySentJids,
@@ -21058,8 +21077,11 @@ async function main(): Promise<void> {
       if (options.sourceAlreadyDelivered && getChannelType(chatJid)) {
         alreadySent.add(chatJid);
       }
-      const deliveries: Array<{ channel: string; result: Promise<boolean> }> =
-        [];
+      const deliveries: Array<{
+        channel: string;
+        result: Promise<boolean>;
+        failure?: { error?: unknown };
+      }> = [];
       // A task records the exact place it was scheduled from. Deliver there
       // first: the previous behaviour resolved the target by scanning the
       // owner's groups and taking the first folder match, with no ORDER BY, so
@@ -21071,9 +21093,19 @@ async function main(): Promise<void> {
         !alreadySent.has(boundRoute)
       ) {
         alreadySent.add(boundRoute);
+        const failure: { error?: unknown } = {};
         deliveries.push({
           channel: getChannelType(boundRoute) ?? boundRoute,
-          result: sendImWithRetry(boundRoute, text, localImages),
+          result: sendImWithRetry(
+            boundRoute,
+            text,
+            localImages,
+            undefined,
+            undefined,
+            undefined,
+            failure,
+          ),
+          failure,
         });
       }
       // Fan-out is opt-in. Without an explicit `notify_channels` the notice
@@ -21081,20 +21113,41 @@ async function main(): Promise<void> {
       // had connected in that workspace, so a task created in Feishu also
       // notified Telegram.
       if (options.notifyChannels && options.notifyChannels.length > 0) {
-        broadcastToOwnerIMChannels(
+        const unavailableChannels = broadcastToOwnerIMChannels(
           options.ownerId,
           broadcastFolder,
           alreadySent,
           (jid) => {
+            const failure: { error?: unknown } = {};
             deliveries.push({
               // Notification retries filter on channel type, not the concrete
               // binding jid. Keep the concrete jid only as a defensive fallback.
               channel: getChannelType(jid) ?? jid,
-              result: sendImWithRetry(jid, text, localImages),
+              result: sendImWithRetry(
+                jid,
+                text,
+                localImages,
+                undefined,
+                undefined,
+                undefined,
+                failure,
+              ),
+              failure,
             });
           },
           options.notifyChannels,
         );
+        for (const channel of unavailableChannels) {
+          deliveries.push({
+            channel,
+            result: Promise.resolve(false),
+            failure: {
+              error: new Error(
+                `未找到已连接且绑定到当前工作区的 ${channel} 渠道`,
+              ),
+            },
+          });
+        }
       }
       if (deliveries.length === 0) {
         return {
@@ -21112,6 +21165,7 @@ async function main(): Promise<void> {
         deliveries.map(async (delivery) => ({
           channel: delivery.channel,
           success: await delivery.result,
+          error: delivery.failure?.error,
         })),
       );
       const failedChannels = outcomes
@@ -21133,7 +21187,18 @@ async function main(): Promise<void> {
         },
         error:
           failedChannels.length > 0
-            ? `通知发送失败：${failedChannels.join(', ')}`
+            ? outcomes
+                .filter((outcome) => !outcome.success)
+                .map((outcome) => {
+                  const detail =
+                    outcome.error instanceof Error
+                      ? outcome.error.message
+                      : outcome.error
+                        ? String(outcome.error)
+                        : '发送未获严格确认';
+                  return `${outcome.channel}: ${detail}`;
+                })
+                .join('; ')
             : null,
       };
     },

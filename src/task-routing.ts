@@ -140,9 +140,7 @@ export function resolveTaskRoutingDecision(
 
 export interface BroadcastToOwnerIMChannelsDeps {
   getConnectedChannelTypes: (userId: string) => string[];
-  getGroupsByOwner: (
-    userId: string,
-  ) => Array<{
+  getGroupsByOwner: (userId: string) => Array<{
     jid: string;
     folder: string;
     /**
@@ -235,7 +233,7 @@ export function broadcastToOwnerIMChannels(
   sendFn: (jid: string) => void,
   notifyChannels: string[] | null | undefined,
   deps: BroadcastToOwnerIMChannelsDeps,
-): void {
+): string[] {
   const sentChannelTypes = new Set<string>();
   for (const jid of alreadySentJids) {
     const ct = deps.getChannelType(jid);
@@ -253,7 +251,10 @@ export function broadcastToOwnerIMChannels(
       // Without this, ImBindingDialog-bound IM groups (whose own folder
       // stays at 'main') silently miss scheduled-task broadcasts from
       // non-home workspaces.
-      const effectiveFolder = resolveImGroupEffectiveFolder(g, deps.resolveJidFolder);
+      const effectiveFolder = resolveImGroupEffectiveFolder(
+        g,
+        deps.resolveJidFolder,
+      );
       return effectiveFolder === sourceFolder;
     });
     if (target) {
@@ -261,4 +262,13 @@ export function broadcastToOwnerIMChannels(
       sentChannelTypes.add(channelType);
     }
   }
+  // An explicit notification selection is a delivery contract, not a best-
+  // effort hint. Return requested channel types that could not be resolved to
+  // a connected binding so the caller can persist a truthful failed receipt.
+  // Legacy fan-out (`null` / `undefined`) keeps its best-effort semantics.
+  return notifyChannels
+    ? [...new Set(notifyChannels)].filter(
+        (channelType) => !sentChannelTypes.has(channelType),
+      )
+    : [];
 }
