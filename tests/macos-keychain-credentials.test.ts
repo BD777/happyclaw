@@ -69,8 +69,22 @@ class FakeKeychain {
       return { stdout: value, stderr: '' };
     }
     if (this.failWrites) throw new Error('keychain locked');
-    expect(request.args).toEqual(['-i']);
-    const { service, payload } = parseInteractiveWrite(request.stdin ?? '');
+    // Writes arrive either as `security -i` (command on stdin) or, when the
+    // payload would overflow security's 4096-byte stdin line buffer, as a plain
+    // argv invocation. Model both, and reproduce the real truncation so a
+    // regression cannot pass silently.
+    if (request.args[0] === '-i') {
+      const line = request.stdin ?? '';
+      if (Buffer.byteLength(line, 'utf8') > 4096) {
+        throw new Error('security: unknown command (line truncated at 4096)');
+      }
+      const { service, payload } = parseInteractiveWrite(line);
+      this.items.set(service, payload);
+      return { stdout: '', stderr: '' };
+    }
+    expect(request.args[0]).toBe('add-generic-password');
+    const service = request.args[request.args.indexOf('-s') + 1];
+    const payload = request.args[request.args.indexOf('-w') + 1];
     this.items.set(service, payload);
     return { stdout: '', stderr: '' };
   };
@@ -266,20 +280,74 @@ describe('MacosKeychainCredentialStore', () => {
     );
   });
 
-  test('fails closed on unknown ownership, concurrent changes, and failed persistence', async () => {
+  // A real Keychain item carrying mcpOAuth for ~10 MCP servers is >5KB, which
+  // overflows security's 4096-byte stdin line buffer. Overflow there is
+  // silently destructive: security runs the truncated prefix, storing a mangled
+  // item, and only then rejects the rest.
+  test('writes oversized payloads through argv instead of security -i', async () => {
+    const fake = new FakeKeychain();
+    const service = claudeKeychainServiceName(CONFIG_DIR);
+    const bulkyMcpOAuth = { blob: 'y'.repeat(6000) };
+    fake.items.set(
+      service,
+      JSON.stringify({ claudeAiOauth: OAUTH, mcpOAuth: bulkyMcpOAuth }),
+    );
+    await fake.store().reconcile(CONFIG_DIR, {
+      providerId: 'official-a',
+      claudeAiOauth: OAUTH,
+    });
+    await fake.store().reconcile(CONFIG_DIR, {
+      providerId: 'official-b',
+      claudeAiOauth: REFRESHED,
+    });
+
+    const stored = JSON.parse(fake.items.get(service)!);
+    expect(stored.claudeAiOauth).toEqual(normalizeClaudeAiOauth(REFRESHED));
+    expect(stored.mcpOAuth).toEqual(bulkyMcpOAuth);
+    expect(
+      fake.requests.some((r) => r.args[0] === 'add-generic-password'),
+    ).toBe(true);
+    // the short ownership item still takes the argv-hiding interactive path
+    expect(
+      fake.requests.some(
+        (r) => r.args[0] === '-i' && r.stdin?.includes('provider-owner'),
+      ),
+    ).toBe(true);
+  });
+
+  // Without an ownership item there is nothing to reconcile against, and a
+  // multi-account pool can never satisfy a match check — so adopt the selected
+  // provider and record ownership instead of blocking host mode permanently.
+  test('adopts the selected provider when ownership is unknown', async () => {
     const fake = new FakeKeychain();
     const service = claudeKeychainServiceName(CONFIG_DIR);
     fake.items.set(
       service,
-      JSON.stringify({ claudeAiOauth: REFRESHED, mcpOAuth: {} }),
-    );
-    await expect(
-      fake.store().reconcile(CONFIG_DIR, {
-        providerId: 'official-a',
-        claudeAiOauth: OAUTH,
+      JSON.stringify({
+        claudeAiOauth: REFRESHED,
+        mcpOAuth: { 'some-server': 'keep-me' },
       }),
-    ).rejects.toThrow('ownership is unknown');
+    );
 
+    const migrated = await fake.store().reconcile(CONFIG_DIR, {
+      providerId: 'official-a',
+      claudeAiOauth: OAUTH,
+    });
+
+    expect(migrated).toEqual(normalizeClaudeAiOauth(OAUTH));
+    const stored = JSON.parse(fake.items.get(service)!);
+    expect(stored.claudeAiOauth).toEqual(normalizeClaudeAiOauth(OAUTH));
+    expect(stored.mcpOAuth).toEqual({ 'some-server': 'keep-me' });
+    expect(
+      JSON.parse(
+        fake.items.get(claudeKeychainOwnershipServiceName(CONFIG_DIR))!,
+      ).providerId,
+    ).toBe('official-a');
+  });
+
+  test('fails closed on concurrent changes and failed persistence', async () => {
+    const fake = new FakeKeychain();
+    const service = claudeKeychainServiceName(CONFIG_DIR);
     fake.items.clear();
     fake.items.set(service, JSON.stringify({ claudeAiOauth: OAUTH }));
     const store = fake.store();

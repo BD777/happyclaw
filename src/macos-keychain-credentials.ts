@@ -18,6 +18,16 @@ const SECURITY_BIN = '/usr/bin/security';
 const SECURITY_TIMEOUT_MS = 10_000;
 const NOT_FOUND_MARKER = 'could not be found';
 const OWNERSHIP_SUFFIX = '.happyclaw-provider-owner';
+/**
+ * `security -i` reads each command through a fixed 4096-byte line buffer.
+ * Overflowing it is not a clean failure: security runs the truncated prefix —
+ * storing a mangled payload — and only then rejects the remainder as an unknown
+ * command. A Keychain item that also carries `mcpOAuth` for a handful of MCP
+ * servers passes 4KB easily, so any command at risk of crossing this boundary
+ * has to go through argv instead. Kept below the real 4096-byte cutoff so the
+ * check never depends on counting the trailing newline exactly.
+ */
+const SECURITY_INTERACTIVE_LINE_LIMIT = 4000;
 
 export interface KeychainClaudeAiOauth {
   accessToken: string;
@@ -409,12 +419,33 @@ export class MacosKeychainCredentialStore {
     ].join(' ');
     try {
       // `security -i` reads the command from stdin, so OAuth/MCP payloads never
-      // appear in process argv or the process environment.
-      await this.runSecurity({
-        args: ['-i'],
-        stdin: `${input}\n`,
-        timeoutMs: SECURITY_TIMEOUT_MS,
-      });
+      // appear in process argv or the process environment. Prefer it whenever
+      // the command fits, and fall back to argv rather than let the payload be
+      // silently truncated (see SECURITY_INTERACTIVE_LINE_LIMIT). The fallback
+      // trades argv exposure for correctness: a corrupted credential item locks
+      // the user out of host mode, and the value is only readable by processes
+      // already running as the same user.
+      const request: SecurityCommandRequest =
+        Buffer.byteLength(input, 'utf8') + 1 <= SECURITY_INTERACTIVE_LINE_LIMIT
+          ? {
+              args: ['-i'],
+              stdin: `${input}\n`,
+              timeoutMs: SECURITY_TIMEOUT_MS,
+            }
+          : {
+              args: [
+                'add-generic-password',
+                '-U',
+                '-s',
+                service,
+                '-a',
+                account,
+                '-w',
+                payload,
+              ],
+              timeoutMs: SECURITY_TIMEOUT_MS,
+            };
+      await this.runSecurity(request);
     } catch {
       throw new MacosKeychainCredentialError(
         `Unable to write macOS Keychain item ${service}`,
@@ -495,9 +526,30 @@ export class MacosKeychainCredentialStore {
           return desired;
         }
         if (!sharesCredentialLineage(existingOauth, desired)) {
-          throw new MacosKeychainCredentialError(
-            'Keychain OAuth ownership is unknown and does not match the selected provider',
+          // No ownership item means this is the first reconcile after the
+          // upgrade that introduced ownership tracking, so an unrelated
+          // credential is the expected state rather than a suspicious one.
+          //
+          // Failing closed here is unrecoverable for a multi-account provider
+          // pool: the item holds whichever account was seeded last, the pool
+          // keeps rotating, and no selected provider can ever match it — so
+          // host mode stays blocked for every provider, forever, with no
+          // supported way to clear the item.
+          //
+          // There is also no third party to protect. The service name is
+          // derived from HappyClaw's own CLAUDE_CONFIG_DIR, so HappyClaw is the
+          // only writer of that item. Adopt the selected provider and record
+          // ownership; this is a one-shot migration that reproduces the
+          // pre-ownership behaviour, and every later reconcile takes the
+          // rotation-aware branches below.
+          const migrated = mergeClaudeKeychainPayload(existingJson, desired);
+          if (migrated !== null) await this.write(service, migrated);
+          await this.writeOwnership(
+            service,
+            options.providerId,
+            desiredFingerprint,
           );
+          return desired;
         }
         if (existingOauth.expiresAt > desired.expiresAt) {
           await this.persistRefresh(options, desired, existingOauth);
