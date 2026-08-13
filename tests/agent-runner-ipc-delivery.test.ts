@@ -14,6 +14,7 @@ import {
   partitionIpcMessagesForLogicalTurn,
   requeueIpcInputMessages,
   resolveLogicalQueryInputTurnId,
+  scheduledGroupRunIdFromIpcMessages,
   shouldAcceptIpcMessagesDuringQuery,
   serializeIpcInputMessage,
   type IpcDeliveryReceipt,
@@ -40,6 +41,33 @@ function message(id: string): IpcInputMessage {
 }
 
 describe('agent-runner IPC delivery turn tracker', () => {
+  test('recovers the scheduled group occurrence from a warm-runner receipt', () => {
+    const scheduled: IpcInputMessage = {
+      text: 'scheduled',
+      taskId: 'task-42',
+      receipt: {
+        deliveryId: 'delivery-random',
+        chatJid: 'web:main',
+        coveredCursors: [
+          {
+            timestamp: '2026-08-13T00:00:00.000Z',
+            id: 'scheduled-task-prompt:run-abc',
+          },
+        ],
+        cursor: {
+          timestamp: '2026-08-13T00:00:00.000Z',
+          id: 'scheduled-task-prompt:run-abc',
+        },
+      },
+    };
+    expect(scheduledGroupRunIdFromIpcMessages([scheduled], 'task-42')).toBe(
+      'run-abc',
+    );
+    expect(
+      scheduledGroupRunIdFromIpcMessages([scheduled], 'another-task'),
+    ).toBeNull();
+  });
+
   test('orders requeued older messages before newly written messages by durable cursor', () => {
     const olderRequeued = message('1');
     const newerArrival = message('2');

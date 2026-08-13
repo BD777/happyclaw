@@ -13,7 +13,7 @@ import type {
   RunnerRuntime,
   StuckRecoveryCandidate,
 } from './stuck-runner-recovery.js';
-import type { ChannelTurnContext } from './types.js';
+import type { ChannelTurnContext, InteractionMode } from './types.js';
 export type SendMessageResult = 'sent' | 'no_active';
 export interface IpcMessageCursor {
   timestamp: string;
@@ -52,6 +52,8 @@ export interface RunnerMessageRequirements {
    * constraint. Ignored for host-mode processes.
    */
   feishuCliAccountId?: string | null;
+  /** Delivery contract fixed in the runner system prompt and MCP tools. */
+  interactionMode?: InteractionMode;
 }
 
 interface FeishuCliIdentityRequirement {
@@ -172,6 +174,8 @@ interface GroupState {
    * Host processes always keep this null because their native feishu-cli
    * environment/config is authoritative. */
   feishuCliAccountId: string | null;
+  /** Main runner contract; null for task/legacy runners. */
+  interactionMode: InteractionMode | null;
   /** True when a _drain sentinel has been written for the current active runner. */
   drainSentinelWritten: boolean;
   /** True when messages have been IPC-injected into the running agent via sendMessage().
@@ -298,6 +302,7 @@ export class GroupQueue {
         restarting: false,
         selectedProviderId: null,
         feishuCliAccountId: null,
+        interactionMode: null,
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
         ipcOwedSinceAt: null,
@@ -1328,6 +1333,14 @@ export class GroupQueue {
     );
   }
 
+  requiresInteractionModeRestart(
+    groupJid: string,
+    interactionMode: InteractionMode,
+  ): boolean {
+    const state = this.resolveActiveState(groupJid);
+    return state !== null && state.interactionMode !== interactionMode;
+  }
+
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
@@ -1497,6 +1510,7 @@ export class GroupQueue {
       taskRunId?: string;
       selectedProviderId?: string | null;
       feishuCliAccountId?: string | null;
+      interactionMode?: InteractionMode;
     },
   ): void {
     const state = this.getGroup(groupJid);
@@ -1509,6 +1523,19 @@ export class GroupQueue {
     state.taskRunId = opts.taskRunId || null;
     state.selectedProviderId = opts.selectedProviderId ?? null;
     state.feishuCliAccountId = opts.feishuCliAccountId ?? null;
+    state.interactionMode = opts.interactionMode ?? null;
+    // An incompatible suffix or a new message can be queued after runForGroup
+    // marks the lane active but before the child process registers. The first
+    // drain attempt has no groupFolder/input path yet; close that boot window
+    // here so pending work does not wait for the warm runner's idle timeout.
+    if (
+      state.pendingMessages &&
+      !state.activeRunnerIsTask &&
+      !state.drainSentinelWritten
+    ) {
+      const wrote = this.writeDrainSentinel(state as ActiveGroupState);
+      if (wrote) state.drainSentinelWritten = true;
+    }
   }
 
   /**
@@ -1590,6 +1617,25 @@ export class GroupQueue {
           requiredFeishuCliAccountId: identityRequirement.accountId,
         },
         'Rejected warm IPC injection across Feishu Bot identities',
+      );
+      return 'no_active';
+    }
+
+    if (
+      requirements?.interactionMode !== undefined &&
+      state.interactionMode !== requirements.interactionMode
+    ) {
+      this.requestDrainForActiveRunner(
+        groupJid,
+        'Draining runner before switching interaction mode',
+      );
+      logger.info(
+        {
+          groupJid,
+          activeInteractionMode: state.interactionMode,
+          requiredInteractionMode: requirements.interactionMode,
+        },
+        'Rejected warm IPC injection across interaction modes',
       );
       return 'no_active';
     }
@@ -2485,6 +2531,7 @@ export class GroupQueue {
       state.agentId = null;
       state.taskRunId = null;
       state.runnerRuntime = null;
+      state.interactionMode = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
@@ -2645,6 +2692,7 @@ export class GroupQueue {
       state.agentId = null;
       state.taskRunId = null;
       state.runnerRuntime = null;
+      state.interactionMode = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;

@@ -94,6 +94,7 @@ import {
   partitionIpcMessagesForLogicalTurn,
   requeueIpcInputMessages,
   resolveLogicalQueryInputTurnId,
+  scheduledGroupRunIdFromIpcMessages,
   shouldAcceptIpcMessagesDuringQuery,
   type IpcDeliveryReceipt,
   type IpcInputMessage,
@@ -1743,6 +1744,11 @@ async function runQueryAttempt(
       mcpToolsContext.currentInputTurnId = currentInputTurnId;
       if (currentMessage) {
         mcpToolsContext.currentTaskId = currentMessage.taskId ?? null;
+        mcpToolsContext.currentScheduledTaskRunId =
+          scheduledGroupRunIdFromIpcMessages(
+            currentMessages,
+            currentMessage.taskId,
+          );
       }
     }
     if (currentMessage) {
@@ -3956,6 +3962,7 @@ async function main(): Promise<void> {
     interactionMode: containerInput.interactionMode ?? 'assistant',
     isScheduledTask: containerInput.isScheduledTask || false,
     currentTaskId: containerInput.messageTaskId ?? null,
+    currentScheduledTaskRunId: null,
     currentInputTurnId: containerInput.turnId,
     workspaceMemoryMutationAuth:
       containerInput.workspaceMemoryMutationSigningSecret &&
@@ -4059,6 +4066,8 @@ async function main(): Promise<void> {
       const tid = pendingDrain.messages[i].taskId;
       if (tid) {
         mcpToolsConfig.currentTaskId = tid;
+        mcpToolsConfig.currentScheduledTaskRunId =
+          scheduledGroupRunIdFromIpcMessages(pendingDrain.messages, tid);
         containerInput.messageTaskId = tid;
         break;
       }
@@ -4300,6 +4309,11 @@ async function main(): Promise<void> {
           latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+        mcpToolsConfig.currentScheduledTaskRunId =
+          scheduledGroupRunIdFromIpcMessages(
+            nextMessage.messages,
+            nextMessage.taskId,
+          );
         containerInput.messageTaskId =
           mcpToolsConfig.currentTaskId ?? undefined;
         setCurrentChannelTurn(
@@ -4622,6 +4636,11 @@ async function main(): Promise<void> {
       // Forgetting to clear would cause regular user replies to be broadcast
       // to the task's notify channels, hijacking later conversation.
       mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+      mcpToolsConfig.currentScheduledTaskRunId =
+        scheduledGroupRunIdFromIpcMessages(
+          nextMessage.messages,
+          nextMessage.taskId,
+        );
       containerInput.messageTaskId = mcpToolsConfig.currentTaskId ?? undefined;
       setCurrentChannelTurn(
         containerInput,

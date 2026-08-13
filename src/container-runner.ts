@@ -52,7 +52,13 @@ import {
   resolveProviderById,
   shellQuoteEnvLines,
   writeCredentialsFile,
+  buildClaudeAiOauthPayload,
+  updateProviderOAuthCredentialsIfCurrent,
 } from './runtime-config.js';
+import {
+  removeClaudeKeychainOAuth,
+  syncClaudeKeychainOAuth,
+} from './macos-keychain-credentials.js';
 import { providerModelTier, providerPool } from './provider-pool.js';
 import type { ProviderTier } from './provider-pool.js';
 import {
@@ -3029,6 +3035,16 @@ export async function runHostAgent(
     }
     if (tierEnv.model) hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
 
+    // Resolve symlinks up front: this exact string becomes CLAUDE_CONFIG_DIR
+    // below, and the macOS Keychain entry the CLI reads is addressed by a
+    // hash of it — both consumers must see the identical path.
+    let resolvedSessionsDir = groupSessionsDir;
+    try {
+      resolvedSessionsDir = fs.realpathSync(groupSessionsDir);
+    } catch {
+      // Path may not exist yet on first spawn; fall back to the literal path.
+    }
+
     // Third-party provider: unless this provider explicitly injects
     // ANTHROPIC_AUTH_TOKEN (Bearer proxy mode), remove any inherited host token
     // so API-key mode can take effect.
@@ -3064,9 +3080,12 @@ export async function runHostAgent(
           { mode: 0o600 },
         );
       } catch (err) {
-        logger.warn(
+        logger.error(
           { folder: group.folder, err },
           'Failed to strip oauthAccount from session .claude.json',
+        );
+        return hostModeSetupError(
+          '无法清理宿主机会话 OAuth 账户信息，已阻止第三方模型启动',
         );
       }
 
@@ -3076,9 +3095,30 @@ export async function runHostAgent(
         const credsPath = path.join(groupSessionsDir, '.credentials.json');
         if (fs.existsSync(credsPath)) fs.unlinkSync(credsPath);
       } catch (err) {
-        logger.warn(
+        logger.error(
           { folder: group.folder, err },
           'Failed to remove .credentials.json for third-party provider',
+        );
+        return hostModeSetupError(
+          '无法清理宿主机会话 OAuth 凭据文件，已阻止第三方模型启动',
+        );
+      }
+      // Same forced-OAuth hazard, second store: on macOS the CLI keeps OAuth
+      // credentials in the Keychain and prefers them over the (now removed)
+      // file, so the claudeAiOauth field must be stripped there as well.
+      try {
+        await removeClaudeKeychainOAuth(
+          resolvedSessionsDir,
+          hostSelectedProfileId ??
+            `runtime-third-party:${hostEnv['ANTHROPIC_BASE_URL']}`,
+        );
+      } catch (err) {
+        logger.error(
+          { folder: group.folder, err },
+          'Failed to remove macOS Keychain OAuth for third-party provider',
+        );
+        return hostModeSetupError(
+          '无法清理 macOS Keychain OAuth 凭据，已阻止第三方模型启动',
         );
       }
     }
@@ -3086,12 +3126,44 @@ export async function runHostAgent(
     // Write .credentials.json for OAuth credentials
     const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
     if (mergedConfig.claudeOAuthCredentials) {
+      let effectiveOauth = buildClaudeAiOauthPayload(mergedConfig);
+      if (!effectiveOauth) {
+        return hostModeSetupError('官方 OAuth 凭据不完整，已阻止启动');
+      }
       try {
-        writeCredentialsFile(groupSessionsDir, mergedConfig);
+        effectiveOauth = await syncClaudeKeychainOAuth(resolvedSessionsDir, {
+          providerId: hostSelectedProfileId ?? '',
+          claudeAiOauth: effectiveOauth,
+          persistRefreshedCredentials: (expected, refreshed) => {
+            if (!hostSelectedProfileId) return false;
+            return updateProviderOAuthCredentialsIfCurrent(
+              hostSelectedProfileId,
+              expected,
+              refreshed,
+            );
+          },
+        });
       } catch (err) {
-        logger.warn(
+        logger.error(
+          { folder: group.folder, err },
+          'Failed to reconcile macOS Keychain OAuth credentials',
+        );
+        return hostModeSetupError(
+          '无法安全同步 macOS Keychain OAuth 凭据，已阻止启动',
+        );
+      }
+      try {
+        writeCredentialsFile(groupSessionsDir, {
+          ...mergedConfig,
+          claudeOAuthCredentials: effectiveOauth,
+        });
+      } catch (err) {
+        logger.error(
           { folder: group.folder, err },
           'Failed to write .credentials.json for host agent',
+        );
+        return hostModeSetupError(
+          '无法写入宿主机会话 OAuth 凭据文件，已阻止启动',
         );
       }
     }
@@ -3120,15 +3192,10 @@ export async function runHostAgent(
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
     hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
 
-    // Resolve symlinks so CLAUDE_CONFIG_DIR ends up as the real on-disk path.
-    // Host mode also goes through the synchronized session .claude directory so
-    // explicit externalClaudeDir is authoritative for CLAUDE.md/rules/skills.
-    let resolvedSessionsDir = groupSessionsDir;
-    try {
-      resolvedSessionsDir = fs.realpathSync(groupSessionsDir);
-    } catch {
-      // Path may not exist yet on first spawn; fall back to the literal path.
-    }
+    // CLAUDE_CONFIG_DIR is the real on-disk path (resolved above, before the
+    // credential writes). Host mode also goes through the synchronized session
+    // .claude directory so explicit externalClaudeDir is authoritative for
+    // CLAUDE.md/rules/skills.
     hostEnv['CLAUDE_CONFIG_DIR'] = resolvedSessionsDir;
 
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败

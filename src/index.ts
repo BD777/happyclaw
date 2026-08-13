@@ -25,6 +25,8 @@ import {
   decideAssistantPrimaryProjection,
   isGenuineReplyResult,
   occupiesPrimaryReplyDeliverySlot,
+  resolveScheduledGroupDeliveryContract,
+  resolveScheduledProactiveArchiveCandidate,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
   shouldFinalizeScheduledGroupPrimaryResult,
@@ -451,8 +453,11 @@ import {
   formatScheduledTaskWorkspaceResult,
   hasAuthoritativeScheduledGroupTerminal,
   resolveScheduledGroupRunsForOutput,
+  resolveScheduledGroupDeliveryRoute,
+  selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
+  resolveScheduledTaskIpcRunId,
 } from './task-scheduler.js';
 import { getMergedTaskRunHistory } from './task-run-history.js';
 import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
@@ -5589,6 +5594,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (missedMessages.length === 0) return true;
   }
 
+  const liveInteractionMode = resolveRuntimeInteractionMode(
+    getWorkspaceInteractionMode(effectiveGroup.folder),
+    { agentKind: 'main' },
+  );
+  const interactionBatch = selectInteractionModeCompatibleMessagePrefix(
+    missedMessages,
+    liveInteractionMode,
+    getTaskRunById,
+  );
+  missedMessages = interactionBatch.messages;
+  const interactionMode = interactionBatch.interactionMode;
+  const scheduledGroupDeliveryContract =
+    resolveScheduledGroupDeliveryContract(interactionMode);
+  if (interactionBatch.hasDeferredMessages) {
+    // A runner has one system/MCP/output contract for its lifetime. Keep the
+    // incompatible suffix behind the durable cursor and force a fresh runner
+    // after this prefix, rather than coalescing both contracts into one query.
+    queue.enqueueMessageCheck(chatJid);
+  }
+
   // Direct IM chats reply to themselves. Routed IM messages keep their original
   // source_jid so workspace-bound conversations can reply back to the sender
   // without mirroring every Web reply into IM.
@@ -5613,11 +5638,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     incomingImOwner = chatJid;
   }
   const persistedMainOwner = getSessionChannelOwner(effectiveGroup.folder);
-  let replySourceImJid = resolveStickyChannelOwner(
-    persistedMainOwner ?? null,
-    incomingImOwner,
+  const scheduledGroupDeliveryRoute = resolveScheduledGroupDeliveryRoute(
+    missedMessages,
+    effectiveGroup.folder,
+    getTaskRunById,
+    getChannelType,
   );
-  if (!persistedMainOwner && replySourceImJid) {
+  let replySourceImJid =
+    scheduledGroupDeliveryRoute ??
+    resolveStickyChannelOwner(persistedMainOwner ?? null, incomingImOwner);
+  if (!scheduledGroupDeliveryRoute && !persistedMainOwner && replySourceImJid) {
     replySourceImJid = setSessionChannelOwnerOnce(
       effectiveGroup.folder,
       null,
@@ -5715,10 +5745,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       effectiveGroup.folder,
       effectiveGroup.created_by,
     ),
-  );
-  const interactionMode = resolveRuntimeInteractionMode(
-    getWorkspaceInteractionMode(effectiveGroup.folder),
-    { agentKind: 'main' },
   );
   const resetForAgentProfile = resetMainSessionForAgentProfileMismatch(
     effectiveGroup,
@@ -6284,6 +6310,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           streamingSessionJid,
           makeOnCardCreated(streamingSessionJid),
           activeDurableCardLifecycle,
+          lastProcessed.id,
         );
   const channelStreamingSessionsByInput = new Map<
     string,
@@ -6416,6 +6443,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     runtime?: ChannelTurnRuntime;
     scope?: ActiveChannelOutboxScope;
     lifecycle?: typeof activeDurableCardLifecycle;
+    inputMessageId: string;
   }
   const admittedWarmMainInputs = new Map<string, AdmittedWarmMainInput>();
   const mainAdmissionKey = channelTurnScope(effectiveGroup.folder);
@@ -6503,10 +6531,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         return false;
       }
 
-      const newImJid = resolveStickyChannelOwner(
-        replySourceImJid,
-        newSourceJid,
+      const scheduledRoute = resolveScheduledGroupDeliveryRoute(
+        (coveredInputs ?? [])
+          .map((input) =>
+            getAgentBuilderInputMessage(receipt?.chatJid ?? chatJid, input.id),
+          )
+          .filter((message): message is NonNullable<typeof message> =>
+            Boolean(message),
+          ),
+        effectiveGroup.folder,
+        getTaskRunById,
+        getChannelType,
       );
+      const newImJid =
+        scheduledRoute ??
+        resolveStickyChannelOwner(replySourceImJid, newSourceJid);
       let nextRuntime: ChannelTurnRuntime | undefined;
       let nextScope: ActiveChannelOutboxScope | undefined;
       let nextLifecycle: typeof activeDurableCardLifecycle;
@@ -6571,6 +6610,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         runtime: nextRuntime,
         scope: nextScope,
         lifecycle: nextLifecycle,
+        inputMessageId: inputCursor?.id ?? inputTurnId,
       });
       genuineReplyDeliveredByInput.set(inputTurnId, false);
       const exactInputs =
@@ -6763,6 +6803,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               streamingSessionJid,
               makeOnCardCreated(streamingSessionJid),
               durableLifecycleForInput,
+              admittedInput?.inputMessageId ?? inputTurnId,
             );
           } catch (err: any) {
             logger.warn(
@@ -6791,6 +6832,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               streamingSessionJid,
               makeOnCardCreated(streamingSessionJid),
               durableLifecycleForInput,
+              admittedInput?.inputMessageId ?? inputTurnId,
             )
             .catch((err) => {
               logger.error(
@@ -6838,6 +6880,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             streamingSessionJid,
             makeOnCardCreated(streamingSessionJid),
             durableLifecycleForInput,
+            admittedInput?.inputMessageId ?? inputTurnId,
           );
         } catch (err: any) {
           logger.error(
@@ -6879,6 +6922,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         projectionJid,
         makeOnCardCreated(projectionJid),
         admitted.lifecycle,
+        admitted.inputMessageId,
       )
       .catch((error) => {
         logger.error(
@@ -7684,12 +7728,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               ...(scheduledGroupRunsByInput.get(proactiveInputId)?.values() ??
                 []),
             ];
-            const completedScheduledCandidate =
-              result.status === 'success' &&
-              result.inputTurnCompleted === true &&
-              result.proactiveFinalCandidate?.trim()
-                ? stripAgentInternalTags(result.proactiveFinalCandidate).trim()
-                : '';
+            const scheduledArchiveCandidate =
+              resolveScheduledProactiveArchiveCandidate({
+                status: result.status,
+                inputTurnCompleted: result.inputTurnCompleted,
+                hasScheduledGroupRuns: scheduledRuns.length > 0,
+                proactiveFinalCandidate: result.proactiveFinalCandidate,
+                result: result.result,
+              });
+            const completedScheduledCandidate = scheduledArchiveCandidate
+              ? stripAgentInternalTags(scheduledArchiveCandidate).trim()
+              : '';
             if (
               scheduledRuns.length > 0 &&
               result.inputTurnCompleted === true
@@ -8166,7 +8215,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 dbText,
                 {
                   messageId: scheduledGroupResultMessageId,
-                  sendToIM: directImReply && !skipImSend,
+                  sendToIM:
+                    (scheduledGroupRuns.length === 0 ||
+                      scheduledGroupDeliveryContract.frameworkDeliversFinalText) &&
+                    directImReply &&
+                    !skipImSend,
                   imTextOverride: dbText !== text ? text : undefined,
                   localImagePaths,
                   channelOutbox: outputChannelScope.scope
@@ -9529,6 +9582,7 @@ async function runAgent(
         displayName: identifier,
         selectedProviderId,
         feishuCliAccountId,
+        interactionMode,
       });
     };
 
@@ -10180,7 +10234,8 @@ function startIpcWatcher(): void {
       agentId: ipcAgentId,
       taskId: ipcTaskId,
     } of ipcRoots) {
-      const durableTaskRunId = extractDurableTaskRunIdFromNamespace(ipcTaskId);
+      const isolatedDurableTaskRunId =
+        extractDurableTaskRunIdFromNamespace(ipcTaskId);
       const messagesDir = path.join(ipcRoot, 'messages');
       const messageResultsDir = path.join(ipcRoot, 'message-results');
       const tasksDir = path.join(ipcRoot, 'tasks');
@@ -10198,6 +10253,12 @@ function startIpcWatcher(): void {
           try {
             const raw = await fsp.readFile(filePath, 'utf-8');
             const data = JSON.parse(raw);
+            const durableTaskRunId = resolveScheduledTaskIpcRunId(
+              data,
+              isolatedDurableTaskRunId,
+              sourceGroup,
+              getTaskRunById,
+            );
             messageRequestId =
               typeof data.requestId === 'string' ? data.requestId : undefined;
             if (
@@ -11308,7 +11369,7 @@ function startIpcWatcher(): void {
                 );
               }
               const completedDurableRunId =
-                completion.durableRunId ?? durableTaskRunId;
+                completion.durableRunId ?? isolatedDurableTaskRunId;
               if (completedDurableRunId) {
                 finalizeTaskRunNotificationIfPending(completedDurableRunId);
               }
@@ -11546,6 +11607,7 @@ async function processTaskIpc(
     before?: string;
     // Host-side Feishu capability broker
     inputTurnId?: string;
+    scheduledTaskRunId?: string;
     operation?: string;
     params?: Record<string, unknown>;
     // Workspace Memory v2. Workspace/actor/sourceType are never accepted from
@@ -11588,7 +11650,12 @@ async function processTaskIpc(
   ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
   ipcTaskId: string | null = null, // Non-null for an isolated scheduled-task run namespace
 ): Promise<void> {
-  const durableTaskRunId = extractDurableTaskRunIdFromNamespace(ipcTaskId);
+  const durableTaskRunId = resolveScheduledTaskIpcRunId(
+    data,
+    extractDurableTaskRunIdFromNamespace(ipcTaskId),
+    sourceGroup,
+    getTaskRunById,
+  );
   const ownerHomeFolderCandidate = sourceGroupEntry?.created_by
     ? getUserHomeGroup(sourceGroupEntry.created_by)?.folder
     : null;
@@ -14600,6 +14667,7 @@ async function processAgentConversation(
           (messageId) =>
             registerMessageIdMapping(messageId, streamingSessionJid!),
           activeAgentDurableCardLifecycle,
+          lastProcessed.id,
         )
       : undefined;
   const agentStreamingSessionsByInput = new Map<
@@ -14737,6 +14805,7 @@ async function processAgentConversation(
     runtime?: ChannelTurnRuntime;
     scope?: ActiveChannelOutboxScope;
     lifecycle?: typeof activeAgentDurableCardLifecycle;
+    inputMessageId: string;
   }
   const admittedWarmAgentInputs = new Map<string, AdmittedWarmAgentInput>();
   const agentAdmissionKey = channelTurnScope(effectiveGroup.folder, agentId);
@@ -14886,6 +14955,7 @@ async function processAgentConversation(
         runtime: nextRuntime,
         scope: nextScope,
         lifecycle: nextLifecycle,
+        inputMessageId: inputCursor?.id ?? inputTurnId,
       });
       agentAnyReplyProjectedByInput.set(inputTurnId, false);
       agentGenuineReplyDeliveredByInput.set(inputTurnId, false);
@@ -15036,6 +15106,7 @@ async function processAgentConversation(
                 (messageId) =>
                   registerMessageIdMapping(messageId, streamingSessionJid!),
                 admittedAgentLifecycle,
+                inputTurnId,
               )
               .catch(() => undefined)
           : undefined;
@@ -15072,6 +15143,7 @@ async function processAgentConversation(
         admitted.imJid,
         (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
         admitted.lifecycle,
+        admitted.inputMessageId,
       )
       .catch((error) => {
         logger.error(
@@ -17109,6 +17181,20 @@ async function startMessageLoop(): Promise<void> {
           );
           let messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+          const { effectiveGroup: activeEffectiveGroup } =
+            resolveEffectiveGroup(group);
+          const liveWarmInteractionMode = resolveRuntimeInteractionMode(
+            getWorkspaceInteractionMode(activeEffectiveGroup.folder),
+            { agentKind: 'main' },
+          );
+          const warmInteractionBatch =
+            selectInteractionModeCompatibleMessagePrefix(
+              messagesToSend,
+              liveWarmInteractionMode,
+              getTaskRunById,
+            );
+          messagesToSend = warmInteractionBatch.messages;
+          const requiredInteractionMode = warmInteractionBatch.interactionMode;
           // The receipt covers the exact pre-expansion DB batch. Plugin replies
           // removed from `messagesToSend` below are already handled out-of-band,
           // so a healthy agent result for the remainder may safely commit the
@@ -17117,8 +17203,6 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             messagesToSend,
           );
-          const { effectiveGroup: activeEffectiveGroup } =
-            resolveEffectiveGroup(group);
           const warmChannelContext = resolveBatchChannelContext(
             messagesToSend,
             chatJid,
@@ -17139,6 +17223,15 @@ async function startMessageLoop(): Promise<void> {
             queue.requiresFeishuCliContainerRestart(chatJid, {
               feishuCliAccountId: requiredFeishuCliAccountId,
             })
+          ) {
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
+          if (
+            queue.requiresInteractionModeRestart(
+              chatJid,
+              requiredInteractionMode,
+            )
           ) {
             queue.enqueueMessageCheck(chatJid);
             continue;
@@ -17304,7 +17397,10 @@ async function startMessageLoop(): Promise<void> {
                 lastSourceJidForRoute,
                 receipt,
               ),
-            { feishuCliAccountId: requiredFeishuCliAccountId },
+            {
+              feishuCliAccountId: requiredFeishuCliAccountId,
+              interactionMode: requiredInteractionMode,
+            },
           );
           if (sendResult === 'sent' && deliveryTarget) {
             logger.debug(
@@ -17320,6 +17416,9 @@ async function startMessageLoop(): Promise<void> {
             // which would cause it to be re-pulled and replayed on the next
             // poll (#18 P1-bug-1).
             advanceNextPullCursorOnly(chatJid, deliveryTarget.cursor);
+            if (warmInteractionBatch.hasDeferredMessages) {
+              queue.enqueueMessageCheck(chatJid);
+            }
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -19335,6 +19434,61 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           },
         },
       );
+    } else if (account.provider === 'wecom') {
+      connected = await imManager.connectUserWeCom(
+        account.owner_user_id,
+        {
+          botId: secret.botId || '',
+          secret: secret.secret || '',
+          corpId: secret.corpId,
+          enabled: true,
+        },
+        onNewChat,
+        {
+          ...common,
+          isChatAuthorized: buildIsChatAuthorized(
+            account.owner_user_id,
+            account.id,
+            account.is_legacy_default,
+          ),
+          onPairAttempt: buildOnPairAttempt(
+            account.owner_user_id,
+            account.id,
+            workspace.jid,
+            account.is_legacy_default,
+          ),
+          shouldProcessGroupMessage,
+          isGroupOwnerMessage,
+          isSenderAllowedInGroup,
+          resolveRegisteredGroup: getRegisteredGroup,
+          onConnectionStateChange: (state) => {
+            if (state.status === 'connected') {
+              updateChannelAccountAuthStatus(account.id, 'authorized');
+              updateChannelAccountStatus(account.id, 'connected');
+            } else if (state.status === 'connecting') {
+              updateChannelAccountStatus(account.id, 'connecting');
+            } else if (state.status === 'reconnecting') {
+              updateChannelAccountStatus(account.id, 'reconnecting');
+            } else if (state.status === 'error') {
+              updateChannelAccountStatus(account.id, 'error', state.error);
+            } else {
+              updateChannelAccountStatus(
+                account.id,
+                'disconnected',
+                state.error,
+              );
+            }
+            const latest = getChannelAccount(account.id);
+            if (latest) {
+              broadcastChannelAccountStatus(account.owner_user_id, account.id, {
+                transportStatus: latest.transport_status,
+                lastError: latest.last_error,
+                connectedAt: latest.connected_at,
+              });
+            }
+          },
+        },
+      );
     } else if (account.provider === 'dingtalk') {
       connected = await imManager.connectUserDingTalk(
         account.owner_user_id,
@@ -19389,7 +19543,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           isGroupOwnerMessage,
         },
       );
-    } else {
+    } else if (account.provider === 'whatsapp') {
       if (account.is_legacy_default) {
         migrateLegacyWhatsAppAuthDir(
           DATA_DIR,
@@ -19451,6 +19605,8 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           },
         },
       );
+    } else {
+      throw new Error(`Unsupported channel provider: ${account.provider}`);
     }
     if (account.provider === 'whatsapp') {
       // Baileys returns after the socket is created, before QR authorization
@@ -20848,6 +21004,7 @@ async function main(): Promise<void> {
         senderName: input.senderName,
         text: input.text,
         queuedResult: input.queuedResult,
+        interactionMode: input.interactionMode,
       });
       const now = new Date().toISOString();
       broadcastNewMessage(input.chatJid, {
