@@ -29,6 +29,12 @@ import {
 import { weChatIlinkHeaders } from './wechat-onboarding.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
 import { createWeChatHttpDispatcher } from './wechat-http.js';
+import {
+  createDatabaseWeChatContextTokenStore,
+  WeChatContextTokenManager,
+  type WeChatContextTokenRecord,
+  type WeChatContextTokenStore,
+} from './wechat-context-token.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -163,6 +169,7 @@ export interface WeChatConnectionDeps {
   createDispatcher?: (bypassProxy: boolean) => Dispatcher;
   random?: () => number;
   now?: () => number;
+  contextTokenStore?: WeChatContextTokenStore | null;
 }
 
 interface WeixinMessage {
@@ -206,6 +213,22 @@ type WeChatApiEnvelope = {
   base_resp?: { ret?: unknown; errcode?: unknown; errmsg?: unknown };
 };
 
+export class WeChatApiError extends Error {
+  readonly code = 'WECHAT_API_ERROR';
+
+  constructor(
+    readonly operation: string,
+    readonly codeField: string,
+    readonly apiCode: unknown,
+    readonly apiMessage: string,
+  ) {
+    super(
+      `${operation} failed: ${codeField}=${String(apiCode)}${apiMessage ? ` message=${apiMessage}` : ''}`,
+    );
+    this.name = 'WeChatApiError';
+  }
+}
+
 function nonZeroApiCode(value: unknown): boolean {
   if (value === undefined || value === null || value === '') return false;
   const numeric = typeof value === 'number' ? value : Number(value);
@@ -234,8 +257,25 @@ export function assertWeChatApiSuccess(
     response.message ??
     response.base_resp?.errmsg ??
     '';
-  throw new Error(
-    `${operation} failed: ${failure[0]}=${String(failure[1])}${message ? ` message=${String(message)}` : ''}`,
+  throw new WeChatApiError(operation, failure[0], failure[1], String(message));
+}
+
+/** ret=-2 is overloaded. Preserve genuine throttling, invalidate only the
+ * stale/missing-context variants observed across Tencent and Hermes reports. */
+export function isWeChatContextTokenRejection(error: unknown): boolean {
+  if (!(error instanceof WeChatApiError)) return false;
+  const numericCode = Number(error.apiCode);
+  if (numericCode === ERRCODE_SESSION_EXPIRED) return true;
+  if (numericCode !== -2 && numericCode !== -3) return false;
+  const message = error.apiMessage.trim().toLowerCase();
+  if (/rate|frequency|frequent|freq|limit|频率|限流/.test(message)) {
+    return false;
+  }
+  return (
+    message === '' ||
+    /unknown error|prepare failed|invalid argument|context.?token|session/.test(
+      message,
+    )
   );
 }
 
@@ -485,8 +525,18 @@ export function createWeChatConnection(
   let lastLoggedErrorCode: WeChatConnectionErrorCode | null = null;
   let lastRepeatedErrorLogAt = 0;
 
-  // context_token cache: from_user_id -> latest context_token
-  const contextTokenCache = new Map<string, string>();
+  const contextTokenStore =
+    deps.contextTokenStore === undefined
+      ? createDatabaseWeChatContextTokenStore()
+      : deps.contextTokenStore;
+  // Tokens are scoped by channel account in durable storage and restored when
+  // a connector is recreated. A direct/test connector without an account ID
+  // retains the same strict lifetime/quota behavior in memory only.
+  const contextTokens = new WeChatContextTokenManager({
+    accountId: config.logContext?.accountId,
+    store: contextTokenStore,
+    now,
+  });
 
   // Known JIDs — skip redundant storeChatMetadata/onNewChat for repeat messages
   const knownJids = new Set<string>();
@@ -622,6 +672,40 @@ export function createWeChatConnection(
     });
 
     assertWeChatApiSuccess(resp, 'sendMessage');
+  }
+
+  async function sendWithReservedContext(
+    record: WeChatContextTokenRecord,
+    send: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await send();
+    } catch (error) {
+      if (isWeChatContextTokenRejection(error)) {
+        const invalidated = contextTokens.invalidate(record);
+        logger.warn(
+          {
+            ...logContext,
+            chatId: record.userId,
+            apiCode:
+              error instanceof WeChatApiError ? error.apiCode : undefined,
+            invalidated,
+          },
+          'WeChat context_token rejected; waiting for a fresh inbound message',
+        );
+      }
+      throw error;
+    }
+  }
+
+  async function sendManagedText(userId: string, text: string): Promise<void> {
+    const chunks = splitTextChunks(markdownToPlainText(text), MSG_SPLIT_LIMIT);
+    const record = contextTokens.claim(userId, chunks.length);
+    await sendWithReservedContext(record, async () => {
+      for (const chunk of chunks) {
+        await sendMessageApi(userId, record.token, chunk);
+      }
+    });
   }
 
   async function getTypingTicket(
@@ -790,6 +874,7 @@ export function createWeChatConnection(
     msg: WeixinMessage,
     opts: WeChatConnectOpts,
   ): Promise<void> {
+    let markedDedupKey: string | undefined;
     try {
       // Skip bot's own messages
       if (msg.message_type === MESSAGE_TYPE_BOT) return;
@@ -801,6 +886,7 @@ export function createWeChatConnection(
       const key = dedupKey(msg);
       if (dedup.isDuplicate(key)) return;
       dedup.markSeen(key);
+      markedDedupKey = key;
 
       // Skip stale messages — if no timestamp available, skip as well (can't verify freshness)
       if (opts.ignoreMessagesBefore) {
@@ -878,9 +964,21 @@ export function createWeChatConnection(
       const { targetJid, routing: agentRouting } = resolvedRoute;
 
       // Cache a reply token only after authorization, preventing arbitrary
-      // senders from growing the long-lived per-connection cache.
+      // senders from growing durable account-scoped storage. Persist before
+      // acknowledging the getUpdates cursor so a restart cannot lose it.
       if (msg.context_token) {
-        contextTokenCache.set(fromUserId, msg.context_token);
+        try {
+          contextTokens.refresh(
+            fromUserId,
+            msg.context_token,
+            msg.create_time_ms ?? now(),
+          );
+        } catch (cause) {
+          throw Object.assign(
+            new Error('Failed to persist WeChat context_token', { cause }),
+            { code: 'WECHAT_CONTEXT_TOKEN_PERSISTENCE_ERROR' },
+          );
+        }
       }
 
       // ── Register the authorized base chat ──
@@ -901,17 +999,18 @@ export function createWeChatConnection(
         try {
           const reply = await opts.onCommand(jid, cmdBody, fromUserId);
           if (reply) {
-            const ct = contextTokenCache.get(fromUserId);
-            if (ct) {
-              await sendMessageApi(fromUserId, ct, markdownToPlainText(reply));
-            }
+            await sendManagedText(fromUserId, reply);
             return;
           }
         } catch (err) {
           logger.error({ jid, err }, 'WeChat slash command failed');
-          const ct = contextTokenCache.get(fromUserId);
-          if (ct) {
-            await sendMessageApi(fromUserId, ct, '命令执行失败，请稍后重试');
+          try {
+            await sendManagedText(fromUserId, '命令执行失败，请稍后重试');
+          } catch (replyError) {
+            logger.warn(
+              { jid, err: replyError },
+              'Failed to send WeChat command error reply',
+            );
           }
           return;
         }
@@ -1031,6 +1130,13 @@ export function createWeChatConnection(
         { err, msgId: msg.message_id },
         'Error handling WeChat message',
       );
+      if (
+        (err as { code?: unknown })?.code ===
+        'WECHAT_CONTEXT_TOKEN_PERSISTENCE_ERROR'
+      ) {
+        if (markedDedupKey) dedup.forget(markedDedupKey);
+        throw err;
+      }
     }
   }
 
@@ -1240,10 +1346,18 @@ export function createWeChatConnection(
 
       try {
         ensureDispatcher();
+        const restoredTokens = contextTokens.restore();
+        if (restoredTokens > 0) {
+          logger.info(
+            { ...logContext, restoredTokens },
+            'Restored durable WeChat context_tokens',
+          );
+        }
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
         publishState({ status: 'disconnected', error });
         activeOpts = null;
+        await closeDispatcher();
         throw err;
       }
 
@@ -1254,7 +1368,6 @@ export function createWeChatConnection(
       consecutivePollTimeouts = 0;
       failureStartedAt = 0;
       dedup.clear();
-      contextTokenCache.clear();
       knownJids.clear();
 
       logger.info(
@@ -1306,7 +1419,7 @@ export function createWeChatConnection(
       await closeDispatcher();
 
       dedup.clear();
-      contextTokenCache.clear();
+      contextTokens.clearMemory();
       knownJids.clear();
       rejectTimestamps.clear();
       logger.info(logContext, 'WeChat iLink poller disconnected');
@@ -1320,23 +1433,8 @@ export function createWeChatConnection(
       // chatId is the raw WeChat user ID (prefix already stripped by IM manager)
       const userId = chatId;
 
-      const contextToken = contextTokenCache.get(userId);
-      if (!contextToken) {
-        logger.warn(
-          { chatId },
-          'No context_token available for WeChat user, cannot send message',
-        );
-        throw new Error(`No context_token available for WeChat chat ${chatId}`);
-      }
-
       try {
-        const plainText = markdownToPlainText(text);
-        const chunks = splitTextChunks(plainText, MSG_SPLIT_LIMIT);
-
-        for (const chunk of chunks) {
-          await sendMessageApi(userId, contextToken, chunk);
-        }
-
+        await sendManagedText(userId, text);
         logger.info({ chatId }, 'WeChat message sent');
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send WeChat message');
@@ -1353,15 +1451,6 @@ export function createWeChatConnection(
     ): Promise<void> {
       const userId = chatId;
 
-      const contextToken = contextTokenCache.get(userId);
-      if (!contextToken) {
-        logger.warn(
-          { chatId },
-          'No context_token for WeChat user, cannot send image',
-        );
-        throw new Error(`No context_token available for WeChat chat ${chatId}`);
-      }
-
       if (imageBuffer.length > MAX_FILE_SIZE) {
         throw new Error(
           `WeChat image size ${imageBuffer.length} exceeds max ${MAX_FILE_SIZE}`,
@@ -1376,59 +1465,63 @@ export function createWeChatConnection(
       };
       const ext = extMap[mimeType] ?? '.jpg';
       const resolvedFileName = fileName ?? `image_${Date.now()}${ext}`;
+      const captionChunks = caption
+        ? splitTextChunks(markdownToPlainText(caption), MSG_SPLIT_LIMIT)
+        : [];
+      const record = contextTokens.claim(userId, captionChunks.length + 1);
 
       try {
-        // Optional caption is sent first as a separate text message — WeChat's
-        // sendmessage API does not accept mixed text+image item_list payloads.
-        if (caption) {
-          const plain = markdownToPlainText(caption);
-          for (const chunk of splitTextChunks(plain, MSG_SPLIT_LIMIT)) {
-            await sendMessageApi(userId, contextToken, chunk);
+        await sendWithReservedContext(record, async () => {
+          // Optional caption is sent first as a separate text message —
+          // WeChat's sendmessage API does not accept mixed text+image items.
+          for (const chunk of captionChunks) {
+            await sendMessageApi(userId, record.token, chunk);
           }
-        }
 
-        // Upload to WeChat CDN (getuploadurl → AES-128-ECB encrypt → PUT ciphertext).
-        const upload = await uploadMediaBuffer({
-          buf: imageBuffer,
-          fileName: resolvedFileName,
-          toUserId: userId,
-          baseUrl,
-          token: config.botToken,
-          cdnBaseUrl,
-          mediaType: 1, // MEDIA_IMAGE
-          dispatcher: ensureDispatcher(),
-        });
+          // Upload to WeChat CDN (getuploadurl → AES-128-ECB encrypt → PUT
+          // ciphertext).
+          const upload = await uploadMediaBuffer({
+            buf: imageBuffer,
+            fileName: resolvedFileName,
+            toUserId: userId,
+            baseUrl,
+            token: config.botToken,
+            cdnBaseUrl,
+            mediaType: 1, // MEDIA_IMAGE
+            dispatcher: ensureDispatcher(),
+          });
 
-        const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
-        const resp = await apiPost<{
-          ret?: number;
-          errcode?: number;
-          errmsg?: string;
-        }>('ilink/bot/sendmessage', {
-          msg: {
-            to_user_id: userId,
-            context_token: contextToken,
-            item_list: [
-              {
-                type: MESSAGE_ITEM_TYPE_IMAGE,
-                image_item: {
-                  media: {
-                    encrypt_query_param: upload.downloadEncryptedQueryParam,
-                    aes_key: upload.aeskey,
-                    encrypt_type: 1,
+          const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
+          const resp = await apiPost<{
+            ret?: number;
+            errcode?: number;
+            errmsg?: string;
+          }>('ilink/bot/sendmessage', {
+            msg: {
+              to_user_id: userId,
+              context_token: record.token,
+              item_list: [
+                {
+                  type: MESSAGE_ITEM_TYPE_IMAGE,
+                  image_item: {
+                    media: {
+                      encrypt_query_param: upload.downloadEncryptedQueryParam,
+                      aes_key: upload.aeskey,
+                      encrypt_type: 1,
+                    },
+                    mid_size: upload.fileSizeCiphertext,
                   },
-                  mid_size: upload.fileSizeCiphertext,
                 },
-              },
-            ],
-            message_type: MESSAGE_TYPE_BOT,
-            message_state: MESSAGE_STATE_FINISH,
-            client_id: clientId,
-          },
-          base_info: baseInfo(),
-        });
+              ],
+              message_type: MESSAGE_TYPE_BOT,
+              message_state: MESSAGE_STATE_FINISH,
+              client_id: clientId,
+            },
+            base_info: baseInfo(),
+          });
 
-        assertWeChatApiSuccess(resp, 'sendImage');
+          assertWeChatApiSuccess(resp, 'sendImage');
+        });
 
         logger.info(
           { chatId, size: imageBuffer.length, fileName: resolvedFileName },
@@ -1447,15 +1540,6 @@ export function createWeChatConnection(
     ): Promise<void> {
       const userId = chatId;
 
-      const contextToken = contextTokenCache.get(userId);
-      if (!contextToken) {
-        logger.warn(
-          { chatId },
-          'No context_token for WeChat user, cannot send file',
-        );
-        throw new Error(`No context_token available for WeChat chat ${chatId}`);
-      }
-
       // Single readFile + size check, then pass buffer to uploadMediaBuffer —
       // avoids stat + readFile double-I/O that uploadMediaFile would incur.
       const buf = await fs.promises.readFile(filePath);
@@ -1464,53 +1548,56 @@ export function createWeChatConnection(
           `WeChat file size ${buf.length} exceeds max ${MAX_FILE_SIZE}`,
         );
       }
+      const record = contextTokens.claim(userId);
 
       try {
-        // Upload raw bytes to WeChat CDN as FILE attachment (mediaType=3).
-        const upload = await uploadMediaBuffer({
-          buf,
-          fileName,
-          toUserId: userId,
-          baseUrl,
-          token: config.botToken,
-          cdnBaseUrl,
-          mediaType: 3, // MEDIA_FILE
-          dispatcher: ensureDispatcher(),
-        });
+        await sendWithReservedContext(record, async () => {
+          // Upload raw bytes to WeChat CDN as FILE attachment (mediaType=3).
+          const upload = await uploadMediaBuffer({
+            buf,
+            fileName,
+            toUserId: userId,
+            baseUrl,
+            token: config.botToken,
+            cdnBaseUrl,
+            mediaType: 3, // MEDIA_FILE
+            dispatcher: ensureDispatcher(),
+          });
 
-        const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
-        const resp = await apiPost<{
-          ret?: number;
-          errcode?: number;
-          errmsg?: string;
-        }>('ilink/bot/sendmessage', {
-          msg: {
-            to_user_id: userId,
-            context_token: contextToken,
-            item_list: [
-              {
-                type: MESSAGE_ITEM_TYPE_FILE,
-                file_item: {
-                  media: {
-                    encrypt_query_param: upload.downloadEncryptedQueryParam,
-                    aes_key: upload.aeskey,
-                    encrypt_type: 1,
+          const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
+          const resp = await apiPost<{
+            ret?: number;
+            errcode?: number;
+            errmsg?: string;
+          }>('ilink/bot/sendmessage', {
+            msg: {
+              to_user_id: userId,
+              context_token: record.token,
+              item_list: [
+                {
+                  type: MESSAGE_ITEM_TYPE_FILE,
+                  file_item: {
+                    media: {
+                      encrypt_query_param: upload.downloadEncryptedQueryParam,
+                      aes_key: upload.aeskey,
+                      encrypt_type: 1,
+                    },
+                    file_name: fileName,
+                    // 'len' is the raw (plaintext) file size as a string — per
+                    // nightsailer/wechat-clawbot reference.
+                    len: String(upload.fileSize),
                   },
-                  file_name: fileName,
-                  // 'len' is the raw (plaintext) file size as a string — per
-                  // nightsailer/wechat-clawbot reference.
-                  len: String(upload.fileSize),
                 },
-              },
-            ],
-            message_type: MESSAGE_TYPE_BOT,
-            message_state: MESSAGE_STATE_FINISH,
-            client_id: clientId,
-          },
-          base_info: baseInfo(),
-        });
+              ],
+              message_type: MESSAGE_TYPE_BOT,
+              message_state: MESSAGE_STATE_FINISH,
+              client_id: clientId,
+            },
+            base_info: baseInfo(),
+          });
 
-        assertWeChatApiSuccess(resp, 'sendFile');
+          assertWeChatApiSuccess(resp, 'sendFile');
+        });
 
         logger.info({ chatId, size: buf.length, fileName }, 'WeChat file sent');
       } catch (err) {
@@ -1523,10 +1610,10 @@ export function createWeChatConnection(
       // chatId is the raw WeChat user ID (prefix already stripped by IM manager)
       const userId = chatId;
 
-      const contextToken = contextTokenCache.get(userId);
-      if (!contextToken) return;
+      const record = contextTokens.peek(userId);
+      if (!record) return;
 
-      const ticket = await getTypingTicket(userId, contextToken);
+      const ticket = await getTypingTicket(userId, record.token);
       if (!ticket) return;
 
       await sendTypingApi(userId, ticket, isTyping ? 1 : 2);

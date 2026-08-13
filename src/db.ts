@@ -103,7 +103,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 69;
+export const CURRENT_SCHEMA_VERSION = 70;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -702,6 +702,18 @@ export function initDatabase(): void {
       ON channel_accounts(owner_user_id, provider, updated_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_accounts_one_default
       ON channel_accounts(owner_user_id, provider) WHERE is_default = 1;
+    CREATE TABLE IF NOT EXISTS wechat_context_tokens (
+      channel_account_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      context_token TEXT NOT NULL,
+      refreshed_at_ms INTEGER NOT NULL,
+      send_count INTEGER NOT NULL DEFAULT 0,
+      last_sent_at_ms INTEGER,
+      PRIMARY KEY (channel_account_id, user_id),
+      FOREIGN KEY (channel_account_id) REFERENCES channel_accounts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_wechat_context_tokens_refreshed
+      ON wechat_context_tokens(refreshed_at_ms);
     CREATE TABLE IF NOT EXISTS im_context_bindings (
       source_jid TEXT NOT NULL,
       context_type TEXT NOT NULL,
@@ -10212,6 +10224,165 @@ export function getLegacyChannelAccount(
   return row ? parseChannelAccountRow(row) : undefined;
 }
 
+export interface StoredWeChatContextToken {
+  channel_account_id: string;
+  user_id: string;
+  context_token: string;
+  refreshed_at_ms: number;
+  send_count: number;
+  last_sent_at_ms: number | null;
+}
+
+export type WeChatContextTokenClaimResult =
+  | { status: 'claimed'; record: StoredWeChatContextToken }
+  | { status: 'missing' | 'changed' | 'expired' | 'quota_exhausted' };
+
+/** List only one channel account's reply credentials; tokens never cross accounts. */
+export function listWeChatContextTokens(
+  channelAccountId: string,
+): StoredWeChatContextToken[] {
+  return db
+    .prepare(
+      `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+              send_count, last_sent_at_ms
+       FROM wechat_context_tokens
+       WHERE channel_account_id = ?`,
+    )
+    .all(channelAccountId) as StoredWeChatContextToken[];
+}
+
+/** A new authorized inbound message refreshes both lifetime and send budget. */
+export function upsertWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  contextToken: string;
+  refreshedAtMs: number;
+}): StoredWeChatContextToken {
+  db.prepare(
+    `INSERT INTO wechat_context_tokens (
+       channel_account_id, user_id, context_token, refreshed_at_ms,
+       send_count, last_sent_at_ms
+     ) VALUES (?, ?, ?, ?, 0, NULL)
+     ON CONFLICT(channel_account_id, user_id) DO UPDATE SET
+       context_token = excluded.context_token,
+       refreshed_at_ms = excluded.refreshed_at_ms,
+       send_count = 0,
+       last_sent_at_ms = NULL
+     WHERE excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms`,
+  ).run(
+    input.channelAccountId,
+    input.userId,
+    input.contextToken,
+    input.refreshedAtMs,
+  );
+  return db
+    .prepare(
+      `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+              send_count, last_sent_at_ms
+       FROM wechat_context_tokens
+       WHERE channel_account_id = ? AND user_id = ?`,
+    )
+    .get(input.channelAccountId, input.userId) as StoredWeChatContextToken;
+}
+
+/**
+ * Atomically reserve one or more sendmessage calls against a specific token
+ * generation. Reserving before network I/O is deliberately conservative: a
+ * crash can consume local budget, but can never make us exceed iLink's limit.
+ */
+export function claimWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  expectedToken: string;
+  expectedRefreshedAtMs: number;
+  claimCount: number;
+  maxSendCount: number;
+  maxAgeMs: number;
+  nowMs: number;
+}): WeChatContextTokenClaimResult {
+  if (!Number.isInteger(input.claimCount) || input.claimCount <= 0) {
+    throw new Error('WeChat context_token claimCount must be positive');
+  }
+  return db
+    .transaction((): WeChatContextTokenClaimResult => {
+      const record = db
+        .prepare(
+          `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+                  send_count, last_sent_at_ms
+           FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?`,
+        )
+        .get(input.channelAccountId, input.userId) as
+        | StoredWeChatContextToken
+        | undefined;
+      if (!record) return { status: 'missing' };
+      if (
+        record.context_token !== input.expectedToken ||
+        record.refreshed_at_ms !== input.expectedRefreshedAtMs
+      ) {
+        return { status: 'changed' };
+      }
+      if (input.nowMs - record.refreshed_at_ms >= input.maxAgeMs) {
+        return { status: 'expired' };
+      }
+      if (record.send_count + input.claimCount > input.maxSendCount) {
+        return { status: 'quota_exhausted' };
+      }
+      const sendCount = record.send_count + input.claimCount;
+      db.prepare(
+        `UPDATE wechat_context_tokens
+         SET send_count = ?, last_sent_at_ms = ?
+         WHERE channel_account_id = ? AND user_id = ?
+           AND context_token = ? AND refreshed_at_ms = ?`,
+      ).run(
+        sendCount,
+        input.nowMs,
+        input.channelAccountId,
+        input.userId,
+        input.expectedToken,
+        input.expectedRefreshedAtMs,
+      );
+      return {
+        status: 'claimed',
+        record: {
+          ...record,
+          send_count: sendCount,
+          last_sent_at_ms: input.nowMs,
+        },
+      };
+    })
+    .immediate();
+}
+
+/** Compare-and-delete prevents an old failed request from erasing a refresh. */
+export function deleteWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  expectedToken?: string;
+  expectedRefreshedAtMs?: number;
+}): boolean {
+  const withGeneration =
+    input.expectedToken !== undefined &&
+    input.expectedRefreshedAtMs !== undefined;
+  const result = db
+    .prepare(
+      withGeneration
+        ? `DELETE FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?
+             AND context_token = ? AND refreshed_at_ms = ?`
+        : `DELETE FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?`,
+    )
+    .run(
+      input.channelAccountId,
+      input.userId,
+      ...(withGeneration
+        ? [input.expectedToken, input.expectedRefreshedAtMs]
+        : []),
+    );
+  return result.changes > 0;
+}
+
 export function listChannelAccountsForUser(
   ownerUserId: string,
 ): ChannelAccount[] {
@@ -10342,6 +10513,11 @@ export function deleteChannelAccount(id: string, ownerUserId: string): boolean {
   return db.transaction(() => {
     const current = getChannelAccountForUser(id, ownerUserId);
     if (!current) return false;
+    // Keep cleanup correct even on legacy databases where foreign-key
+    // enforcement had to be disabled because of unrelated historical orphans.
+    db.prepare(
+      'DELETE FROM wechat_context_tokens WHERE channel_account_id = ?',
+    ).run(id);
     const result = db
       .prepare(
         'DELETE FROM channel_accounts WHERE id = ? AND owner_user_id = ?',
