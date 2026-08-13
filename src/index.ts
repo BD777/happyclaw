@@ -25,6 +25,7 @@ import {
   decideAssistantPrimaryProjection,
   isGenuineReplyResult,
   occupiesPrimaryReplyDeliverySlot,
+  resolveScheduledGroupDeliveryContract,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
   shouldFinalizeScheduledGroupPrimaryResult,
@@ -451,6 +452,7 @@ import {
   formatScheduledTaskWorkspaceResult,
   hasAuthoritativeScheduledGroupTerminal,
   resolveScheduledGroupRunsForOutput,
+  selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
 } from './task-scheduler.js';
@@ -5589,6 +5591,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (missedMessages.length === 0) return true;
   }
 
+  const liveInteractionMode = resolveRuntimeInteractionMode(
+    getWorkspaceInteractionMode(effectiveGroup.folder),
+    { agentKind: 'main' },
+  );
+  const interactionBatch = selectInteractionModeCompatibleMessagePrefix(
+    missedMessages,
+    liveInteractionMode,
+    getTaskRunById,
+  );
+  missedMessages = interactionBatch.messages;
+  const interactionMode = interactionBatch.interactionMode;
+  const scheduledGroupDeliveryContract =
+    resolveScheduledGroupDeliveryContract(interactionMode);
+  if (interactionBatch.hasDeferredMessages) {
+    // A runner has one system/MCP/output contract for its lifetime. Keep the
+    // incompatible suffix behind the durable cursor and force a fresh runner
+    // after this prefix, rather than coalescing both contracts into one query.
+    queue.enqueueMessageCheck(chatJid);
+  }
+
   // Direct IM chats reply to themselves. Routed IM messages keep their original
   // source_jid so workspace-bound conversations can reply back to the sender
   // without mirroring every Web reply into IM.
@@ -5715,10 +5737,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       effectiveGroup.folder,
       effectiveGroup.created_by,
     ),
-  );
-  const interactionMode = resolveRuntimeInteractionMode(
-    getWorkspaceInteractionMode(effectiveGroup.folder),
-    { agentKind: 'main' },
   );
   const resetForAgentProfile = resetMainSessionForAgentProfileMismatch(
     effectiveGroup,
@@ -8166,7 +8184,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 dbText,
                 {
                   messageId: scheduledGroupResultMessageId,
-                  sendToIM: directImReply && !skipImSend,
+                  sendToIM:
+                    (scheduledGroupRuns.length === 0 ||
+                      scheduledGroupDeliveryContract.frameworkDeliversFinalText) &&
+                    directImReply &&
+                    !skipImSend,
                   imTextOverride: dbText !== text ? text : undefined,
                   localImagePaths,
                   channelOutbox: outputChannelScope.scope
@@ -9529,6 +9551,7 @@ async function runAgent(
         displayName: identifier,
         selectedProviderId,
         feishuCliAccountId,
+        interactionMode,
       });
     };
 
@@ -17109,6 +17132,20 @@ async function startMessageLoop(): Promise<void> {
           );
           let messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+          const { effectiveGroup: activeEffectiveGroup } =
+            resolveEffectiveGroup(group);
+          const liveWarmInteractionMode = resolveRuntimeInteractionMode(
+            getWorkspaceInteractionMode(activeEffectiveGroup.folder),
+            { agentKind: 'main' },
+          );
+          const warmInteractionBatch =
+            selectInteractionModeCompatibleMessagePrefix(
+              messagesToSend,
+              liveWarmInteractionMode,
+              getTaskRunById,
+            );
+          messagesToSend = warmInteractionBatch.messages;
+          const requiredInteractionMode = warmInteractionBatch.interactionMode;
           // The receipt covers the exact pre-expansion DB batch. Plugin replies
           // removed from `messagesToSend` below are already handled out-of-band,
           // so a healthy agent result for the remainder may safely commit the
@@ -17117,8 +17154,6 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             messagesToSend,
           );
-          const { effectiveGroup: activeEffectiveGroup } =
-            resolveEffectiveGroup(group);
           const warmChannelContext = resolveBatchChannelContext(
             messagesToSend,
             chatJid,
@@ -17139,6 +17174,15 @@ async function startMessageLoop(): Promise<void> {
             queue.requiresFeishuCliContainerRestart(chatJid, {
               feishuCliAccountId: requiredFeishuCliAccountId,
             })
+          ) {
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
+          if (
+            queue.requiresInteractionModeRestart(
+              chatJid,
+              requiredInteractionMode,
+            )
           ) {
             queue.enqueueMessageCheck(chatJid);
             continue;
@@ -17304,7 +17348,10 @@ async function startMessageLoop(): Promise<void> {
                 lastSourceJidForRoute,
                 receipt,
               ),
-            { feishuCliAccountId: requiredFeishuCliAccountId },
+            {
+              feishuCliAccountId: requiredFeishuCliAccountId,
+              interactionMode: requiredInteractionMode,
+            },
           );
           if (sendResult === 'sent' && deliveryTarget) {
             logger.debug(
@@ -17320,6 +17367,9 @@ async function startMessageLoop(): Promise<void> {
             // which would cause it to be re-pulled and replayed on the next
             // poll (#18 P1-bug-1).
             advanceNextPullCursorOnly(chatJid, deliveryTarget.cursor);
+            if (warmInteractionBatch.hasDeferredMessages) {
+              queue.enqueueMessageCheck(chatJid);
+            }
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -20867,6 +20917,7 @@ async function main(): Promise<void> {
         senderName: input.senderName,
         text: input.text,
         queuedResult: input.queuedResult,
+        interactionMode: input.interactionMode,
       });
       const now = new Date().toISOString();
       broadcastNewMessage(input.chatJid, {

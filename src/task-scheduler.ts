@@ -85,6 +85,7 @@ import {
   AgentProfile,
   ClaimedTaskRun,
   ExecutionMode,
+  InteractionMode,
   MessageSourceKind,
   RegisteredGroup,
   ScheduledTask,
@@ -109,10 +110,8 @@ import {
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
 import { getScriptTaskHostExecutionError } from './script-task-policy.js';
-import {
-  publishesFrameworkAnswer,
-  resolveRuntimeInteractionMode,
-} from './workspace-interaction-runtime.js';
+import { resolveScheduledGroupDeliveryContract } from './reply-delivery.js';
+import { resolveRuntimeInteractionMode } from './workspace-interaction-runtime.js';
 
 export function shouldFinalizeScheduledRunOutput(
   output: Pick<
@@ -476,6 +475,7 @@ export interface SchedulerDependencies {
     text: string;
     taskId: string;
     queuedResult: string;
+    interactionMode: InteractionMode;
   }) => string;
   /** Store task result in workspace chat and push to owner's IM channels */
   storeResultAndNotify?: (
@@ -1884,12 +1884,11 @@ async function runScriptTaskInner(
  * 自己负责。因此按目标工作区当前的 interaction mode 生成对应措辞，判定方式与
  * index.ts 消费该消息时的 resolveRuntimeInteractionMode({ agentKind: 'main' }) 一致。
  */
-export function buildScheduledGroupTriggerFraming(groupFolder: string): string {
-  const frameworkDeliversFinalText = publishesFrameworkAnswer(
-    resolveRuntimeInteractionMode(getWorkspaceInteractionMode(groupFolder), {
-      agentKind: 'main',
-    }),
-  );
+export function buildScheduledGroupTriggerFraming(
+  interactionMode: InteractionMode,
+): string {
+  const { frameworkDeliversFinalText } =
+    resolveScheduledGroupDeliveryContract(interactionMode);
   const deliveryContract = frameworkDeliversFinalText
     ? [
         '你的最终 SDK Assistant 文本会由框架作为正式任务结果统一投递：归档到所属 Web 工作区，任务绑定 IM 渠道时同一份内容也会自动发送到该渠道。因此必须包含一份完整、可独立阅读的业务结果；所有结论、报告和数据都要写在最终文本中，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。',
@@ -1929,6 +1928,66 @@ interface ScheduledGroupPromptMessage {
   timestamp?: string;
   source_kind?: string | null;
   task_id?: string | null;
+}
+
+/**
+ * Resolve the immutable interaction contract carried by one scheduler prompt.
+ * Historical delivered rows predate the snapshot field and deliberately
+ * return null so the caller can retain the legacy live-workspace fallback.
+ */
+export function resolveScheduledGroupPromptInteractionMode(
+  message: ScheduledGroupPromptMessage,
+  getRun: (runId: string) => TaskRun | undefined,
+): InteractionMode | null {
+  if (message.source_kind !== 'scheduled_task_prompt' || !message.task_id) {
+    return null;
+  }
+  const runId = scheduledGroupRunIdFromPromptMessageId(message.id);
+  if (!runId) return null;
+  const run = getRun(runId);
+  if (
+    !run ||
+    run.task_id !== message.task_id ||
+    run.definition_snapshot.context_mode !== 'group'
+  ) {
+    return null;
+  }
+  const mode = run.definition_snapshot.interaction_mode;
+  return mode === 'assistant' || mode === 'proactive' ? mode : null;
+}
+
+/**
+ * One SDK query has exactly one interaction contract. Keep only the
+ * contiguous prefix compatible with its first input; the caller schedules the
+ * remainder for a fresh/warm-compatible runner. This prevents two scheduled
+ * prompts frozen under different modes from being coalesced into one answer.
+ */
+export function selectInteractionModeCompatibleMessagePrefix<
+  T extends ScheduledGroupPromptMessage,
+>(
+  messages: readonly T[],
+  liveInteractionMode: InteractionMode,
+  getRun: (runId: string) => TaskRun | undefined,
+): {
+  messages: T[];
+  interactionMode: InteractionMode;
+  hasDeferredMessages: boolean;
+} {
+  const modeFor = (message: T): InteractionMode =>
+    resolveScheduledGroupPromptInteractionMode(message, getRun) ??
+    liveInteractionMode;
+  const interactionMode = messages[0]
+    ? modeFor(messages[0])
+    : liveInteractionMode;
+  const boundary = messages.findIndex(
+    (message) => modeFor(message) !== interactionMode,
+  );
+  const end = boundary < 0 ? messages.length : boundary;
+  return {
+    messages: messages.slice(0, end),
+    interactionMode,
+    hasDeferredMessages: end < messages.length,
+  };
 }
 
 /**
@@ -2074,7 +2133,11 @@ async function runGroupModeTask(
     const owner = task.created_by ? getUserById(task.created_by) : null;
     const senderName = owner?.display_name || owner?.username || '定时任务';
 
-    const promptText = `${buildScheduledGroupTriggerFraming(task.group_folder)}\n\n${task.prompt}`;
+    const interactionMode = resolveRuntimeInteractionMode(
+      getWorkspaceInteractionMode(task.group_folder),
+      { agentKind: 'main' },
+    );
+    const promptText = `${buildScheduledGroupTriggerFraming(interactionMode)}\n\n${task.prompt}`;
     if (durableRun) {
       if (!deps.storeGroupPromptAndDeliverRun) {
         throw new Error(
@@ -2090,6 +2153,7 @@ async function runGroupModeTask(
         text: promptText,
         taskId: task.id,
         queuedResult: resultSummary,
+        interactionMode,
       });
     } else {
       if (!deps.storePromptMessage) {

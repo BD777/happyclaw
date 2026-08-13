@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -7,6 +7,7 @@ import {
   decideAssistantPrimaryProjection,
   isGenuineReplyResult,
   occupiesPrimaryReplyDeliverySlot,
+  resolveScheduledGroupDeliveryContract,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
   shouldFinalizeScheduledGroupPrimaryResult,
@@ -15,6 +16,35 @@ import {
 } from '../src/reply-delivery.js';
 import { resolveContainerOutputInputTurnId } from '../src/channel-output-correlation.js';
 import { TurnOutputCoordinator } from '../src/turn-output-coordinator.js';
+
+describe('scheduled group physical delivery contract', () => {
+  test.each([
+    ['assistant', 0, 1],
+    ['proactive', 1, 0],
+  ] as const)(
+    '%s mode has exactly one physical IM delivery lane',
+    (mode, expectedNativeSends, expectedFrameworkSends) => {
+      const nativeSend = vi.fn();
+      const frameworkFinalSend = vi.fn();
+      const archiveSdkFinal = vi.fn();
+      const contract = resolveScheduledGroupDeliveryContract(mode);
+
+      // Model the two independently executing halves of the real pipeline:
+      // the Agent follows framing and may call send_message, then the host
+      // consumes/archives the SDK final and may publish it to IM.
+      if (contract.agentDeliversWithSendMessage) nativeSend();
+      archiveSdkFinal();
+      if (contract.frameworkDeliversFinalText) frameworkFinalSend();
+
+      expect(nativeSend).toHaveBeenCalledTimes(expectedNativeSends);
+      expect(frameworkFinalSend).toHaveBeenCalledTimes(expectedFrameworkSends);
+      expect(archiveSdkFinal).toHaveBeenCalledOnce();
+      expect(
+        nativeSend.mock.calls.length + frameworkFinalSend.mock.calls.length,
+      ).toBe(1);
+    },
+  );
+});
 
 describe('isGenuineReplyResult', () => {
   test('a normal completed SDK final result is genuine', () => {

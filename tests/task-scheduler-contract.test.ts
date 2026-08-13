@@ -131,6 +131,7 @@ const {
   hasAuthoritativeScheduledGroupTerminal,
   processClaimedTaskRunNotification,
   resolveScheduledGroupRunsForOutput,
+  selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
   shouldFinalizeScheduledRunOutput,
@@ -178,6 +179,7 @@ function makeDeps(
         senderName: input.senderName,
         text: input.text,
         queuedResult: input.queuedResult,
+        interactionMode: input.interactionMode,
       }),
     ),
     storeResultAndNotify: vi.fn(),
@@ -715,7 +717,8 @@ describe('scheduled task workspace/session contract', () => {
     };
     const { deps, queue } = makeDeps(groups);
 
-    expect(triggerTaskNow(taskId, deps).success).toBe(true);
+    const trigger = triggerTaskNow(taskId, deps);
+    expect(trigger.success).toBe(true);
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(queue.enqueueMessageCheck).toHaveBeenCalledWith(GROUP_JID);
@@ -746,6 +749,9 @@ describe('scheduled task workspace/session contract', () => {
     expect(storedPrompt).toContain('也会自动发送到该渠道');
     expect(storedPrompt).toContain('不要再用 send_message');
     expect(storedPrompt).not.toContain('不会自动发送到 IM 渠道');
+    expect(
+      db.getTaskRunById(trigger.runId!)?.definition_snapshot.interaction_mode,
+    ).toBe('assistant');
   });
 
   test('proactive workspaces get the archive-only delivery framing', async () => {
@@ -763,7 +769,8 @@ describe('scheduled task workspace/session contract', () => {
       };
       const { deps } = makeDeps(groups);
 
-      expect(triggerTaskNow(taskId, deps).success).toBe(true);
+      const trigger = triggerTaskNow(taskId, deps);
+      expect(trigger.success).toBe(true);
       await new Promise((resolve) => setImmediate(resolve));
 
       const storedPrompt = (deps.storeGroupPromptAndDeliverRun as any).mock
@@ -775,9 +782,88 @@ describe('scheduled task workspace/session contract', () => {
       expect(storedPrompt).not.toContain('不要再用 send_message');
       expect(storedPrompt).toContain('完整、可独立阅读的业务结果');
       expect(storedPrompt).toContain('feishu-cli');
+
+      // The prompt is already queued. A later workspace toggle cannot
+      // reinterpret either its final SDK output or its send_message duty.
+      expect(db.setWorkspaceInteractionMode(GROUP_FOLDER, 'assistant')).toBe(
+        true,
+      );
+      const pending = db
+        .getMessagesSince(GROUP_JID, { timestamp: '', id: '' })
+        .filter((message) => message.task_id === taskId);
+      const frozen = selectInteractionModeCompatibleMessagePrefix(
+        pending,
+        'assistant',
+        db.getTaskRunById,
+      );
+      expect(frozen).toMatchObject({
+        interactionMode: 'proactive',
+        hasDeferredMessages: false,
+      });
+      expect(
+        db.getTaskRunById(trigger.runId!)?.definition_snapshot.interaction_mode,
+      ).toBe('proactive');
     } finally {
       db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
     }
+  });
+
+  test('does not coalesce queued scheduler prompts frozen under different modes', async () => {
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, 'profile-batch-freeze');
+    const groups = { [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)! };
+
+    const assistantTask = createTask({
+      id: 'task-group-assistant-batch',
+      context_mode: 'group',
+    });
+    const assistantDeps = makeDeps(groups);
+    expect(triggerTaskNow(assistantTask, assistantDeps.deps).success).toBe(
+      true,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(db.setWorkspaceInteractionMode(GROUP_FOLDER, 'proactive')).toBe(
+      true,
+    );
+    const proactiveTask = createTask({
+      id: 'task-group-proactive-batch',
+      context_mode: 'group',
+    });
+    const proactiveDeps = makeDeps(groups);
+    expect(triggerTaskNow(proactiveTask, proactiveDeps.deps).success).toBe(
+      true,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const pending = db
+      .getMessagesSince(GROUP_JID, { timestamp: '', id: '' })
+      .filter(
+        (message) =>
+          message.task_id === assistantTask ||
+          message.task_id === proactiveTask,
+      );
+    const firstBatch = selectInteractionModeCompatibleMessagePrefix(
+      pending,
+      'proactive',
+      db.getTaskRunById,
+    );
+    expect(firstBatch.interactionMode).toBe('assistant');
+    expect(firstBatch.hasDeferredMessages).toBe(true);
+    expect(firstBatch.messages).toHaveLength(1);
+    expect(firstBatch.messages[0].task_id).toBe(assistantTask);
+
+    const secondBatch = selectInteractionModeCompatibleMessagePrefix(
+      pending.slice(1),
+      'proactive',
+      db.getTaskRunById,
+    );
+    expect(secondBatch).toMatchObject({
+      interactionMode: 'proactive',
+      hasDeferredMessages: false,
+    });
+    expect(secondBatch.messages[0].task_id).toBe(proactiveTask);
+    db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
   });
 
   test('cancels a delivered group run and durably projects the cancellation into its workspace', async () => {
@@ -1099,6 +1185,7 @@ describe('scheduled task workspace/session contract', () => {
       senderName: '定时任务',
       text: 'run the production-shaped cold report',
       queuedResult: '已排队',
+      interactionMode: 'assistant',
     });
 
     const coldMessages = db.getMessagesSince(chatJid, {
@@ -1218,6 +1305,7 @@ describe('scheduled task workspace/session contract', () => {
         senderName: '定时任务',
         text: 'atomic prompt',
         queuedResult: '已排队',
+        interactionMode: 'assistant',
       }),
     ).toThrow(/lost its execution fence/);
     expect(db.getMessage(GROUP_JID, messageId)).toBeNull();
@@ -1235,6 +1323,7 @@ describe('scheduled task workspace/session contract', () => {
         senderName: '定时任务',
         text: 'atomic prompt',
         queuedResult: '已排队',
+        interactionMode: 'assistant',
       }),
     ).toBe(messageId);
     expect(db.getMessage(GROUP_JID, messageId)).toMatchObject({
@@ -1623,6 +1712,7 @@ describe('scheduled task workspace/session contract', () => {
       senderName: '定时任务',
       text: 'run the report',
       queuedResult: '已排队',
+      interactionMode: 'assistant',
     });
     const resultMessageId = `scheduled-group-result:${claim.id}`;
     const retryPayload: db.TaskRunNotificationPayload = {
@@ -1720,6 +1810,7 @@ describe('scheduled task workspace/session contract', () => {
       senderName: '定时任务',
       text: 'run terminal report',
       queuedResult: '已排队',
+      interactionMode: 'assistant',
     });
     const error = '处理失败，已达最大重试次数';
     const messageId = `scheduled-group-terminal:${claim.id}`;

@@ -5776,6 +5776,7 @@ export interface StoreScheduledGroupPromptInput {
   senderName: string;
   text: string;
   queuedResult: string;
+  interactionMode: InteractionMode;
 }
 
 /**
@@ -5790,10 +5791,17 @@ export interface StoreScheduledGroupPromptInput {
 export function storeScheduledGroupPromptAndCompleteRun(
   input: StoreScheduledGroupPromptInput,
 ): string {
+  if (
+    input.interactionMode !== 'assistant' &&
+    input.interactionMode !== 'proactive'
+  ) {
+    throw new Error('Invalid scheduled group interaction mode');
+  }
   return db.transaction(() => {
     const run = db
       .prepare(
-        `SELECT task_id, status, lease_owner, lease_token, started_at, created_at
+        `SELECT task_id, status, lease_owner, lease_token, started_at, created_at,
+                definition_snapshot
          FROM task_runs WHERE id = ?`,
       )
       .get(input.runId) as
@@ -5805,6 +5813,7 @@ export function storeScheduledGroupPromptAndCompleteRun(
           | 'lease_token'
           | 'started_at'
           | 'created_at'
+          | 'definition_snapshot'
         >
       | undefined;
     if (!run || run.task_id !== input.taskId) {
@@ -5812,6 +5821,21 @@ export function storeScheduledGroupPromptAndCompleteRun(
         `Group task run ${input.runId} does not belong to task ${input.taskId}`,
       );
     }
+
+    let definitionSnapshot: TaskRunDefinitionSnapshot;
+    try {
+      definitionSnapshot = JSON.parse(
+        run.definition_snapshot,
+      ) as TaskRunDefinitionSnapshot;
+    } catch {
+      throw new Error(
+        `Group task run ${input.runId} has an invalid definition snapshot`,
+      );
+    }
+    if (definitionSnapshot.context_mode !== 'group') {
+      throw new Error(`Task run ${input.runId} is not a group-mode occurrence`);
+    }
+    definitionSnapshot.interaction_mode = input.interactionMode;
 
     ensureChatExists(input.chatJid);
     const messageId = storeMessageDirect(
@@ -5839,6 +5863,7 @@ export function storeScheduledGroupPromptAndCompleteRun(
       .prepare(
         `UPDATE task_runs
          SET status = 'delivered', result = ?, error = NULL,
+             definition_snapshot = ?,
              notification_status = 'skipped', notification_error = NULL,
              duration_ms = ?, completed_at = ?,
              lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
@@ -5847,6 +5872,7 @@ export function storeScheduledGroupPromptAndCompleteRun(
       )
       .run(
         input.queuedResult,
+        JSON.stringify(definitionSnapshot),
         durationMs,
         now,
         now,

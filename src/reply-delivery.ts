@@ -8,6 +8,30 @@
  * without the surrounding IO/streaming machinery.
  */
 
+import type { InteractionMode } from './types.js';
+
+export interface ScheduledGroupDeliveryContract {
+  /** SDK final is the one physical IM delivery lane. */
+  frameworkDeliversFinalText: boolean;
+  /** Agent must call send_message; SDK final remains archive-only. */
+  agentDeliversWithSendMessage: boolean;
+}
+
+/** Exactly one lane owns physical IM delivery for a scheduled group turn. */
+export function resolveScheduledGroupDeliveryContract(
+  interactionMode: InteractionMode,
+): ScheduledGroupDeliveryContract {
+  return interactionMode === 'assistant'
+    ? {
+        frameworkDeliversFinalText: true,
+        agentDeliversWithSendMessage: false,
+      }
+    : {
+        frameworkDeliversFinalText: false,
+        agentDeliversWithSendMessage: true,
+      };
+}
+
 export interface ReplyResultInfo {
   /**
    * Non-null means this result is an interim checkpoint, not the final

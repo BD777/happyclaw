@@ -590,6 +590,13 @@ export interface TaskRunDefinitionSnapshot {
   execution_mode: 'host' | 'container' | null;
   script_command: string | null;
   notify_channels: string[] | null;
+  /**
+   * Delivery contract frozen when a group-mode occurrence crosses the durable
+   * workspace-prompt hand-off.  It is intentionally absent on historical and
+   * isolated runs; consumers fall back to the workspace mode only for those
+   * legacy rows.
+   */
+  interaction_mode?: InteractionMode;
 }
 
 /** Durable state for one scheduled/manual occurrence. */
