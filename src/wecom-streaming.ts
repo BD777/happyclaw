@@ -36,6 +36,32 @@ import { logger } from './logger.js';
  *  (default cap 500), so keep updates coarse to avoid backpressure. */
 const STREAM_UPDATE_INTERVAL = 700;
 
+/** Official maximum for one WeCom intelligent-bot markdown payload. */
+export const WECOM_MARKDOWN_MAX_BYTES = 20_480;
+
+function utf8Bytes(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+/** Keep a streaming preview inside the byte limit without splitting Unicode. */
+export function truncateWeComUtf8(
+  value: string,
+  maxBytes = WECOM_MARKDOWN_MAX_BYTES,
+  suffix = '\n\n> 内容较长，完成后将分段发送…',
+): string {
+  if (utf8Bytes(value) <= maxBytes) return value;
+  const budget = Math.max(0, maxBytes - utf8Bytes(suffix));
+  let result = '';
+  let bytes = 0;
+  for (const char of value) {
+    const size = utf8Bytes(char);
+    if (bytes + size > budget) break;
+    result += char;
+    bytes += size;
+  }
+  return `${result.trimEnd()}${suffix}`;
+}
+
 // ─── Callback types ──────────────────────────────────────────
 
 /** Send one streaming frame. Resolves on ack; rejects on transport error
@@ -73,7 +99,7 @@ export class WeComStreamingController {
   private readonly chatId: string;
   private readonly sendStream: WeComSendStreamFn;
   private readonly fallbackSend: WeComFallbackSendFn;
-  private fallbackUsed = false;
+  private fallbackPromise: Promise<void> | null = null;
 
   // Transient status (rendered in streaming view only, NEVER in final text)
   private systemStatus: string | null = null;
@@ -84,7 +110,12 @@ export class WeComStreamingController {
   // not surfaced to the WeCom bubble to keep the status line compact).
   private tools = new Map<
     string,
-    { name: string; status: 'running' | 'complete' | 'error'; startTime: number; summary?: string }
+    {
+      name: string;
+      status: 'running' | 'complete' | 'error';
+      startTime: number;
+      summary?: string;
+    }
   >();
   private recentEvents: string[] = [];
 
@@ -134,11 +165,16 @@ export class WeComStreamingController {
     // Block late append()s during the awaits below.
     this.state = 'completing';
     this.clearTimers();
-    if (this.currentFlushPromise) await this.currentFlushPromise.catch(() => {});
+    if (this.currentFlushPromise)
+      await this.currentFlushPromise.catch(() => {});
 
     this.accumulatedText = finalText;
     logger.info(
-      { chatId: this.chatId, sentChunks: this.sentChunkCount, textLen: finalText.length },
+      {
+        chatId: this.chatId,
+        sentChunks: this.sentChunkCount,
+        textLen: finalText.length,
+      },
       'WeCom streaming complete() entry',
     );
 
@@ -148,12 +184,27 @@ export class WeComStreamingController {
       // Nothing to say. If we already opened a stream, close it empty so the
       // bubble is finalized; otherwise there is simply nothing to send.
       if (this.sentChunkCount > 0) {
-        try {
-          await this.sendStream(this.accumulatedText || '', true);
-        } catch (err: any) {
-          logger.debug({ err: err?.message, chatId: this.chatId }, 'WeCom streaming empty finish failed');
-        }
+        await this.sendStream(this.accumulatedText || '', true);
       }
+      this.state = 'completed';
+      return;
+    }
+
+    // A stream is one provider message and cannot be paginated. Close an
+    // already-open preview, then deliver the complete answer through the
+    // ACK-governed proactive pagination path.
+    if (utf8Bytes(finalBody) > WECOM_MARKDOWN_MAX_BYTES) {
+      if (this.sentChunkCount > 0) {
+        await this.sendStream('内容较长，完整回复将分段发送。', true).catch(
+          (err: any) => {
+            logger.warn(
+              { err: err?.message, chatId: this.chatId },
+              'WeCom oversized stream close failed; continuing with pagination',
+            );
+          },
+        );
+      }
+      await this.tryFallback(finalBody);
       this.state = 'completed';
       return;
     }
@@ -187,7 +238,8 @@ export class WeComStreamingController {
     }
     this.state = 'aborting';
     this.clearTimers();
-    if (this.currentFlushPromise) await this.currentFlushPromise.catch(() => {});
+    if (this.currentFlushPromise)
+      await this.currentFlushPromise.catch(() => {});
 
     const notice = `⚠️ 已中断: ${reason ?? '用户取消'}`;
     const body = this.accumulatedText.trim()
@@ -197,7 +249,10 @@ export class WeComStreamingController {
       await this.sendStream(body, true); // DONE
       this.sentChunkCount++;
     } catch (err: any) {
-      logger.debug({ err: err?.message, chatId: this.chatId }, 'WeCom streaming abort chunk failed, using fallback');
+      logger.debug(
+        { err: err?.message, chatId: this.chatId },
+        'WeCom streaming abort chunk failed, using fallback',
+      );
       await this.tryFallback(body);
     }
     this.state = 'aborted';
@@ -212,39 +267,54 @@ export class WeComStreamingController {
   setSystemStatus(status: string | null): void {
     this.systemStatus = status;
     // Refresh the status line live while streaming.
-    if (this.state === 'streaming' || this.state === 'idle') this.scheduleFlush();
+    if (this.state === 'streaming' || this.state === 'idle')
+      this.scheduleFlush();
   }
 
   setThinking(): void {
     this.thinking = true;
-    if (this.state === 'streaming' || this.state === 'idle') this.scheduleFlush();
+    if (this.state === 'streaming' || this.state === 'idle')
+      this.scheduleFlush();
   }
 
   appendThinking(text: string): void {
     this.thinkingText += text;
-    if (this.thinkingText.length > WeComStreamingController.MAX_THINKING_CHARS) {
+    if (
+      this.thinkingText.length > WeComStreamingController.MAX_THINKING_CHARS
+    ) {
       this.thinkingText =
-        '...' + this.thinkingText.slice(-(WeComStreamingController.MAX_THINKING_CHARS - 3));
+        '...' +
+        this.thinkingText.slice(
+          -(WeComStreamingController.MAX_THINKING_CHARS - 3),
+        );
     }
     this.thinking = true;
-    if (this.state === 'streaming' || this.state === 'idle') this.scheduleFlush();
+    if (this.state === 'streaming' || this.state === 'idle')
+      this.scheduleFlush();
   }
 
   setHook(_hook: { hookName: string; hookEvent: string } | null): void {
     // Not surfaced for WeCom plain-text streaming.
   }
 
-  setTodos(_todos: Array<{ id: string; content: string; status: string }>): void {
+  setTodos(
+    _todos: Array<{ id: string; content: string; status: string }>,
+  ): void {
     // Too verbose for the compact WeCom status line.
   }
 
   pushRecentEvent(text: string): void {
     this.recentEvents.push(text);
-    if (this.recentEvents.length > 5) this.recentEvents = this.recentEvents.slice(-5);
+    if (this.recentEvents.length > 5)
+      this.recentEvents = this.recentEvents.slice(-5);
   }
 
   startTool(toolId: string, toolName: string): void {
-    this.tools.set(toolId, { name: toolName, status: 'running', startTime: Date.now() });
+    this.tools.set(toolId, {
+      name: toolName,
+      status: 'running',
+      startTime: Date.now(),
+    });
   }
 
   endTool(toolId: string, isError: boolean): void {
@@ -304,7 +374,10 @@ export class WeComStreamingController {
       this.flushPending = false;
       this.currentFlushPromise = this.doFlush()
         .catch((err: any) => {
-          logger.debug({ err: err?.message, chatId: this.chatId }, 'WeCom streaming flush failed');
+          logger.debug(
+            { err: err?.message, chatId: this.chatId },
+            'WeCom streaming flush failed',
+          );
         })
         .finally(() => {
           this.currentFlushPromise = null;
@@ -317,19 +390,22 @@ export class WeComStreamingController {
     if (!this.isActive()) return;
     const content = this.renderStreaming();
     if (!content.trim()) return;
-    await this.sendStream(content, false); // GENERATING
+    await this.sendStream(truncateWeComUtf8(content), false); // GENERATING
     this.sentChunkCount++;
     this.lastUpdateTime = Date.now();
     if (this.state === 'idle') this.state = 'streaming';
   }
 
   private async tryFallback(text: string): Promise<void> {
-    if (this.fallbackUsed) return;
-    this.fallbackUsed = true;
+    this.fallbackPromise ??= this.fallbackSend(text);
     try {
-      await this.fallbackSend(text);
+      await this.fallbackPromise;
     } catch (err: any) {
-      logger.warn({ err: err?.message, chatId: this.chatId }, 'WeCom streaming fallback send also failed');
+      logger.warn(
+        { err: err?.message, chatId: this.chatId },
+        'WeCom streaming fallback send also failed',
+      );
+      throw err;
     }
   }
 

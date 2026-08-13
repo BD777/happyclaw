@@ -34,7 +34,7 @@ import type {
   WeChatConnectionConfig,
   WeChatConnectionState,
 } from './wechat.js';
-import type { WeComConnectionConfig } from './wecom.js';
+import type { WeComConnectionConfig, WeComConnectionState } from './wecom.js';
 import type { DingTalkConnectionConfig } from './dingtalk.js';
 import type { DiscordConnectionConfig } from './discord.js';
 import {
@@ -958,6 +958,7 @@ export class IMConnectionManager {
     jid: string,
     onCardCreated?: (messageId: string) => void,
     lifecycle?: StreamingCardLifecycle,
+    inputMessageId?: string,
   ): Promise<StreamingSession | undefined> {
     const channelType = getChannelType(jid);
     if (
@@ -995,7 +996,12 @@ export class IMConnectionManager {
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.createStreamingSession) {
-      return channel.createStreamingSession(chatId, onCardCreated, lifecycle);
+      return channel.createStreamingSession(
+        chatId,
+        onCardCreated,
+        lifecycle,
+        inputMessageId,
+      );
     }
     return undefined;
   }
@@ -1484,6 +1490,17 @@ export class IMConnectionManager {
         chatJid: string,
         senderImId?: string,
       ) => boolean;
+      isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+      isChatAuthorized?: (jid: string) => boolean;
+      onPairAttempt?: (
+        jid: string,
+        chatName: string,
+        code: string,
+      ) => Promise<boolean>;
+      onConnectionStateChange?: (state: WeComConnectionState) => void;
+      onCommand?: IMChannelConnectOpts['onCommand'];
+      isSenderAllowedInGroup?: IMChannelConnectOpts['isSenderAllowedInGroup'];
+      resolveRegisteredGroup?: IMChannelConnectOpts['resolveRegisteredGroup'];
     },
   ): Promise<boolean> {
     if (!config.botId || !config.secret) {
@@ -1511,9 +1528,16 @@ export class IMConnectionManager {
         },
         onNewChat,
         ignoreMessagesBefore: options?.ignoreMessagesBefore,
+        isChatAuthorized: options?.isChatAuthorized,
+        onPairAttempt: options?.onPairAttempt,
+        onCommand: options?.onCommand,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
+        isGroupOwnerMessage: options?.isGroupOwnerMessage,
+        isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+        resolveRegisteredGroup: options?.resolveRegisteredGroup,
+        onWeComConnectionStateChange: options?.onConnectionStateChange,
       },
       options?.accountId,
       options?.scopeIncomingJids,

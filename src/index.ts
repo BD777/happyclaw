@@ -6302,6 +6302,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           streamingSessionJid,
           makeOnCardCreated(streamingSessionJid),
           activeDurableCardLifecycle,
+          lastProcessed.id,
         );
   const channelStreamingSessionsByInput = new Map<
     string,
@@ -6434,6 +6435,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     runtime?: ChannelTurnRuntime;
     scope?: ActiveChannelOutboxScope;
     lifecycle?: typeof activeDurableCardLifecycle;
+    inputMessageId: string;
   }
   const admittedWarmMainInputs = new Map<string, AdmittedWarmMainInput>();
   const mainAdmissionKey = channelTurnScope(effectiveGroup.folder);
@@ -6589,6 +6591,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         runtime: nextRuntime,
         scope: nextScope,
         lifecycle: nextLifecycle,
+        inputMessageId: inputCursor?.id ?? inputTurnId,
       });
       genuineReplyDeliveredByInput.set(inputTurnId, false);
       const exactInputs =
@@ -6781,6 +6784,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               streamingSessionJid,
               makeOnCardCreated(streamingSessionJid),
               durableLifecycleForInput,
+              admittedInput?.inputMessageId ?? inputTurnId,
             );
           } catch (err: any) {
             logger.warn(
@@ -6809,6 +6813,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               streamingSessionJid,
               makeOnCardCreated(streamingSessionJid),
               durableLifecycleForInput,
+              admittedInput?.inputMessageId ?? inputTurnId,
             )
             .catch((err) => {
               logger.error(
@@ -6856,6 +6861,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             streamingSessionJid,
             makeOnCardCreated(streamingSessionJid),
             durableLifecycleForInput,
+            admittedInput?.inputMessageId ?? inputTurnId,
           );
         } catch (err: any) {
           logger.error(
@@ -6897,6 +6903,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         projectionJid,
         makeOnCardCreated(projectionJid),
         admitted.lifecycle,
+        admitted.inputMessageId,
       )
       .catch((error) => {
         logger.error(
@@ -14623,6 +14630,7 @@ async function processAgentConversation(
           (messageId) =>
             registerMessageIdMapping(messageId, streamingSessionJid!),
           activeAgentDurableCardLifecycle,
+          lastProcessed.id,
         )
       : undefined;
   const agentStreamingSessionsByInput = new Map<
@@ -14760,6 +14768,7 @@ async function processAgentConversation(
     runtime?: ChannelTurnRuntime;
     scope?: ActiveChannelOutboxScope;
     lifecycle?: typeof activeAgentDurableCardLifecycle;
+    inputMessageId: string;
   }
   const admittedWarmAgentInputs = new Map<string, AdmittedWarmAgentInput>();
   const agentAdmissionKey = channelTurnScope(effectiveGroup.folder, agentId);
@@ -14909,6 +14918,7 @@ async function processAgentConversation(
         runtime: nextRuntime,
         scope: nextScope,
         lifecycle: nextLifecycle,
+        inputMessageId: inputCursor?.id ?? inputTurnId,
       });
       agentAnyReplyProjectedByInput.set(inputTurnId, false);
       agentGenuineReplyDeliveredByInput.set(inputTurnId, false);
@@ -15059,6 +15069,7 @@ async function processAgentConversation(
                 (messageId) =>
                   registerMessageIdMapping(messageId, streamingSessionJid!),
                 admittedAgentLifecycle,
+                inputTurnId,
               )
               .catch(() => undefined)
           : undefined;
@@ -15095,6 +15106,7 @@ async function processAgentConversation(
         admitted.imJid,
         (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
         admitted.lifecycle,
+        admitted.inputMessageId,
       )
       .catch((error) => {
         logger.error(
@@ -19396,12 +19408,48 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
         },
         onNewChat,
         {
-          accountId: common.accountId,
-          scopeIncomingJids: common.scopeIncomingJids,
-          ignoreMessagesBefore: common.ignoreMessagesBefore,
-          resolveEffectiveChatJid: common.resolveEffectiveChatJid,
-          onAgentMessage: common.onAgentMessage,
+          ...common,
+          isChatAuthorized: buildIsChatAuthorized(
+            account.owner_user_id,
+            account.id,
+            account.is_legacy_default,
+          ),
+          onPairAttempt: buildOnPairAttempt(
+            account.owner_user_id,
+            account.id,
+            workspace.jid,
+            account.is_legacy_default,
+          ),
           shouldProcessGroupMessage,
+          isGroupOwnerMessage,
+          isSenderAllowedInGroup,
+          resolveRegisteredGroup: getRegisteredGroup,
+          onConnectionStateChange: (state) => {
+            if (state.status === 'connected') {
+              updateChannelAccountAuthStatus(account.id, 'authorized');
+              updateChannelAccountStatus(account.id, 'connected');
+            } else if (state.status === 'connecting') {
+              updateChannelAccountStatus(account.id, 'connecting');
+            } else if (state.status === 'reconnecting') {
+              updateChannelAccountStatus(account.id, 'reconnecting');
+            } else if (state.status === 'error') {
+              updateChannelAccountStatus(account.id, 'error', state.error);
+            } else {
+              updateChannelAccountStatus(
+                account.id,
+                'disconnected',
+                state.error,
+              );
+            }
+            const latest = getChannelAccount(account.id);
+            if (latest) {
+              broadcastChannelAccountStatus(account.owner_user_id, account.id, {
+                transportStatus: latest.transport_status,
+                lastError: latest.last_error,
+                connectedAt: latest.connected_at,
+              });
+            }
+          },
         },
       );
     } else if (account.provider === 'dingtalk') {
@@ -19458,7 +19506,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           isGroupOwnerMessage,
         },
       );
-    } else {
+    } else if (account.provider === 'whatsapp') {
       if (account.is_legacy_default) {
         migrateLegacyWhatsAppAuthDir(
           DATA_DIR,
@@ -19520,6 +19568,8 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           },
         },
       );
+    } else {
+      throw new Error(`Unsupported channel provider: ${account.provider}`);
     }
     if (account.provider === 'whatsapp') {
       // Baileys returns after the socket is created, before QR authorization

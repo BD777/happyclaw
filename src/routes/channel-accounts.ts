@@ -106,6 +106,7 @@ export const PAIRING_CHANNEL_PROVIDERS = new Set<ChannelProvider>([
   'telegram',
   'qq',
   'wechat',
+  'wecom',
   'dingtalk',
   'discord',
   'whatsapp',
@@ -377,7 +378,7 @@ function syncLegacyUserImFacade(
       streamingMode: secret.streamingMode === 'edit' ? 'edit' : 'off',
       enabled,
     });
-  } else {
+  } else if (account.provider === 'whatsapp') {
     saveUserWhatsAppConfig(account.owner_user_id, {
       accountId: account.id,
       phoneNumber: secret.phoneNumber || '',
@@ -482,13 +483,21 @@ function legacyCredentialsFor(
         }
       : null;
   }
-  const value = getUserWhatsAppConfig(userId);
-  return value
-    ? {
-        secret: { accountId: value.accountId, phoneNumber: value.phoneNumber },
-        enabled: value.enabled !== false,
-      }
-    : null;
+  if (provider === 'whatsapp') {
+    const value = getUserWhatsAppConfig(userId);
+    return value
+      ? {
+          secret: {
+            accountId: value.accountId,
+            phoneNumber: value.phoneNumber,
+          },
+          enabled: value.enabled !== false,
+        }
+      : null;
+  }
+  // WeCom has never had a legacy /user-im singleton. It must not inherit the
+  // WhatsApp facade or auth directory through a catch-all branch.
+  return null;
 }
 
 /** Lazy, idempotent projection of legacy per-user/provider singleton configs. */

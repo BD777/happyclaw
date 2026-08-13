@@ -152,6 +152,7 @@ export const TaskCreateSchema = z
           'telegram',
           'qq',
           'wechat',
+          'wecom',
           'dingtalk',
           'discord',
           'whatsapp',

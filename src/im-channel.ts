@@ -31,6 +31,7 @@ import {
   createWeComConnection,
   type WeComConnection,
   type WeComConnectionConfig,
+  type WeComConnectionState,
 } from './wecom.js';
 import {
   createDingTalkConnection,
@@ -200,6 +201,8 @@ export interface IMChannelConnectOpts {
   shouldDeferInbound?: () => boolean;
   /** WeChat iLink authorization/transport lifecycle. */
   onWeChatConnectionStateChange?: (state: WeChatConnectionState) => void;
+  /** WeCom WebSocket authentication/transport lifecycle. */
+  onWeComConnectionStateChange?: (state: WeComConnectionState) => void;
 }
 
 export interface IMChannel {
@@ -233,6 +236,7 @@ export interface IMChannel {
     chatId: string,
     onCardCreated?: (messageId: string) => void,
     lifecycle?: StreamingCardLifecycle,
+    inputMessageId?: string,
   ): Promise<StreamingSession | undefined>;
   /** Reconcile a non-terminal card through this exact connected Bot. */
   reconcileStreamingCard?(
@@ -939,9 +943,7 @@ export function createWeChatChannel(
 
 // ─── WeCom (企业微信智能机器人) Adapter ──────────────────────────
 
-export function createWeComChannel(
-  config: WeComConnectionConfig,
-): IMChannel {
+export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
   let inner: WeComConnection | null = null;
 
   const channel: IMChannel = {
@@ -953,10 +955,18 @@ export function createWeComChannel(
         await inner.connect({
           onReady: opts.onReady,
           onNewChat: opts.onNewChat,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
+          isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
+          onConnectionStateChange: opts.onWeComConnectionStateChange,
+          onCommand: opts.onCommand,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
           normalizeIncomingJid: opts.normalizeIncomingJid,
           shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
+          isGroupOwnerMessage: opts.isGroupOwnerMessage,
+          isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
+          resolveRegisteredGroup: opts.resolveRegisteredGroup,
         });
         return true;
       } catch (err) {
@@ -974,8 +984,7 @@ export function createWeComChannel(
 
     async sendMessage(chatId: string, text: string): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'WeCom channel not connected, skip sending message');
-        return;
+        throw new Error('WeCom channel is not connected');
       }
       await inner.sendMessage(chatId, text);
     },
@@ -991,10 +1000,12 @@ export function createWeComChannel(
 
     async createStreamingSession(
       chatId: string,
-      onCardCreated?: (messageId: string) => void,
+      _onCardCreated?: (messageId: string) => void,
+      _lifecycle?: StreamingCardLifecycle,
+      inputMessageId?: string,
     ): Promise<StreamingSession | undefined> {
-      if (!inner) return undefined;
-      return inner.createStreamingSession(chatId, onCardCreated);
+      if (!inner) throw new Error('WeCom channel is not connected');
+      return inner.createStreamingSession(chatId, inputMessageId);
     },
   };
 

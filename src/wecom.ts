@@ -1,43 +1,83 @@
-// 企业微信「智能机器人」IM 通道（长连接）。
+// Enterprise WeCom intelligent-bot channel (WebSocket long connection).
 //
-// 走企业微信官方 SDK `@wecom/aibot-node-sdk` 的 WebSocket 长连接：用 botId+secret
-// 建连并鉴权，收 `message.text` 回调 → 归一化成 HappyClaw 消息 → 触发 agent；
-// 回复走 SDK 的主动发送 `sendMessage(chatid, {msgtype:'markdown'})`（无需依赖回调帧）。
-//
-// 设计对齐现有 IM 通道（见 wechat.ts）：本模块只负责「连接 + 收发」，inbound 通过
-// storeMessageDirect + notifyNewImMessage 交给通用的 GroupQueue→runAgent 流水线；
-// outbound 由 im-manager 按 JID 前缀 `wecom:` 路由到本模块的 sendMessage。
-import crypto from 'crypto';
+// Security invariants:
+// - pairing/admission and route resolution run before chat registration,
+//   persistence, frame caching, broadcasts, or Agent notification;
+// - every account supplies account-scoped authorization callbacks;
+// - a streaming reply is bound to the exact durable inbound message id, so a
+//   later message in the same chat cannot steal its req_id;
+// - outbound promises resolve only after the SDK receives a successful ACK.
+import crypto from 'node:crypto';
 import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
 import type { WsFrame, TextMessage } from '@wecom/aibot-node-sdk';
 import { storeMessageDirect } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
-import { WeComStreamingController } from './wecom-streaming.js';
+import {
+  evaluateChannelAdmission,
+  resolveAdmittedChannelRoute,
+} from './channel-admission.js';
+import { createDedupCache } from './im-utils.js';
+import { ProcessingLock } from './im-safety/processing-lock.js';
+import {
+  WECOM_MARKDOWN_MAX_BYTES,
+  WeComStreamingController,
+} from './wecom-streaming.js';
+
+const AUTH_TIMEOUT_MS = 15_000;
+const MESSAGE_DEDUP_TTL_MS = 30 * 60_000;
+const MESSAGE_DEDUP_MAX = 1000;
+const FRAME_TTL_MS = 30 * 60_000;
+const FRAME_CACHE_MAX = 1000;
+const REJECT_COOLDOWN_MS = 60_000;
+const PAGE_HEADER_RESERVE_BYTES = 64;
+
+export type WeComConnectionState =
+  | { status: 'connecting' }
+  | { status: 'connected' }
+  | { status: 'reconnecting'; attempt: number }
+  | { status: 'disconnected'; error?: string }
+  | { status: 'error'; error: string };
 
 export interface WeComConnectionConfig {
   botId: string;
   secret: string;
-  /** 企业 ID（企业微信「企业信息」底部）。当前收发不需要，仅作记录/未来 API 调用用。 */
   corpId?: string;
-  /** 可选 HappyClaw 账号 id，仅用于日志。 */
   channelAccountId?: string;
+  /** Test-only override; production uses a bounded 15-second authentication wait. */
+  authTimeoutMs?: number;
 }
 
 export interface WeComConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
-  /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话）。 */
-  resolveEffectiveChatJid?: (
+  ignoreMessagesBefore?: number;
+  isChatAuthorized?: (jid: string) => boolean;
+  onPairAttempt?: (
+    jid: string,
+    chatName: string,
+    code: string,
+  ) => Promise<boolean>;
+  onConnectionStateChange?: (state: WeComConnectionState) => void;
+  onCommand?: (
     chatJid: string,
-  ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
-  /** 消息被路由到 conversation agent 后调用，触发 agent 处理。 */
+    command: string,
+    senderImId?: string,
+  ) => Promise<string | null>;
+  resolveEffectiveChatJid?: (chatJid: string) => {
+    effectiveJid: string;
+    agentId: string | null;
+    sourceJid?: string;
+  } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  /** 入库前对 provider JID 做规范化。 */
   normalizeIncomingJid?: (jid: string) => string;
-  /** 群聊未 @ 机器人时的过滤：返回 false 则丢弃（企微智能机器人回调本身即被动触发，默认放行）。 */
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
+  isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+  isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
+  resolveRegisteredGroup?: (
+    jid: string,
+  ) => { activation_mode?: string } | undefined;
 }
 
 export interface WeComConnection {
@@ -48,16 +88,63 @@ export interface WeComConnection {
     text: string,
     localImagePaths?: string[],
   ): Promise<void>;
-  /**
-   * Open a streaming reply session for `chatId`. Uses the latest stashed
-   * inbound frame (req_id) for that chat to drive `replyStream`. Returns
-   * undefined if no inbound frame is available yet (nothing to reply to).
-   */
   createStreamingSession(
     chatId: string,
-    onCardCreated?: (messageId: string) => void,
+    inputMessageId?: string,
   ): Promise<WeComStreamingController | undefined>;
   isConnected(): boolean;
+}
+
+interface CachedInboundFrame {
+  frame: WsFrame<TextMessage>;
+  chatId: string;
+  expiresAt: number;
+}
+
+function utf8Bytes(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+/** Split without cutting a Unicode code point. Prefer a recent line/space boundary. */
+export function splitWeComMarkdown(
+  text: string,
+  maxBytes = WECOM_MARKDOWN_MAX_BYTES,
+): string[] {
+  if (maxBytes <= 0) throw new Error('maxBytes must be positive');
+  const value = text.trim();
+  if (!value) return [];
+  if (utf8Bytes(value) <= maxBytes) return [value];
+
+  const chunks: string[] = [];
+  let remaining = value;
+  while (utf8Bytes(remaining) > maxBytes) {
+    let bytes = 0;
+    let end = 0;
+    let preferredEnd = 0;
+    for (const char of remaining) {
+      const charBytes = utf8Bytes(char);
+      if (bytes + charBytes > maxBytes) break;
+      bytes += charBytes;
+      end += char.length;
+      if (/\s/u.test(char) && bytes >= maxBytes * 0.65) preferredEnd = end;
+    }
+    const splitAt = preferredEnd || end;
+    if (splitAt <= 0) throw new Error('Unable to paginate WeCom message');
+    chunks.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+function sdkChatId(chatId: string): string {
+  if (chatId.startsWith('c2c:')) return chatId.slice('c2c:'.length);
+  if (chatId.startsWith('group:')) return chatId.slice('group:'.length);
+  return chatId;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function createWeComConnection(
@@ -66,55 +153,233 @@ export function createWeComConnection(
   let ws: WSClient | null = null;
   let authenticated = false;
   let opts: WeComConnectOpts | null = null;
+  let intentionalDisconnect = false;
   const logCtx = { accountId: config.channelAccountId, botId: config.botId };
-  // Latest inbound frame per WeCom chatId. replyStream() must echo the req_id
-  // of the message it replies to, so we stash the most recent frame per chat.
-  const inboundFrames = new Map<string, WsFrame<TextMessage>>();
+  const dedup = createDedupCache({
+    ttlMs: MESSAGE_DEDUP_TTL_MS,
+    max: MESSAGE_DEDUP_MAX,
+  });
+  const processingLock = new ProcessingLock();
+  const rejectTimestamps = new Map<string, number>();
+  // Exact durable input id -> original callback frame. Map insertion order is
+  // the LRU order; a session removes its entry and retains the frozen frame.
+  const inboundFrames = new Map<string, CachedInboundFrame>();
 
-  function resolveChatId(body: TextMessage): string {
-    // 单聊：会话 id 用 from.userid；群聊：用 chatid。
-    if (body.chattype === 'group' && body.chatid) return body.chatid;
-    return body.from?.userid ?? body.chatid ?? '';
+  function emitState(state: WeComConnectionState): void {
+    try {
+      opts?.onConnectionStateChange?.(state);
+    } catch (error) {
+      logger.warn({ ...logCtx, error }, 'WeCom state listener failed');
+    }
+  }
+
+  function pruneFrames(now = Date.now()): void {
+    for (const [inputId, cached] of inboundFrames) {
+      if (cached.expiresAt > now) break;
+      inboundFrames.delete(inputId);
+    }
+    while (inboundFrames.size > FRAME_CACHE_MAX) {
+      const oldest = inboundFrames.keys().next().value;
+      if (oldest === undefined) break;
+      inboundFrames.delete(oldest);
+    }
+  }
+
+  function cacheFrame(
+    inputMessageId: string,
+    chatId: string,
+    frame: WsFrame<TextMessage>,
+  ): void {
+    pruneFrames();
+    inboundFrames.delete(inputMessageId);
+    inboundFrames.set(inputMessageId, {
+      frame,
+      chatId,
+      expiresAt: Date.now() + FRAME_TTL_MS,
+    });
+    pruneFrames();
+  }
+
+  async function sendReply(
+    client: WSClient,
+    frame: WsFrame<TextMessage>,
+    text: string,
+  ): Promise<void> {
+    await client.replyStream(frame, generateReqId('reply'), text, true);
+  }
+
+  async function sendMarkdownPages(
+    client: WSClient,
+    chatId: string,
+    text: string,
+  ): Promise<void> {
+    const pageLimit = WECOM_MARKDOWN_MAX_BYTES - PAGE_HEADER_RESERVE_BYTES;
+    const pages = splitWeComMarkdown(text, pageLimit);
+    for (let index = 0; index < pages.length; index += 1) {
+      const header =
+        pages.length > 1 ? `（${index + 1}/${pages.length}）\n` : '';
+      const content = `${header}${pages[index]}`;
+      if (utf8Bytes(content) > WECOM_MARKDOWN_MAX_BYTES) {
+        throw new Error('WeCom pagination exceeded the provider byte limit');
+      }
+      // The SDK rejects on a timeout or non-zero errcode; awaiting each page
+      // makes a resolved delivery promise a strict provider ACK.
+      await client.sendMessage(sdkChatId(chatId), {
+        msgtype: 'markdown',
+        markdown: { content },
+      });
+    }
+  }
+
+  function rawConversationJid(body: TextMessage): {
+    jid: string;
+    providerChatId: string;
+    isGroup: boolean;
+  } | null {
+    if (body.chattype === 'group') {
+      if (!body.chatid) return null;
+      return {
+        jid: `wecom:group:${body.chatid}`,
+        providerChatId: body.chatid,
+        isGroup: true,
+      };
+    }
+    const userId = body.from?.userid;
+    if (!userId) return null;
+    return {
+      jid: `wecom:c2c:${userId}`,
+      providerChatId: userId,
+      isGroup: false,
+    };
   }
 
   async function handleInbound(frame: WsFrame<TextMessage>): Promise<void> {
+    const body = frame.body;
+    if (!body) return;
+    const content = body.text?.content?.trim();
+    if (!content) return;
+    const conversation = rawConversationJid(body);
+    if (!conversation) return;
+    const eventId = body.msgid || frame.headers?.req_id;
+    if (!eventId) return;
+    const dedupKey = `${conversation.providerChatId}\u0000${eventId}`;
+    if (dedup.isDuplicate(dedupKey)) return;
+    if (!processingLock.acquire(dedupKey)) return;
+    dedup.markSeen(dedupKey);
+
     try {
-      const body = frame.body;
-      if (!body) return;
-      const content = body.text?.content?.trim();
-      if (!content) return;
-      const rawChatId = resolveChatId(body);
-      if (!rawChatId) return;
-      // Stash the frame so a streaming reply can reuse its req_id.
-      inboundFrames.set(rawChatId, frame);
-      const fromUserId = body.from?.userid ?? rawChatId;
-
-      let jid = `wecom:${rawChatId}`;
-      if (opts?.normalizeIncomingJid) jid = opts.normalizeIncomingJid(jid);
-
-      const senderName = fromUserId; // 企微回调仅带 userid，无展示名
-      opts?.onNewChat?.(jid, senderName);
-
+      const createdAt = body.create_time ? body.create_time * 1000 : 0;
       if (
-        body.chattype === 'group' &&
-        opts?.shouldProcessGroupMessage &&
-        !opts.shouldProcessGroupMessage(jid, fromUserId)
+        opts?.ignoreMessagesBefore &&
+        (!createdAt || createdAt < opts.ignoreMessagesBefore)
       ) {
         return;
       }
 
-      const routing = opts?.resolveEffectiveChatJid?.(jid) ?? null;
-      const targetJid = routing?.effectiveJid ?? jid;
+      let jid = conversation.jid;
+      if (opts?.normalizeIncomingJid) jid = opts.normalizeIncomingJid(jid);
+      const fromUserId = body.from?.userid;
+      if (!fromUserId) return;
+      const senderName = fromUserId;
 
-      const id = crypto.randomUUID();
-      const timestamp = body.create_time
-        ? new Date(body.create_time * 1000).toISOString()
-        : new Date().toISOString();
-      const senderId = `wecom:${fromUserId}`;
-
-      storeMessageDirect(id, targetJid, senderId, senderName, content, timestamp, false, {
-        sourceJid: jid,
+      // WeCom accounts must never inherit evaluateChannelAdmission's legacy
+      // open-channel behavior: absent account-scoped auth is a deny.
+      const admission = await evaluateChannelAdmission({
+        jid,
+        chatName: senderName,
+        text: content,
+        isChatAuthorized: opts?.isChatAuthorized ?? (() => false),
+        onPairAttempt: opts?.onPairAttempt,
       });
+      if (admission.kind === 'paired') {
+        if (ws)
+          await sendReply(ws, frame, '配对成功！此聊天已连接到你的工作区。');
+        return;
+      }
+      if (admission.kind === 'pair_rejected') {
+        if (ws) {
+          await sendReply(
+            ws,
+            frame,
+            '配对码无效或已过期，请在 Web 设置页重新生成。',
+          );
+        }
+        return;
+      }
+      if (admission.kind === 'deny') {
+        const now = Date.now();
+        const lastReject = rejectTimestamps.get(jid) ?? 0;
+        if (ws && now - lastReject >= REJECT_COOLDOWN_MS) {
+          rejectTimestamps.set(jid, now);
+          await sendReply(
+            ws,
+            frame,
+            '此聊天尚未配对。请在 Web 设置页生成配对码，然后发送 /pair <code>。',
+          );
+        }
+        logger.debug({ ...logCtx, jid }, 'Unauthorized WeCom chat ignored');
+        return;
+      }
+
+      const resolvedRoute = resolveAdmittedChannelRoute(
+        jid,
+        opts?.resolveEffectiveChatJid,
+      );
+      if (!resolvedRoute) {
+        logger.warn(
+          { ...logCtx, jid },
+          'WeCom message dropped: binding resolver rejected route',
+        );
+        return;
+      }
+      const { targetJid, routing } = resolvedRoute;
+
+      const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/u);
+      if (slashMatch && opts?.onCommand) {
+        const command = `${slashMatch[1]}${slashMatch[2] ? ` ${slashMatch[2]}` : ''}`;
+        const reply = await opts.onCommand(jid, command, fromUserId);
+        if (reply && ws) await sendReply(ws, frame, reply);
+        return;
+      }
+
+      if (
+        conversation.isGroup &&
+        opts?.isSenderAllowedInGroup &&
+        !opts.isSenderAllowedInGroup(jid, fromUserId)
+      ) {
+        return;
+      }
+      if (
+        conversation.isGroup &&
+        opts?.shouldProcessGroupMessage &&
+        !opts.shouldProcessGroupMessage(jid, fromUserId)
+      ) {
+        const mode = opts.resolveRegisteredGroup?.(jid)?.activation_mode;
+        if (
+          mode !== 'owner_mentioned' ||
+          !opts.isGroupOwnerMessage?.(jid, fromUserId)
+        ) {
+          return;
+        }
+      }
+
+      // All registration and business side effects are after admission,
+      // routing, command handling, and group policy filters.
+      opts?.onNewChat(jid, senderName);
+      const id = crypto.randomUUID();
+      const timestamp = new Date(createdAt || Date.now()).toISOString();
+      const senderId = `wecom:${fromUserId}`;
+      storeMessageDirect(
+        id,
+        targetJid,
+        senderId,
+        senderName,
+        content,
+        timestamp,
+        false,
+        { sourceJid: jid },
+      );
+      cacheFrame(id, conversation.providerChatId, frame);
       broadcastNewMessage(
         targetJid,
         {
@@ -133,119 +398,161 @@ export function createWeComConnection(
 
       if (routing?.agentId) {
         opts?.onAgentMessage?.(jid, routing.agentId);
-        logger.info(
-          { ...logCtx, jid, effectiveJid: targetJid, agentId: routing.agentId },
-          'WeCom message routed to agent',
-        );
-      } else {
-        logger.info({ ...logCtx, jid, msgid: body.msgid }, 'WeCom message stored');
       }
-    } catch (err) {
-      logger.error({ ...logCtx, err }, 'WeCom inbound handling failed');
+      logger.info(
+        {
+          ...logCtx,
+          jid,
+          effectiveJid: targetJid,
+          agentId: routing?.agentId,
+          msgid: body.msgid,
+        },
+        'WeCom message admitted and stored',
+      );
+    } catch (error) {
+      logger.error({ ...logCtx, error }, 'WeCom inbound handling failed');
+    } finally {
+      processingLock.release(dedupKey);
     }
   }
 
   return {
     async connect(connectOpts: WeComConnectOpts): Promise<void> {
+      if (ws) throw new Error('WeCom connection is already started');
       opts = connectOpts;
+      intentionalDisconnect = false;
+      authenticated = false;
+      emitState({ status: 'connecting' });
+
       const client = new WSClient({
         botId: config.botId,
         secret: config.secret,
-        maxReconnectAttempts: -1, // 服务端常驻，无限重连
+        maxReconnectAttempts: -1,
         logger: {
           debug: () => undefined,
-          info: (msg: string) => logger.debug({ ...logCtx }, `WeCom SDK: ${msg}`),
-          warn: (msg: string) => logger.warn({ ...logCtx }, `WeCom SDK: ${msg}`),
-          error: (msg: string, err?: unknown) =>
-            logger.error({ ...logCtx, err }, `WeCom SDK: ${msg}`),
+          info: (message: string) =>
+            logger.debug({ ...logCtx }, `WeCom SDK: ${message}`),
+          warn: (message: string) =>
+            logger.warn({ ...logCtx }, `WeCom SDK: ${message}`),
+          error: (message: string, error?: unknown) =>
+            logger.error({ ...logCtx, error }, `WeCom SDK: ${message}`),
         },
       });
+      ws = client;
+
+      let settleInitial: ((error?: Error) => void) | null = null;
+      const authenticatedPromise = new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (error) reject(error);
+          else resolve();
+        };
+        settleInitial = finish;
+      });
+      const timeout = setTimeout(
+        () => settleInitial?.(new Error('WeCom authentication timed out')),
+        config.authTimeoutMs ?? AUTH_TIMEOUT_MS,
+      );
+      timeout.unref?.();
 
       client.on('message.text', (data) => {
         void handleInbound(data);
       });
       client.on('authenticated', () => {
         authenticated = true;
+        emitState({ status: 'connected' });
         logger.info({ ...logCtx }, 'WeCom WebSocket authenticated');
         connectOpts.onReady?.();
+        settleInitial?.();
       });
       client.on('connected', () => {
         logger.info({ ...logCtx }, 'WeCom WebSocket connected');
       });
       client.on('disconnected', (reason: string) => {
         authenticated = false;
+        const error = reason || 'WebSocket disconnected';
+        emitState({ status: 'disconnected', error });
         logger.warn({ ...logCtx, reason }, 'WeCom WebSocket disconnected');
+        if (!intentionalDisconnect) settleInitial?.(new Error(error));
       });
       client.on('reconnecting', (attempt: number) => {
         authenticated = false;
+        emitState({ status: 'reconnecting', attempt });
         logger.info({ ...logCtx, attempt }, 'WeCom WebSocket reconnecting');
       });
-      client.on('error', (err: Error) => {
-        logger.error({ ...logCtx, err }, 'WeCom WebSocket error');
+      client.on('error', (error: Error) => {
+        authenticated = false;
+        emitState({ status: 'error', error: error.message });
+        logger.error({ ...logCtx, error }, 'WeCom WebSocket error');
+        settleInitial?.(error);
       });
 
-      client.connect();
-      ws = client;
+      try {
+        client.connect();
+        await authenticatedPromise;
+      } catch (error) {
+        authenticated = false;
+        intentionalDisconnect = true;
+        try {
+          client.disconnect();
+        } finally {
+          if (ws === client) ws = null;
+          opts = null;
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        settleInitial = null;
+      }
     },
 
     async disconnect(): Promise<void> {
+      intentionalDisconnect = true;
       authenticated = false;
-      try {
-        ws?.disconnect();
-      } finally {
-        ws = null;
-        opts = null;
-        inboundFrames.clear();
-      }
+      const client = ws;
+      ws = null;
+      opts = null;
+      inboundFrames.clear();
+      rejectTimestamps.clear();
+      dedup.clear();
+      processingLock.dispose();
+      client?.disconnect();
     },
 
     async sendMessage(chatId: string, text: string): Promise<void> {
-      if (!ws) {
-        logger.warn({ ...logCtx, chatId }, 'WeCom not connected, skip send');
-        return;
+      const client = ws;
+      if (!client || !authenticated) {
+        throw new Error('WeCom channel is not authenticated');
       }
-      const content = text?.trim();
-      if (!content) return;
-      await ws.sendMessage(chatId, {
-        msgtype: 'markdown',
-        markdown: { content },
-      });
+      await sendMarkdownPages(client, chatId, text);
     },
 
     async createStreamingSession(
       chatId: string,
+      inputMessageId?: string,
     ): Promise<WeComStreamingController | undefined> {
-      if (!ws) {
-        logger.warn({ ...logCtx, chatId }, 'WeCom not connected, no streaming session');
-        return undefined;
-      }
-      const frame = inboundFrames.get(chatId);
-      if (!frame) {
-        // No inbound frame → no req_id to bind replyStream to. The caller
-        // falls back to the plain sendMessage path.
-        logger.debug(
-          { ...logCtx, chatId },
-          'WeCom streaming session skipped: no inbound frame yet',
-        );
-        return undefined;
-      }
-      const streamId = generateReqId('stream');
       const client = ws;
+      if (!client || !authenticated) {
+        throw new Error('WeCom channel is not authenticated');
+      }
+      pruneFrames();
+      if (!inputMessageId) return undefined;
+      const cached = inboundFrames.get(inputMessageId);
+      if (!cached || cached.chatId !== sdkChatId(chatId)) return undefined;
+      inboundFrames.delete(inputMessageId);
+      const frame = cached.frame;
+      const streamId = generateReqId('stream');
       return new WeComStreamingController({
         chatId,
         sendStream: async (streamContent: string, finish: boolean) => {
-          // Always re-read the latest frame in case a newer inbound message
-          // for the same chat arrived; fall back to the captured one.
-          const f = inboundFrames.get(chatId) ?? frame;
-          await client.replyStream(f, streamId, streamContent, finish);
+          // `frame` is deliberately closed over. Never re-read a per-chat map:
+          // concurrent messages in one chat retain their own req_id.
+          await client.replyStream(frame, streamId, streamContent, finish);
         },
-        fallbackSend: async (text: string) => {
-          const body = text?.trim();
-          if (!body) return;
-          await client.sendMessage(chatId, {
-            msgtype: 'markdown',
-            markdown: { content: body },
-          });
+        fallbackSend: async (fallbackText: string) => {
+          await sendMarkdownPages(client, chatId, fallbackText);
         },
       });
     },
