@@ -53,6 +53,7 @@ import {
   shellQuoteEnvLines,
   writeCredentialsFile,
   buildClaudeAiOauthPayload,
+  updateProviderOAuthCredentialsIfCurrent,
 } from './runtime-config.js';
 import {
   removeClaudeKeychainOAuth,
@@ -3079,9 +3080,12 @@ export async function runHostAgent(
           { mode: 0o600 },
         );
       } catch (err) {
-        logger.warn(
+        logger.error(
           { folder: group.folder, err },
           'Failed to strip oauthAccount from session .claude.json',
+        );
+        return hostModeSetupError(
+          '无法清理宿主机会话 OAuth 账户信息，已阻止第三方模型启动',
         );
       }
 
@@ -3091,35 +3095,76 @@ export async function runHostAgent(
         const credsPath = path.join(groupSessionsDir, '.credentials.json');
         if (fs.existsSync(credsPath)) fs.unlinkSync(credsPath);
       } catch (err) {
-        logger.warn(
+        logger.error(
           { folder: group.folder, err },
           'Failed to remove .credentials.json for third-party provider',
+        );
+        return hostModeSetupError(
+          '无法清理宿主机会话 OAuth 凭据文件，已阻止第三方模型启动',
         );
       }
       // Same forced-OAuth hazard, second store: on macOS the CLI keeps OAuth
       // credentials in the Keychain and prefers them over the (now removed)
       // file, so the claudeAiOauth field must be stripped there as well.
-      removeClaudeKeychainOAuth(resolvedSessionsDir);
+      try {
+        await removeClaudeKeychainOAuth(
+          resolvedSessionsDir,
+          hostSelectedProfileId ??
+            `runtime-third-party:${hostEnv['ANTHROPIC_BASE_URL']}`,
+        );
+      } catch (err) {
+        logger.error(
+          { folder: group.folder, err },
+          'Failed to remove macOS Keychain OAuth for third-party provider',
+        );
+        return hostModeSetupError(
+          '无法清理 macOS Keychain OAuth 凭据，已阻止第三方模型启动',
+        );
+      }
     }
 
     // Write .credentials.json for OAuth credentials
     const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
     if (mergedConfig.claudeOAuthCredentials) {
+      let effectiveOauth = buildClaudeAiOauthPayload(mergedConfig);
+      if (!effectiveOauth) {
+        return hostModeSetupError('官方 OAuth 凭据不完整，已阻止启动');
+      }
       try {
-        writeCredentialsFile(groupSessionsDir, mergedConfig);
+        effectiveOauth = await syncClaudeKeychainOAuth(resolvedSessionsDir, {
+          providerId: hostSelectedProfileId ?? '',
+          claudeAiOauth: effectiveOauth,
+          persistRefreshedCredentials: (expected, refreshed) => {
+            if (!hostSelectedProfileId) return false;
+            return updateProviderOAuthCredentialsIfCurrent(
+              hostSelectedProfileId,
+              expected,
+              refreshed,
+            );
+          },
+        });
       } catch (err) {
-        logger.warn(
+        logger.error(
+          { folder: group.folder, err },
+          'Failed to reconcile macOS Keychain OAuth credentials',
+        );
+        return hostModeSetupError(
+          '无法安全同步 macOS Keychain OAuth 凭据，已阻止启动',
+        );
+      }
+      try {
+        writeCredentialsFile(groupSessionsDir, {
+          ...mergedConfig,
+          claudeOAuthCredentials: effectiveOauth,
+        });
+      } catch (err) {
+        logger.error(
           { folder: group.folder, err },
           'Failed to write .credentials.json for host agent',
         );
-      }
-      // On macOS the CLI reads the Keychain entry for this config dir in
-      // preference to .credentials.json. Without this sync, provider-pool
-      // rotation only ever rewrites the ignored file and every turn keeps
-      // authenticating as whichever account seeded the Keychain first.
-      const claudeAiOauth = buildClaudeAiOauthPayload(mergedConfig);
-      if (claudeAiOauth) {
-        syncClaudeKeychainOAuth(resolvedSessionsDir, claudeAiOauth);
+        return hostModeSetupError(
+          '无法写入宿主机会话 OAuth 凭据文件，已阻止启动',
+        );
       }
     }
 

@@ -171,4 +171,60 @@ describe('default model configuration', () => {
       runtimeConfig.setProviderEnabled(primary.id, false),
     ).not.toThrow();
   });
+
+  test('persists refreshed OAuth credentials with full compare-and-swap semantics', () => {
+    const original = {
+      accessToken: 'oauth-access-original',
+      refreshToken: 'oauth-refresh-original',
+      expiresAt: 1_800_000_000_000,
+      // Imported legacy credentials can lack scopes; reconciliation sees the
+      // default scopes emitted by buildClaudeAiOauthPayload.
+      scopes: [],
+      subscriptionType: 'max',
+    };
+    const effectiveOriginal = {
+      ...original,
+      scopes: ['user:inference', 'user:profile', 'user:sessions:claude_code'],
+    };
+    const refreshed = {
+      accessToken: 'oauth-access-refreshed',
+      refreshToken: 'oauth-refresh-refreshed',
+      expiresAt: 1_800_003_600_000,
+      scopes: ['user:inference', 'user:profile'],
+      subscriptionType: 'max',
+    };
+    const provider = runtimeConfig.createProvider({
+      name: 'OAuth CAS provider',
+      type: 'official',
+      claudeOAuthCredentials: original,
+      enabled: true,
+    });
+
+    expect(
+      runtimeConfig.updateProviderOAuthCredentialsIfCurrent(
+        provider.id,
+        {
+          ...effectiveOriginal,
+          scopes: [...effectiveOriginal.scopes].reverse(),
+        },
+        refreshed,
+      ),
+    ).toBe(true);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.claudeOAuthCredentials,
+    ).toEqual(refreshed);
+
+    expect(
+      runtimeConfig.updateProviderOAuthCredentialsIfCurrent(
+        provider.id,
+        original,
+        { ...refreshed, accessToken: 'must-not-win' },
+      ),
+    ).toBe(false);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.claudeOAuthCredentials,
+    ).toEqual(refreshed);
+  });
 });

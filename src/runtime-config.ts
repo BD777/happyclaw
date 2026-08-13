@@ -1614,6 +1614,56 @@ export function updateProviderSecrets(
   return updated;
 }
 
+function oauthCredentialsSnapshot(credentials: ClaudeOAuthCredentials): string {
+  return JSON.stringify({
+    accessToken: credentials.accessToken,
+    refreshToken: credentials.refreshToken,
+    expiresAt: credentials.expiresAt,
+    scopes: [...new Set(credentials.scopes)].sort(),
+    ...(credentials.subscriptionType
+      ? { subscriptionType: credentials.subscriptionType }
+      : {}),
+  });
+}
+
+/**
+ * Persist an SDK-refreshed OAuth credential only if the provider still holds
+ * the exact credential snapshot used to start reconciliation. The synchronous
+ * read/modify/write is a compare-and-swap boundary inside the Node process, so
+ * an admin update or another session refresh cannot be silently overwritten.
+ */
+export function updateProviderOAuthCredentialsIfCurrent(
+  id: string,
+  expected: ClaudeOAuthCredentials,
+  refreshed: ClaudeOAuthCredentials,
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+  const idx = state.providers.findIndex((provider) => provider.id === id);
+  if (idx < 0) throw new Error('未找到指定供应商');
+
+  const current = state.providers[idx];
+  const currentOauth = buildClaudeAiOauthPayload(providerToConfig(current));
+  if (
+    !currentOauth ||
+    oauthCredentialsSnapshot(currentOauth) !==
+      oauthCredentialsSnapshot(expected)
+  ) {
+    return false;
+  }
+
+  state.providers[idx] = {
+    ...current,
+    claudeOAuthCredentials: {
+      ...refreshed,
+      scopes: [...new Set(refreshed.scopes)].sort(),
+    },
+    updatedAt: new Date().toISOString(),
+  };
+  writeStoredStateV4(state.providers, state.balancing, state.defaultProviderId);
+  return true;
+}
+
 export function setProviderEnabled(
   id: string,
   enabled: boolean,
