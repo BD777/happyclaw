@@ -8,6 +8,7 @@ import {
   isGenuineReplyResult,
   occupiesPrimaryReplyDeliverySlot,
   resolveScheduledGroupDeliveryContract,
+  resolveScheduledProactiveArchiveCandidate,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
   shouldFinalizeScheduledGroupPrimaryResult,
@@ -44,6 +45,55 @@ describe('scheduled group physical delivery contract', () => {
       ).toBe(1);
     },
   );
+});
+
+describe('scheduled Proactive archive candidate', () => {
+  test('accepts both task-output and interactive Proactive result lanes', () => {
+    expect(
+      resolveScheduledProactiveArchiveCandidate({
+        status: 'success',
+        inputTurnCompleted: true,
+        hasScheduledGroupRuns: true,
+        result: ' archived task result ',
+      }),
+    ).toBe('archived task result');
+    expect(
+      resolveScheduledProactiveArchiveCandidate({
+        status: 'success',
+        inputTurnCompleted: true,
+        hasScheduledGroupRuns: true,
+        proactiveFinalCandidate: 'diagnostic final',
+        result: null,
+      }),
+    ).toBe('diagnostic final');
+  });
+
+  test('rejects non-terminal, failed, and non-scheduled output', () => {
+    const base = {
+      status: 'success' as const,
+      inputTurnCompleted: true,
+      hasScheduledGroupRuns: true,
+      result: 'must not archive',
+    };
+    expect(
+      resolveScheduledProactiveArchiveCandidate({
+        ...base,
+        inputTurnCompleted: false,
+      }),
+    ).toBe('');
+    expect(
+      resolveScheduledProactiveArchiveCandidate({
+        ...base,
+        status: 'error',
+      }),
+    ).toBe('');
+    expect(
+      resolveScheduledProactiveArchiveCandidate({
+        ...base,
+        hasScheduledGroupRuns: false,
+      }),
+    ).toBe('');
+  });
 });
 
 describe('isGenuineReplyResult', () => {

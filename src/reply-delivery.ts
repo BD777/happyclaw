@@ -17,6 +17,30 @@ export interface ScheduledGroupDeliveryContract {
   agentDeliversWithSendMessage: boolean;
 }
 
+export interface ScheduledProactiveArchiveCandidateInput {
+  status: 'success' | 'error' | 'stream' | 'closed';
+  inputTurnCompleted?: boolean;
+  hasScheduledGroupRuns: boolean;
+  /** Interactive Proactive runner output lane. */
+  proactiveFinalCandidate?: string | null;
+  /** Task-output runner lane (scheduled turns intentionally use this lane). */
+  result?: string | null;
+}
+
+/** Select the archive-only SDK final after a healthy scheduled input ends. */
+export function resolveScheduledProactiveArchiveCandidate(
+  input: ScheduledProactiveArchiveCandidateInput,
+): string {
+  if (
+    !input.hasScheduledGroupRuns ||
+    input.status !== 'success' ||
+    input.inputTurnCompleted !== true
+  ) {
+    return '';
+  }
+  return (input.proactiveFinalCandidate ?? input.result ?? '').trim();
+}
+
 /** Exactly one lane owns physical IM delivery for a scheduled group turn. */
 export function resolveScheduledGroupDeliveryContract(
   interactionMode: InteractionMode,

@@ -26,6 +26,7 @@ import {
   isGenuineReplyResult,
   occupiesPrimaryReplyDeliverySlot,
   resolveScheduledGroupDeliveryContract,
+  resolveScheduledProactiveArchiveCandidate,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
   shouldFinalizeScheduledGroupPrimaryResult,
@@ -7710,12 +7711,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               ...(scheduledGroupRunsByInput.get(proactiveInputId)?.values() ??
                 []),
             ];
-            const completedScheduledCandidate =
-              result.status === 'success' &&
-              result.inputTurnCompleted === true &&
-              result.proactiveFinalCandidate?.trim()
-                ? stripAgentInternalTags(result.proactiveFinalCandidate).trim()
-                : '';
+            const scheduledArchiveCandidate =
+              resolveScheduledProactiveArchiveCandidate({
+                status: result.status,
+                inputTurnCompleted: result.inputTurnCompleted,
+                hasScheduledGroupRuns: scheduledRuns.length > 0,
+                proactiveFinalCandidate: result.proactiveFinalCandidate,
+                result: result.result,
+              });
+            const completedScheduledCandidate = scheduledArchiveCandidate
+              ? stripAgentInternalTags(scheduledArchiveCandidate).trim()
+              : '';
             if (
               scheduledRuns.length > 0 &&
               result.inputTurnCompleted === true
