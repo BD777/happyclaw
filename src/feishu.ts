@@ -30,7 +30,6 @@ import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
   buildFollowUpActionResultCard,
-  buildQueuedFollowUpCard,
 } from './feishu-cards/builder.js';
 import {
   evaluateMentionGate,
@@ -48,6 +47,10 @@ import {
   scopeChannelJid,
 } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
+import {
+  isFeishuRuntimeControlLike,
+  parseFeishuRuntimeControl,
+} from './follow-up-policy.js';
 import {
   executeFeishuCapability,
   type FeishuCapabilityRequest,
@@ -145,9 +148,14 @@ export interface ConnectOptions {
     senderImId: string;
     requestedMode?: FollowUpMode;
     coalesceBundleId?: string;
-    repliedToActiveCard: boolean;
   }) => FollowUpDisposition;
-  /** Handle buttons on the compact queued-message card. */
+  /** Execute an exact, structurally authorized Feishu `/break` command. */
+  onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
+  /** Handle buttons from legacy queued-message cards sent by older versions. */
   onFollowUpCardAction?: (input: {
     sourceJid: string;
     targetJid: string;
@@ -1922,6 +1930,7 @@ export function createFeishuConnection(
       resolveEffectiveChatJid,
       onAgentMessage,
       onFollowUpMessage,
+      onSessionBreak,
       shouldProcessGroupMessage,
       resolveFeishuConversationPlan,
       isGroupOwnerMessage,
@@ -2059,30 +2068,51 @@ export function createFeishuConnection(
       }
 
       // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
-      // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
-      // 需要先 strip 掉开头的 @mention 前缀再匹配
-      let textForSlash = text?.trim().replace(/^@\S+\s+/, '') ?? '';
+      // 只有飞书结构化 mentions 证明了真实 Bot 点名，才移除开头的展示名。
+      // 用户手写的同名字面 `@Bot` 不能获得 /steer 或 /break 控制能力。
+      let textForSlash =
+        chatType === 'group'
+          ? stripLeadingBotMention(
+              text ?? '',
+              botOpenId,
+              mentions as MentionGateMention[] | undefined,
+            ).trim()
+          : (text?.trim() ?? '');
       let requestedFollowUpMode: FollowUpMode | undefined;
-      const followUpModeMatch = textForSlash.match(
-        /^\/(queue|steer)(?:\s+([\s\S]+))?$/i,
-      );
-      if (followUpModeMatch) {
-        const modeContent = followUpModeMatch[2]?.trim();
-        if (!modeContent) {
-          await sendTextToChat(
-            messageRouteTarget.raw,
-            `请在 /${followUpModeMatch[1].toLowerCase()} 后输入消息内容。`,
-          );
-          completeClaimedInbound(claim, payload);
-          return;
-        }
-        requestedFollowUpMode =
-          followUpModeMatch[1].toLowerCase() === 'steer' ? 'steer' : 'queue';
-        text = modeContent;
-        textForSlash = modeContent;
+      const runtimeControlGate = evaluateMentionGate({
+        chatType: normalizedChatType,
+        botOpenId,
+        mentions: mentions as MentionGateMention[] | undefined,
+        chatJid,
+        senderOpenId,
+        shouldProcessGroupMessage,
+        isGroupOwnerMessage,
+        conversationPlan,
+      });
+      const runtimeControl = parseFeishuRuntimeControl({
+        commandText: textForSlash,
+        eligible:
+          chatType !== 'group' || (mentionedBot && runtimeControlGate.allow),
+        hasAttachments:
+          Boolean(extracted.imageKeys?.length) ||
+          Boolean(extracted.fileInfos?.length) ||
+          (messageType !== 'text' && messageType !== 'post'),
+      });
+      if (
+        runtimeControl?.kind === 'queue' ||
+        runtimeControl?.kind === 'steer'
+      ) {
+        requestedFollowUpMode = runtimeControl.kind;
+        text = runtimeControl.text;
+        textForSlash = runtimeControl.text;
       }
       const slashMatch = textForSlash.match(/^\/(\S+)(.*)$/);
-      if (slashMatch && onCommand && !requestedFollowUpMode) {
+      const runtimeControlLike = isFeishuRuntimeControlLike(textForSlash);
+      if (
+        slashMatch &&
+        !requestedFollowUpMode &&
+        (runtimeControl?.kind === 'break' || (onCommand && !runtimeControlLike))
+      ) {
         const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
         const persistedCommand = parseFeishuSlashCommandCheckpoint(
           claim.normalizedPayload,
@@ -2173,7 +2203,38 @@ export function createFeishuConnection(
               );
               return;
             }
-            reply = await onCommand(chatJid, cmdBody, senderOpenId, mentions);
+            if (runtimeControl?.kind === 'break') {
+              let targetJid: string | undefined;
+              // Group routes are already registered and may carry a native
+              // thread/topic target. A first-contact P2P route is deliberately
+              // left for the host fallback so command handling never bypasses
+              // the normal P2P bootstrap below.
+              if (chatType === 'group' && resolveEffectiveChatJid) {
+                try {
+                  targetJid = resolveEffectiveChatJid(
+                    chatJid,
+                    rawMessageMeta,
+                  )?.effectiveJid;
+                } catch (error) {
+                  if (!(error instanceof ChannelRouteRejectedError))
+                    throw error;
+                }
+              }
+              reply = onSessionBreak
+                ? await onSessionBreak({
+                    sourceJid: chatJid,
+                    targetJid,
+                    senderImId: senderOpenId,
+                  })
+                : '当前运行环境不支持 /break。';
+            } else {
+              reply = await onCommand!(
+                chatJid,
+                cmdBody,
+                senderOpenId,
+                mentions,
+              );
+            }
             replyTarget = messageRouteTarget.raw;
             if (reply) {
               const pendingReply: FeishuSlashCommandCheckpoint = {
@@ -2930,8 +2991,6 @@ export function createFeishuConnection(
               contentLink
                 ? contentLink.bundleId
                 : undefined,
-            repliedToActiveCard:
-              !!parentId && !!resolveJidByMessageId(parentId),
           }) ?? { disposition: 'started' as const });
       const deliveryFields = subsumedByMessageId
         ? {
@@ -2989,32 +3048,13 @@ export function createFeishuConnection(
       }
       if (followUp.disposition === 'queued') {
         broadcastFollowUpUpdate(targetJid);
-        const position = followUp.position ?? 1;
-        if (followUp.runId) {
-          // Strip the prefix through the shared helper, which also drops the
-          // account fragment. Slicing by hand left `#account:` in place, and
-          // requireFeishuRouteTarget only accepts thread/root fragments — so
-          // every account-scoped route threw here instead of sending the card.
-          const queuedReplyTarget = routeSourceJid
-            ? extractProviderTarget(routeSourceJid)
-            : messageRouteTarget.raw;
-          await sendToFeishu(
-            queuedReplyTarget,
-            'interactive',
-            JSON.stringify(
-              buildQueuedFollowUpCard({
-                content: text,
-                position,
-                sourceJid: chatJid,
-                targetJid,
-                messageId,
-                expectedRunId: followUp.runId,
-              }),
-            ),
-          );
-        }
         logger.info(
-          { chatJid, targetJid, messageId, position },
+          {
+            chatJid,
+            targetJid,
+            messageId,
+            position: followUp.position ?? 1,
+          },
           'Feishu message queued behind active query',
         );
         completeClaimedInbound(claim, payload);

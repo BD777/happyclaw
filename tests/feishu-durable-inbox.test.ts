@@ -221,6 +221,136 @@ async function connect(
 }
 
 describe('Feishu durable Inbox and cursor integration', () => {
+  test('durably queues a busy follow-up without sending an action card', async () => {
+    const accountId = `account-silent-queue-${Date.now()}`;
+    const followUp = vi.fn(() => ({
+      disposition: 'queued' as const,
+      runId: 'run-busy',
+      position: 1,
+    }));
+    const connected = await connect(accountId, vi.fn(), {
+      onFollowUpMessage: followUp,
+    });
+
+    await connected.handler(
+      event('om_silent_queue', Date.now(), '自然排队，不要发卡片'),
+    );
+
+    expect(controls.messageCreate).not.toHaveBeenCalled();
+    expect(controls.messageReply).not.toHaveBeenCalled();
+    expect(followUp).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetJid: 'web:durable-feishu-test',
+        messageId: 'om_silent_queue',
+        requestedMode: undefined,
+      }),
+    );
+  });
+
+  test('a real group mention with exact /steer strips the directive and requests immediate steering', async () => {
+    const accountId = `account-steer-command-${Date.now()}`;
+    const followUp = vi.fn(() => ({
+      disposition: 'steered' as const,
+      runId: 'run-busy',
+    }));
+    const connected = await connect(accountId, vi.fn(), {
+      shouldProcessGroupMessage: () => true,
+      onFollowUpMessage: followUp,
+    });
+    const messageId = 'om_real_steer';
+    const createTime = Date.now();
+
+    await connected.handler({
+      ...event(messageId, createTime, ''),
+      message: {
+        ...event(messageId, createTime, '').message,
+        chat_id: 'oc_steer_group',
+        chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 /steer 优先处理这件事' }),
+        mentions: [
+          {
+            key: '@_user_1',
+            name: 'Inbox Test Bot',
+            id: { open_id: 'ou_bot' },
+          },
+        ],
+      },
+    });
+
+    expect(followUp).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceJid: 'feishu:oc_steer_group',
+        targetJid: 'web:durable-feishu-test',
+        messageId,
+        requestedMode: 'steer',
+      }),
+    );
+    expect(
+      db
+        .getMessagesSince('web:durable-feishu-test', {
+          timestamp: '',
+          id: '',
+        })
+        .find((message) => message.id === messageId)?.content,
+    ).toBe('优先处理这件事');
+    expect(controls.messageCreate).not.toHaveBeenCalled();
+    expect(controls.messageReply).not.toHaveBeenCalled();
+  });
+
+  test('only a real Bot mention can execute the exact lowercase /break command in a group', async () => {
+    const accountId = `account-break-command-${Date.now()}`;
+    const onSessionBreak = vi
+      .fn()
+      .mockResolvedValue('已停止当前任务，并取消此前排队的消息。');
+    const executed = vi.fn();
+    const connected = await connect(accountId, executed, {
+      shouldProcessGroupMessage: () => true,
+      onSessionBreak,
+    });
+    const createTime = Date.now();
+
+    await connected.handler({
+      ...event('om_real_break', createTime, ''),
+      message: {
+        ...event('om_real_break', createTime, '').message,
+        chat_id: 'oc_break_group',
+        chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 /break' }),
+        mentions: [
+          {
+            key: '@_user_1',
+            name: 'Inbox Test Bot',
+            id: { open_id: 'ou_bot' },
+          },
+        ],
+      },
+    });
+
+    expect(onSessionBreak).toHaveBeenCalledWith({
+      sourceJid: 'feishu:oc_break_group',
+      targetJid: 'web:durable-feishu-test',
+      senderImId: 'ou_durable_user',
+    });
+    expect(executed).not.toHaveBeenCalledWith('om_real_break');
+    expect(controls.messageCreate).toHaveBeenCalledTimes(1);
+
+    controls.messageCreate.mockClear();
+    await connected.handler({
+      ...event('om_fake_break', createTime + 1, ''),
+      message: {
+        ...event('om_fake_break', createTime + 1, '').message,
+        chat_id: 'oc_break_group',
+        chat_type: 'group',
+        content: JSON.stringify({ text: '@Inbox Test Bot /break' }),
+        mentions: [],
+      },
+    });
+
+    expect(onSessionBreak).toHaveBeenCalledTimes(1);
+    expect(executed).toHaveBeenCalledWith('om_fake_break');
+    expect(controls.messageCreate).not.toHaveBeenCalled();
+  });
+
   test('bootstraps the first P2P DM after an account-scoped route rejection', async () => {
     const accountId = `account-first-dm-${Date.now()}`;
     const executed = vi.fn();
@@ -549,24 +679,13 @@ describe('Feishu durable Inbox and cursor integration', () => {
     });
 
     await connected.handler(
-      groupEvent(
-        rootId,
-        createTime,
-        'https://github.com/example/example-repo',
-      ),
+      groupEvent(rootId, createTime, 'https://github.com/example/example-repo'),
     );
     await connected.handler({
-      ...groupEvent(
-        noteId,
-        createTime + 287,
-        '<p>请克隆并分析这个仓库。</p>',
-      ),
+      ...groupEvent(noteId, createTime + 287, '<p>请克隆并分析这个仓库。</p>'),
       message: {
-        ...groupEvent(
-          noteId,
-          createTime + 287,
-          '<p>请克隆并分析这个仓库。</p>',
-        ).message,
+        ...groupEvent(noteId, createTime + 287, '<p>请克隆并分析这个仓库。</p>')
+          .message,
         root_id: rootId,
         parent_id: rootId,
       },

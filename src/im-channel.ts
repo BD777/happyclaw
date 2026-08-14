@@ -160,8 +160,12 @@ export interface IMChannelConnectOpts {
     senderImId: string;
     requestedMode?: FollowUpMode;
     coalesceBundleId?: string;
-    repliedToActiveCard: boolean;
   }) => FollowUpDisposition;
+  onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
   onFollowUpCardAction?: (input: {
     sourceJid: string;
     targetJid: string;
@@ -314,6 +318,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
         onAgentMessage: opts.onAgentMessage,
         onFollowUpMessage: opts.onFollowUpMessage,
+        onSessionBreak: opts.onSessionBreak,
         onFollowUpCardAction: opts.onFollowUpCardAction,
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,

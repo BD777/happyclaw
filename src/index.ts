@@ -190,6 +190,7 @@ import {
   listEnabledChannelAccounts,
   updateChannelAccountAuthStatus,
   updateChannelAccountStatus,
+  cancelQueuedFollowUpsAtCutoff,
   cancelQueuedFollowUp,
   claimNextQueuedFollowUpBatch,
   getQueuedFollowUp,
@@ -19283,7 +19284,6 @@ function handleIncomingFollowUp(input: {
   senderImId: string;
   requestedMode?: FollowUpMode;
   coalesceBundleId?: string;
-  repliedToActiveCard: boolean;
 }): import('./types.js').FollowUpDisposition {
   const activeRunId = queue.getActiveQueryId(input.targetJid);
   if (!activeRunId) return { disposition: 'started' };
@@ -19308,7 +19308,6 @@ function handleIncomingFollowUp(input: {
     );
   const mode = resolveFeishuFollowUpMode(
     input.requestedMode ?? (coalesceActiveRoot ? 'steer' : undefined),
-    input.coalesceBundleId ? false : input.repliedToActiveCard,
   );
   setMessageFollowUp(input.targetJid, input.messageId, {
     mode,
@@ -19401,6 +19400,86 @@ function handleCardInterrupt(
     });
   }
   return { ok: true, state: 'interrupting', message: '已停止当前回复。' };
+}
+
+/**
+ * Feishu `/break` is a session cutoff, not a message for the Agent. Cancel
+ * everything that was already durably queued, then interrupt the exact active
+ * query. Messages admitted after this synchronous cutoff remain runnable.
+ */
+async function handleFeishuSessionBreak(input: {
+  sourceJid: string;
+  targetJid?: string;
+  senderImId: string;
+}): Promise<string> {
+  let targetJid = input.targetJid;
+  if (!targetJid) {
+    const group =
+      registeredGroups[input.sourceJid] ?? getRegisteredGroup(input.sourceJid);
+    if (group) {
+      targetJid = resolveBoundChatTarget(
+        input.sourceJid,
+        group,
+        (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+        getAgent,
+        findGroupNameByFolder,
+        resolveWorkspaceJid,
+      )?.targetChatJid;
+    }
+  }
+  if (!targetJid) return '当前绑定目标不存在，无法执行 /break。';
+
+  const deliveryUpdatedAt = new Date().toISOString();
+  const cancelled = cancelQueuedFollowUpsAtCutoff(targetJid, deliveryUpdatedAt);
+  for (const item of cancelled) {
+    broadcastFollowUpUpdate(targetJid, {
+      id: item.id,
+      delivery_status: 'cancelled',
+      delivery_run_id: item.delivery_run_id,
+      delivery_updated_at: deliveryUpdatedAt,
+    });
+    const indicatorJid =
+      item.source_jid && getChannelType(item.source_jid)
+        ? item.source_jid
+        : getChannelType(targetJid)
+          ? targetJid
+          : null;
+    if (indicatorJid) {
+      void clearStandaloneProcessingIndicator(targetJid, indicatorJid, item.id);
+    }
+  }
+
+  const activeRunId = queue.getActiveQueryId(targetJid);
+  const interrupted = activeRunId
+    ? queue.interruptQuery(targetJid, activeRunId)
+    : false;
+  if (interrupted) {
+    void clearTrackedProcessingIndicators(targetJid);
+    const session = getStreamingSession(targetJid);
+    if (session?.isActive()) {
+      void session.abort('已停止').catch((err) => {
+        logger.debug(
+          { err, targetJid },
+          'Failed to abort streaming card for /break',
+        );
+      });
+    }
+  }
+
+  logger.info(
+    {
+      sourceJid: input.sourceJid,
+      targetJid,
+      senderImId: input.senderImId,
+      activeRunId,
+      interrupted,
+      cancelledMessageIds: cancelled.map((item) => item.id),
+    },
+    'Feishu session break processed',
+  );
+  return interrupted || cancelled.length > 0
+    ? '已停止当前任务，并取消此前排队的消息。'
+    : '当前没有正在执行或排队的任务。';
 }
 
 function resolveChannelAccountWorkspace(account: ChannelAccount): {
@@ -19507,6 +19586,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
               () => secret.ownerOpenId || undefined,
             ),
           onFollowUpMessage: handleIncomingFollowUp,
+          onSessionBreak: handleFeishuSessionBreak,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
           onP2pSender: (senderOpenId: string) => {
@@ -20427,6 +20507,7 @@ async function main(): Promise<void> {
             isSenderAllowedInGroup: (jid: string, sender?: string) =>
               isSenderAllowedInGroup(jid, sender, getReloadOwnerOpenId),
             onFollowUpMessage: handleIncomingFollowUp,
+            onSessionBreak: handleFeishuSessionBreak,
             onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
             onP2pSender: onReloadP2pSender,

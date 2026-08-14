@@ -3352,6 +3352,43 @@ export function cancelQueuedFollowUp(
 }
 
 /**
+ * Atomically cancel the durable follow-up cutoff captured by `/break`.
+ * Rows arriving after this synchronous transaction are not part of the
+ * cutoff and continue through the normal queue. A covered late-forward root
+ * is cancelled with its owning note so the audit trail does not leave half a
+ * bundle hidden as `subsumed`.
+ */
+export function cancelQueuedFollowUpsAtCutoff(
+  chatJid: string,
+  updatedAt = new Date().toISOString(),
+): QueuedFollowUp[] {
+  return db.transaction(() => {
+    const items = listQueuedFollowUps(chatJid);
+    if (items.length === 0) return [];
+    const cancelQueued = db.prepare(
+      `UPDATE messages
+       SET delivery_status = 'cancelled', delivery_updated_at = ?
+       WHERE chat_jid = ? AND id = ?
+         AND delivery_status IN ('queued', 'promoting')`,
+    );
+    const cancelCoveredRoot = db.prepare(
+      `UPDATE messages
+       SET delivery_status = 'cancelled', delivery_updated_at = ?
+       WHERE chat_jid = ? AND delivery_status = 'subsumed'
+         AND delivery_run_id = ?`,
+    );
+    for (const item of items) {
+      const result = cancelQueued.run(updatedAt, chatJid, item.id);
+      if (result.changes !== 1) {
+        throw new Error(`Failed to cancel follow-up cutoff row ${item.id}`);
+      }
+      cancelCoveredRoot.run(updatedAt, chatJid, item.id);
+    }
+    return items;
+  })();
+}
+
+/**
  * Read the `attachments` JSON column for a single message row, or null
  * if the row is missing (caller treats null as "no persisted state").
  */

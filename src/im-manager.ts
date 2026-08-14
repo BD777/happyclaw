@@ -175,8 +175,12 @@ export interface ConnectFeishuOptions {
     senderImId: string;
     requestedMode?: FollowUpMode;
     coalesceBundleId?: string;
-    repliedToActiveCard: boolean;
   }) => FollowUpDisposition;
+  onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
   onFollowUpCardAction?: (input: {
     sourceJid: string;
     targetJid: string;
@@ -452,6 +456,21 @@ export class IMConnectionManager {
               inboundAllowed()
                 ? opts.onFollowUpMessage!(input)
                 : { disposition: 'queued' as const },
+          }
+        : {}),
+      ...(opts.onSessionBreak
+        ? {
+            onSessionBreak: (input: {
+              sourceJid: string;
+              targetJid?: string;
+              senderImId: string;
+            }) =>
+              inboundAllowed()
+                ? opts.onSessionBreak!({
+                    ...input,
+                    sourceJid: scope(input.sourceJid),
+                  })
+                : Promise.resolve('当前通道暂不可用。'),
           }
         : {}),
       ...(opts.onFollowUpCardAction
@@ -1229,6 +1248,7 @@ export class IMConnectionManager {
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onFollowUpMessage: options?.onFollowUpMessage,
+        onSessionBreak: options?.onSessionBreak,
         onFollowUpCardAction: options?.onFollowUpCardAction,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,

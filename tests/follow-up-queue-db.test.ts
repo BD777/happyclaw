@@ -424,4 +424,67 @@ describe('durable follow-up queue', () => {
     expect(db.cancelQueuedFollowUp(jid, 'om_note_owner')).toBeNull();
     expect(db.getQueuedFollowUp(jid, 'om_note_owner')).not.toBeNull();
   });
+
+  test('/break atomically cancels the current queue cutoff including a covered root', () => {
+    const jid = 'web:follow-up-break-cutoff';
+    db.ensureChatExists(jid);
+    for (const [id, timestamp] of [
+      ['first', '2026-07-20T05:00:00.000Z'],
+      ['note', '2026-07-20T05:00:01.000Z'],
+    ]) {
+      db.storeMessageDirect(id, jid, 'user-1', 'User', id, timestamp, false, {
+        meta: {
+          deliveryMode: 'queue',
+          deliveryStatus: 'queued',
+          deliveryRunId: 'run-active',
+        },
+      });
+    }
+    db.storeMessageDirect(
+      'covered-root',
+      jid,
+      'user-1',
+      'User',
+      '[合并转发消息]',
+      '2026-07-20T04:59:59.000Z',
+      false,
+      {
+        meta: {
+          deliveryStatus: 'subsumed',
+          deliveryRunId: 'note',
+        },
+      },
+    );
+
+    expect(
+      db
+        .cancelQueuedFollowUpsAtCutoff(jid, '2026-07-20T05:00:02.000Z')
+        .map((item) => item.id),
+    ).toEqual(['first', 'note']);
+    expect(db.listQueuedFollowUps(jid)).toEqual([]);
+    const statuses = new Map(
+      db
+        .getMessagesPage(jid)
+        .map((message) => [message.id, message.delivery_status]),
+    );
+    expect(statuses.get('first')).toBe('cancelled');
+    expect(statuses.get('note')).toBe('cancelled');
+    expect(statuses.get('covered-root')).toBe('cancelled');
+
+    db.storeMessageDirect(
+      'after-break',
+      jid,
+      'user-1',
+      'User',
+      'after',
+      '2026-07-20T05:00:03.000Z',
+      false,
+      {
+        meta: { deliveryMode: 'queue', deliveryStatus: 'queued' },
+      },
+    );
+    expect(db.listQueuedFollowUps(jid).map((item) => item.id)).toEqual([
+      'after-break',
+    ]);
+  });
 });
