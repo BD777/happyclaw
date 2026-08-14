@@ -200,7 +200,6 @@ import {
   releaseQueuedFollowUp,
   releaseQueuedFollowUpBatch,
   restorePromotingFollowUpBatch,
-  restorePromotingFollowUp,
   setMessageFollowUp,
   updateQueuedFollowUpContent,
 } from './db.js';
@@ -1461,7 +1460,7 @@ const activeHeldCardFinalizers = new Map<
 
 interface PreparedFollowUp {
   messages: NewMessage[];
-  replyText?: string;
+  replies: Array<{ item: QueuedFollowUp; text: string }>;
 }
 
 function resolveFollowUpRuntime(chatJid: string): {
@@ -1496,13 +1495,13 @@ async function prepareFollowUp(
 ): Promise<PreparedFollowUp> {
   const item = items[items.length - 1];
   const runtime = resolveFollowUpRuntime(item.chat_jid);
-  if (!runtime) return { messages: items };
+  if (!runtime) return { messages: items, replies: [] };
   const expandContext = buildExpandContext(
     item.chat_jid,
     runtime.effectiveGroup,
     runtime.effectiveGroup.created_by,
   );
-  if (!expandContext) return { messages: items };
+  if (!expandContext) return { messages: items, replies: [] };
   const { toSend, replies } = await expandMessagesIfNeeded(
     items,
     expandContext,
@@ -1511,7 +1510,10 @@ async function prepareFollowUp(
   );
   return {
     messages: toSend,
-    replyText: replies[0]?.text,
+    replies: replies.map((reply) => ({
+      item: reply.originalMsg,
+      text: reply.text,
+    })),
   };
 }
 
@@ -1688,7 +1690,6 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
     queue.releaseQueryReservation(chatJid, reservedRunId);
     return;
   }
-  const item = items[items.length - 1];
   const batchCoverage = createIpcDeliveryTarget(chatJid, items);
   if (batchCoverage) {
     queue.setCurrentQueryCoverage(chatJid, reservedRunId, batchCoverage);
@@ -1710,26 +1711,40 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
       queue.releaseQueryReservation(chatJid, reservedRunId, true);
       return;
     }
-    if (
-      items.length === 1 &&
-      prepared.replyText &&
-      prepared.messages.length === 0
-    ) {
-      const completed = await completeFollowUpReply(item, prepared.replyText);
+    for (const reply of prepared.replies) {
+      const completed = await completeFollowUpReply(reply.item, reply.text);
       if (!completed) {
-        restorePromotingFollowUp(chatJid, item.id);
+        const remaining = items.filter((queued) =>
+          getQueuedFollowUp(chatJid, queued.id),
+        );
+        if (remaining.length > 0 && !restorePromotingFollowUpBatch(remaining)) {
+          logger.error(
+            {
+              chatJid,
+              messageIds: remaining.map((queued) => queued.id),
+              runId: reservedRunId,
+            },
+            'Failed to restore queued follow-ups after a plugin reply failure',
+          );
+        }
         broadcastFollowUpUpdate(chatJid);
-      }
-      queue.releaseQueryReservation(chatJid, reservedRunId, completed);
-      if (!completed) {
+        queue.releaseQueryReservation(chatJid, reservedRunId);
         const retryTimer = setTimeout(() => {
           void dispatchNextQueuedFollowUp(chatJid);
         }, 1_000);
         retryTimer.unref();
+        return;
       }
+    }
+    const agentMessageIds = new Set(
+      prepared.messages.map((message) => message.id),
+    );
+    const agentItems = items.filter((queued) => agentMessageIds.has(queued.id));
+    if (agentItems.length === 0) {
+      queue.releaseQueryReservation(chatJid, reservedRunId, true);
       return;
     }
-    const result = injectPreparedFollowUp(items, prepared, reservedRunId);
+    const result = injectPreparedFollowUp(agentItems, prepared, reservedRunId);
     if (result !== 'sent') {
       queue.releaseQueryReservation(chatJid, reservedRunId);
     }

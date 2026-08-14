@@ -94,7 +94,7 @@ describe('durable follow-up queue', () => {
     ).toBe(true);
   });
 
-  test('does not pull an unrelated queued message into a forward bundle', () => {
+  test('snapshots ordinary Web and Feishu forward messages into one turn', () => {
     const jid = 'web:follow-up-forward-boundary';
     db.ensureChatExists(jid);
     for (const [index, id] of ['ordinary', 'om_root', 'om_note'].entries()) {
@@ -142,10 +142,78 @@ describe('durable follow-up queue', () => {
       db
         .claimNextQueuedFollowUpBatch(jid, 'run-ordinary')
         .map((item) => item.id),
-    ).toEqual(['ordinary']);
+    ).toEqual(['ordinary', 'om_root', 'om_note']);
+    expect(db.claimNextQueuedFollowUpBatch(jid, 'run-empty')).toEqual([]);
+  });
+
+  test('keeps an explicit steer as a single-message barrier', () => {
+    const jid = 'web:follow-up-steer-barrier';
+    db.ensureChatExists(jid);
+    for (const [index, id] of ['first', 'second', 'third'].entries()) {
+      db.storeMessageDirect(
+        id,
+        jid,
+        'user-1',
+        'User',
+        id,
+        new Date(Date.parse('2026-07-20T01:30:00.000Z') + index).toISOString(),
+        false,
+        {
+          meta: {
+            deliveryMode: 'queue',
+            deliveryStatus: 'queued',
+            deliveryRunId: 'run-current',
+          },
+        },
+      );
+    }
+
     expect(
-      db.claimNextQueuedFollowUpBatch(jid, 'run-bundle').map((item) => item.id),
-    ).toEqual(['om_root', 'om_note']);
+      db.prioritizeQueuedFollowUp(jid, 'second', 'run-current'),
+    ).toMatchObject({ delivery_mode: 'steer' });
+    expect(
+      db.claimNextQueuedFollowUpBatch(jid, 'run-steer').map((item) => item.id),
+    ).toEqual(['second']);
+    expect(
+      db.claimNextQueuedFollowUpBatch(jid, 'run-queued').map((item) => item.id),
+    ).toEqual(['first', 'third']);
+  });
+
+  test('leaves messages admitted after a snapshot for the following turn', () => {
+    const jid = 'web:follow-up-snapshot-boundary';
+    db.ensureChatExists(jid);
+    const store = (id: string, timestamp: string) =>
+      db.storeMessageDirect(id, jid, 'user-1', 'User', id, timestamp, false, {
+        meta: {
+          deliveryMode: 'queue',
+          deliveryStatus: 'queued',
+          deliveryRunId: 'run-current',
+        },
+      });
+
+    store('before-one', '2026-07-20T01:45:00.000Z');
+    store('before-two', '2026-07-20T01:45:01.000Z');
+    expect(
+      db
+        .claimNextQueuedFollowUpBatch(jid, 'run-snapshot')
+        .map((item) => item.id),
+    ).toEqual(['before-one', 'before-two']);
+
+    store('after-snapshot', '2026-07-20T01:45:02.000Z');
+    expect(db.listQueuedFollowUps(jid)).toEqual([
+      expect.objectContaining({
+        id: 'before-one',
+        delivery_status: 'promoting',
+      }),
+      expect.objectContaining({
+        id: 'before-two',
+        delivery_status: 'promoting',
+      }),
+      expect.objectContaining({
+        id: 'after-snapshot',
+        delivery_status: 'queued',
+      }),
+    ]);
   });
 
   test('hides queued rows from the runner and releases them in priority order', () => {

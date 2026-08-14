@@ -120,6 +120,11 @@ Radix UI。路由以 `web/src/App.tsx` 为准：
 
 - 同一序列化键内的消息保持顺序。
 - 不同飞书话题、不同 Runtime Session 使用不同序列化键，可以并发。
+- Agent loop 运行期间到达的普通消息逐条进入可见、可编辑和可排序的 durable 队列；
+  当前 loop 自然结束后，调度器原子快照当时剩余的普通队列，并将其作为一个批次交给
+  下一轮 Agent。Web 与飞书等渠道共用这套 Workspace/Session 级语义。
+- 显式“发送”或 `steer` 是单条优先屏障：它可以中断当前 loop，但不会顺带吞并后面的
+  普通排队消息；后续普通消息留到再下一轮合批。
 - 普通消息与定时任务使用明确的队列状态；失败采用有界指数退避。
 - `CONTAINER_TIMEOUT` 控制单次运行上限，`IDLE_TIMEOUT` 控制暖 Runner 的空闲保留时间。
 - Script 任务与其他任务共用 `CONTAINER_TIMEOUT`，不设置独立并发池或超时配置。

@@ -96,7 +96,6 @@ import {
   reconcileLegacyOwnerProfileMemory,
 } from './owner-profile-store.js';
 import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
-import { resolveForwardBundleBatchAnchor } from './forward-bundle-batch.js';
 
 let db: InstanceType<typeof Database>;
 /**
@@ -3189,10 +3188,14 @@ export function claimNextQueuedFollowUp(
 }
 
 /**
- * Claim the next durable follow-up, plus immediately adjacent messages that
- * the provider has structurally identified as the same merged-forward bundle.
- * Keeping this atomic prevents an idle runner from processing the forwarded
- * material and its authored note as two independent Agent turns.
+ * Atomically snapshot the next durable follow-up turn.
+ *
+ * Normal queued messages are drained together in the user-visible queue order
+ * so a burst received while an Agent loop is active becomes one subsequent
+ * Agent turn.  A steer is an explicit priority hand-off and therefore remains
+ * a single-message barrier; later queued messages wait for the turn after it.
+ * Rows admitted after this transaction are intentionally left for the next
+ * snapshot.
  */
 export function claimNextQueuedFollowUpBatch(
   chatJid: string,
@@ -3213,12 +3216,16 @@ export function claimNextQueuedFollowUpBatch(
     const rows = select.all(chatJid) as Array<Record<string, unknown>>;
     if (rows.length === 0) return [];
     const queued = rows.map(normalizeQueuedFollowUpRow);
-    let batchSize = 1;
-    for (let size = 2; size <= queued.length; size += 1) {
-      if (!resolveForwardBundleBatchAnchor(queued.slice(0, size))) break;
-      batchSize = size;
-    }
-    const claimed = queued.slice(0, batchSize);
+    const firstSteerIndex = queued.findIndex(
+      (item) => item.delivery_mode === 'steer',
+    );
+    const claimed =
+      firstSteerIndex === 0
+        ? queued.slice(0, 1)
+        : queued.slice(
+            0,
+            firstSteerIndex === -1 ? queued.length : firstSteerIndex,
+          );
     const updatedAt = new Date().toISOString();
     for (const item of claimed) {
       const result = update.run(runId, updatedAt, chatJid, item.id);
