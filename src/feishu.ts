@@ -4,6 +4,9 @@ import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import {
+  findForwardBundleCommentTail,
+  findForwardBundleCoveringComment,
+  sequenceInboundTimestampAfterChatTail,
   storeChatMetadata,
   storeMessageDirect,
   updateChatName,
@@ -51,6 +54,7 @@ import {
   type FeishuCapabilityResult,
 } from './feishu-capability.js';
 import { enrichFeishuInboundContent } from './feishu-rich-content.js';
+import { FeishuForwardBundleResolver } from './feishu-forward-bundle.js';
 import {
   advanceChannelCursor,
   claimChannelInboxById,
@@ -70,6 +74,7 @@ import {
   processingIndicatorKey,
 } from './processing-indicator.js';
 import type {
+  ChannelContentLink,
   ChannelReferencedMessage,
   ChannelTurnContext,
   FeishuMessageMeta,
@@ -78,6 +83,11 @@ import type {
   FollowUpDisposition,
   FollowUpMode,
 } from './types.js';
+
+// All live/recovery connections in this process share the same per-account,
+// per-chat intake lane. This closes the common HA/reconnect race where one
+// connection handles the root while another handles its authored note.
+const feishuInboundTailByRoute = new Map<string, Promise<void>>();
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -131,6 +141,7 @@ export interface ConnectOptions {
     messageId: string;
     senderImId: string;
     requestedMode?: FollowUpMode;
+    coalesceBundleId?: string;
     repliedToActiveCard: boolean;
   }) => FollowUpDisposition;
   /** Handle buttons on the compact queued-message card. */
@@ -439,6 +450,7 @@ export function buildFeishuChannelTurnContext(input: {
     parentId?: string;
     threadId?: string;
     type?: string;
+    contentLink?: ChannelContentLink;
     referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
@@ -497,6 +509,9 @@ export function buildFeishuChannelTurnContext(input: {
       ...(input.message.parentId ? { parentId: input.message.parentId } : {}),
       ...(input.message.threadId ? { threadId: input.message.threadId } : {}),
       ...(input.message.type ? { type: input.message.type } : {}),
+      ...(input.message.contentLink
+        ? { contentLink: input.message.contentLink }
+        : {}),
       ...(input.message.referencedMessages?.length
         ? { referencedMessages: input.message.referencedMessages }
         : {}),
@@ -1163,6 +1178,13 @@ export function createFeishuConnection(
   let disconnectedChecks = 0;
   let healthTimer: NodeJS.Timeout | null = null;
   let inboxRecoveryTimer: NodeJS.Timeout | null = null;
+  const forwardBundles = new FeishuForwardBundleResolver(async (messageId) => {
+    if (!client) return undefined;
+    return client.im.v1.message.get({
+      path: { message_id: messageId },
+      params: { card_msg_content_type: 'user_card_content' },
+    });
+  });
   // botOpenId 自愈状态：lastBotInfoFetchAt 防止 lazy refetch 高频骚扰 OAPI；
   // botInfoRefetchInFlight 防止并发拉取
   let lastBotInfoFetchAt = 0;
@@ -1170,6 +1192,38 @@ export function createFeishuConnection(
   // mention gate fail-closed 的 warn 节流：避免 botOpenId 长时间缺失时日志洪水
   let lastBotInfoMissingWarnAt = 0;
   let botInfoMissingDroppedSinceLastWarn = 0;
+
+  async function serializeInboundForChat(
+    chatId: string,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const routeKey = `${reliabilityAccountId}\u0000${chatId}`;
+    const previous =
+      feishuInboundTailByRoute.get(routeKey) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    feishuInboundTailByRoute.set(routeKey, current);
+    try {
+      await current;
+    } finally {
+      if (feishuInboundTailByRoute.get(routeKey) === current) {
+        feishuInboundTailByRoute.delete(routeKey);
+      }
+    }
+  }
+
+  async function processClaimedInboundSerialized(
+    payload: IncomingMessagePayload,
+    source: 'ws' | 'backfill',
+    claim: ClaimedChannelInboxItem,
+  ): Promise<void> {
+    // Claims may wait behind rich-content work from an earlier physical event.
+    // Begin renewal before entering that shared lane so the DB lease remains
+    // fenced for the whole wait.
+    startInboxHeartbeat(claim);
+    await serializeInboundForChat(payload.chatId, () =>
+      processClaimedIncomingMessage(payload, source, claim),
+    );
+  }
 
   function rememberChatProgress(
     chatId: string,
@@ -1826,7 +1880,7 @@ export function createFeishuConnection(
       );
       return;
     }
-    await processClaimedIncomingMessage(payload, source, claim);
+    await processClaimedInboundSerialized(payload, source, claim);
   }
 
   async function processClaimedIncomingMessage(
@@ -1834,7 +1888,6 @@ export function createFeishuConnection(
     source: 'ws' | 'backfill',
     claim: ClaimedChannelInboxItem,
   ): Promise<void> {
-    startInboxHeartbeat(claim);
     if (connectOptions?.shouldDeferInbound?.()) {
       failClaimedInbound(
         claim,
@@ -1880,6 +1933,20 @@ export function createFeishuConnection(
       senderTenantKey,
       senderType,
     } = payload;
+    const forwardCandidate = {
+      messageId,
+      messageType,
+      content: rawContent,
+      rootId,
+      parentId,
+      threadId,
+      senderOpenId,
+      createTimeMs,
+    };
+    // Register roots before any rich-content lookup. A concurrently delivered
+    // note may otherwise finish normalization first and miss the structural
+    // fact even though both provider events are already in this process.
+    let contentLink = forwardBundles.observeRoot(forwardCandidate);
     if (!chatId || !messageId) {
       failClaimedInbound(
         claim,
@@ -2395,6 +2462,13 @@ export function createFeishuConnection(
       }
       const agentRouting = admittedRoute.routing;
 
+      // Known commands and rejected messages returned above. Only an admitted
+      // textual direct child may spend a message.get lookup to prove that its
+      // root is a merge_forward from the same sender.
+      if (!contentLink) {
+        contentLink = await forwardBundles.resolveCompanion(forwardCandidate);
+      }
+
       // Event payloads intentionally contain only a lossy placeholder for
       // cards and merged forwards. Resolve their complete user-facing content
       // and bounded quoted context only after audience, mention and binding
@@ -2440,7 +2514,7 @@ export function createFeishuConnection(
       }
       lastMessageIdByChat.set(chatId, messageId);
       const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
-      const timestamp = new Date(resolvedCreateTimeMs).toISOString();
+      let timestamp = new Date(resolvedCreateTimeMs).toISOString();
 
       let attachmentsJson: string | undefined;
 
@@ -2454,7 +2528,20 @@ export function createFeishuConnection(
       const referencedImageRefs = enriched.referencedImageRefs ?? [];
       const referencedMessages: ChannelReferencedMessage[] = (
         enriched.references ?? []
-      ).map((reference) => ({ ...reference }));
+      ).map((reference) => ({
+        ...reference,
+        ...(contentLink?.role === 'forwarder_comment' &&
+        reference.id === contentLink.bundleId
+          ? {
+              contentLink: {
+                kind: 'forward_bundle' as const,
+                bundleId: contentLink.bundleId,
+                role: 'forwarded_content' as const,
+                relatedMessageId: messageId,
+              },
+            }
+          : {}),
+      }));
       const replaceReferenceMarker = (
         referenceMessageId: string,
         marker: string,
@@ -2542,6 +2629,10 @@ export function createFeishuConnection(
             ref.imageKey,
           );
           if (!imageData) {
+            const failedReference = referencedMessages.find(
+              (item) => item.id === ref.referenceMessageId,
+            );
+            if (failedReference) failedReference.materialResolved = false;
             replaceReferenceMarker(
               ref.referenceMessageId,
               ref.marker,
@@ -2713,6 +2804,7 @@ export function createFeishuConnection(
           parentId,
           threadId,
           type: messageType,
+          contentLink,
           referencedMessages,
         },
         sender: {
@@ -2728,6 +2820,16 @@ export function createFeishuConnection(
         targetJid,
         sessionAgentId: targetAgentId,
       });
+      const forwardCommentCarriesCompleteMaterial =
+        contentLink?.role === 'forwarder_comment' &&
+        referencedMessages.some(
+          (reference) =>
+            reference.id === contentLink!.bundleId &&
+            reference.materialResolved === true &&
+            reference.contentLink?.kind === 'forward_bundle' &&
+            reference.contentLink.bundleId === contentLink!.bundleId &&
+            reference.contentLink.role === 'forwarded_content',
+        );
       updateClaimedChannelInbox(claim, {
         normalizedPayload: {
           version: 1,
@@ -2738,6 +2840,30 @@ export function createFeishuConnection(
         },
       });
 
+      const earlierBundleComment =
+        contentLink?.role === 'forwarded_content'
+          ? findForwardBundleCommentTail(
+              targetJid,
+              contentLink.bundleId,
+              senderOpenId,
+              timestamp,
+            )
+          : null;
+      const subsumedByMessageId =
+        contentLink?.role === 'forwarded_content'
+          ? findForwardBundleCoveringComment(
+              targetJid,
+              contentLink.bundleId,
+              senderOpenId,
+            )
+          : null;
+      if (earlierBundleComment && !subsumedByMessageId) {
+        // The note was admitted first but could not carry a complete copy of
+        // the root. Keep the late root independently runnable by placing it
+        // after the durable chat tail; its original provider time remains in
+        // the rendered forwarded material/context rather than cursor order.
+        timestamp = sequenceInboundTimestampAfterChatTail(targetJid, timestamp);
+      }
       storeChatMetadata(targetJid, timestamp);
       storeMessageDirect(
         messageId,
@@ -2751,18 +2877,46 @@ export function createFeishuConnection(
           attachments: attachmentsJson,
           sourceJid: routeSourceJid,
           channelContext,
+          ...(subsumedByMessageId
+            ? {
+                meta: {
+                  deliveryStatus: 'subsumed' as const,
+                  deliveryRunId: subsumedByMessageId,
+                  deliveryUpdatedAt: new Date().toISOString(),
+                },
+              }
+            : {}),
         },
       );
-      const followUp = onFollowUpMessage?.({
-        targetJid,
-        sourceJid: routeSourceJid,
-        messageId,
-        senderImId: senderOpenId,
-        requestedMode: requestedFollowUpMode,
-        repliedToActiveCard: !!parentId && !!resolveJidByMessageId(parentId),
-      }) ?? { disposition: 'started' as const };
-      const deliveryFields =
-        followUp.disposition === 'queued'
+      const followUp = subsumedByMessageId
+        ? ({ disposition: 'started' } as const)
+        : (onFollowUpMessage?.({
+            targetJid,
+            sourceJid: routeSourceJid,
+            messageId,
+            senderImId: senderOpenId,
+            // Explicit composer commands remain authoritative. Structural
+            // coalescing is decided by the scheduler, which can prove whether
+            // the active query actually owns this bundle root before
+            // interrupting it.
+            requestedMode: requestedFollowUpMode,
+            coalesceBundleId:
+              !requestedFollowUpMode &&
+              !slashMatch &&
+              forwardCommentCarriesCompleteMaterial &&
+              contentLink
+                ? contentLink.bundleId
+                : undefined,
+            repliedToActiveCard:
+              !!parentId && !!resolveJidByMessageId(parentId),
+          }) ?? { disposition: 'started' as const });
+      const deliveryFields = subsumedByMessageId
+        ? {
+            delivery_status: 'subsumed' as const,
+            delivery_run_id: subsumedByMessageId,
+            delivery_updated_at: new Date().toISOString(),
+          }
+        : followUp.disposition === 'queued'
           ? {
               delivery_mode: 'queue' as const,
               delivery_status: 'queued' as const,
@@ -2796,6 +2950,20 @@ export function createFeishuConnection(
         },
         targetAgentId ?? undefined,
       );
+      if (subsumedByMessageId) {
+        await clearAckForInput(routeSourceJid, messageId).catch((err) =>
+          logger.debug(
+            { err, messageId, subsumedByMessageId },
+            'Failed to clear acknowledgement for covered forward root',
+          ),
+        );
+        logger.info(
+          { chatJid, targetJid, messageId, subsumedByMessageId },
+          'Late merged-forward root preserved without redundant Agent turn',
+        );
+        completeClaimedInbound(claim, payload);
+        return;
+      }
       if (followUp.disposition === 'queued') {
         broadcastFollowUpUpdate(targetJid);
         const position = followUp.position ?? 1;
@@ -3059,7 +3227,7 @@ export function createFeishuConnection(
         );
         continue;
       }
-      await processClaimedIncomingMessage(
+      await processClaimedInboundSerialized(
         envelope.payload,
         envelope.source,
         claim,

@@ -174,6 +174,7 @@ export interface ConnectFeishuOptions {
     messageId: string;
     senderImId: string;
     requestedMode?: FollowUpMode;
+    coalesceBundleId?: string;
     repliedToActiveCard: boolean;
   }) => FollowUpDisposition;
   onFollowUpCardAction?: (input: {

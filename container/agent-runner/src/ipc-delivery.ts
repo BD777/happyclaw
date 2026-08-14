@@ -210,6 +210,13 @@ export class IpcTurnDeliveryTracker {
     return latestIpcDeliveryId(this.turns[0] ?? []);
   }
 
+  /** Durable receipts owned by the SDK turn producing output right now. */
+  get currentTurnReceipts(): IpcDeliveryReceipt[] {
+    return this.currentTurnMessages
+      .map((message) => message.receipt)
+      .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
+  }
+
   /** Accepted follow-up turns after the current one, kept in delivery order. */
   get laterTurnMessages(): IpcInputMessage[] {
     return this.turns.slice(1).flatMap((turn) => turn);

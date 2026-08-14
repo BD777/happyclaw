@@ -96,6 +96,7 @@ import {
   reconcileLegacyOwnerProfileMemory,
 } from './owner-profile-store.js';
 import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
+import { resolveForwardBundleBatchAnchor } from './forward-bundle-batch.js';
 
 let db: InstanceType<typeof Database>;
 /**
@@ -193,7 +194,7 @@ function stmts() {
                 delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
-           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled')
+           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
          ORDER BY timestamp ASC, id ASC`,
       ),
       getExpiredSessionIds: db.prepare(
@@ -216,7 +217,7 @@ function getNewMessagesStmt(jidCount: number): any {
          AND chat_jid IN (${placeholders})
          AND is_from_me = 0
          AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
-         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled')
+         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
        ORDER BY timestamp ASC, id ASC`,
     );
     // Cap cache size to avoid unbounded growth in deployments where the
@@ -2776,6 +2777,132 @@ export function getMessageChannelTurnContext(
   return parseChannelTurnContext(row?.channel_context) ?? null;
 }
 
+/**
+ * Find a previously admitted note that already carries the complete material
+ * for this physical merged-forward root. This durable lookup lets a root event
+ * that arrives after its note remain visible in history without scheduling a
+ * redundant Agent turn. Merely sharing a bundle id is not enough: enrichment
+ * must have persisted the provider-fetched root as forwarded material.
+ */
+export function findForwardBundleCoveringComment(
+  chatJid: string,
+  bundleId: string,
+  sender: string,
+): string | null {
+  const rows = db
+    .prepare(
+      `SELECT id, channel_context
+       FROM messages
+       WHERE chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND channel_context IS NOT NULL
+         AND COALESCE(delivery_status, '') <> 'cancelled'
+         AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarder_comment'
+       ORDER BY timestamp DESC, id DESC`,
+    )
+    .all(chatJid, sender, bundleId) as Array<{
+    id: string;
+    channel_context?: unknown;
+  }>;
+  for (const row of rows) {
+    const context = parseChannelTurnContext(row.channel_context);
+    if (!context) continue;
+    const link = context.message.contentLink;
+    if (
+      link?.kind !== 'forward_bundle' ||
+      link.bundleId !== bundleId ||
+      link.role !== 'forwarder_comment'
+    ) {
+      continue;
+    }
+    const coversRoot = context.message.referencedMessages?.some(
+      (reference) =>
+        reference.id === bundleId &&
+        reference.materialResolved === true &&
+        reference.contentLink?.kind === 'forward_bundle' &&
+        reference.contentLink.bundleId === bundleId &&
+        reference.contentLink.role === 'forwarded_content',
+    );
+    if (coversRoot) return String(row.id);
+  }
+  return null;
+}
+
+/** Find any already-persisted companion note for a provider bundle, including
+ * a note that was cancelled or whose quoted material was incomplete. The
+ * result is used only to recognize a root event that arrived out of provider
+ * order; delivery eligibility remains the responsibility of the covering
+ * lookup above. The raw direct-parent shape is included because a best-effort
+ * note-first OAPI probe can return no item, leaving no link to persist even
+ * though the later root proves the relation. */
+export function findForwardBundleCommentTail(
+  chatJid: string,
+  bundleId: string,
+  sender: string,
+  rootTimestamp: string,
+): { id: string; timestamp: string } | null {
+  const rootMs = Date.parse(rootTimestamp);
+  const latestCompanionTimestamp = Number.isFinite(rootMs)
+    ? new Date(rootMs + 60_000).toISOString()
+    : rootTimestamp;
+  const row = db
+    .prepare(
+      `SELECT id, timestamp
+       FROM messages
+       WHERE chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND channel_context IS NOT NULL
+         AND json_valid(channel_context)
+         AND timestamp >= ? AND timestamp <= ?
+         AND (
+           (
+             json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+             AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+             AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarder_comment'
+           ) OR (
+             json_extract(channel_context, '$.message.rootId') = ?
+             AND json_extract(channel_context, '$.message.parentId') = ?
+             AND json_extract(channel_context, '$.message.type') IN ('text', 'post')
+           )
+         )
+       ORDER BY timestamp DESC, id DESC
+       LIMIT 1`,
+    )
+    .get(
+      chatJid,
+      sender,
+      rootTimestamp,
+      latestCompanionTimestamp,
+      bundleId,
+      bundleId,
+      bundleId,
+    ) as { id: string; timestamp: string } | undefined;
+  return row ?? null;
+}
+
+/** Preserve actual admission order for a provider event known to have arrived
+ * late. Cursor readers are intentionally monotonic in `(timestamp,id)`; using
+ * the root's older provider create_time here would make a complete late root
+ * permanently invisible after its newer note committed. */
+export function sequenceInboundTimestampAfterChatTail(
+  chatJid: string,
+  proposedTimestamp: string,
+): string {
+  const row = db
+    .prepare(
+      `SELECT timestamp FROM messages
+       WHERE chat_jid = ? AND is_from_me = 0
+       ORDER BY timestamp DESC, id DESC LIMIT 1`,
+    )
+    .get(chatJid) as { timestamp?: string } | undefined;
+  const tail = row?.timestamp;
+  if (!tail || proposedTimestamp > tail) return proposedTimestamp;
+  const tailMs = Date.parse(tail);
+  if (!Number.isFinite(tailMs)) return proposedTimestamp;
+  return new Date(tailMs + 1).toISOString();
+}
+
 function normalizeQueuedFollowUpRow(
   row: Record<string, unknown>,
 ): QueuedFollowUp {
@@ -3061,6 +3188,50 @@ export function claimNextQueuedFollowUp(
   })();
 }
 
+/**
+ * Claim the next durable follow-up, plus immediately adjacent messages that
+ * the provider has structurally identified as the same merged-forward bundle.
+ * Keeping this atomic prevents an idle runner from processing the forwarded
+ * material and its authored note as two independent Agent turns.
+ */
+export function claimNextQueuedFollowUpBatch(
+  chatJid: string,
+  runId: string,
+): QueuedFollowUp[] {
+  const select = db.prepare(
+    `${FOLLOW_UP_SELECT}
+     WHERE chat_jid = ? AND delivery_status = 'queued'
+     ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+  );
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'promoting', delivery_run_id = ?,
+         delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ? AND delivery_status = 'queued'`,
+  );
+  return db.transaction(() => {
+    const rows = select.all(chatJid) as Array<Record<string, unknown>>;
+    if (rows.length === 0) return [];
+    const queued = rows.map(normalizeQueuedFollowUpRow);
+    let batchSize = 1;
+    for (let size = 2; size <= queued.length; size += 1) {
+      if (!resolveForwardBundleBatchAnchor(queued.slice(0, size))) break;
+      batchSize = size;
+    }
+    const claimed = queued.slice(0, batchSize);
+    const updatedAt = new Date().toISOString();
+    for (const item of claimed) {
+      const result = update.run(runId, updatedAt, chatJid, item.id);
+      if (result.changes !== 1) {
+        throw new Error(
+          `Failed to claim queued follow-up batch row ${item.id}`,
+        );
+      }
+    }
+    return claimed;
+  })();
+}
+
 export function releaseQueuedFollowUp(
   chatJid: string,
   messageId: string,
@@ -3077,6 +3248,59 @@ export function releaseQueuedFollowUp(
       updatedAt,
     },
   );
+}
+
+export function releaseQueuedFollowUpBatch(
+  items: Array<Pick<QueuedFollowUp, 'chat_jid' | 'id'>>,
+  runId: string,
+  updatedAt = new Date().toISOString(),
+): boolean {
+  if (items.length === 0) return false;
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'released', delivery_run_id = ?,
+         delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ?
+       AND delivery_status IN ('queued', 'promoting')`,
+  );
+  try {
+    return db.transaction(() => {
+      for (const item of items) {
+        const result = update.run(runId, updatedAt, item.chat_jid, item.id);
+        if (result.changes !== 1) {
+          throw new Error(`Failed to release follow-up batch row ${item.id}`);
+        }
+      }
+      return true;
+    })();
+  } catch {
+    return false;
+  }
+}
+
+export function restorePromotingFollowUpBatch(
+  items: Array<Pick<QueuedFollowUp, 'chat_jid' | 'id'>>,
+): boolean {
+  if (items.length === 0) return false;
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'queued', delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ? AND delivery_status = 'promoting'`,
+  );
+  try {
+    return db.transaction(() => {
+      const updatedAt = new Date().toISOString();
+      for (const item of items) {
+        const result = update.run(updatedAt, item.chat_jid, item.id);
+        if (result.changes !== 1) {
+          throw new Error(`Failed to restore follow-up batch row ${item.id}`);
+        }
+      }
+      return true;
+    })();
+  } catch {
+    return false;
+  }
 }
 
 export function beginPromotingFollowUp(
@@ -3098,6 +3322,19 @@ export function cancelQueuedFollowUp(
   messageId: string,
   updatedAt?: string,
 ): QueuedFollowUp | null {
+  // A late physical forward root can be durably covered by this note. Once
+  // that happens, cancelling only the note would hide both inputs. Treat the
+  // pair as already admitted; a cancel that wins before root arrival remains
+  // allowed, and the later root is then scheduled normally.
+  const coversSubsumedRoot = db
+    .prepare(
+      `SELECT 1 FROM messages
+       WHERE chat_jid = ? AND delivery_status = 'subsumed'
+         AND delivery_run_id = ?
+       LIMIT 1`,
+    )
+    .get(chatJid, messageId);
+  if (coversSubsumedRoot) return null;
   return transitionFollowUp(
     chatJid,
     messageId,

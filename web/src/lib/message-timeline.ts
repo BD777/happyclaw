@@ -2,7 +2,13 @@ export interface TimelineMessageLike {
   id: string;
   timestamp: string;
   is_from_me: boolean;
-  delivery_status?: 'queued' | 'promoting' | 'released' | 'cancelled' | null;
+  delivery_status?:
+    | 'queued'
+    | 'promoting'
+    | 'released'
+    | 'cancelled'
+    | 'subsumed'
+    | null;
   delivery_updated_at?: string | null;
   delivery_run_id?: string | null;
 }

@@ -362,7 +362,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
     ).toBe('processed');
   });
 
-  test('downloads a merged-forward child image using the child owner message id', async () => {
+  test('downloads a merged-forward child image using the outer owner message id', async () => {
     const accountId = `account-forward-image-${Date.now()}`;
     const executed = vi.fn();
     controls.messageGet.mockResolvedValue({
@@ -398,13 +398,393 @@ describe('Feishu durable Inbox and cursor integration', () => {
     expect(controls.messageResourceGet).toHaveBeenCalledWith(
       expect.objectContaining({
         path: {
-          message_id: 'om_forward_child_image',
+          message_id: 'om_forward_owner_test',
           file_key: 'img_child_owned',
         },
         params: { type: 'image' },
       }),
     );
     expect(executed).toHaveBeenCalledWith('om_forward_owner_test');
+  });
+
+  test('requests safe merged-forward coalescing while preserving both structural roles', async () => {
+    const accountId = `account-forward-companion-${Date.now()}`;
+    const followUps = vi.fn((input: { messageId: string }) =>
+      input.messageId === 'om_forward_bundle_root'
+        ? { disposition: 'started' as const }
+        : { disposition: 'steered' as const, runId: 'run_forward' },
+    );
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: 'om_forward_bundle_root',
+            msg_type: 'merge_forward',
+            create_time: '1000',
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: 'om_forward_bundle_child',
+            upper_message_id: 'om_forward_bundle_root',
+            msg_type: 'text',
+            sender: { id: 'ou_customer', name: 'Customer' },
+            body: {
+              content: JSON.stringify({ text: '被转发的客诉正文' }),
+            },
+          },
+        ],
+      },
+    });
+    const connected = await connect(accountId, vi.fn(), {
+      onFollowUpMessage: followUps as TestConnectOptions['onFollowUpMessage'],
+    });
+    const createTime = Date.now();
+
+    await Promise.all([
+      connected.handler({
+        ...event('om_forward_bundle_root', createTime, ''),
+        message: {
+          ...event('om_forward_bundle_root', createTime, '').message,
+          message_type: 'merge_forward',
+          content: 'Merged and Forwarded Message',
+        },
+      }),
+      connected.handler({
+        ...event('om_forward_bundle_note', createTime + 9_000, '怎么处理？'),
+        message: {
+          ...event('om_forward_bundle_note', createTime + 9_000, '怎么处理？')
+            .message,
+          root_id: 'om_forward_bundle_root',
+          parent_id: 'om_forward_bundle_root',
+        },
+      }),
+    ]);
+
+    expect(followUps).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        messageId: 'om_forward_bundle_root',
+        requestedMode: undefined,
+        coalesceBundleId: undefined,
+      }),
+    );
+    expect(followUps).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        messageId: 'om_forward_bundle_note',
+        requestedMode: undefined,
+        coalesceBundleId: 'om_forward_bundle_root',
+      }),
+    );
+    expect(
+      db.getMessageChannelTurnContext(
+        'web:durable-feishu-test',
+        'om_forward_bundle_root',
+      )?.message.contentLink,
+    ).toEqual({
+      kind: 'forward_bundle',
+      bundleId: 'om_forward_bundle_root',
+      role: 'forwarded_content',
+    });
+    const noteContext = db.getMessageChannelTurnContext(
+      'web:durable-feishu-test',
+      'om_forward_bundle_note',
+    );
+    expect(noteContext?.message.contentLink).toMatchObject({
+      bundleId: 'om_forward_bundle_root',
+      role: 'forwarder_comment',
+    });
+    expect(noteContext?.message.referencedMessages?.[0]).toMatchObject({
+      id: 'om_forward_bundle_root',
+      text: expect.stringContaining('被转发的客诉正文'),
+      contentLink: {
+        bundleId: 'om_forward_bundle_root',
+        role: 'forwarded_content',
+      },
+    });
+  });
+
+  test('note-first intake preserves a late root without scheduling it twice', async () => {
+    const accountId = `account-forward-note-first-${Date.now()}`;
+    const executed = vi.fn();
+    const rootId = `om_note_first_root_${Date.now()}`;
+    const noteId = `${rootId}_note`;
+    const rootTime = Date.now();
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            create_time: String(rootTime),
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: `${rootId}_child`,
+            upper_message_id: rootId,
+            msg_type: 'text',
+            sender: { id: 'ou_customer', name: 'Customer' },
+            body: { content: JSON.stringify({ text: '反序到达的材料' }) },
+          },
+        ],
+      },
+    });
+    const connected = await connect(accountId, executed);
+
+    await connected.handler({
+      ...event(noteId, rootTime + 9_000, '请分析这个问题'),
+      message: {
+        ...event(noteId, rootTime + 9_000, '请分析这个问题').message,
+        root_id: rootId,
+        parent_id: rootId,
+      },
+    });
+    await connected.handler({
+      ...event(rootId, rootTime, ''),
+      message: {
+        ...event(rootId, rootTime, '').message,
+        message_type: 'merge_forward',
+        content: 'Merged and Forwarded Message',
+      },
+    });
+
+    expect(executed).toHaveBeenCalledTimes(1);
+    expect(executed).toHaveBeenCalledWith(noteId);
+    expect(
+      db
+        .getMessagesSince('web:durable-feishu-test', {
+          timestamp: new Date(rootTime - 1).toISOString(),
+          id: '',
+        })
+        .filter((message) => message.id === rootId || message.id === noteId)
+        .map((message) => message.id),
+    ).toEqual([noteId]);
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === rootId),
+    ).toMatchObject({
+      delivery_status: 'subsumed',
+      delivery_run_id: noteId,
+      channel_context: {
+        message: {
+          contentLink: {
+            bundleId: rootId,
+            role: 'forwarded_content',
+          },
+        },
+      },
+    });
+  });
+
+  test('keeps an incomplete note from steering and sequences its late root after the cursor', async () => {
+    const accountId = `account-forward-note-first-incomplete-${Date.now()}`;
+    const followUps = vi.fn(() => ({ disposition: 'started' as const }));
+    const rootId = `om_note_first_incomplete_root_${Date.now()}`;
+    const noteId = `${rootId}_note`;
+    const rootTime = Date.now();
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            create_time: String(rootTime),
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+        ],
+      },
+    });
+    const connected = await connect(accountId, vi.fn(), {
+      onFollowUpMessage: followUps as TestConnectOptions['onFollowUpMessage'],
+    });
+
+    await connected.handler({
+      ...event(noteId, rootTime + 9_000, '请分析这个问题'),
+      message: {
+        ...event(noteId, rootTime + 9_000, '请分析这个问题').message,
+        root_id: rootId,
+        parent_id: rootId,
+      },
+    });
+    expect(followUps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        messageId: noteId,
+        coalesceBundleId: undefined,
+      }),
+    );
+
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            create_time: String(rootTime),
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: `${rootId}_child`,
+            upper_message_id: rootId,
+            msg_type: 'text',
+            sender: { id: 'ou_customer', name: 'Customer' },
+            body: { content: JSON.stringify({ text: '迟到的完整材料' }) },
+          },
+        ],
+      },
+    });
+    await connected.handler({
+      ...event(rootId, rootTime, ''),
+      message: {
+        ...event(rootId, rootTime, '').message,
+        message_type: 'merge_forward',
+        content: 'Merged and Forwarded Message',
+      },
+    });
+
+    const afterNote = db.getMessagesSince('web:durable-feishu-test', {
+      timestamp: new Date(rootTime + 9_000).toISOString(),
+      id: noteId,
+    });
+    expect(afterNote.map((message) => message.id)).toContain(rootId);
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === rootId),
+    ).toMatchObject({
+      delivery_status: null,
+      content: expect.stringContaining('迟到的完整材料'),
+    });
+  });
+
+  test('sequences a late root when the note-first structural lookup returned no item', async () => {
+    const accountId = `account-forward-note-first-empty-${Date.now()}`;
+    const rootId = `om_note_first_empty_root_${Date.now()}`;
+    const noteId = `${rootId}_note`;
+    const rootTime = Date.now();
+    controls.messageGet.mockResolvedValue({ data: { items: [] } });
+    const connected = await connect(accountId, vi.fn(), {
+      onFollowUpMessage: vi.fn(() => ({
+        disposition: 'started' as const,
+      })) as TestConnectOptions['onFollowUpMessage'],
+    });
+
+    await connected.handler({
+      ...event(noteId, rootTime + 9_000, '请分析这个问题'),
+      message: {
+        ...event(noteId, rootTime + 9_000, '请分析这个问题').message,
+        root_id: rootId,
+        parent_id: rootId,
+      },
+    });
+    expect(
+      db.getMessageChannelTurnContext('web:durable-feishu-test', noteId)
+        ?.message.contentLink,
+    ).toBeUndefined();
+
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            create_time: String(rootTime),
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: `${rootId}_child`,
+            upper_message_id: rootId,
+            msg_type: 'text',
+            sender: { id: 'ou_customer', name: 'Customer' },
+            body: { content: JSON.stringify({ text: '空查询后迟到的材料' }) },
+          },
+        ],
+      },
+    });
+    await connected.handler({
+      ...event(rootId, rootTime, ''),
+      message: {
+        ...event(rootId, rootTime, '').message,
+        message_type: 'merge_forward',
+        content: 'Merged and Forwarded Message',
+      },
+    });
+
+    expect(
+      db
+        .getMessagesSince('web:durable-feishu-test', {
+          timestamp: new Date(rootTime + 9_000).toISOString(),
+          id: noteId,
+        })
+        .map((message) => message.id),
+    ).toContain(rootId);
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === rootId),
+    ).toMatchObject({
+      delivery_status: null,
+      content: expect.stringContaining('空查询后迟到的材料'),
+    });
+  });
+
+  test('keeps an explicit /queue override on a merged-forward companion', async () => {
+    const accountId = `account-forward-explicit-queue-${Date.now()}`;
+    const followUps = vi.fn(() => ({ disposition: 'started' as const }));
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: 'om_forward_queue_root',
+            msg_type: 'merge_forward',
+            create_time: '1000',
+            sender: { id: 'ou_durable_user' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: 'om_forward_queue_child',
+            upper_message_id: 'om_forward_queue_root',
+            msg_type: 'text',
+            body: { content: JSON.stringify({ text: '材料' }) },
+          },
+        ],
+      },
+    });
+    const connected = await connect(accountId, vi.fn(), {
+      onFollowUpMessage: followUps as TestConnectOptions['onFollowUpMessage'],
+    });
+    const createTime = Date.now();
+
+    await connected.handler({
+      ...event('om_forward_queue_root', createTime, ''),
+      message: {
+        ...event('om_forward_queue_root', createTime, '').message,
+        message_type: 'merge_forward',
+        content: 'Merged and Forwarded Message',
+      },
+    });
+    await connected.handler({
+      ...event('om_forward_queue_note', createTime + 1_000, '/queue 稍后处理'),
+      message: {
+        ...event('om_forward_queue_note', createTime + 1_000, '/queue 稍后处理')
+          .message,
+        root_id: 'om_forward_queue_root',
+        parent_id: 'om_forward_queue_root',
+      },
+    });
+
+    expect(followUps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        messageId: 'om_forward_queue_note',
+        requestedMode: 'queue',
+        coalesceBundleId: undefined,
+      }),
+    );
   });
 
   test('two live instances concurrently execute one external message exactly once', async () => {

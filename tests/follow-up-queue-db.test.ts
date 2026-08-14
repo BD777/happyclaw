@@ -25,6 +25,129 @@ afterAll(() => {
 });
 
 describe('durable follow-up queue', () => {
+  test('atomically claims an adjacent merged-forward root and note', () => {
+    const jid = 'web:follow-up-forward-bundle';
+    db.ensureChatExists(jid);
+    const store = (
+      id: string,
+      timestamp: string,
+      role: 'forwarded_content' | 'forwarder_comment',
+    ) =>
+      db.storeMessageDirect(id, jid, 'user-1', 'User', id, timestamp, false, {
+        sourceJid:
+          role === 'forwarded_content'
+            ? 'feishu:bot-a:oc_chat'
+            : 'feishu:bot-a:oc_chat#root:om_root',
+        channelContext: {
+          schemaVersion: 1,
+          provider: 'feishu',
+          channelAccountId: 'bot-a',
+          sourceJid:
+            role === 'forwarded_content'
+              ? 'feishu:bot-a:oc_chat'
+              : 'feishu:bot-a:oc_chat#root:om_root',
+          chat: { id: 'oc_chat', type: 'group' },
+          message: {
+            id,
+            ...(role === 'forwarder_comment'
+              ? { rootId: 'om_root', parentId: 'om_root' }
+              : {}),
+            contentLink: {
+              kind: 'forward_bundle',
+              bundleId: 'om_root',
+              role,
+            },
+          },
+        },
+        meta: {
+          deliveryMode: 'queue',
+          deliveryStatus: 'queued',
+          deliveryRunId: 'run-current',
+        },
+      });
+
+    store('om_root', '2026-07-20T00:00:00.000Z', 'forwarded_content');
+    store('om_note', '2026-07-20T00:00:01.000Z', 'forwarder_comment');
+
+    expect(
+      db.claimNextQueuedFollowUpBatch(jid, 'run-bundle').map((item) => item.id),
+    ).toEqual(['om_root', 'om_note']);
+    expect(db.listQueuedFollowUps(jid)).toEqual([
+      expect.objectContaining({
+        id: 'om_root',
+        delivery_status: 'promoting',
+        delivery_run_id: 'run-bundle',
+      }),
+      expect.objectContaining({
+        id: 'om_note',
+        delivery_status: 'promoting',
+        delivery_run_id: 'run-bundle',
+      }),
+    ]);
+    const claimed = db.listQueuedFollowUps(jid);
+    expect(db.releaseQueuedFollowUpBatch(claimed, 'run-bundle')).toBe(true);
+    expect(
+      db
+        .getMessagesPage(jid)
+        .filter((item) => item.id === 'om_root' || item.id === 'om_note')
+        .every((item) => item.delivery_status === 'released'),
+    ).toBe(true);
+  });
+
+  test('does not pull an unrelated queued message into a forward bundle', () => {
+    const jid = 'web:follow-up-forward-boundary';
+    db.ensureChatExists(jid);
+    for (const [index, id] of ['ordinary', 'om_root', 'om_note'].entries()) {
+      db.storeMessageDirect(
+        id,
+        jid,
+        'user-1',
+        'User',
+        id,
+        new Date(Date.parse('2026-07-20T01:00:00.000Z') + index).toISOString(),
+        false,
+        {
+          ...(id !== 'ordinary'
+            ? {
+                sourceJid: 'feishu:bot-a:oc_chat',
+                channelContext: {
+                  schemaVersion: 1 as const,
+                  provider: 'feishu',
+                  channelAccountId: 'bot-a',
+                  sourceJid: 'feishu:bot-a:oc_chat',
+                  chat: { id: 'oc_chat', type: 'group' as const },
+                  message: {
+                    id,
+                    contentLink: {
+                      kind: 'forward_bundle' as const,
+                      bundleId: 'om_root',
+                      role:
+                        id === 'om_root'
+                          ? ('forwarded_content' as const)
+                          : ('forwarder_comment' as const),
+                    },
+                  },
+                },
+              }
+            : {}),
+          meta: {
+            deliveryMode: 'queue',
+            deliveryStatus: 'queued',
+          },
+        },
+      );
+    }
+
+    expect(
+      db
+        .claimNextQueuedFollowUpBatch(jid, 'run-ordinary')
+        .map((item) => item.id),
+    ).toEqual(['ordinary']);
+    expect(
+      db.claimNextQueuedFollowUpBatch(jid, 'run-bundle').map((item) => item.id),
+    ).toEqual(['om_root', 'om_note']);
+  });
+
   test('hides queued rows from the runner and releases them in priority order', () => {
     const jid = 'web:follow-up-test';
     const timestamp = '2026-07-20T00:00:00.000Z';
@@ -197,5 +320,40 @@ describe('durable follow-up queue', () => {
       content: 'second',
       delivery_mode: 'steer',
     });
+  });
+
+  test('does not cancel a note after a late forward root depends on it', () => {
+    const jid = 'web:follow-up-covered-root';
+    db.ensureChatExists(jid);
+    db.storeMessageDirect(
+      'om_note_owner',
+      jid,
+      'user-1',
+      'User',
+      '请分析',
+      '2026-07-20T04:00:01.000Z',
+      false,
+      {
+        meta: { deliveryMode: 'queue', deliveryStatus: 'queued' },
+      },
+    );
+    db.storeMessageDirect(
+      'om_late_root',
+      jid,
+      'user-1',
+      'User',
+      '[合并转发消息]',
+      '2026-07-20T04:00:00.000Z',
+      false,
+      {
+        meta: {
+          deliveryStatus: 'subsumed',
+          deliveryRunId: 'om_note_owner',
+        },
+      },
+    );
+
+    expect(db.cancelQueuedFollowUp(jid, 'om_note_owner')).toBeNull();
+    expect(db.getQueuedFollowUp(jid, 'om_note_owner')).not.toBeNull();
   });
 });

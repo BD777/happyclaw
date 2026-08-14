@@ -510,6 +510,17 @@ export interface ContainerOutput {
     }>;
     cursor: { timestamp: string; id: string; sourceJid?: string };
   }>;
+  /** Exact IPC inputs that now own output after the completed turn. */
+  activeIpcReceipts?: Array<{
+    deliveryId: string;
+    chatJid: string;
+    coveredCursors?: Array<{
+      timestamp: string;
+      id: string;
+      sourceJid?: string;
+    }>;
+    cursor: { timestamp: string; id: string; sourceJid?: string };
+  }>;
 }
 
 /**

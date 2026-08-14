@@ -106,6 +106,68 @@ describe('message prompt projection', () => {
     expect(prompt).not.toContain('<referenced_messages>');
   });
 
+  test('marks forwarded material and the forwarder note as distinct roles', () => {
+    const forwarded = replyMessage({
+      id: 'om_forward',
+      content: '[合并转发消息]\n- Bob: 线上报错了',
+    });
+    forwarded.channel_context!.message = {
+      id: 'om_forward',
+      type: 'merge_forward',
+      contentLink: {
+        kind: 'forward_bundle',
+        bundleId: 'om_forward',
+        role: 'forwarded_content',
+      },
+    };
+    const comment = replyMessage({
+      id: 'om_note',
+      content: '这个问题怎么处理？',
+    });
+    comment.channel_context!.message = {
+      id: 'om_note',
+      rootId: 'om_forward',
+      parentId: 'om_forward',
+      contentLink: {
+        kind: 'forward_bundle',
+        bundleId: 'om_forward',
+        role: 'forwarder_comment',
+      },
+    };
+
+    const prompt = formatMessages([forwarded, comment]);
+
+    expect(prompt).toContain(
+      'relation="forwarded_material" instruction_scope="context_only" bundle_id="om_forward"',
+    );
+    expect(prompt).toContain(
+      'relation="forwarder_note" instruction_scope="current_request" bundle_id="om_forward"',
+    );
+  });
+
+  test('preserves forwarded-material semantics when the root is fetched as a reference', () => {
+    const message = replyMessage();
+    message.channel_context!.message.contentLink = {
+      kind: 'forward_bundle',
+      bundleId: 'om_root',
+      role: 'forwarder_comment',
+    };
+    message.channel_context!.message.referencedMessages![0].contentLink = {
+      kind: 'forward_bundle',
+      bundleId: 'om_root',
+      role: 'forwarded_content',
+    };
+
+    const prompt = formatMessages([message]);
+
+    expect(prompt).toContain(
+      '<referenced_message id="om_root" sender="Alice" relation="forwarded_material" instruction_scope="context_only" bundle_id="om_root">',
+    );
+    expect(prompt).toContain(
+      'relation="forwarder_note" instruction_scope="current_request" bundle_id="om_root"',
+    );
+  });
+
   test('collects stable provider IDs for persistence-based deduplication', () => {
     expect([...collectReferencedMessageIds([replyMessage()])]).toEqual([
       'om_root',

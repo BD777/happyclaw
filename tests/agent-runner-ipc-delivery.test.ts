@@ -153,6 +153,19 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(tracker.hasPendingTurns).toBe(false);
   });
 
+  test('after interrupt, exposes only the next turn and not every later turn', () => {
+    const turnA = message('1');
+    const turnB = message('2');
+    const turnC = message('3');
+    const tracker = new IpcTurnDeliveryTracker([turnA]);
+    tracker.acceptTurn([turnB]);
+    tracker.acceptTurn([turnC]);
+
+    expect(tracker.cancelCurrentTurn()).toEqual([turnA]);
+    expect(tracker.currentTurnReceipts).toEqual([turnB.receipt]);
+    expect(tracker.laterTurnMessages).toEqual([turnC]);
+  });
+
   test('keeps slow turn A as output owner until A completes, then advances to queued B', () => {
     const turnA = message('1');
     const turnB = message('2');
@@ -209,6 +222,7 @@ describe('agent-runner IPC delivery turn tracker', () => {
     ]);
 
     expect(tracker.completeNextTurn()).toEqual([turnA.receipt]);
+    expect(tracker.currentTurnReceipts).toEqual([turnB.receipt]);
     correlation.syncCurrentTurn();
     const firstBEvent = correlation.correlate({
       status: 'stream',

@@ -47,6 +47,10 @@ import {
 } from './host-ipc-output-router.js';
 import { resolveBoundWorkspaceJid } from './workspace-attribution.js';
 import {
+  resolveCompatibleChannelBatchAnchor,
+  resolveForwardBundleBatchAnchor,
+} from './forward-bundle-batch.js';
+import {
   buildInterruptedReply,
   buildSteeredReply,
   buildStoppedReply,
@@ -187,13 +191,15 @@ import {
   updateChannelAccountAuthStatus,
   updateChannelAccountStatus,
   cancelQueuedFollowUp,
-  claimNextQueuedFollowUp,
+  claimNextQueuedFollowUpBatch,
   getQueuedFollowUp,
   getQueuedFollowUpChatJids,
   listQueuedFollowUps,
   moveQueuedFollowUp,
   prioritizeQueuedFollowUp,
   releaseQueuedFollowUp,
+  releaseQueuedFollowUpBatch,
+  restorePromotingFollowUpBatch,
   restorePromotingFollowUp,
   setMessageFollowUp,
   updateQueuedFollowUpContent,
@@ -943,6 +949,31 @@ function commitIpcDeliveryReceipts(receipts: IpcDeliveryReceipt[]): void {
   }
 }
 
+/** Advance host-side provider coalescing ownership when the runner reports
+ * that a queued IPC turn—not merely an accepted future turn—became current. */
+function bindRunnerActiveIpcCoverage(
+  runnerJid: string,
+  receipts: IpcDeliveryReceipt[] | undefined,
+): void {
+  if (!receipts?.length) return;
+  const coveredCursors = receipts
+    .flatMap((receipt) => receipt.coveredCursors ?? [receipt.cursor])
+    .map((cursor) => ({ ...cursor }))
+    .sort((a, b) => {
+      if (a.timestamp !== b.timestamp)
+        return a.timestamp < b.timestamp ? -1 : 1;
+      if (a.id === b.id) return 0;
+      return a.id < b.id ? -1 : 1;
+    });
+  if (coveredCursors.length === 0) return;
+  const queryId = queue.getActiveQueryId(runnerJid);
+  if (!queryId) return;
+  queue.setCurrentQueryCoverage(runnerJid, queryId, {
+    coveredCursors,
+    cursor: coveredCursors[coveredCursors.length - 1],
+  });
+}
+
 function hasEarlierPendingMessage(
   jid: string,
   candidate: MessageCursor,
@@ -1461,18 +1492,19 @@ function resolveFollowUpRuntime(chatJid: string): {
 }
 
 async function prepareFollowUp(
-  item: QueuedFollowUp,
+  items: QueuedFollowUp[],
 ): Promise<PreparedFollowUp> {
+  const item = items[items.length - 1];
   const runtime = resolveFollowUpRuntime(item.chat_jid);
-  if (!runtime) return { messages: [item] };
+  if (!runtime) return { messages: items };
   const expandContext = buildExpandContext(
     item.chat_jid,
     runtime.effectiveGroup,
     runtime.effectiveGroup.created_by,
   );
-  if (!expandContext) return { messages: [item] };
+  if (!expandContext) return { messages: items };
   const { toSend, replies } = await expandMessagesIfNeeded(
-    [item],
+    items,
     expandContext,
     undefined,
     persistPluginExpansion,
@@ -1534,13 +1566,24 @@ function enqueueReleasedFollowUp(item: QueuedFollowUp): void {
 }
 
 function injectPreparedFollowUp(
-  item: QueuedFollowUp,
+  items: QueuedFollowUp[],
   prepared: PreparedFollowUp,
   runId: string,
 ): 'sent' | 'no_active' | 'cancelled' {
-  if (!getQueuedFollowUp(item.chat_jid, item.id)) return 'cancelled';
-  const sourceJid = item.source_jid || item.chat_jid;
-  const deliveryTarget = createIpcDeliveryTarget(item.chat_jid, [item]);
+  const item = items[items.length - 1];
+  if (items.some((queued) => !getQueuedFollowUp(queued.chat_jid, queued.id))) {
+    return 'cancelled';
+  }
+  const linkedAnchor = resolveForwardBundleBatchAnchor(items);
+  const sourceJid =
+    linkedAnchor?.context.sourceJid || item.source_jid || item.chat_jid;
+  const deliveryTarget = createIpcDeliveryTarget(item.chat_jid, items);
+  const runtime = resolveFollowUpRuntime(item.chat_jid);
+  const channelContext = resolveBatchChannelContext(
+    prepared.messages,
+    item.chat_jid,
+    runtime?.agentId,
+  );
   const knownReferencedMessageIds = collectPersistedReferencedMessageIds(
     item.chat_jid,
     prepared.messages,
@@ -1548,7 +1591,6 @@ function injectPreparedFollowUp(
   const images = collectMessageImages(item.chat_jid, prepared.messages, {
     knownMessageIds: knownReferencedMessageIds,
   });
-  const runtime = resolveFollowUpRuntime(item.chat_jid);
   const result = queue.sendMessage(
     item.chat_jid,
     formatMessages(prepared.messages, {
@@ -1592,7 +1634,7 @@ function injectPreparedFollowUp(
     sourceJid,
     undefined,
     deliveryTarget,
-    undefined,
+    channelContext,
     (receipt) =>
       runtime
         ? invokeActiveRouteAdmission(
@@ -1606,55 +1648,34 @@ function injectPreparedFollowUp(
 
   if (result === 'sent') {
     const deliveryUpdatedAt = new Date().toISOString();
-    const released = releaseQueuedFollowUp(
-      item.chat_jid,
-      item.id,
+    const released = releaseQueuedFollowUpBatch(
+      items,
       runId,
       deliveryUpdatedAt,
     );
     if (!released) {
       logger.error(
-        { chatJid: item.chat_jid, messageId: item.id, runId },
+        {
+          chatJid: item.chat_jid,
+          messageIds: items.map((queued) => queued.id),
+          runId,
+        },
         'Follow-up was injected but its durable queue claim could not be released',
       );
     }
     if (deliveryTarget) {
+      queue.setCurrentQueryCoverage(item.chat_jid, runId, deliveryTarget);
       advanceNextPullCursorOnly(item.chat_jid, deliveryTarget.cursor);
     }
-    broadcastFollowUpUpdate(
-      item.chat_jid,
-      released
-        ? {
-            id: item.id,
-            delivery_status: 'released',
-            delivery_run_id: runId,
-            delivery_updated_at: deliveryUpdatedAt,
-          }
-        : undefined,
-    );
+    broadcastFollowUpUpdate(item.chat_jid);
     return 'sent';
   }
 
   // The runner disappeared between preparation and injection. Make the row
   // visible to the normal cold-start reader so it can be recovered safely.
   const deliveryUpdatedAt = new Date().toISOString();
-  const released = releaseQueuedFollowUp(
-    item.chat_jid,
-    item.id,
-    runId,
-    deliveryUpdatedAt,
-  );
-  broadcastFollowUpUpdate(
-    item.chat_jid,
-    released
-      ? {
-          id: item.id,
-          delivery_status: 'released',
-          delivery_run_id: runId,
-          delivery_updated_at: deliveryUpdatedAt,
-        }
-      : undefined,
-  );
+  releaseQueuedFollowUpBatch(items, runId, deliveryUpdatedAt);
+  broadcastFollowUpUpdate(item.chat_jid);
   enqueueReleasedFollowUp(item);
   return 'no_active';
 }
@@ -1662,23 +1683,38 @@ function injectPreparedFollowUp(
 async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
   const reservedRunId = queue.reserveNextQuery(chatJid);
   if (!reservedRunId) return;
-  const item = claimNextQueuedFollowUp(chatJid, reservedRunId);
-  if (!item) {
+  const items = claimNextQueuedFollowUpBatch(chatJid, reservedRunId);
+  if (items.length === 0) {
     queue.releaseQueryReservation(chatJid, reservedRunId);
     return;
   }
+  const item = items[items.length - 1];
+  const batchCoverage = createIpcDeliveryTarget(chatJid, items);
+  if (batchCoverage) {
+    queue.setCurrentQueryCoverage(chatJid, reservedRunId, batchCoverage);
+  }
   queue.announceReservedQuery(chatJid, reservedRunId);
-  item.delivery_run_id = reservedRunId;
-  item.delivery_status = 'promoting';
+  for (const queued of items) {
+    queued.delivery_run_id = reservedRunId;
+    queued.delivery_status = 'promoting';
+  }
   broadcastFollowUpUpdate(chatJid);
 
   try {
-    const prepared = await prepareFollowUp(item);
-    if (!getQueuedFollowUp(chatJid, item.id)) {
+    const prepared = await prepareFollowUp(items);
+    if (items.some((queued) => !getQueuedFollowUp(chatJid, queued.id))) {
+      restorePromotingFollowUpBatch(
+        items.filter((queued) => getQueuedFollowUp(chatJid, queued.id)),
+      );
+      broadcastFollowUpUpdate(chatJid);
       queue.releaseQueryReservation(chatJid, reservedRunId, true);
       return;
     }
-    if (prepared.replyText && prepared.messages.length === 0) {
+    if (
+      items.length === 1 &&
+      prepared.replyText &&
+      prepared.messages.length === 0
+    ) {
       const completed = await completeFollowUpReply(item, prepared.replyText);
       if (!completed) {
         restorePromotingFollowUp(chatJid, item.id);
@@ -1693,16 +1729,28 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
       }
       return;
     }
-    const result = injectPreparedFollowUp(item, prepared, reservedRunId);
+    const result = injectPreparedFollowUp(items, prepared, reservedRunId);
     if (result !== 'sent') {
       queue.releaseQueryReservation(chatJid, reservedRunId);
     }
   } catch (err) {
-    restorePromotingFollowUp(chatJid, item.id);
+    const remaining = items.filter((queued) =>
+      getQueuedFollowUp(chatJid, queued.id),
+    );
+    if (remaining.length > 0 && !restorePromotingFollowUpBatch(remaining)) {
+      logger.error(
+        {
+          chatJid,
+          messageIds: remaining.map((queued) => queued.id),
+          runId: reservedRunId,
+        },
+        'Failed to restore the remaining queued follow-up batch',
+      );
+    }
     queue.releaseQueryReservation(chatJid, reservedRunId);
     broadcastFollowUpUpdate(chatJid);
     logger.error(
-      { err, chatJid, messageId: item.id },
+      { err, chatJid, messageIds: items.map((queued) => queued.id) },
       'Failed to prepare queued follow-up',
     );
     const retryTimer = setTimeout(() => {
@@ -1867,10 +1915,10 @@ function interruptAndRunFollowUp(
 function recoverDurableFollowUps(): void {
   for (const chatJid of getQueuedFollowUpChatJids()) {
     const recoveryRunId = `recovery:${crypto.randomUUID()}`;
-    const item = claimNextQueuedFollowUp(chatJid, recoveryRunId);
-    if (!item) continue;
-    releaseQueuedFollowUp(chatJid, item.id, recoveryRunId);
-    enqueueReleasedFollowUp(item);
+    const items = claimNextQueuedFollowUpBatch(chatJid, recoveryRunId);
+    if (items.length === 0) continue;
+    releaseQueuedFollowUpBatch(items, recoveryRunId);
+    enqueueReleasedFollowUp(items[items.length - 1]);
   }
 }
 
@@ -5253,9 +5301,26 @@ function collectPersistedReferencedMessageIds(
   chatJid: string,
   messages: NewMessage[],
 ): Set<string> {
+  const replayForwardMaterial = new Set<string>();
+  for (const message of messages) {
+    for (const reference of message.channel_context?.message
+      .referencedMessages ?? []) {
+      if (
+        reference.contentLink?.kind === 'forward_bundle' &&
+        reference.contentLink.role === 'forwarded_content'
+      ) {
+        // A coalescing interrupt may happen after the root was persisted but
+        // before it reached the SDK transcript. Keep the replacement note
+        // self-contained instead of treating DB presence as delivery proof.
+        replayForwardMaterial.add(reference.id);
+      }
+    }
+  }
   return new Set(
-    [...collectReferencedMessageIds(messages)].filter((messageId) =>
-      Boolean(getMessage(chatJid, messageId)),
+    [...collectReferencedMessageIds(messages)].filter(
+      (messageId) =>
+        !replayForwardMaterial.has(messageId) &&
+        Boolean(getMessage(chatJid, messageId)),
     ),
   );
 }
@@ -5278,13 +5343,25 @@ function resolveBatchChannelContext(
       context.message.threadId ?? '',
       context.message.rootId ?? '',
     ].join('\u0000');
-  if (contexts.some((context) => routeKey(context!) !== routeKey(latest))) {
-    return undefined;
-  }
-  const latestMessage = messages[messages.length - 1];
+  const sameRoute = contexts.every(
+    (context) => routeKey(context!) === routeKey(latest),
+  );
+  const linkedAnchor = sameRoute
+    ? undefined
+    : resolveForwardBundleBatchAnchor(messages);
+  const compatibleAnchor = sameRoute
+    ? undefined
+    : resolveCompatibleChannelBatchAnchor(messages);
+  if (!sameRoute && !compatibleAnchor) return undefined;
+  const selectedContext =
+    linkedAnchor?.context ?? compatibleAnchor?.context ?? latest;
+  const selectedMessage =
+    linkedAnchor?.message ??
+    compatibleAnchor?.message ??
+    messages[messages.length - 1];
   return {
-    ...latest,
-    targetJid: latestMessage.chat_jid,
+    ...selectedContext,
+    targetJid: selectedMessage.chat_jid,
     workspaceJid,
     sessionAgentId: sessionAgentId ?? null,
   };
@@ -5632,6 +5709,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // after this prefix, rather than coalescing both contracts into one query.
     queue.enqueueMessageCheck(chatJid);
   }
+  const admissionSnapshot = createIpcDeliveryTarget(chatJid, missedMessages);
+  if (admissionSnapshot) {
+    // Publish exact physical ownership before async plugin/history/prompt
+    // preparation. A provider companion arriving in that window may only
+    // steer when this active query already owns its root.
+    queue.setMessageRetrySnapshot(chatJid, admissionSnapshot);
+    const admissionQueryId = queue.getActiveQueryId(chatJid);
+    if (admissionQueryId) {
+      queue.setCurrentQueryCoverage(
+        chatJid,
+        admissionQueryId,
+        admissionSnapshot,
+      );
+    }
+  }
 
   // Direct IM chats reply to themselves. Routed IM messages keep their original
   // source_jid so workspace-bound conversations can reply back to the sender
@@ -5651,6 +5743,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       missedMessages.every((m) => (m.source_jid || chatJid) === firstSourceJid);
     if (allSameImSource) {
       incomingImOwner = firstSourceJid;
+    } else {
+      const linkedForwardAnchor =
+        resolveForwardBundleBatchAnchor(missedMessages);
+      const linkedSourceJid =
+        linkedForwardAnchor?.context.sourceJid ??
+        resolveCompatibleChannelBatchAnchor(missedMessages)?.context.sourceJid;
+      if (linkedSourceJid && getChannelType(linkedSourceJid) !== null) {
+        // Root and note intentionally have different native route fragments.
+        // Reply to the authored note, which is the user-visible bundle anchor.
+        incomingImOwner = linkedSourceJid;
+      }
     }
   } else {
     // chatJid is an IM channel — reply directly
@@ -7118,6 +7221,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       lastProcessed.id,
       async (result) => {
         try {
+          const outputTurnId = result.turnId || result.streamEvent?.turnId;
           const isInterruptStatus =
             result.status === 'stream' &&
             result.streamEvent?.eventType === 'status' &&
@@ -7125,18 +7229,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           const isUsageEvent =
             result.status === 'stream' &&
             result.streamEvent?.eventType === 'usage';
-          if (
+          const suppressSupersededOutput =
             !isInterruptStatus &&
             !isUsageEvent &&
-            steeringTransitions.shouldSuppressOutput(
-              chatJid,
-              result.turnId || result.streamEvent?.turnId,
-            )
-          ) {
+            steeringTransitions.shouldSuppressOutput(chatJid, outputTurnId);
+          if (suppressSupersededOutput && result.queryIdle !== true) {
             logger.info(
               {
                 chatJid,
-                turnId: result.turnId || result.streamEvent?.turnId,
+                turnId: outputTurnId,
                 status: result.status,
                 eventType: result.streamEvent?.eventType,
               },
@@ -7149,7 +7250,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           // callbacks return so the later genuine final can settle the same
           // durable run without guessing from ordinary conversation history.
           rememberScheduledGroupRuns(result);
-          await activateMainProjectionForInput(result.inputTurnId);
+          if (!suppressSupersededOutput) {
+            await activateMainProjectionForInput(result.inputTurnId);
+          }
           if (result.inputTurnCompleted) {
             const completedInputTurnIds = result.ipcReceipts?.length
               ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
@@ -7174,6 +7277,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
           if (result.newSessionId && result.status !== 'error') {
             activeSessionId = result.newSessionId;
+          }
+          if (suppressSupersededOutput) {
+            // The buffered healthy terminal is the final disposition of this
+            // physical input even though its assistant projection is hidden.
+            // Commit it just like an interrupted terminal so later IPC receipt
+            // commits are not fenced behind a permanently pending cold root.
+            commitCursor(
+              resolveContainerOutputInputTurnId(result, lastProcessed.id),
+            );
+            logger.info(
+              { chatJid, turnId: outputTurnId, status: result.status },
+              'Superseded terminal projection suppressed after lifecycle settlement',
+            );
+            return;
           }
           // 流式事件处理 - 广播 WebSocket + 持久化 SDK Task 生命周期到 DB
           if (result.status === 'stream' && result.streamEvent) {
@@ -9524,6 +9641,22 @@ async function runAgent(
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = async (output: ContainerOutput) => {
     queue.markRunnerActivity(chatJid);
+    bindRunnerActiveIpcCoverage(chatJid, output.activeIpcReceipts);
+    const outputTurnId = output.turnId || output.streamEvent?.turnId;
+    const isInterruptStatus =
+      output.status === 'stream' &&
+      output.streamEvent?.eventType === 'status' &&
+      output.streamEvent.statusText === 'interrupted';
+    if (
+      !isInterruptStatus &&
+      output.queryIdle === true &&
+      steeringTransitions.shouldSuppressOutput(chatJid, outputTurnId)
+    ) {
+      // A healthy terminal can already be buffered when its companion marks
+      // the turn for steering. Keep the old turn ID hidden while settling the
+      // transition so ACK/idle below can launch the replacement normally.
+      resolveSteeringInterrupt(chatJid, outputTurnId);
+    }
     if (
       output.ipcReceipts?.length &&
       (!output.providerFailure || output.providerFailureTerminal === true)
@@ -9536,9 +9669,7 @@ async function runAgent(
     }
     if (
       output.queryIdle === true ||
-      (output.status === 'stream' &&
-        output.streamEvent?.eventType === 'status' &&
-        output.streamEvent.statusText === 'interrupted')
+      (isInterruptStatus && output.queryIdle !== false)
     ) {
       queue.markRunnerQueryIdle(chatJid);
     }
@@ -9602,6 +9733,10 @@ async function runAgent(
         selectedProviderId,
         feishuCliAccountId,
         interactionMode,
+        onDeferredInterruptFailure: () => {
+          clearSteeringInterrupt(chatJid);
+          dispatchQueuedFollowUpFamily(chatJid);
+        },
       });
     };
 
@@ -14131,6 +14266,21 @@ async function processAgentConversation(
     }
     return;
   }
+  const agentAdmissionSnapshot = createIpcDeliveryTarget(
+    virtualChatJid,
+    missedMessages,
+  );
+  if (agentAdmissionSnapshot) {
+    queue.setMessageRetrySnapshot(virtualChatJid, agentAdmissionSnapshot);
+    const admissionQueryId = queue.getActiveQueryId(virtualChatJid);
+    if (admissionQueryId) {
+      queue.setCurrentQueryCoverage(
+        virtualChatJid,
+        admissionQueryId,
+        agentAdmissionSnapshot,
+      );
+    }
+  }
 
   const isHome = !!effectiveGroup.is_home;
   const effectiveOwner = effectiveGroup.created_by
@@ -15282,26 +15432,32 @@ async function processAgentConversation(
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
+    bindRunnerActiveIpcCoverage(virtualJid, output.activeIpcReceipts);
     const isInterruptStatus =
       output.status === 'stream' &&
       output.streamEvent?.eventType === 'status' &&
       output.streamEvent.statusText === 'interrupted';
     const isUsageEvent =
       output.status === 'stream' && output.streamEvent?.eventType === 'usage';
-    if (
+    const outputTurnId = output.turnId || output.streamEvent?.turnId;
+    let suppressSupersededOutput =
       !isInterruptStatus &&
       !isUsageEvent &&
-      steeringTransitions.shouldSuppressOutput(
+      steeringTransitions.shouldSuppressOutput(virtualChatJid, outputTurnId);
+    if (suppressSupersededOutput && output.queryIdle === true) {
+      resolveSteeringInterrupt(virtualChatJid, outputTurnId);
+      suppressSupersededOutput = steeringTransitions.shouldSuppressOutput(
         virtualChatJid,
-        output.turnId || output.streamEvent?.turnId,
-      )
-    ) {
+        outputTurnId,
+      );
+    }
+    if (suppressSupersededOutput && output.queryIdle !== true) {
       logger.info(
         {
           chatJid,
           agentId,
           virtualChatJid,
-          turnId: output.turnId || output.streamEvent?.turnId,
+          turnId: outputTurnId,
           status: output.status,
           eventType: output.streamEvent?.eventType,
         },
@@ -15309,7 +15465,9 @@ async function processAgentConversation(
       );
       return;
     }
-    await activateAgentProjectionForInput(output.inputTurnId);
+    if (!suppressSupersededOutput) {
+      await activateAgentProjectionForInput(output.inputTurnId);
+    }
     if (
       output.ipcReceipts?.length &&
       (!output.providerFailure || output.providerFailureTerminal === true)
@@ -15344,7 +15502,8 @@ async function processAgentConversation(
       output.queryIdle === true ||
       (output.status === 'stream' &&
         output.streamEvent?.eventType === 'status' &&
-        output.streamEvent.statusText === 'interrupted')
+        output.streamEvent.statusText === 'interrupted' &&
+        output.queryIdle !== false)
     ) {
       queue.markRunnerQueryIdle(virtualJid);
     }
@@ -15380,6 +15539,21 @@ async function processAgentConversation(
         identityHash: agentProfile?.identity_hash,
       });
       currentAgentSessionId = output.newSessionId;
+    }
+
+    if (suppressSupersededOutput) {
+      commitCursor(output.inputTurnId ?? activeAgentInputTurnId);
+      logger.info(
+        {
+          chatJid,
+          agentId,
+          virtualChatJid,
+          turnId: outputTurnId,
+          status: output.status,
+        },
+        'Superseded agent terminal projection suppressed after lifecycle settlement',
+      );
+      return;
     }
 
     // Stream events
@@ -16376,6 +16550,10 @@ async function processAgentConversation(
         agentId,
         selectedProviderId,
         feishuCliAccountId,
+        onDeferredInterruptFailure: () => {
+          clearSteeringInterrupt(virtualJid);
+          dispatchQueuedFollowUpFamily(virtualJid);
+        },
       });
     };
 
@@ -17405,6 +17583,10 @@ async function startMessageLoop(): Promise<void> {
                 receipt?.deliveryId,
                 receipt?.cursor,
               );
+              // A busy warm runner accepts this IPC batch as a later SDK turn.
+              // Do not overwrite the physical ownership of the query that is
+              // producing output now; the idle/reservation transition binds
+              // coverage when this delivery actually becomes current.
             },
             lastSourceJidForRoute,
             injectionTaskId,
@@ -19084,13 +19266,32 @@ function handleIncomingFollowUp(input: {
   messageId: string;
   senderImId: string;
   requestedMode?: FollowUpMode;
+  coalesceBundleId?: string;
   repliedToActiveCard: boolean;
 }): import('./types.js').FollowUpDisposition {
   const activeRunId = queue.getActiveQueryId(input.targetJid);
   if (!activeRunId) return { disposition: 'started' };
+  const hasEarlierBundleComment = input.coalesceBundleId
+    ? listQueuedFollowUps(input.targetJid).some((item) => {
+        if (item.id === input.messageId) return false;
+        const link = item.channel_context?.message.contentLink;
+        return (
+          link?.kind === 'forward_bundle' &&
+          link.bundleId === input.coalesceBundleId &&
+          link.role === 'forwarder_comment'
+        );
+      })
+    : false;
+  const coalesceActiveRoot =
+    Boolean(input.coalesceBundleId) &&
+    !hasEarlierBundleComment &&
+    queue.activeQueryExclusivelyCoversMessage(
+      input.targetJid,
+      input.coalesceBundleId!,
+    );
   const mode = resolveFeishuFollowUpMode(
-    input.requestedMode,
-    input.repliedToActiveCard,
+    input.requestedMode ?? (coalesceActiveRoot ? 'steer' : undefined),
+    input.coalesceBundleId ? false : input.repliedToActiveCard,
   );
   setMessageFollowUp(input.targetJid, input.messageId, {
     mode,
@@ -20773,6 +20974,13 @@ async function main(): Promise<void> {
   await ensureDockerRunning();
 
   queue.setProcessMessagesFn(processGroupMessages);
+  queue.setOnRunnerQueryTeardown((chatJid) => {
+    // A child that exits before acknowledging `_interrupt` can leave the
+    // chat-level suppression transition pending. GroupQueue invokes this only
+    // after queryInFlight is synchronously fenced off, so a companion arriving
+    // during lengthy async finalizers cannot recreate an uncleared transition.
+    clearSteeringInterrupt(chatJid);
+  });
   queue.setOnQueryIdle((chatJid) => {
     dispatchQueuedFollowUpFamily(chatJid);
   });

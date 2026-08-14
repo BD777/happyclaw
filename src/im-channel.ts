@@ -159,6 +159,7 @@ export interface IMChannelConnectOpts {
     messageId: string;
     senderImId: string;
     requestedMode?: FollowUpMode;
+    coalesceBundleId?: string;
     repliedToActiveCard: boolean;
   }) => FollowUpDisposition;
   onFollowUpCardAction?: (input: {

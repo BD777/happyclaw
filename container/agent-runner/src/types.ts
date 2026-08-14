@@ -8,6 +8,13 @@
 export type { StreamEventType, StreamEvent } from './stream-event.types.js';
 import type { ClaudeContextAudit, StreamEvent } from './stream-event.types.js';
 
+export interface ChannelContentLink {
+  kind: 'forward_bundle';
+  bundleId: string;
+  role: 'forwarded_content' | 'forwarder_comment';
+  relatedMessageId?: string;
+}
+
 /**
  * Sanitized, per-input-turn channel identity supplied by the HappyClaw host.
  *
@@ -44,6 +51,7 @@ export interface ChannelTurnContext {
     parentId?: string;
     threadId?: string;
     type?: string;
+    contentLink?: ChannelContentLink;
   };
   sender?: {
     openId?: string;
@@ -79,6 +87,27 @@ function compactObject<T extends UnknownRecord>(value: T): T | undefined {
   return Object.values(value).some((item) => item !== undefined)
     ? value
     : undefined;
+}
+
+function normalizeContentLink(value: unknown): ChannelContentLink | undefined {
+  const link = asRecord(value);
+  const bundleId = optionalString(link?.bundleId);
+  const kind = optionalString(link?.kind);
+  const role = optionalString(link?.role);
+  if (
+    kind !== 'forward_bundle' ||
+    !bundleId ||
+    (role !== 'forwarded_content' && role !== 'forwarder_comment')
+  ) {
+    return undefined;
+  }
+  const relatedMessageId = optionalString(link?.relatedMessageId);
+  return {
+    kind,
+    bundleId,
+    role,
+    ...(relatedMessageId ? { relatedMessageId } : {}),
+  };
 }
 
 /**
@@ -163,6 +192,7 @@ export function normalizeChannelTurnContext(
       parentId: optionalString(message?.parentId),
       threadId: optionalString(message?.threadId),
       type: optionalString(message?.type),
+      contentLink: normalizeContentLink(message?.contentLink),
     }),
     sender: compactObject({
       openId: optionalString(sender?.openId),
@@ -371,6 +401,20 @@ export interface ContainerOutput {
    * release the next durable queued follow-up. */
   queryIdle?: boolean;
   ipcReceipts?: Array<{
+    deliveryId: string;
+    chatJid: string;
+    coveredCursors?: Array<{
+      timestamp: string;
+      id: string;
+      sourceJid?: string;
+    }>;
+    cursor: { timestamp: string; id: string; sourceJid?: string };
+  }>;
+  /** Exact durable inputs that became the current SDK turn immediately after
+   * this completion. Present only while the same streaming query stays busy.
+   * Hosts use it to bind provider coalescing to the real current turn rather
+   * than to a later IPC message that merely entered the stream. */
+  activeIpcReceipts?: Array<{
     deliveryId: string;
     chatJid: string;
     coveredCursors?: Array<{

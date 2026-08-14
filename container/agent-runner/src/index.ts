@@ -1310,6 +1310,7 @@ const IPC_INPUT_DRAIN_SENTINEL = path.join(IPC_INPUT_DIR, '_drain');
 const IPC_INPUT_INTERRUPT_SENTINEL = path.join(IPC_INPUT_DIR, '_interrupt');
 const INTERRUPT_GRACE_WINDOW_MS = 10_000;
 let lastInterruptRequestedAt = 0;
+let activeInterruptQueryRunId: string | undefined;
 
 function markInterruptRequested(): void {
   lastInterruptRequestedAt = Date.now();
@@ -1340,34 +1341,29 @@ function isInterruptRelatedError(err: unknown): boolean {
  */
 function shouldInterrupt(): boolean {
   if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
+    let sentinelQueryRunId = '';
     try {
+      sentinelQueryRunId = fs
+        .readFileSync(IPC_INPUT_INTERRUPT_SENTINEL, 'utf8')
+        .trim();
       fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
     } catch {
       /* ignore */
+    }
+    if (
+      sentinelQueryRunId &&
+      activeInterruptQueryRunId &&
+      sentinelQueryRunId !== activeInterruptQueryRunId
+    ) {
+      log(
+        `Ignoring interrupt for stale query ${sentinelQueryRunId} (active ${activeInterruptQueryRunId})`,
+      );
+      return false;
     }
     markInterruptRequested();
     return true;
   }
   return false;
-}
-
-function cleanupStartupInterruptSentinel(): void {
-  try {
-    const stat = fs.statSync(IPC_INPUT_INTERRUPT_SENTINEL);
-    const ageMs = Date.now() - stat.mtimeMs;
-    if (ageMs <= INTERRUPT_GRACE_WINDOW_MS) {
-      log(
-        `Preserving recent interrupt sentinel at startup (${Math.round(ageMs)}ms old)`,
-      );
-      return;
-    }
-    fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-    log(
-      `Removed stale interrupt sentinel at startup (${Math.round(ageMs)}ms old)`,
-    );
-  } catch {
-    /* ignore */
-  }
 }
 
 /**
@@ -1535,11 +1531,6 @@ function waitForIpcMessage(): Promise<
         return;
       }
 
-      if (shouldInterrupt()) {
-        log('Interrupt sentinel received while idle, ignoring');
-        clearInterruptRequested();
-      }
-
       const { messages } = drainIpcInput();
 
       if (messages.length > 0) {
@@ -1582,6 +1573,12 @@ function waitForIpcMessage(): Promise<
         });
         return;
       }
+
+      // Do not consume _interrupt while idle, even when no IPC file is present
+      // yet. The host can reserve a durable query and publish its query-bound
+      // interrupt while asynchronous prompt preparation is still in progress.
+      // Once that input arrives, the outer loop binds queryRunId and runQuery's
+      // pre-start check consumes or rejects the sentinel exactly.
     };
 
     const ipcWatcher = createIpcWatcher(tryDrain);
@@ -1754,6 +1751,7 @@ async function runQueryAttempt(
     if (currentMessage) {
       if (currentMessage.queryRunId) {
         containerInput.queryRunId = currentMessage.queryRunId;
+        activeInterruptQueryRunId = currentMessage.queryRunId;
       }
       setCurrentChannelTurn(
         containerInput,
@@ -2337,6 +2335,10 @@ async function runQueryAttempt(
       ? ipcDeliveryTracker.completeNextTurn()
       : undefined;
     const queryIdle = inputTurnCompleted && !ipcDeliveryTracker.hasPendingTurns;
+    const activeIpcReceipts =
+      inputTurnCompleted && ipcDeliveryTracker.hasPendingTurns
+        ? ipcDeliveryTracker.currentTurnReceipts
+        : undefined;
     durableInputCompletion.publishResult(
       inputTurnCompleted,
       ipcDeliveryTracker.hasPendingTurns,
@@ -2364,6 +2366,9 @@ async function runQueryAttempt(
       inputTurnCompleted,
       queryIdle,
       ...(ipcReceipts && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
+      ...(activeIpcReceipts && activeIpcReceipts.length > 0
+        ? { activeIpcReceipts }
+        : {}),
     });
 
     containerInput.turnId = generateTurnId();
@@ -3892,6 +3897,7 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
+    activeInterruptQueryRunId = containerInput.queryRunId;
     // A cold turn without a durable IPC receipt is correlated by the original
     // host turn ID. Keep that fallback stable for every frame in this run.
     containerInput.turnId ||= generateTurnId();
@@ -4007,7 +4013,11 @@ async function main(): Promise<void> {
   } catch {
     /* ignore */
   }
-  cleanupStartupInterruptSentinel();
+  // `_interrupt` is deliberately not age-pruned here. The host cleans stale
+  // sentinels before every runner attempt, then may publish this file as soon
+  // as the child process is registered. A cold image can take well over ten
+  // seconds to reach this point, so wall-clock age cannot distinguish that
+  // current query-bound interrupt from stale state.
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -4088,15 +4098,12 @@ async function main(): Promise<void> {
     while (true) {
       pruneProcessedHistoryImagesInTranscript(sessionId);
 
-      // 清理残留的 _interrupt sentinel（空闲期间写入的中断信号不应影响下一次 query）。
-      // 注意：_drain 不在此处清理 — 如果 _drain 存在，说明有待处理的消息，
-      // pollIpcDuringQuery 会在查询结果后检测到并正确退出容器。
-      try {
-        fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-      } catch {
-        /* ignore */
-      }
-      clearInterruptRequested();
+      // At cold startup the host can register the process, then write a
+      // query-bound interrupt before this loop begins. Preserve that signal
+      // for runQuery()'s pre-start check. Later loop iterations are entered
+      // only after the previous query produced a terminal result, whose
+      // interrupt path already consumes/clears its sentinel.
+      if (resumeAt !== undefined) clearInterruptRequested();
 
       // 消费 auto-continue 阶段暂存的 history context（如果存在）。
       // 对应 sessionResumeFailed 在 auto-continue 路径上的镜像处理：
@@ -4246,6 +4253,49 @@ async function main(): Promise<void> {
         // 中断后清除 resumeAt：被中断的 assistant 消息可能未完整提交到 session 历史。
         // 使用 undefined 让 SDK 自行选择恢复点，避免因指向不完整消息的 UUID 导致 resume 失败。
         resumeAt = undefined;
+        // Finish consuming the old interrupt before acknowledging it. The
+        // host may synchronously publish a new interrupt for the next current
+        // turn as soon as it receives the status below; cleaning afterwards
+        // would erase that newer, query-valid sentinel.
+        try {
+          fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+        } catch {
+          /* ignore */
+        }
+        // Do not delete _drain here. It is an independent runner-lifecycle
+        // request (for example, an incompatible queued replacement), not part
+        // of the query-bound interrupt being acknowledged. The subsequent
+        // wait consumes it and exits, leaving requeued inputs for a new runner.
+        clearInterruptRequested();
+        consecutiveCompactions = 0;
+
+        // The current turn was removed by cancelCurrentTurn(). Requeue only
+        // later accepted turns, and do so before the acknowledgement so a
+        // replacement interrupt always observes a runnable next turn.
+        if (queryResult.pipedMessagesDuringQuery.length > 0) {
+          const piped = queryResult.pipedMessagesDuringQuery;
+          log(
+            `Query interrupted; re-enqueueing ${piped.length} later accepted message(s) to IPC`,
+          );
+          requeueIpcInputMessages(IPC_INPUT_DIR, piped);
+        }
+
+        // A drain combines every file currently present into the next SDK
+        // input. When accepted later turns already exist, perform that drain
+        // before acknowledging the interrupt so the host receives the exact
+        // next-batch ownership—including any IPC that landed during teardown.
+        // Otherwise it could mistake a mixed batch for an exclusive forward
+        // root and destructively steer unrelated work.
+        let nextMessage:
+          | Awaited<ReturnType<typeof waitForIpcMessage>>
+          | undefined;
+        if (queryResult.pipedMessagesDuringQuery.length > 0) {
+          log('Draining requeued turns before acknowledging interrupt');
+          nextMessage = await waitForIpcMessage();
+        }
+        const activeIpcReceipts = (nextMessage?.messages ?? [])
+          .map((message) => message.receipt)
+          .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
         writeOutput({
           status: 'stream',
           result: null,
@@ -4262,35 +4312,15 @@ async function main(): Promise<void> {
           ...(queryResult.cancelledIpcReceipts?.length
             ? { ipcReceipts: queryResult.cancelledIpcReceipts }
             : {}),
+          queryIdle: !nextMessage,
+          ...(activeIpcReceipts.length > 0 ? { activeIpcReceipts } : {}),
         });
-        // 清理可能残留的 _interrupt / _drain 文件
-        try {
-          fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-        } catch {
-          /* ignore */
-        }
-        try {
-          fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL);
-        } catch {
-          /* ignore */
-        }
-        clearInterruptRequested();
-        consecutiveCompactions = 0;
-
-        // 当前 turn 已由 cancelCurrentTurn() 从未确认列表移除，不能重放；否则热
-        // runner 的旧用户输入会抢在 steer 后再次执行。这里只回放当前 turn 之后
-        // 已经被 SDK 接受、但尚未获得结果的后续 turn（若有）。
-        if (queryResult.pipedMessagesDuringQuery.length > 0) {
-          const piped = queryResult.pipedMessagesDuringQuery;
-          log(
-            `Query interrupted; re-enqueueing ${piped.length} later accepted message(s) to IPC`,
-          );
-          requeueIpcInputMessages(IPC_INPUT_DIR, piped);
-        }
 
         // 等待下一条消息（包括刚重新入队的 piped 消息）
-        log('Query interrupted by user, waiting for next message');
-        const nextMessage = await waitForIpcMessage();
+        if (nextMessage === undefined) {
+          log('Query interrupted by user, waiting for next message');
+          nextMessage = await waitForIpcMessage();
+        }
         if (nextMessage === null) {
           log('Close sentinel received after interrupt, exiting');
           // 退出前发送 session 更新，确保主进程持久化最新 session ID
@@ -4304,6 +4334,10 @@ async function main(): Promise<void> {
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
         currentIpcMessages = nextMessage.messages;
+        containerInput.queryRunId =
+          latestIpcInputMessage(nextMessage.messages)?.queryRunId ??
+          containerInput.queryRunId;
+        activeInterruptQueryRunId = containerInput.queryRunId;
         containerInput.turnId = generateTurnId();
         mcpToolsConfig.currentInputTurnId =
           latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
@@ -4627,6 +4661,7 @@ async function main(): Promise<void> {
       containerInput.queryRunId =
         latestIpcInputMessage(nextMessage.messages)?.queryRunId ??
         containerInput.queryRunId;
+      activeInterruptQueryRunId = containerInput.queryRunId;
       containerInput.turnId = generateTurnId();
       mcpToolsConfig.currentInputTurnId =
         latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
