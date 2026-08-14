@@ -507,9 +507,9 @@ describe('Feishu durable Inbox and cursor integration', () => {
 
   test('coalesces the real rapid topic root+reply event shape as one complete request', async () => {
     const accountId = `account-rapid-topic-${Date.now()}`;
-    const rootId = 'om_x100b68c1edd3ed30e88ddab22c801cd';
-    const noteId = 'om_x100b68c1ede9d8ace84ccd98f225da5';
-    const threadId = 'omt_191ad2f8c0161924';
+    const rootId = 'om_x100rapidtopicroot000000000000001';
+    const noteId = 'om_x100rapidtopicnote000000000000002';
+    const threadId = 'omt_rapidtopic000000000000001';
     const createTime = Date.now();
     const followUps = vi.fn((input: { messageId: string }) =>
       input.messageId === rootId
@@ -528,7 +528,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
             sender: { id: 'ou_durable_user', name: 'Durable User' },
             body: {
               content: JSON.stringify({
-                text: 'https://github.com/AsterGateway/astergate',
+                text: 'https://github.com/example/example-repo',
               }),
             },
           },
@@ -552,20 +552,20 @@ describe('Feishu durable Inbox and cursor integration', () => {
       groupEvent(
         rootId,
         createTime,
-        'https://github.com/AsterGateway/astergate',
+        'https://github.com/example/example-repo',
       ),
     );
     await connected.handler({
       ...groupEvent(
         noteId,
         createTime + 287,
-        '<p>你把这个仓库克隆下来，看一下这个仓库里面是什么。</p>',
+        '<p>请克隆并分析这个仓库。</p>',
       ),
       message: {
         ...groupEvent(
           noteId,
           createTime + 287,
-          '<p>你把这个仓库克隆下来，看一下这个仓库里面是什么。</p>',
+          '<p>请克隆并分析这个仓库。</p>',
         ).message,
         root_id: rootId,
         parent_id: rootId,
@@ -603,7 +603,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
     });
     expect(noteContext?.message.referencedMessages?.[0]).toMatchObject({
       id: rootId,
-      text: 'https://github.com/AsterGateway/astergate',
+      text: 'https://github.com/example/example-repo',
       contentLink: {
         kind: 'rapid_topic_bundle',
         bundleId: rootId,
@@ -617,7 +617,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
           id: '',
         })
         .find((message) => message.id === noteId)?.content,
-    ).toBe('你把这个仓库克隆下来，看一下这个仓库里面是什么。');
+    ).toBe('请克隆并分析这个仓库。');
   });
 
   test('note-first intake preserves a late root without scheduling it twice', async () => {
