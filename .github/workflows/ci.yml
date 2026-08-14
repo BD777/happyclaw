@@ -41,6 +41,9 @@ jobs:
         env:
           FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
 
+      - name: Audit production dependency trees
+        run: npm run audit:prod
+
       - name: Verify generated type sources
         run: |
           make sync-types

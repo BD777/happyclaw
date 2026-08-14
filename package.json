@@ -10,6 +10,7 @@
     "dev": "tsx src/index.ts",
     "self-test": "npm run build:all && npm run self-test:agent-runner && npm test -- --run",
     "self-test:agent-runner": "tsx scripts/self-test-agent-runner.ts",
+    "audit:prod": "npm audit --omit=dev && npm --prefix web audit --omit=dev && npm --prefix container/agent-runner audit --omit=dev",
     "reset:admin": "tsx src/reset-admin.ts",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\"",
