@@ -37,7 +37,9 @@ interface BrandAssetLogger {
 interface BrandAssetFileOps {
   existsSync: typeof fs.existsSync;
   mkdirSync: typeof fs.mkdirSync;
-  readFile: (filename: string) => Promise<Buffer>;
+  openReadOnlyNoFollow: (
+    filename: string,
+  ) => Promise<Awaited<ReturnType<typeof fs.promises.open>>>;
   readdirSync: typeof fs.readdirSync;
   renameSync: typeof fs.renameSync;
   rmSync: typeof fs.rmSync;
@@ -56,12 +58,15 @@ export interface BrandAssetRouteDeps {
 const DEFAULT_FILE_OPS: BrandAssetFileOps = {
   existsSync: fs.existsSync,
   mkdirSync: fs.mkdirSync,
-  readFile: (filename) => fs.promises.readFile(filename),
+  openReadOnlyNoFollow: (filename) =>
+    fs.promises.open(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW),
   readdirSync: fs.readdirSync,
   renameSync: fs.renameSync,
   rmSync: fs.rmSync,
   writeFileSync: fs.writeFileSync,
 };
+
+class UnsafeBrandAssetError extends Error {}
 
 /**
  * Build the brand-asset routes with explicit dependencies so filesystem and
@@ -233,9 +238,28 @@ export function createBrandAssetRoutes(deps: BrandAssetRouteDeps) {
 
     let data: Buffer;
     try {
-      data = await fileOps.readFile(path.join(assetsDir, filename));
+      const handle = await fileOps.openReadOnlyNoFollow(
+        path.join(assetsDir, filename),
+      );
+      try {
+        const stat = await handle.stat();
+        // Uploaded assets are atomically-created regular files with one link.
+        // Validate the opened descriptor rather than the path so a symlink or
+        // hardlink cannot turn this public endpoint into a host-file oracle.
+        if (!stat.isFile() || stat.nlink !== 1) {
+          throw new UnsafeBrandAssetError('Unsafe brand asset file');
+        }
+        data = await handle.readFile();
+      } finally {
+        await handle.close();
+      }
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (
+        err instanceof UnsafeBrandAssetError ||
+        code === 'ENOENT' ||
+        code === 'ELOOP'
+      ) {
         return c.json({ error: 'Brand asset not found' }, 404);
       }
       deps.log.error({ err, filename }, 'Failed to read brand asset');

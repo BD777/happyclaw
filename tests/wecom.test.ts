@@ -35,7 +35,13 @@ vi.mock('@wecom/aibot-node-sdk', () => ({
   generateReqId: (prefix: string) => `${prefix}-${++sdkMock.req}`,
 }));
 
-vi.mock('../src/db.js', () => ({ storeMessageDirect: vi.fn() }));
+vi.mock('../src/db.js', () => ({
+  getMessage: vi.fn(() => null),
+  sequenceInboundTimestampAfterChatTail: vi.fn(
+    (_chatJid: string, proposedTimestamp: string) => proposedTimestamp,
+  ),
+  storeMessageDirect: vi.fn(),
+}));
 vi.mock('../src/message-notifier.js', () => ({
   notifyNewImMessage: vi.fn(),
 }));
@@ -49,7 +55,11 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
-import { storeMessageDirect } from '../src/db.js';
+import {
+  getMessage,
+  sequenceInboundTimestampAfterChatTail,
+  storeMessageDirect,
+} from '../src/db.js';
 import { notifyNewImMessage } from '../src/message-notifier.js';
 import { broadcastNewMessage } from '../src/web.js';
 import { createWeComConnection, splitWeComMarkdown } from '../src/wecom.js';
@@ -115,6 +125,11 @@ async function connect(overrides: Record<string, unknown> = {}): Promise<{
 describe('WeCom connection security and delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getMessage).mockReturnValue(null);
+    vi.mocked(sequenceInboundTimestampAfterChatTail).mockImplementation(
+      (_chatJid, proposedTimestamp) => proposedTimestamp,
+    );
+    vi.mocked(storeMessageDirect).mockImplementation(() => 'stored');
     sdkMock.MockWSClient.instances.length = 0;
     sdkMock.req = 0;
   });
@@ -241,6 +256,258 @@ describe('WeCom connection security and delivery', () => {
     connected.client.emit('message.text', duplicate);
     connected.client.emit('message.text', duplicate);
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(1));
+  });
+
+  test('retries a failed provider event without repeating completed side effects', async () => {
+    const connected = await connect();
+    vi.mocked(storeMessageDirect)
+      .mockImplementationOnce(() => {
+        throw new Error('database temporarily unavailable');
+      })
+      .mockImplementation(() => 'stored');
+    const retry = frame({ reqId: 'retry', msgId: 'provider-event-1' });
+
+    connected.client.emit('message.text', retry);
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(broadcastNewMessage).not.toHaveBeenCalled();
+    expect(notifyNewImMessage).not.toHaveBeenCalled();
+
+    connected.client.emit('message.text', retry);
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(broadcastNewMessage).toHaveBeenCalledTimes(1),
+    );
+    expect(notifyNewImMessage).toHaveBeenCalledTimes(1);
+    expect(connected.opts.onNewChat).toHaveBeenCalledTimes(1);
+    const firstId = vi.mocked(storeMessageDirect).mock.calls[0][0];
+    const retryId = vi.mocked(storeMessageDirect).mock.calls[1][0];
+    expect(retryId).toBe(firstId);
+    expect(retryId).toMatch(/^wecom_[0-9a-f]{64}$/);
+  });
+
+  test('resumes after persistence when a later Agent notification fails', async () => {
+    const onAgentMessage = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('queue temporarily unavailable');
+      })
+      .mockImplementation(() => undefined);
+    const connected = await connect({
+      resolveEffectiveChatJid: vi.fn((jid: string) => ({
+        effectiveJid: `${jid}#agent:agent-1`,
+        agentId: 'agent-1',
+      })),
+      onAgentMessage,
+    });
+    const retry = frame({ reqId: 'late-retry', msgId: 'provider-event-2' });
+
+    connected.client.emit('message.text', retry);
+    await vi.waitFor(() => expect(onAgentMessage).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storeMessageDirect).toHaveBeenCalledTimes(1);
+    expect(broadcastNewMessage).toHaveBeenCalledTimes(1);
+    expect(notifyNewImMessage).toHaveBeenCalledTimes(1);
+
+    connected.client.emit('message.text', retry);
+    await vi.waitFor(() => expect(onAgentMessage).toHaveBeenCalledTimes(2));
+    expect(storeMessageDirect).toHaveBeenCalledTimes(1);
+    expect(broadcastNewMessage).toHaveBeenCalledTimes(1);
+    expect(notifyNewImMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test('sequences same-second messages and reuses the committed timestamp on staged retry', async () => {
+    const firstTimestamp = '2026-08-15T00:00:00.000Z';
+    const secondTimestamp = '2026-08-15T00:00:00.001Z';
+    vi.mocked(sequenceInboundTimestampAfterChatTail)
+      .mockReturnValueOnce(firstTimestamp)
+      .mockReturnValueOnce(secondTimestamp);
+    const onAgentMessage = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('queue temporarily unavailable');
+      })
+      .mockImplementation(() => undefined);
+    const connected = await connect({
+      resolveEffectiveChatJid: vi.fn((jid: string) => ({
+        effectiveJid: `${jid}#agent:agent-1`,
+        agentId: 'agent-1',
+      })),
+      onAgentMessage,
+    });
+
+    connected.client.emit(
+      'message.text',
+      frame({ reqId: 'same-second-a', createTime: 1_786_752_000 }),
+    );
+    await vi.waitFor(() => expect(onAgentMessage).toHaveBeenCalledTimes(1));
+    connected.client.emit(
+      'message.text',
+      frame({
+        reqId: 'same-second-a-retry',
+        msgId: 'same-second-a',
+        createTime: 1_786_752_000,
+      }),
+    );
+    await vi.waitFor(() => expect(onAgentMessage).toHaveBeenCalledTimes(2));
+    connected.client.emit(
+      'message.text',
+      frame({ reqId: 'same-second-b', createTime: 1_786_752_000 }),
+    );
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(2));
+
+    expect(sequenceInboundTimestampAfterChatTail).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(storeMessageDirect).mock.calls[0][5]).toBe(firstTimestamp);
+    expect(vi.mocked(storeMessageDirect).mock.calls[1][5]).toBe(
+      secondTimestamp,
+    );
+    expect(vi.mocked(broadcastNewMessage).mock.calls[0][1]).toMatchObject({
+      timestamp: firstTimestamp,
+    });
+    expect(vi.mocked(broadcastNewMessage).mock.calls[1][1]).toMatchObject({
+      timestamp: secondTimestamp,
+    });
+  });
+
+  test('checks the group audience before commands and permits only unowned owner bootstrap', async () => {
+    const onCommand = vi.fn(async () => 'command reply');
+    const connected = await connect({
+      onCommand,
+      isSenderAllowedInGroup: vi.fn(() => false),
+      resolveRegisteredGroup: vi.fn(() => ({
+        activation_mode: 'when_mentioned',
+        owner_im_id: 'owner-1',
+      })),
+    });
+
+    connected.client.emit(
+      'message.text',
+      frame({
+        reqId: 'blocked-command',
+        chattype: 'group',
+        content: '/recall',
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(onCommand).not.toHaveBeenCalled();
+    expect(connected.client.replyStream).not.toHaveBeenCalled();
+
+    const unowned = await connect({
+      onCommand,
+      isSenderAllowedInGroup: vi.fn(() => false),
+      resolveRegisteredGroup: vi.fn(() => ({
+        activation_mode: 'when_mentioned',
+      })),
+    });
+    unowned.client.emit(
+      'message.text',
+      frame({
+        reqId: 'owner-bootstrap',
+        msgId: 'owner-bootstrap',
+        chattype: 'group',
+        content: '/owner_mention',
+      }),
+    );
+    await vi.waitFor(() => expect(onCommand).toHaveBeenCalledTimes(1));
+    expect(onCommand).toHaveBeenCalledWith(
+      'wecom:group:group-1',
+      'owner_mention',
+      'user-1',
+    );
+    expect(unowned.client.replyStream).toHaveBeenCalledTimes(1);
+  });
+
+  test('retries a failed command reply without executing the command twice', async () => {
+    const onCommand = vi.fn(async () => 'cached command result');
+    const connected = await connect({ onCommand });
+    connected.client.replyStream.mockRejectedValueOnce(
+      new Error('temporary reply failure'),
+    );
+
+    connected.client.emit(
+      'message.text',
+      frame({
+        reqId: 'command-first',
+        msgId: 'command-event',
+        content: '/where',
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(connected.client.replyStream).toHaveBeenCalledTimes(1),
+    );
+    connected.client.emit(
+      'message.text',
+      frame({
+        reqId: 'command-retry',
+        msgId: 'command-event',
+        content: '/where',
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(connected.client.replyStream).toHaveBeenCalledTimes(2),
+    );
+
+    expect(onCommand).toHaveBeenCalledTimes(1);
+    expect(connected.client.replyStream.mock.calls[1][2]).toBe(
+      'cached command result',
+    );
+  });
+
+  test('treats a WeCom group callback as provider mention evidence', async () => {
+    const shouldProcessGroupMessage = vi.fn(() => false);
+    let activationMode = 'when_mentioned';
+    const connected = await connect({
+      shouldProcessGroupMessage,
+      isSenderAllowedInGroup: vi.fn(() => true),
+      resolveRegisteredGroup: vi.fn(() => ({
+        activation_mode: activationMode,
+      })),
+    });
+
+    connected.client.emit(
+      'message.text',
+      frame({
+        reqId: 'mentioned-group',
+        chattype: 'group',
+        content: '@HappyClaw hello',
+      }),
+    );
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(1));
+    expect(shouldProcessGroupMessage).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    vi.mocked(getMessage).mockReturnValue(null);
+    vi.mocked(storeMessageDirect).mockImplementation(() => 'stored');
+    activationMode = 'disabled';
+    connected.client.emit(
+      'message.text',
+      frame({
+        reqId: 'disabled-group',
+        msgId: 'disabled-group',
+        chattype: 'group',
+        content: '@HappyClaw ignored',
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+    expect(shouldProcessGroupMessage).not.toHaveBeenCalled();
+  });
+
+  test('keeps legacy owner_mentioned restricted to the owner', async () => {
+    const connected = await connect({
+      isSenderAllowedInGroup: vi.fn(() => true),
+      isGroupOwnerMessage: vi.fn(() => false),
+      resolveRegisteredGroup: vi.fn(() => ({
+        activation_mode: 'owner_mentioned',
+        owner_im_id: 'owner-1',
+      })),
+    });
+    connected.client.emit(
+      'message.text',
+      frame({ reqId: 'non-owner', chattype: 'group' }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storeMessageDirect).not.toHaveBeenCalled();
   });
 
   test('freezes the original req_id for concurrent messages in one chat', async () => {

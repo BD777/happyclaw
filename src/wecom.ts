@@ -10,7 +10,11 @@
 import crypto from 'node:crypto';
 import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
 import type { WsFrame, TextMessage } from '@wecom/aibot-node-sdk';
-import { storeMessageDirect } from './db.js';
+import {
+  getMessage,
+  sequenceInboundTimestampAfterChatTail,
+  storeMessageDirect,
+} from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
@@ -75,9 +79,13 @@ export interface WeComConnectOpts {
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
-  resolveRegisteredGroup?: (
-    jid: string,
-  ) => { activation_mode?: string } | undefined;
+  resolveRegisteredGroup?: (jid: string) =>
+    | {
+        activation_mode?: string;
+        owner_im_id?: string;
+        owner_claim_source?: string;
+      }
+    | undefined;
 }
 
 export interface WeComConnection {
@@ -99,6 +107,49 @@ interface CachedInboundFrame {
   frame: WsFrame<TextMessage>;
   chatId: string;
   expiresAt: number;
+}
+
+type WeComGroupMentionState = 'provider_mentioned' | 'not_group';
+
+interface WeComInboundProgress {
+  timestamp?: string;
+  registered?: boolean;
+  stored?: boolean;
+  frameCached?: boolean;
+  broadcast?: boolean;
+  notified?: boolean;
+  agentNotified?: boolean;
+}
+
+/**
+ * WeCom's intelligent-bot API emits a group message callback only after the
+ * user @mentions the bot. The official TextMessage payload consequently has no
+ * separate mention boolean (and may retain the display mention in text). Treat
+ * the provider callback itself as structured mention evidence; never guess by
+ * parsing a user-controlled "@name" prefix.
+ */
+function weComGroupMentionState(body: TextMessage): WeComGroupMentionState {
+  return body.chattype === 'group' ? 'provider_mentioned' : 'not_group';
+}
+
+function stableWeComInboundId(input: {
+  accountId?: string;
+  botId: string;
+  providerChatId: string;
+  eventId: string;
+}): string {
+  const digest = crypto
+    .createHash('sha256')
+    .update(
+      [
+        'wecom',
+        input.accountId || input.botId,
+        input.providerChatId,
+        input.eventId,
+      ].join('\u0000'),
+    )
+    .digest('hex');
+  return `wecom_${digest}`;
 }
 
 function utf8Bytes(value: string): number {
@@ -161,6 +212,15 @@ export function createWeComConnection(
   });
   const processingLock = new ProcessingLock();
   const rejectTimestamps = new Map<string, number>();
+  // A provider retry in the same process resumes after the last completed
+  // effect instead of repeating registration, persistence, Web projection, or
+  // Agent notification. The durable stable message id covers reconnect/restart
+  // replays after persistence has already committed.
+  const inboundProgress = new Map<string, WeComInboundProgress>();
+  // Once a command handler resolves, retain only its reply across a provider
+  // retry. This lets a failed transport ACK retry sendReply without executing
+  // a potentially mutating command twice.
+  const commandReplies = new Map<string, string | null>();
   // Exact durable input id -> original callback frame. Map insertion order is
   // the LRU order; a session removes its entry and retains the frozen frame.
   const inboundFrames = new Map<string, CachedInboundFrame>();
@@ -335,70 +395,169 @@ export function createWeComConnection(
       const { targetJid, routing } = resolvedRoute;
 
       const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/u);
-      if (slashMatch && opts?.onCommand) {
-        const command = `${slashMatch[1]}${slashMatch[2] ? ` ${slashMatch[2]}` : ''}`;
-        const reply = await opts.onCommand(jid, command, fromUserId);
-        if (reply && ws) await sendReply(ws, frame, reply);
-        return;
-      }
+      const commandName = slashMatch?.[1]?.toLowerCase();
+      const registeredGroup = conversation.isGroup
+        ? opts?.resolveRegisteredGroup?.(jid)
+        : undefined;
+      // /owner_mention is the sole audience bootstrap exception, and only
+      // while the group is genuinely unowned and not credential-quarantined.
+      const ownerBootstrap = Boolean(
+        conversation.isGroup &&
+        commandName === 'owner_mention' &&
+        registeredGroup &&
+        !registeredGroup.owner_im_id &&
+        registeredGroup.owner_claim_source !== 'transfer_reset',
+      );
 
-      if (
-        conversation.isGroup &&
-        opts?.isSenderAllowedInGroup &&
-        !opts.isSenderAllowedInGroup(jid, fromUserId)
-      ) {
-        return;
-      }
-      if (
-        conversation.isGroup &&
-        opts?.shouldProcessGroupMessage &&
-        !opts.shouldProcessGroupMessage(jid, fromUserId)
-      ) {
-        const mode = opts.resolveRegisteredGroup?.(jid)?.activation_mode;
+      if (conversation.isGroup) {
         if (
-          mode !== 'owner_mentioned' ||
-          !opts.isGroupOwnerMessage?.(jid, fromUserId)
+          opts?.isSenderAllowedInGroup &&
+          !opts.isSenderAllowedInGroup(jid, fromUserId) &&
+          !ownerBootstrap
+        ) {
+          return;
+        }
+
+        const mode = registeredGroup?.activation_mode;
+        if (mode === 'disabled') return;
+
+        const mentionState = weComGroupMentionState(body);
+        if (
+          mentionState !== 'provider_mentioned' &&
+          opts?.shouldProcessGroupMessage &&
+          !opts.shouldProcessGroupMessage(jid, fromUserId)
+        ) {
+          return;
+        }
+        if (
+          mode === 'owner_mentioned' &&
+          !ownerBootstrap &&
+          !opts?.isGroupOwnerMessage?.(jid, fromUserId)
         ) {
           return;
         }
       }
 
+      if (slashMatch && opts?.onCommand) {
+        const command = `${slashMatch[1]}${slashMatch[2] ? ` ${slashMatch[2]}` : ''}`;
+        if (!commandReplies.has(dedupKey)) {
+          while (commandReplies.size >= MESSAGE_DEDUP_MAX) {
+            const oldest = commandReplies.keys().next().value;
+            if (oldest === undefined) break;
+            commandReplies.delete(oldest);
+          }
+          try {
+            commandReplies.set(
+              dedupKey,
+              (await opts.onCommand(jid, command, fromUserId)) ?? null,
+            );
+          } catch (error) {
+            // The handler may have committed state before throwing. Cache a
+            // terminal error response so a transport retry never replays the
+            // uncertain command mutation.
+            logger.error(
+              { ...logCtx, jid, command: commandName, error },
+              'WeCom slash command failed',
+            );
+            commandReplies.set(dedupKey, '命令执行失败，请稍后重试。');
+          }
+        }
+        const reply = commandReplies.get(dedupKey);
+        if (reply) {
+          if (!ws) throw new Error('WeCom connection is unavailable');
+          await sendReply(ws, frame, reply);
+        }
+        commandReplies.delete(dedupKey);
+        return;
+      }
+
       // All registration and business side effects are after admission,
       // routing, command handling, and group policy filters.
-      opts?.onNewChat(jid, senderName);
-      const id = crypto.randomUUID();
-      const timestamp = new Date(createdAt || Date.now()).toISOString();
+      let progress = inboundProgress.get(dedupKey);
+      if (!progress) {
+        while (inboundProgress.size >= MESSAGE_DEDUP_MAX) {
+          const oldest = inboundProgress.keys().next().value;
+          if (oldest === undefined) break;
+          inboundProgress.delete(oldest);
+        }
+        progress = {};
+        inboundProgress.set(dedupKey, progress);
+      }
+      const id = stableWeComInboundId({
+        accountId: config.channelAccountId,
+        botId: config.botId,
+        providerChatId: conversation.providerChatId,
+        eventId,
+      });
+      const proposedTimestamp = new Date(createdAt || Date.now()).toISOString();
       const senderId = `wecom:${fromUserId}`;
-      storeMessageDirect(
-        id,
+
+      if (!progress.stored && getMessage(targetJid, id)) {
+        // A process/reconnect replay found the provider event already durable.
+        // Refresh only the callback frame needed for a still-pending reply; the
+        // DB poller owns recovery, so repeating projections would duplicate it.
+        cacheFrame(id, conversation.providerChatId, frame);
+        inboundProgress.delete(dedupKey);
+        return;
+      }
+      // WeCom create_time has only second precision. Cursor polling is ordered
+      // by (timestamp,id), so sequence concurrent events after the durable chat
+      // tail. Keep the assigned value in staged progress: if persistence
+      // succeeds but a later projection fails, the retry must broadcast the
+      // exact timestamp that was committed.
+      progress.timestamp ??= sequenceInboundTimestampAfterChatTail(
         targetJid,
-        senderId,
-        senderName,
-        content,
-        timestamp,
-        false,
-        { sourceJid: jid },
+        proposedTimestamp,
       );
-      cacheFrame(id, conversation.providerChatId, frame);
-      broadcastNewMessage(
-        targetJid,
-        {
+      const timestamp = progress.timestamp;
+      if (!progress.registered) {
+        opts?.onNewChat(jid, senderName);
+        progress.registered = true;
+      }
+      if (!progress.stored) {
+        storeMessageDirect(
           id,
-          chat_jid: targetJid,
-          source_jid: jid,
-          sender: senderId,
-          sender_name: senderName,
+          targetJid,
+          senderId,
+          senderName,
           content,
           timestamp,
-          is_from_me: false,
-        },
-        routing?.agentId ?? undefined,
-      );
-      notifyNewImMessage();
-
-      if (routing?.agentId) {
-        opts?.onAgentMessage?.(jid, routing.agentId);
+          false,
+          { sourceJid: jid },
+        );
+        progress.stored = true;
       }
+      if (!progress.frameCached) {
+        cacheFrame(id, conversation.providerChatId, frame);
+        progress.frameCached = true;
+      }
+      if (!progress.broadcast) {
+        broadcastNewMessage(
+          targetJid,
+          {
+            id,
+            chat_jid: targetJid,
+            source_jid: jid,
+            sender: senderId,
+            sender_name: senderName,
+            content,
+            timestamp,
+            is_from_me: false,
+          },
+          routing?.agentId ?? undefined,
+        );
+        progress.broadcast = true;
+      }
+      if (!progress.notified) {
+        notifyNewImMessage();
+        progress.notified = true;
+      }
+
+      if (routing?.agentId && !progress.agentNotified) {
+        opts?.onAgentMessage?.(jid, routing.agentId);
+        progress.agentNotified = true;
+      }
+      inboundProgress.delete(dedupKey);
       logger.info(
         {
           ...logCtx,
@@ -410,6 +569,9 @@ export function createWeComConnection(
         'WeCom message admitted and stored',
       );
     } catch (error) {
+      // The mark is provisional until every required effect completes. A
+      // provider retry with the same msgid resumes from inboundProgress.
+      dedup.forget(dedupKey);
       logger.error({ ...logCtx, error }, 'WeCom inbound handling failed');
     } finally {
       processingLock.release(dedupKey);
@@ -515,6 +677,8 @@ export function createWeComConnection(
       ws = null;
       opts = null;
       inboundFrames.clear();
+      inboundProgress.clear();
+      commandReplies.clear();
       rejectTimestamps.clear();
       dedup.clear();
       processingLock.dispose();

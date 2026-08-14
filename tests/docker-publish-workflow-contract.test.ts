@@ -44,6 +44,12 @@ describe('Docker image distribution contract', () => {
     expect(workflow).toContain('password: ${{ secrets.DOCKERHUB_TOKEN }}');
     expect(workflow).not.toContain(`${['dckr', 'pat'].join('_')}_`);
     expect(workflow).not.toContain('docker/setup-qemu-action');
+    expect(workflow).toContain(
+      'BUILDKIT_IMAGE: moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8',
+    );
+    expect(workflow).toContain('docker pull "$BUILDKIT_IMAGE"');
+    expect(workflow).toContain('driver-opts: image=${{ env.BUILDKIT_IMAGE }}');
+    expect(workflow).not.toMatch(/moby\/buildkit:[A-Za-z0-9_.-]+/);
 
     const actionUses = [
       ...workflow.matchAll(/^\s*uses:\s+(\S+)(?:\s+#.*)?$/gm),

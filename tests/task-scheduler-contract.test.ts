@@ -205,6 +205,51 @@ describe('scheduled-task IPC durable occurrence correlation', () => {
       ),
     ).toBeNull();
   });
+
+  test('validates isolated namespace runs instead of trusting the directory name', () => {
+    const isolatedRun = {
+      ...run,
+      definition_snapshot: {
+        context_mode: 'isolated',
+        group_folder: GROUP_FOLDER,
+      },
+    } as never;
+    const getRun = (id: string) =>
+      id === 'run-isolated' ? isolatedRun : undefined;
+
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'task-42', scheduledTaskRunId: 'run-isolated' },
+        'run-isolated',
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBe('run-isolated');
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'forged-task' },
+        'run-isolated',
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'task-42' },
+        'missing-run',
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'task-42' },
+        'run-isolated',
+        'another-workspace',
+        getRun,
+      ),
+    ).toBeNull();
+  });
 });
 
 describe('scheduled group frozen delivery route', () => {
@@ -2549,6 +2594,35 @@ describe('scheduled task workspace/session contract', () => {
       summary: { failed_channels: ['web:notification-retry-source'] },
     });
     expect(result.retryPayload).toEqual(payload);
+  });
+
+  test('persists unresolved explicit channel work until a binding can be resolved', async () => {
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_channel_file',
+      targetChannel: 'wechat',
+      ownerId: 'owner-1',
+      workspaceFolder: GROUP_FOLDER,
+      filePath: 'report.pdf',
+      fileName: 'report.pdf',
+    };
+    const retryTaskNotification = vi.fn(async () => ({
+      status: 'success' as const,
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    }));
+
+    const result = await deliverPersistedNotificationPayload(payload, {
+      retryTaskNotification,
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(result.receipt.status).toBe('success');
+    expect(result.retryPayload).toBeUndefined();
+    expect(retryTaskNotification).toHaveBeenCalledWith(payload);
   });
 
   test('strictly acknowledged script source is excluded from fallback', async () => {

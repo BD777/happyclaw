@@ -1,5 +1,5 @@
 import type { Dispatcher } from 'undici';
-import { describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import type {
   WeChatContextTokenClaimInput,
@@ -27,6 +27,11 @@ vi.mock('../src/logger.js', () => ({
 
 const { createWeChatConnection } = await import('../src/wechat.js');
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  dbCalls.storeMessageDirect.mockImplementation(() => undefined);
+});
+
 class SharedStore implements WeChatContextTokenStore {
   record: WeChatContextTokenRecord | undefined;
 
@@ -39,6 +44,8 @@ class SharedStore implements WeChatContextTokenStore {
     userId: string;
     token: string;
     refreshedAtMs: number;
+    sourceMessageId?: string | null;
+    sourceSequence?: number | null;
   }): WeChatContextTokenRecord {
     this.record = { ...input, sendCount: 0, lastSentAtMs: null };
     return { ...this.record };
@@ -53,7 +60,9 @@ class SharedStore implements WeChatContextTokenStore {
     if (!record) return { status: 'missing' };
     if (
       record.token !== input.expectedToken ||
-      record.refreshedAtMs !== input.expectedRefreshedAtMs
+      record.refreshedAtMs !== input.expectedRefreshedAtMs ||
+      (input.expectedSourceMessageId !== undefined &&
+        (record.sourceMessageId ?? null) !== input.expectedSourceMessageId)
     ) {
       return { status: 'changed' };
     }
@@ -71,6 +80,7 @@ class SharedStore implements WeChatContextTokenStore {
     userId: string;
     expectedToken?: string;
     expectedRefreshedAtMs?: number;
+    expectedSourceMessageId?: string | null;
   }): boolean {
     if (
       !this.record ||
@@ -78,7 +88,10 @@ class SharedStore implements WeChatContextTokenStore {
       this.record.userId !== input.userId ||
       (input.expectedToken !== undefined &&
         (this.record.token !== input.expectedToken ||
-          this.record.refreshedAtMs !== input.expectedRefreshedAtMs))
+          this.record.refreshedAtMs !== input.expectedRefreshedAtMs ||
+          (input.expectedSourceMessageId !== undefined &&
+            (this.record.sourceMessageId ?? null) !==
+              input.expectedSourceMessageId)))
     ) {
       return false;
     }
@@ -182,5 +195,112 @@ describe('WeChat connection durable context_token integration', () => {
     ).rejects.toThrow('请让该用户先向机器人发送一条新消息');
     expect(sendAttempts).toBe(2);
     await restarted.disconnect();
+  });
+});
+
+describe('WeChat inbound replay classification', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test('keeps the old cursor and replays after an infrastructure failure', async () => {
+    const store = new SharedStore();
+    const onUpdatesBuf = vi.fn();
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const batch = {
+      get_updates_buf: 'cursor-after-message',
+      msgs: [
+        {
+          message_id: 42,
+          from_user_id: 'peer',
+          message_type: 1,
+          create_time_ms: Date.now(),
+          context_token: 'retry-token',
+          item_list: [{ type: 1, text_item: { text: 'retry me' } }],
+        },
+      ],
+    };
+    let polls = 0;
+    const fetchMock = vi.fn(
+      async (_url: string, init?: { signal?: AbortSignal | null }) => {
+        polls += 1;
+        if (polls <= 2) return Response.json(batch);
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    dbCalls.storeMessageDirect
+      .mockImplementationOnce(() => {
+        throw new Error('database temporarily unavailable');
+      })
+      .mockImplementation(() => undefined);
+
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+        random: () => 0.5,
+      },
+    );
+    await connection.connect({
+      onNewChat: vi.fn(),
+      isChatAuthorized: () => true,
+      onUpdatesBuf,
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(dbCalls.storeMessageDirect).toHaveBeenCalledTimes(1);
+    expect(onUpdatesBuf).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(dbCalls.storeMessageDirect).toHaveBeenCalledTimes(2);
+    expect(onUpdatesBuf).toHaveBeenCalledTimes(1);
+    expect(onUpdatesBuf).toHaveBeenCalledWith('cursor-after-message');
+    await connection.disconnect();
+  });
+
+  test('acknowledges an intentional terminal ignore without persistence', async () => {
+    const onUpdatesBuf = vi.fn();
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    let firstPoll = true;
+    const fetchMock = vi.fn(
+      async (_url: string, init?: { signal?: AbortSignal | null }) => {
+        if (firstPoll) {
+          firstPoll = false;
+          return Response.json({
+            get_updates_buf: 'cursor-after-bot-message',
+            msgs: [{ message_id: 7, message_type: 2 }],
+          });
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      { botToken: 'bot-token', ilinkBotId: 'bot-id' },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: null,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn(), onUpdatesBuf });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(dbCalls.storeMessageDirect).not.toHaveBeenCalled();
+    expect(onUpdatesBuf).toHaveBeenCalledWith('cursor-after-bot-message');
+    await connection.disconnect();
   });
 });

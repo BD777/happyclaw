@@ -1,5 +1,7 @@
 import path from 'path';
 import fs from 'fs';
+import { spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import { DATA_DIR, GROUPS_DIR, MAX_FILE_SIZE } from './config.js';
 import { deleteContainerEnvConfig } from './runtime-config.js';
 import { logger } from './logger.js';
@@ -51,6 +53,158 @@ const EDITABLE_SYSTEM_PATHS_LOWER = EDITABLE_SYSTEM_PATHS.map((p) =>
 // 其它平台保留 strict ===。
 const CASE_INSENSITIVE_FS =
   process.platform === 'darwin' || process.platform === 'win32';
+
+const SAFE_WORKSPACE_FS_HELPER = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../scripts/safe-workspace-fs.py',
+);
+
+interface SafeWorkspaceMutationRequest {
+  operation: 'write_file' | 'mkdir' | 'delete';
+  root: string;
+  path: string;
+  dataBase64?: string;
+  mustExist?: boolean;
+  createParents?: boolean;
+}
+
+function runSafeWorkspaceMutation(request: SafeWorkspaceMutationRequest): void {
+  if (process.platform === 'win32') {
+    // Windows does not expose POSIX dir_fd/openat through its Python runtime.
+    // Preserve the existing no-follow/revalidation behavior there; creating
+    // symlinks/junctions already requires a privileged principal. Unix hosts,
+    // including production macOS, use the descriptor-relative helper below.
+    const root = path.resolve(request.root);
+    const target = path.resolve(root, request.path);
+    const relative = path.relative(root, target);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new Error('Path traversal detected');
+    }
+    const verifyInsideRoot = (candidate: string): void => {
+      let existing = candidate;
+      while (!fs.existsSync(existing) && existing !== root) {
+        existing = path.dirname(existing);
+      }
+      const realRoot = fs.realpathSync(root);
+      const realExisting = fs.realpathSync(existing);
+      if (
+        realExisting !== realRoot &&
+        !realExisting.startsWith(`${realRoot}${path.sep}`)
+      ) {
+        throw new Error('Symlink traversal detected');
+      }
+    };
+    verifyInsideRoot(target);
+    if (request.operation === 'mkdir') {
+      if (fs.existsSync(target)) throw new Error('Directory already exists');
+      fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+      return;
+    }
+    if (request.operation === 'delete') {
+      if (!fs.existsSync(target))
+        throw new Error('File or directory not found');
+      verifyInsideRoot(target);
+      const info = fs.lstatSync(target);
+      if (info.isSymbolicLink()) throw new Error('Symlink traversal detected');
+      if (info.isDirectory()) fs.rmSync(target, { recursive: true });
+      else fs.unlinkSync(target);
+      return;
+    }
+    const parent = path.dirname(target);
+    if (request.createParents) fs.mkdirSync(parent, { recursive: true });
+    if (request.mustExist && !fs.existsSync(target)) {
+      throw new Error('File not found');
+    }
+    verifyInsideRoot(target);
+    if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) {
+      throw new Error('Refusing to overwrite symbolic link');
+    }
+    const temporary = `${target}.happyclaw-${process.pid}-${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(
+        temporary,
+        Buffer.from(request.dataBase64 || '', 'base64'),
+        { flag: 'wx', mode: 0o644 },
+      );
+      fs.renameSync(temporary, target);
+    } finally {
+      try {
+        fs.unlinkSync(temporary);
+      } catch {
+        // already renamed or never created
+      }
+    }
+    return;
+  }
+  const python =
+    process.env.HAPPYCLAW_PYTHON3?.trim() ||
+    process.env.PYTHON3?.trim() ||
+    'python3';
+  const result = spawnSync(python, [SAFE_WORKSPACE_FS_HELPER], {
+    input: JSON.stringify(request),
+    encoding: 'utf-8',
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  let response: { ok?: boolean; error?: string } | undefined;
+  try {
+    response = JSON.parse(result.stdout.trim()) as {
+      ok?: boolean;
+      error?: string;
+    };
+  } catch {
+    response = undefined;
+  }
+  if (result.status !== 0 || response?.ok !== true) {
+    throw new Error(
+      response?.error ||
+        (result.error
+          ? 'Secure workspace mutation helper is unavailable'
+          : 'Secure workspace mutation failed'),
+    );
+  }
+}
+
+/** Atomically replace/create a file through descriptor-relative openat calls. */
+export function safeWriteWorkspaceFile(
+  folder: string,
+  relativePath: string,
+  data: Buffer,
+  options: { mustExist: boolean; createParents: boolean },
+  rootOverride?: string,
+): void {
+  runSafeWorkspaceMutation({
+    operation: 'write_file',
+    root: fs.realpathSync(getFileRoot(folder, rootOverride)),
+    path: relativePath,
+    dataBase64: data.toString('base64'),
+    mustExist: options.mustExist,
+    createParents: options.createParents,
+  });
+}
+
+export function safeDeleteWorkspaceEntry(
+  folder: string,
+  relativePath: string,
+  rootOverride?: string,
+): void {
+  runSafeWorkspaceMutation({
+    operation: 'delete',
+    root: fs.realpathSync(getFileRoot(folder, rootOverride)),
+    path: relativePath,
+  });
+}
+
+export function safeCreateWorkspaceDirectory(
+  folder: string,
+  relativePath: string,
+  rootOverride?: string,
+): void {
+  runSafeWorkspaceMutation({
+    operation: 'mkdir',
+    root: fs.realpathSync(getFileRoot(folder, rootOverride)),
+    path: relativePath,
+  });
+}
 
 /**
  * 获取会话流的文件根目录
@@ -278,22 +432,7 @@ export function deleteFile(
     throw new Error('File or directory not found');
   }
 
-  // Re-verify realpath right before destructive operation (TOCTOU defense-in-depth)
-  const realRoot = fs.realpathSync(root);
-  const realPath = fs.realpathSync(absolutePath);
-  if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
-    throw new Error('Symlink traversal detected');
-  }
-  if (realPath === realRoot) {
-    throw new Error('Cannot delete root directory');
-  }
-
-  const stats = fs.statSync(absolutePath);
-  if (stats.isDirectory()) {
-    fs.rmSync(absolutePath, { recursive: true, force: true });
-  } else {
-    fs.unlinkSync(absolutePath);
-  }
+  safeDeleteWorkspaceEntry(folder, relativePath, rootOverride);
 }
 
 /**
@@ -323,14 +462,7 @@ export function createDirectory(
     throw new Error('Directory already exists');
   }
 
-  fs.mkdirSync(absolutePath, { recursive: true });
-  // Host-created writable roots stay owner-only. The container entrypoint
-  // applies the selected direct/rootless/Desktop identity bridge.
-  try {
-    fs.chmodSync(absolutePath, 0o700);
-  } catch {
-    /* 忽略只读文件系统 */
-  }
+  safeCreateWorkspaceDirectory(folder, targetPath, rootOverride);
 }
 
 /**

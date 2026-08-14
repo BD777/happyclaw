@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { afterAll, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-files-'));
 const groupsDir = path.join(tmpRoot, 'groups');
@@ -32,10 +32,22 @@ const {
   isEditLockedPath,
   listFiles,
   deleteFile,
+  safeCreateWorkspaceDirectory,
+  safeDeleteWorkspaceEntry,
+  safeWriteWorkspaceFile,
+  validateAndResolvePath,
 } = await import('../src/file-manager.ts');
 
 const FOLDER = 'flow-x';
 const folderRoot = path.join(groupsDir, FOLDER);
+const outsideRoot = fs.mkdtempSync(
+  path.join(os.tmpdir(), 'happyclaw-files-outside-'),
+);
+
+afterAll(() => {
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(outsideRoot, { recursive: true, force: true });
+});
 
 beforeEach(() => {
   fs.rmSync(folderRoot, { recursive: true, force: true });
@@ -124,5 +136,60 @@ describe('listFiles editable flag', () => {
       isSystem: false,
       editable: true,
     });
+  });
+});
+
+describe('descriptor-relative workspace mutations', () => {
+  test('a parent swapped to an external symlink cannot redirect a file write', () => {
+    const parent = path.join(folderRoot, 'drafts');
+    const originalParent = path.join(folderRoot, 'drafts-original');
+    fs.mkdirSync(parent);
+    fs.writeFileSync(path.join(parent, 'note.md'), 'inside-old');
+    const outsideFile = path.join(outsideRoot, 'note.md');
+    fs.writeFileSync(outsideFile, 'outside-secret');
+
+    // Reproduce the route's former await window: validation succeeds first,
+    // then another workspace writer replaces the already-checked ancestor.
+    validateAndResolvePath(FOLDER, path.join('drafts', 'note.md'));
+    fs.renameSync(parent, originalParent);
+    fs.symlinkSync(outsideRoot, parent, 'dir');
+
+    expect(() =>
+      safeWriteWorkspaceFile(
+        FOLDER,
+        path.join('drafts', 'note.md'),
+        Buffer.from('attacker-controlled'),
+        { mustExist: true, createParents: false },
+      ),
+    ).toThrow('Symlink traversal detected');
+    expect(fs.readFileSync(outsideFile, 'utf-8')).toBe('outside-secret');
+    expect(fs.readFileSync(path.join(originalParent, 'note.md'), 'utf-8')).toBe(
+      'inside-old',
+    );
+  });
+
+  test('safe write, mkdir, and recursive delete preserve normal behavior', () => {
+    safeCreateWorkspaceDirectory(FOLDER, path.join('reports', 'daily'));
+    safeWriteWorkspaceFile(
+      FOLDER,
+      path.join('reports', 'daily', 'result.md'),
+      Buffer.from('v1'),
+      { mustExist: false, createParents: false },
+    );
+    safeWriteWorkspaceFile(
+      FOLDER,
+      path.join('reports', 'daily', 'result.md'),
+      Buffer.from('v2'),
+      { mustExist: true, createParents: false },
+    );
+    expect(
+      fs.readFileSync(
+        path.join(folderRoot, 'reports', 'daily', 'result.md'),
+        'utf-8',
+      ),
+    ).toBe('v2');
+
+    safeDeleteWorkspaceEntry(FOLDER, 'reports');
+    expect(fs.existsSync(path.join(folderRoot, 'reports'))).toBe(false);
   });
 });

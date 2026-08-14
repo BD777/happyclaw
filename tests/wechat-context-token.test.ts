@@ -27,6 +27,8 @@ class MemoryStore implements WeChatContextTokenStore {
     userId: string;
     token: string;
     refreshedAtMs: number;
+    sourceMessageId?: string | null;
+    sourceSequence?: number | null;
   }): WeChatContextTokenRecord {
     const record: WeChatContextTokenRecord = {
       ...input,
@@ -47,7 +49,9 @@ class MemoryStore implements WeChatContextTokenStore {
     if (!record) return { status: 'missing' };
     if (
       record.token !== input.expectedToken ||
-      record.refreshedAtMs !== input.expectedRefreshedAtMs
+      record.refreshedAtMs !== input.expectedRefreshedAtMs ||
+      (input.expectedSourceMessageId !== undefined &&
+        (record.sourceMessageId ?? null) !== input.expectedSourceMessageId)
     ) {
       return { status: 'changed' };
     }
@@ -71,6 +75,7 @@ class MemoryStore implements WeChatContextTokenStore {
     userId: string;
     expectedToken?: string;
     expectedRefreshedAtMs?: number;
+    expectedSourceMessageId?: string | null;
   }): boolean {
     const key = this.key(input.accountId, input.userId);
     const record = this.rows.get(key);
@@ -78,7 +83,9 @@ class MemoryStore implements WeChatContextTokenStore {
     if (
       input.expectedToken !== undefined &&
       (record.token !== input.expectedToken ||
-        record.refreshedAtMs !== input.expectedRefreshedAtMs)
+        record.refreshedAtMs !== input.expectedRefreshedAtMs ||
+        (input.expectedSourceMessageId !== undefined &&
+          (record.sourceMessageId ?? null) !== input.expectedSourceMessageId))
     ) {
       return false;
     }
@@ -178,6 +185,76 @@ describe('WeChat context_token lifecycle', () => {
       token: 'same-token',
       refreshedAtMs: 101,
       sendCount: 1,
+    });
+  });
+
+  test('keeps exact replay quota but accepts a distinct same-millisecond generation', () => {
+    const store = new MemoryStore();
+    const manager = new WeChatContextTokenManager({
+      accountId: 'account',
+      store,
+      now: () => 10_000,
+    });
+    manager.refresh('peer', 'token-1', 10_000, {
+      messageId: 'message-1',
+      sequence: 1,
+    });
+    expect(manager.claim('peer', 7).sendCount).toBe(7);
+
+    manager.refresh('peer', 'changed-on-replay', 10_000, {
+      messageId: 'message-1',
+      sequence: 1,
+    });
+    expect(manager.peek('peer')).toMatchObject({
+      token: 'token-1',
+      sendCount: 7,
+    });
+
+    manager.refresh('peer', 'token-2', 10_000, {
+      messageId: 'message-2',
+      sequence: 2,
+    });
+    expect(manager.peek('peer')).toMatchObject({
+      token: 'token-2',
+      sendCount: 0,
+    });
+    manager.refresh('peer', 'old-replay', 10_000, {
+      messageId: 'message-1',
+      sequence: 1,
+    });
+    expect(manager.peek('peer')).toMatchObject({
+      token: 'token-2',
+      sendCount: 0,
+    });
+  });
+
+  test('classifies the first same-millisecond generation after a legacy v70 restore by token', () => {
+    const store = new MemoryStore();
+    const manager = new WeChatContextTokenManager({
+      accountId: 'account',
+      store,
+      now: () => 10_000,
+    });
+    manager.refresh('peer', 'legacy-token', 10_000);
+    expect(manager.claim('peer', 4).sendCount).toBe(4);
+
+    manager.refresh('peer', 'legacy-token', 10_000, {
+      messageId: 'message-1',
+      sequence: 1,
+    });
+    expect(manager.peek('peer')).toMatchObject({
+      sendCount: 4,
+      sourceMessageId: null,
+    });
+
+    manager.refresh('peer', 'new-token', 10_000, {
+      messageId: 'message-2',
+      sequence: 2,
+    });
+    expect(manager.peek('peer')).toMatchObject({
+      token: 'new-token',
+      sendCount: 0,
+      sourceMessageId: 'message-2',
     });
   });
 });

@@ -1941,7 +1941,23 @@ export function resolveScheduledTaskIpcRunId(
   sourceGroup: string,
   getRun: (runId: string) => TaskRun | undefined,
 ): string | null {
-  if (isolatedRunId) return isolatedRunId;
+  if (isolatedRunId) {
+    const run = getRun(isolatedRunId);
+    if (
+      !run ||
+      run.definition_snapshot.context_mode !== 'isolated' ||
+      run.definition_snapshot.group_folder !== sourceGroup ||
+      (typeof data.taskId === 'string' &&
+        data.taskId.length > 0 &&
+        data.taskId !== run.task_id) ||
+      (typeof data.scheduledTaskRunId === 'string' &&
+        data.scheduledTaskRunId.length > 0 &&
+        data.scheduledTaskRunId !== isolatedRunId)
+    ) {
+      return null;
+    }
+    return isolatedRunId;
+  }
   if (
     typeof data.inputTurnId !== 'string' ||
     typeof data.taskId !== 'string' ||
