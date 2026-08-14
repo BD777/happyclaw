@@ -29,6 +29,10 @@ describe('Docker image distribution contract', () => {
       '[[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]',
     );
     expect(workflow).toContain('needs: build-and-smoke');
+    expect(workflow).toContain('group: docker-publish-${{ github.ref }}');
+    expect(workflow).toContain(
+      "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+    );
     expect(workflow).toContain(
       'docker buildx imagetools create --tag "$commit_tag"',
     );

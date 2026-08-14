@@ -6,7 +6,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: docker-publish-main
+  # A manually verified branch build must not cancel an in-flight main
+  # publication (or vice versa). Each ref owns its own build lane.
+  group: docker-publish-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -201,6 +203,10 @@ jobs:
           echo "digest=$manifest_digest" >>"$GITHUB_OUTPUT"
 
       - name: Promote signed manifest to latest
+        # workflow_dispatch is also used to publish an immutable git-<sha> tag
+        # for pre-merge production verification. Only a push to main may move
+        # the shared latest tag.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           MANIFEST_DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |

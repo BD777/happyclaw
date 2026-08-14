@@ -13,8 +13,10 @@ Agent 镜像；`data/`、本机环境变量、Keychain、渠道凭据及 launchd
 部署前必须满足：
 
 - 目标提交已经推送到远程分支，且本地测试、类型检查和生产构建通过。
-- 若 `container/` 或 Agent Runner 发生变化，等待 `main` 的镜像发布工作流完成，并确认
-  `riba2534/happyclaw-agent:latest` 已包含目标提交；Mac mini 不做本地镜像构建。
+- 若 `container/` 或 Agent Runner 发生变化：已合入 `main` 时等待 `latest` 发布；部署尚未
+  合入的远程分支时，用 GitHub Actions 的 `workflow_dispatch` 在该精确 ref 上构建，并使用
+  `riba2534/happyclaw-agent:git-<完整提交 SHA>`。分支构建只发布不可变提交标签，不得推进
+  公共 `latest`；Mac mini 不做本地镜像构建。
 - 明确记录本次远程分支名和预期提交 SHA，不使用浮动的本地工作树作为部署来源。
 
 连接并设置本次部署参数：
@@ -26,6 +28,7 @@ export HAPPYCLAW_DEPLOY_REF='codex/replace-with-remote-branch'
 export HAPPYCLAW_EXPECTED_SHA='replace-with-full-commit-sha'
 export HAPPYCLAW_PUBLIC_URL_PRIMARY='https://claw.riba2534.cn'
 export HAPPYCLAW_PUBLIC_URL_SECONDARY='https://claw.home.riba2534.cn:23333'
+export HAPPYCLAW_AGENT_IMAGE='riba2534/happyclaw-agent:latest'
 ```
 
 ## 2. 只读预检与一致性备份
@@ -83,7 +86,23 @@ test "$(git rev-parse HEAD)" = "$HAPPYCLAW_EXPECTED_SHA"
 
 /bin/zsh -lic 'make install'
 /bin/zsh -lic 'npm run build:all'
-/bin/zsh -lic 'docker pull riba2534/happyclaw-agent:latest'
+/bin/zsh -lic "docker pull '$HAPPYCLAW_AGENT_IMAGE'"
+```
+
+若本次使用不可变分支镜像，在重启前先备份现有 `.env`（如果存在），再只更新其中的
+`CONTAINER_IMAGE`；不得覆盖其他环境变量或把 `.env` 提交到 Git：
+
+```bash
+if [ -f .env ]; then
+  cp -p .env "$HOME/happyclaw-deploy-backups/env-before-$HAPPYCLAW_EXPECTED_SHA"
+  chmod 600 "$HOME/happyclaw-deploy-backups/env-before-$HAPPYCLAW_EXPECTED_SHA"
+fi
+if grep -q '^CONTAINER_IMAGE=' .env 2>/dev/null; then
+  sed -i '' "s|^CONTAINER_IMAGE=.*$|CONTAINER_IMAGE=$HAPPYCLAW_AGENT_IMAGE|" .env
+else
+  printf '\nCONTAINER_IMAGE=%s\n' "$HAPPYCLAW_AGENT_IMAGE" >> .env
+fi
+chmod 600 .env
 ```
 
 构建失败时不要重启服务；旧进程仍在使用此前的 `dist/`。修复分支后重新从预检开始。
