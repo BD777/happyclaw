@@ -16,6 +16,8 @@ describe('Mac mini production deployment contract', () => {
     expect(deployment).toContain(
       'BACKUP_DIR="$HOME/happyclaw-deploy-backups" make backup',
     );
+    expect(deployment).toContain("require.resolve('better-sqlite3')");
+    expect(deployment).toContain('npm ci');
     expect(deployment).toContain('npm run build:all');
     expect(deployment).toContain('launchctl kickstart -k');
     expect(deployment).toContain('/api/health');

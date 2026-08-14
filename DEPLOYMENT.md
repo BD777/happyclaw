@@ -50,6 +50,13 @@ test "$(git rev-parse "origin/$HAPPYCLAW_DEPLOY_REF")" = "$HAPPYCLAW_EXPECTED_SH
 Git 切换、构建或清理操作影响备份：
 
 ```bash
+# 在线 SQLite 快照依赖根项目的 better-sqlite3。生产进程可能仍在运行、但部署目录的
+# node_modules 已被运维清理；这种情况下先按当前已部署 lockfile 恢复根依赖。该步骤
+# 不写 data/、不切换代码，也不重启服务。
+if ! node -e "require.resolve('better-sqlite3')" >/dev/null 2>&1; then
+  npm ci
+fi
+
 mkdir -p "$HOME/happyclaw-deploy-backups"
 BACKUP_DIR="$HOME/happyclaw-deploy-backups" make backup
 export HAPPYCLAW_DEPLOY_BACKUP="$(
@@ -62,7 +69,7 @@ test "$(stat -f '%Lp' "$HAPPYCLAW_DEPLOY_BACKUP")" = 600
 printf 'Rollback backup: %s\n' "$HAPPYCLAW_DEPLOY_BACKUP"
 ```
 
-必须确认 `make backup` 成功退出并生成权限为 `0600` 的归档，再继续部署。禁止运行
+必须确认依赖恢复（如有）和 `make backup` 均成功退出，并生成权限为 `0600` 的归档，再继续部署。禁止运行
 `make reset-init`、`git clean`、`git reset --hard`，也不要用带 `--delete` 的 rsync 同步
 生产目录。
 
