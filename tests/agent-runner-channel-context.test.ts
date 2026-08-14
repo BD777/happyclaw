@@ -141,6 +141,23 @@ describe('Agent Runner channel turn context', () => {
         },
       })?.message?.contentLink,
     ).toBeUndefined();
+    expect(
+      normalizeChannelTurnContext({
+        ...feishuContext(),
+        message: {
+          id: 'om_rapid_note',
+          contentLink: {
+            kind: 'rapid_topic_bundle',
+            bundleId: 'om_rapid_root',
+            role: 'forwarder_comment',
+          },
+        },
+      })?.message?.contentLink,
+    ).toEqual({
+      kind: 'rapid_topic_bundle',
+      bundleId: 'om_rapid_root',
+      role: 'forwarder_comment',
+    });
   });
 
   test('creates a compact host-verified per-turn prompt block', () => {

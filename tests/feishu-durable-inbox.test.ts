@@ -505,6 +505,121 @@ describe('Feishu durable Inbox and cursor integration', () => {
     });
   });
 
+  test('coalesces the real rapid topic root+reply event shape as one complete request', async () => {
+    const accountId = `account-rapid-topic-${Date.now()}`;
+    const rootId = 'om_x100b68c1edd3ed30e88ddab22c801cd';
+    const noteId = 'om_x100b68c1ede9d8ace84ccd98f225da5';
+    const threadId = 'omt_191ad2f8c0161924';
+    const createTime = Date.now();
+    const followUps = vi.fn((input: { messageId: string }) =>
+      input.messageId === rootId
+        ? { disposition: 'started' as const }
+        : { disposition: 'steered' as const, runId: 'run_topic_root' },
+    );
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'text',
+            create_time: String(createTime),
+            thread_id: threadId,
+            chat_type: 'group',
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: {
+              content: JSON.stringify({
+                text: 'https://github.com/AsterGateway/astergate',
+              }),
+            },
+          },
+        ],
+      },
+    });
+    const connected = await connect(accountId, vi.fn(), {
+      onFollowUpMessage: followUps as TestConnectOptions['onFollowUpMessage'],
+    });
+    const groupEvent = (messageId: string, time: number, text: string) => ({
+      ...event(messageId, time, text),
+      message: {
+        ...event(messageId, time, text).message,
+        chat_id: 'oc_rapid_topic_group',
+        chat_type: 'group',
+        thread_id: threadId,
+      },
+    });
+
+    await connected.handler(
+      groupEvent(
+        rootId,
+        createTime,
+        'https://github.com/AsterGateway/astergate',
+      ),
+    );
+    await connected.handler({
+      ...groupEvent(
+        noteId,
+        createTime + 287,
+        '<p>你把这个仓库克隆下来，看一下这个仓库里面是什么。</p>',
+      ),
+      message: {
+        ...groupEvent(
+          noteId,
+          createTime + 287,
+          '<p>你把这个仓库克隆下来，看一下这个仓库里面是什么。</p>',
+        ).message,
+        root_id: rootId,
+        parent_id: rootId,
+      },
+    });
+
+    expect(followUps).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        messageId: rootId,
+        coalesceBundleId: undefined,
+      }),
+    );
+    expect(followUps).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        messageId: noteId,
+        requestedMode: undefined,
+        coalesceBundleId: rootId,
+      }),
+    );
+    expect(
+      db.getMessageChannelTurnContext('web:durable-feishu-test', rootId)
+        ?.message.contentLink,
+    ).toBeUndefined();
+    const noteContext = db.getMessageChannelTurnContext(
+      'web:durable-feishu-test',
+      noteId,
+    );
+    expect(noteContext?.message.contentLink).toEqual({
+      kind: 'rapid_topic_bundle',
+      bundleId: rootId,
+      role: 'forwarder_comment',
+      relatedMessageId: rootId,
+    });
+    expect(noteContext?.message.referencedMessages?.[0]).toMatchObject({
+      id: rootId,
+      text: 'https://github.com/AsterGateway/astergate',
+      contentLink: {
+        kind: 'rapid_topic_bundle',
+        bundleId: rootId,
+        role: 'forwarded_content',
+      },
+    });
+    expect(
+      db
+        .getMessagesSince('web:durable-feishu-test', {
+          timestamp: '',
+          id: '',
+        })
+        .find((message) => message.id === noteId)?.content,
+    ).toBe('你把这个仓库克隆下来，看一下这个仓库里面是什么。');
+  });
+
   test('note-first intake preserves a late root without scheduling it twice', async () => {
     const accountId = `account-forward-note-first-${Date.now()}`;
     const executed = vi.fn();

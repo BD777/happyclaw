@@ -54,7 +54,10 @@ import {
   type FeishuCapabilityResult,
 } from './feishu-capability.js';
 import { enrichFeishuInboundContent } from './feishu-rich-content.js';
-import { FeishuForwardBundleResolver } from './feishu-forward-bundle.js';
+import {
+  FeishuForwardBundleResolver,
+  type FeishuForwardCandidate,
+} from './feishu-forward-bundle.js';
 import {
   advanceChannelCursor,
   claimChannelInboxById,
@@ -730,6 +733,16 @@ function feishuRouteToJid(
  * Extract message content from Feishu message.
  * Returns text content, optional image keys, and optional file infos for download.
  */
+function unwrapFeishuParagraphText(text: string): string {
+  const trimmed = text.trim();
+  if (!/^<p>[\s\S]*<\/p>$/i.test(trimmed)) return text;
+  return trimmed
+    .replace(/^<p>/i, '')
+    .replace(/<\/p>\s*<p>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>$/i, '');
+}
+
 function extractMessageContent(
   messageType: string,
   content: string,
@@ -1933,7 +1946,7 @@ export function createFeishuConnection(
       senderTenantKey,
       senderType,
     } = payload;
-    const forwardCandidate = {
+    const forwardCandidate: FeishuForwardCandidate = {
       messageId,
       messageType,
       content: rawContent,
@@ -1942,6 +1955,8 @@ export function createFeishuConnection(
       threadId,
       senderOpenId,
       createTimeMs,
+      chatType:
+        chatType === 'p2p' || chatType === 'group' ? chatType : undefined,
     };
     // Register roots before any rich-content lookup. A concurrently delivered
     // note may otherwise finish normalization first and miss the structural
@@ -2491,6 +2506,12 @@ export function createFeishuConnection(
         parseContent: (type, content) => extractMessageContent(type, content),
       });
       text = enriched.text;
+      if (contentLink?.kind === 'rapid_topic_bundle') {
+        // This Feishu composer shape wraps its plain-text companion in a
+        // literal <p>...</p>. Keep that transport artifact out of Agent prompts
+        // and queue cards without changing ordinary text-message semantics.
+        text = unwrapFeishuParagraphText(text);
+      }
       extracted = {
         ...extracted,
         text,
@@ -2534,7 +2555,7 @@ export function createFeishuConnection(
         reference.id === contentLink.bundleId
           ? {
               contentLink: {
-                kind: 'forward_bundle' as const,
+                kind: contentLink.kind,
                 bundleId: contentLink.bundleId,
                 role: 'forwarded_content' as const,
                 relatedMessageId: messageId,
@@ -2820,13 +2841,15 @@ export function createFeishuConnection(
         targetJid,
         sessionAgentId: targetAgentId,
       });
-      const forwardCommentCarriesCompleteMaterial =
+      const bundleCommentCarriesCompleteMaterial =
         contentLink?.role === 'forwarder_comment' &&
         referencedMessages.some(
           (reference) =>
             reference.id === contentLink!.bundleId &&
-            reference.materialResolved === true &&
-            reference.contentLink?.kind === 'forward_bundle' &&
+            (contentLink!.kind === 'rapid_topic_bundle'
+              ? Boolean(reference.text.trim())
+              : reference.materialResolved === true) &&
+            reference.contentLink?.kind === contentLink!.kind &&
             reference.contentLink.bundleId === contentLink!.bundleId &&
             reference.contentLink.role === 'forwarded_content',
         );
@@ -2903,7 +2926,7 @@ export function createFeishuConnection(
             coalesceBundleId:
               !requestedFollowUpMode &&
               !slashMatch &&
-              forwardCommentCarriesCompleteMaterial &&
+              bundleCommentCarriesCompleteMaterial &&
               contentLink
                 ? contentLink.bundleId
                 : undefined,

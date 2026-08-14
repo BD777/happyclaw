@@ -5321,7 +5321,8 @@ function collectPersistedReferencedMessageIds(
     for (const reference of message.channel_context?.message
       .referencedMessages ?? []) {
       if (
-        reference.contentLink?.kind === 'forward_bundle' &&
+        (reference.contentLink?.kind === 'forward_bundle' ||
+          reference.contentLink?.kind === 'rapid_topic_bundle') &&
         reference.contentLink.role === 'forwarded_content'
       ) {
         // A coalescing interrupt may happen after the root was persisted but
@@ -19291,7 +19292,8 @@ function handleIncomingFollowUp(input: {
         if (item.id === input.messageId) return false;
         const link = item.channel_context?.message.contentLink;
         return (
-          link?.kind === 'forward_bundle' &&
+          (link?.kind === 'forward_bundle' ||
+            link?.kind === 'rapid_topic_bundle') &&
           link.bundleId === input.coalesceBundleId &&
           link.role === 'forwarder_comment'
         );

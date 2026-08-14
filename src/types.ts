@@ -45,7 +45,7 @@ export type AudienceMode = 'everyone' | 'owner_only';
 
 /** Provider-proven relation between two physical inbound messages. */
 export interface ChannelContentLink {
-  kind: 'forward_bundle';
+  kind: 'forward_bundle' | 'rapid_topic_bundle';
   /** Stable identity for one forward operation, normally its root message id. */
   bundleId: string;
   role: 'forwarded_content' | 'forwarder_comment';

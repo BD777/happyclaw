@@ -9,7 +9,7 @@ export type { StreamEventType, StreamEvent } from './stream-event.types.js';
 import type { ClaudeContextAudit, StreamEvent } from './stream-event.types.js';
 
 export interface ChannelContentLink {
-  kind: 'forward_bundle';
+  kind: 'forward_bundle' | 'rapid_topic_bundle';
   bundleId: string;
   role: 'forwarded_content' | 'forwarder_comment';
   relatedMessageId?: string;
@@ -95,7 +95,7 @@ function normalizeContentLink(value: unknown): ChannelContentLink | undefined {
   const kind = optionalString(link?.kind);
   const role = optionalString(link?.role);
   if (
-    kind !== 'forward_bundle' ||
+    (kind !== 'forward_bundle' && kind !== 'rapid_topic_bundle') ||
     !bundleId ||
     (role !== 'forwarded_content' && role !== 'forwarder_comment')
   ) {

@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from 'vitest';
 
 import {
   FEISHU_FORWARD_COMPANION_MAX_GAP_MS,
+  FEISHU_RAPID_TOPIC_COMPANION_MAX_GAP_MS,
   FeishuForwardBundleResolver,
   TransientFeishuForwardLookupError,
   hasAuthoredFeishuText,
@@ -36,6 +37,38 @@ function note(
   };
 }
 
+function rapidTopicRoot(
+  overrides: Partial<FeishuForwardCandidate> = {},
+): FeishuForwardCandidate {
+  return {
+    messageId: 'om_topic_root',
+    messageType: 'text',
+    content: JSON.stringify({ text: 'https://github.com/example/repo' }),
+    threadId: 'omt_topic',
+    senderOpenId: 'ou_sender',
+    createTimeMs: 1_700_000_000_000,
+    chatType: 'group',
+    ...overrides,
+  };
+}
+
+function rapidTopicNote(
+  overrides: Partial<FeishuForwardCandidate> = {},
+): FeishuForwardCandidate {
+  return {
+    messageId: 'om_topic_note',
+    messageType: 'text',
+    content: JSON.stringify({ text: '<p>请分析这个仓库。</p>' }),
+    rootId: 'om_topic_root',
+    parentId: 'om_topic_root',
+    threadId: 'omt_topic',
+    senderOpenId: 'ou_sender',
+    createTimeMs: 1_700_000_000_287,
+    chatType: 'group',
+    ...overrides,
+  };
+}
+
 function lookupResponse(
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
@@ -55,6 +88,81 @@ function lookupResponse(
 }
 
 describe('Feishu merged-forward companion detection', () => {
+  test('links the production rapid topic root+reply shape without reclassifying the root alone', async () => {
+    const lookup = vi.fn();
+    const resolver = new FeishuForwardBundleResolver(lookup);
+
+    expect(resolver.observeRoot(rapidTopicRoot())).toBeUndefined();
+    await expect(resolver.resolveCompanion(rapidTopicNote())).resolves.toEqual({
+      kind: 'rapid_topic_bundle',
+      bundleId: 'om_topic_root',
+      role: 'forwarder_comment',
+      relatedMessageId: 'om_topic_root',
+    });
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  test('requires a group topic, exact thread, direct parent, same sender and the 2s rapid window', async () => {
+    const variants: Array<Partial<FeishuForwardCandidate>> = [
+      { chatType: 'p2p' },
+      { threadId: 'omt_other' },
+      { parentId: 'om_middle' },
+      { senderOpenId: 'ou_other' },
+      { content: JSON.stringify({ text: '普通话题回复' }) },
+      {
+        createTimeMs:
+          1_700_000_000_000 + FEISHU_RAPID_TOPIC_COMPANION_MAX_GAP_MS + 1,
+      },
+    ];
+    for (const overrides of variants) {
+      const resolver = new FeishuForwardBundleResolver(vi.fn());
+      resolver.observeRoot(rapidTopicRoot());
+      await expect(
+        resolver.resolveCompanion(rapidTopicNote(overrides)),
+      ).resolves.toBeUndefined();
+    }
+
+    const ordinary = new FeishuForwardBundleResolver(
+      vi.fn().mockResolvedValue({ data: { items: [] } }),
+    );
+    ordinary.observeRoot(
+      rapidTopicRoot({ threadId: undefined, rootId: undefined }),
+    );
+    await expect(
+      ordinary.resolveCompanion(rapidTopicNote()),
+    ).resolves.toBeUndefined();
+  });
+
+  test('supports note-first rapid topic lookup only when provider returns the exact authored root shape', async () => {
+    const lookup = vi.fn().mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: 'om_topic_root',
+            msg_type: 'text',
+            create_time: '1700000000000',
+            thread_id: 'omt_topic',
+            chat_type: 'group',
+            sender: { id: 'ou_sender' },
+            body: {
+              content: JSON.stringify({
+                text: 'https://github.com/example/repo',
+              }),
+            },
+          },
+        ],
+      },
+    });
+    const resolver = new FeishuForwardBundleResolver(lookup);
+
+    await expect(
+      resolver.resolveCompanion(rapidTopicNote()),
+    ).resolves.toMatchObject({
+      kind: 'rapid_topic_bundle',
+      bundleId: 'om_topic_root',
+    });
+  });
+
   test('links a cached root and its direct textual note without requiring thread_id', async () => {
     const lookup = vi.fn();
     const resolver = new FeishuForwardBundleResolver(lookup);

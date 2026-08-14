@@ -6,6 +6,14 @@ import type { ChannelContentLink } from './types.js';
  * root_id and parent_id both point directly at the merge_forward root.
  */
 export const FEISHU_FORWARD_COMPANION_MAX_GAP_MS = 60_000;
+/**
+ * Feishu can render a newly-created topic as a root message followed by an
+ * immediate, paragraph-wrapped authored reply even though both provider
+ * events are plain text. Keep this compatibility window and wrapper check
+ * intentionally strict so ordinary topic replies never become implicit steer
+ * requests.
+ */
+export const FEISHU_RAPID_TOPIC_COMPANION_MAX_GAP_MS = 2_000;
 const FEISHU_FORWARD_FACT_TTL_MS = 60_000;
 const FEISHU_FORWARD_FACT_MAX_ENTRIES = 1_000;
 const FEISHU_FORWARD_LOOKUP_TIMEOUT_MS = 5_000;
@@ -19,9 +27,11 @@ export interface FeishuForwardCandidate {
   threadId?: string;
   senderOpenId?: string;
   createTimeMs: number;
+  chatType?: 'p2p' | 'group';
 }
 
 interface ForwardRootFact {
+  kind: ChannelContentLink['kind'];
   messageId: string;
   senderOpenId: string;
   createTimeMs: number;
@@ -38,7 +48,11 @@ interface FeishuMessageGetItem {
   msg_type?: string;
   create_time?: string | number;
   thread_id?: string;
+  root_id?: string;
+  parent_id?: string;
+  chat_type?: string;
   deleted?: boolean;
+  body?: { content?: string };
   sender?: {
     id?: string;
     sender_id?: { open_id?: string };
@@ -100,6 +114,14 @@ function parseJsonObject(raw: string): Record<string, unknown> | undefined {
   } catch {
     return undefined;
   }
+}
+
+function isParagraphWrappedText(content: string): boolean {
+  const parsed = parseJsonObject(content);
+  return (
+    typeof parsed?.text === 'string' &&
+    /^<p>[\s\S]*<\/p>$/i.test(parsed.text.trim())
+  );
 }
 
 function postBodyNodeHasText(node: unknown, seen: Set<object>): boolean {
@@ -180,6 +202,17 @@ function rootContentLink(messageId: string): ChannelContentLink {
   };
 }
 
+function isRapidTopicRoot(candidate: FeishuForwardCandidate): boolean {
+  return (
+    candidate.chatType === 'group' &&
+    candidate.messageType === 'text' &&
+    Boolean(candidate.threadId) &&
+    !candidate.rootId &&
+    !candidate.parentId &&
+    hasAuthoredFeishuText(candidate.messageType, candidate.content)
+  );
+}
+
 /**
  * Per-connection, bounded fact cache. Promise entries collapse concurrent
  * note-first lookups. Failed/empty/deleted lookups are not negative-cached;
@@ -217,13 +250,16 @@ export class FeishuForwardBundleResolver {
   observeRoot(
     candidate: FeishuForwardCandidate,
   ): ChannelContentLink | undefined {
-    if (candidate.messageType !== 'merge_forward') return undefined;
+    const mergeForward = candidate.messageType === 'merge_forward';
+    const rapidTopic = isRapidTopicRoot(candidate);
+    if (!mergeForward && !rapidTopic) return undefined;
     if (
       candidate.senderOpenId &&
       Number.isFinite(candidate.createTimeMs) &&
       candidate.createTimeMs > 0
     ) {
       const fact: ForwardRootFact = {
+        kind: mergeForward ? 'forward_bundle' : 'rapid_topic_bundle',
         messageId: candidate.messageId,
         senderOpenId: candidate.senderOpenId,
         createTimeMs: candidate.createTimeMs,
@@ -235,7 +271,10 @@ export class FeishuForwardBundleResolver {
       });
       this.prune();
     }
-    return rootContentLink(candidate.messageId);
+    // A plain topic root is only a provisional candidate. It must remain an
+    // ordinary current request unless a provider-structured companion arrives
+    // inside the tight compatibility window.
+    return mergeForward ? rootContentLink(candidate.messageId) : undefined;
   }
 
   private lookupRoot(messageId: string): Promise<ForwardRootFact | undefined> {
@@ -254,7 +293,16 @@ export class FeishuForwardBundleResolver {
       if (!item || item.deleted) {
         return { definitive: false, fact: undefined } as const;
       }
-      if (item.msg_type !== 'merge_forward') {
+      const mergeForward = item.msg_type === 'merge_forward';
+      const rapidTopic =
+        item.msg_type === 'text' &&
+        Boolean(item.thread_id) &&
+        !item.root_id &&
+        !item.parent_id &&
+        (!item.chat_type || item.chat_type === 'group') &&
+        typeof item.body?.content === 'string' &&
+        hasAuthoredFeishuText('text', item.body.content);
+      if (!mergeForward && !rapidTopic) {
         return { definitive: true, fact: undefined } as const;
       }
       const senderOpenId = item.sender?.id ?? item.sender?.sender_id?.open_id;
@@ -269,6 +317,7 @@ export class FeishuForwardBundleResolver {
       return {
         definitive: true,
         fact: {
+          kind: mergeForward ? 'forward_bundle' : 'rapid_topic_bundle',
           messageId: item.message_id || messageId,
           senderOpenId,
           createTimeMs,
@@ -327,7 +376,18 @@ export class FeishuForwardBundleResolver {
     const latest = this.facts.get(rootId)?.value;
     if (!fact && latest && latest !== lookup) fact = await latest;
     if (!fact || fact.senderOpenId !== candidate.senderOpenId) return undefined;
-    if (
+    if (fact.kind === 'rapid_topic_bundle') {
+      if (
+        candidate.messageType !== 'text' ||
+        !isParagraphWrappedText(candidate.content) ||
+        candidate.chatType !== 'group' ||
+        !fact.threadId ||
+        !candidate.threadId ||
+        fact.threadId !== candidate.threadId
+      ) {
+        return undefined;
+      }
+    } else if (
       fact.threadId &&
       candidate.threadId &&
       fact.threadId !== candidate.threadId
@@ -335,11 +395,15 @@ export class FeishuForwardBundleResolver {
       return undefined;
     }
     const gapMs = candidate.createTimeMs - fact.createTimeMs;
-    if (gapMs < 0 || gapMs > FEISHU_FORWARD_COMPANION_MAX_GAP_MS) {
+    const maxGapMs =
+      fact.kind === 'rapid_topic_bundle'
+        ? FEISHU_RAPID_TOPIC_COMPANION_MAX_GAP_MS
+        : FEISHU_FORWARD_COMPANION_MAX_GAP_MS;
+    if (gapMs < 0 || gapMs > maxGapMs) {
       return undefined;
     }
     return {
-      kind: 'forward_bundle',
+      kind: fact.kind,
       bundleId: rootId,
       role: 'forwarder_comment',
       relatedMessageId: rootId,

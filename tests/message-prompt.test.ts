@@ -168,6 +168,37 @@ describe('message prompt projection', () => {
     );
   });
 
+  test('keeps rapid topic material context-only while the immediate reply is the request', () => {
+    const message = replyMessage({
+      id: 'om_rapid_note',
+      content: '请分析这个仓库',
+    });
+    message.channel_context!.message.contentLink = {
+      kind: 'rapid_topic_bundle',
+      bundleId: 'om_rapid_root',
+      role: 'forwarder_comment',
+    };
+    message.channel_context!.message.referencedMessages![0] = {
+      id: 'om_rapid_root',
+      sender: 'Alice',
+      text: 'https://github.com/example/repo',
+      contentLink: {
+        kind: 'rapid_topic_bundle',
+        bundleId: 'om_rapid_root',
+        role: 'forwarded_content',
+      },
+    };
+
+    const prompt = formatMessages([message]);
+
+    expect(prompt).toContain(
+      '<referenced_message id="om_rapid_root" sender="Alice" relation="forwarded_material" instruction_scope="context_only" bundle_id="om_rapid_root">',
+    );
+    expect(prompt).toContain(
+      'relation="forwarder_note" instruction_scope="current_request" bundle_id="om_rapid_root"',
+    );
+  });
+
   test('collects stable provider IDs for persistence-based deduplication', () => {
     expect([...collectReferencedMessageIds([replyMessage()])]).toEqual([
       'om_root',
