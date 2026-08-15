@@ -240,6 +240,14 @@ const FEISHU_WS_READY_STATE_OPEN = 1;
 const WS_HEALTH_CHECK_INTERVAL_MS = 15_000;
 const WS_RECONNECT_CHECK_THRESHOLD = 4;
 const WS_RECONNECT_MIN_INTERVAL_MS = 30_000;
+// Enable the lark SDK's ping/pong liveness watchdog. After the SDK sends a
+// keepalive ping it waits this many seconds for a pong (or any inbound frame);
+// if none arrives the socket is terminated so the normal reconnect flow runs.
+// Without it, a silently half-dead connection keeps readyState === OPEN forever
+// and the readyState-based health check never reconnects — the bot goes quiet
+// with no error until the process is restarted. Any inbound frame clears the
+// watchdog, so healthy idle connections are never terminated.
+const FEISHU_WS_PING_TIMEOUT_SEC = 10;
 const BACKFILL_LOOKBACK_MS = 5 * 60 * 1000;
 const BACKFILL_PAGE_SIZE = 50;
 const BACKFILL_MAX_PAGES_PER_CHAT = 5;
@@ -3366,6 +3374,9 @@ export function createFeishuConnection(
         appId: config.appId,
         appSecret: config.appSecret,
         loggerLevel: lark.LoggerLevel.info,
+        // Detect silently-dead long connections instead of hanging on a
+        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
       });
       await wsClient.start({ eventDispatcher });
 
@@ -3627,6 +3638,9 @@ export function createFeishuConnection(
         appId: config.appId,
         appSecret: config.appSecret,
         loggerLevel: lark.LoggerLevel.info,
+        // Detect silently-dead long connections instead of hanging on a
+        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
       });
 
       try {
