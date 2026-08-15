@@ -20,7 +20,12 @@ export interface FollowUpTransitionLike {
   delivery_updated_at: string;
 }
 
-const HIDDEN_FOLLOW_UP_STATUSES = new Set(['queued', 'promoting', 'cancelled']);
+const HIDDEN_FOLLOW_UP_STATUSES = new Set([
+  'queued',
+  'promoting',
+  'cancelled',
+  'subsumed',
+]);
 
 /**
  * Queued user inputs belong beside the composer until they actually start.

@@ -357,6 +357,10 @@ describe('entrypoint permission contract', () => {
     path.join(repoRoot, 'container', 'session-permissions-watcher.mjs'),
     'utf8',
   );
+  const rescanQueue = fs.readFileSync(
+    path.join(repoRoot, 'container', 'session-permissions-rescan-queue.mjs'),
+    'utf8',
+  );
   const mountBoundaryPath = path.join(
     repoRoot,
     'container',
@@ -395,6 +399,7 @@ describe('entrypoint permission contract', () => {
     expect(entrypoint).toContain(
       'runuser -u node -- env HOME=/home/node /usr/bin/git',
     );
+    expect(dockerfile).toContain('session-permissions-rescan-queue.mjs');
     expect(dockerfile).toContain('chown -R root:root /app/prompts');
     expect(dockerfile).toContain('find /app/prompts -type d -exec chmod 0555');
     expect(dockerfile).toContain('find /app/prompts -type f -exec chmod 0444');
@@ -429,6 +434,11 @@ describe('entrypoint permission contract', () => {
     expect(watcher).not.toContain('lstatSync');
     expect(watcher).toContain('RESCAN_INTERVAL_MS = 30_000');
     expect(watcher).not.toContain('RESCAN_INTERVAL_MS = 500');
+    expect(watcher).toContain('fs.opendirSync');
+    expect(watcher).not.toContain('fs.readdirSync');
+    expect(watcher).toContain('createBoundedRescanScheduler');
+    expect(rescanQueue).toContain('MAX_PENDING_RESCAN_TARGETS = 256');
+    expect(rescanQueue).toContain('pendingTargets.clear()');
     expect(mountBoundary).not.toMatch(/catch\s*\{/);
   });
 
@@ -481,6 +491,11 @@ describe.skipIf(!integrationImageAvailable)(
       'container',
       'session-permissions-watcher.mjs',
     );
+    const rescanQueuePath = path.join(
+      repoRoot,
+      'container',
+      'session-permissions-rescan-queue.mjs',
+    );
     const mountBoundaryPath = path.join(
       repoRoot,
       'container',
@@ -516,6 +531,8 @@ describe.skipIf(!integrationImageAvailable)(
           `${helperPath}:/tmp/session-permissions.sh:ro`,
           '-v',
           `${watcherPath}:/app/session-permissions-watcher.mjs:ro`,
+          '-v',
+          `${rescanQueuePath}:/app/session-permissions-rescan-queue.mjs:ro`,
           '-v',
           `${mountBoundaryPath}:/app/session-permissions-mount.mjs:ro`,
           ...extraArgs,

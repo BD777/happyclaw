@@ -7,6 +7,7 @@
 - 产品介绍、安装和常用操作：`README.md`
 - 路由族与主要 Web API：`docs/API.md`
 - 权限边界：`docs/ACL-MATRIX.md`
+- 生产部署与回滚：`DEPLOYMENT.md`
 - 运行时 Prompt：`container/agent-runner/prompts/`
 - 数据库 Schema：`src/db.ts` 中的 `CURRENT_SCHEMA_VERSION` 与建表/迁移代码
 - Web 路由：`web/src/App.tsx`
@@ -20,7 +21,7 @@
 ## 2. 产品模型
 
 HappyClaw 是基于 Claude Agent SDK 的自托管、多用户 Agent 工作台，支持 Web 与飞书、
-Telegram、QQ、钉钉、微信、Discord、WhatsApp。
+Telegram、QQ、钉钉、微信、企业微信、Discord、WhatsApp。
 
 当前产品层级：
 
@@ -67,6 +68,7 @@ Agent Profile（身份、四段 Prompt、能力策略）
 - `src/qq.ts`
 - `src/dingtalk.ts`
 - `src/wechat.ts`
+- `src/wecom.ts`、`src/wecom-streaming.ts`
 - `src/discord.ts`
 - `src/whatsapp.ts`
 

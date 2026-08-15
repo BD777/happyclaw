@@ -2995,19 +2995,34 @@ export function toPublicContainerEnvConfig(
  * Merge global config with per-container overrides.
  * Non-empty per-container fields override the global value.
  */
+export function hasExplicitWorkspaceClaudeAuth(
+  override: ContainerEnvConfig,
+): boolean {
+  return !!(override.anthropicApiKey || override.anthropicAuthToken);
+}
+
 export function mergeClaudeEnvConfig(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
 ): ClaudeProviderConfig {
+  const hasExplicitAuth = hasExplicitWorkspaceClaudeAuth(override);
   const merged: ClaudeProviderConfig = {
     anthropicBaseUrl: override.anthropicBaseUrl || global.anthropicBaseUrl,
-    anthropicAuthToken:
-      override.anthropicAuthToken || global.anthropicAuthToken,
-    anthropicApiKey: override.anthropicApiKey || global.anthropicApiKey,
-    claudeCodeOauthToken:
-      override.claudeCodeOauthToken || global.claudeCodeOauthToken,
-    claudeOAuthCredentials:
-      override.claudeOAuthCredentials ?? global.claudeOAuthCredentials,
+    // A workspace key/token is an authentication-mode selection, not an
+    // independent field overlay. Never combine it with a global credential of
+    // another kind or with an inherited Claude OAuth session.
+    anthropicAuthToken: hasExplicitAuth
+      ? override.anthropicAuthToken || ''
+      : override.anthropicAuthToken || global.anthropicAuthToken,
+    anthropicApiKey: hasExplicitAuth
+      ? override.anthropicApiKey || ''
+      : override.anthropicApiKey || global.anthropicApiKey,
+    claudeCodeOauthToken: hasExplicitAuth
+      ? ''
+      : override.claudeCodeOauthToken || global.claudeCodeOauthToken,
+    claudeOAuthCredentials: hasExplicitAuth
+      ? null
+      : (override.claudeOAuthCredentials ?? global.claudeOAuthCredentials),
     anthropicModel: override.anthropicModel || global.anthropicModel,
     updatedAt: global.updatedAt,
   };

@@ -327,6 +327,7 @@ import {
   extractLastTaskId,
   broadcastToOwnerIMChannels as broadcastToOwnerIMChannelsPure,
   resolveBroadcastFolder,
+  resolveTaskNotificationTargets as resolveTaskNotificationTargetsPure,
   resolveTaskRoutingDecision,
 } from './task-routing.js';
 import {
@@ -10309,6 +10310,26 @@ function broadcastToOwnerIMChannels(
   );
 }
 
+function resolveTaskNotificationTargets(
+  userId: string,
+  sourceFolder: string,
+  decision: Parameters<typeof resolveTaskNotificationTargetsPure>[2],
+): ReturnType<typeof resolveTaskNotificationTargetsPure> {
+  return resolveTaskNotificationTargetsPure(userId, sourceFolder, decision, {
+    getConnectedChannelTypes:
+      imManager.getConnectedChannelTypes.bind(imManager),
+    getGroupsByOwner,
+    getChannelType,
+    resolveJidFolder: (jid: string) => {
+      const effectiveJid = resolveWorkspaceJid(jid);
+      if (!effectiveJid) return null;
+      const target =
+        registeredGroups[effectiveJid] ?? getRegisteredGroup(effectiveJid);
+      return target?.folder ?? null;
+    },
+  });
+}
+
 function startIpcWatcher(): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
@@ -10430,6 +10451,16 @@ function startIpcWatcher(): void {
               sourceGroup,
               getTaskRunById,
             );
+            const claimsScheduledTaskOutput = Boolean(
+              isolatedDurableTaskRunId ||
+              data.isScheduledTask === true ||
+              (typeof data.taskId === 'string' && data.taskId) ||
+              (typeof data.scheduledTaskRunId === 'string' &&
+                data.scheduledTaskRunId),
+            );
+            const durableTaskRun = durableTaskRunId
+              ? getTaskRunById(durableTaskRunId)
+              : undefined;
             messageRequestId =
               typeof data.requestId === 'string' ? data.requestId : undefined;
             if (
@@ -10470,6 +10501,32 @@ function startIpcWatcher(): void {
               await fsp.unlink(filePath);
               continue;
             }
+            if (
+              claimsScheduledTaskOutput &&
+              (!durableTaskRun || !sourceGroupEntry?.created_by)
+            ) {
+              messageResultWritten = writeIpcMessageResult(
+                messageResultsDir,
+                messageRequestId,
+                {
+                  success: false,
+                  error:
+                    'Scheduled-task output is not associated with a valid durable occurrence.',
+                },
+              );
+              if (
+                !canDeleteAcknowledgedIpcSource(
+                  messageRequestId,
+                  messageResultWritten,
+                )
+              ) {
+                throw new Error(
+                  'Failed to acknowledge invalid scheduled-task output',
+                );
+              }
+              await fsp.unlink(filePath);
+              continue;
+            }
             if (data.type === 'message' && data.chatJid && data.text) {
               const targetGroup = getIpcDeliveryTargetGroup(data.chatJid);
               let messageDelivered = false;
@@ -10481,11 +10538,7 @@ function startIpcWatcher(): void {
                 | 'staged_progress'
                 | 'staged_final'
                 | undefined;
-              const isTaskIpcMessage = !!(
-                data.isScheduledTask ||
-                data.taskId ||
-                ipcTaskId
-              );
+              const isTaskIpcMessage = Boolean(durableTaskRun);
               const frozenIpcMode = resolveFrozenIpcInteractionMode(
                 data.interactionMode,
                 {
@@ -10739,10 +10792,10 @@ function startIpcWatcher(): void {
                   // resolveTaskRoutingDecision() (src/task-routing.ts) so it
                   // can be unit-tested without booting this module.
                   const routingDecision = resolveTaskRoutingDecision(
-                    data,
-                    ipcTaskId,
+                    durableTaskRun,
+                    sourceGroup,
                     !!sourceGroupEntry?.created_by,
-                    { getTaskById, getChannelType },
+                    { getChannelType },
                   );
                   if (isTaskIpcMessage) {
                     const taskLocalImages = extractLocalImImagePaths(
@@ -10791,29 +10844,50 @@ function startIpcWatcher(): void {
                         });
                       }
                     };
-                    if (routingDecision.mode === 'direct') {
-                      const targetJid = routingDecision.taskChatJid;
-                      addTargetAttempts(targetJid);
-                    } else if (
-                      routingDecision.mode === 'broadcast' &&
+                    if (
+                      routingDecision.mode !== 'none' &&
                       sourceGroupEntry?.created_by
                     ) {
-                      // Fallback: broadcast to all connected IM channels
-                      const alreadySent = new Set<string>(
-                        [
-                          data.chatJid,
-                          activeImReplyRoutes.get(sourceGroup),
-                        ].filter(Boolean) as string[],
-                      );
-                      broadcastToOwnerIMChannels(
+                      const targetPlan = resolveTaskNotificationTargets(
                         sourceGroupEntry.created_by,
                         broadcastFolder,
-                        alreadySent,
-                        (jid) => {
-                          addTargetAttempts(jid);
-                        },
-                        routingDecision.notifyChannels,
+                        routingDecision,
                       );
+                      for (const targetJid of targetPlan.targetJids) {
+                        addTargetAttempts(targetJid);
+                      }
+                      for (const channel of targetPlan.unavailableChannels) {
+                        attempts.push({
+                          channel,
+                          payload: {
+                            kind: 'im_channel_message',
+                            targetChannel: channel,
+                            ownerId: sourceGroupEntry.created_by,
+                            workspaceFolder: sourceGroup,
+                            text: data.text,
+                          },
+                          deliver: async () => false,
+                        });
+                        for (const imagePath of taskLocalImages) {
+                          const imageBuffer = fs.readFileSync(imagePath);
+                          attempts.push({
+                            channel,
+                            payload: {
+                              kind: 'im_channel_image',
+                              targetChannel: channel,
+                              ownerId: sourceGroupEntry.created_by,
+                              workspaceFolder: sourceGroup,
+                              filePath: path.relative(
+                                path.resolve(GROUPS_DIR, sourceGroup),
+                                imagePath,
+                              ),
+                              mimeType: detectImageMimeType(imageBuffer),
+                              fileName: path.basename(imagePath),
+                            },
+                            deliver: async () => false,
+                          });
+                        }
+                      }
                     }
                     const delivery = await settleAndRecordTaskIpcDeliveries(
                       durableTaskRunId,
@@ -11002,6 +11076,7 @@ function startIpcWatcher(): void {
               // Handle image IPC messages from send_image MCP tool
               const targetGroup = getIpcDeliveryTargetGroup(data.chatJid);
               let taskImageTargetJids: string[] = [];
+              let taskImageUnavailableChannels: string[] = [];
               let taskImageDeliverySettled = false;
               let isTaskIpcImage = false;
               if (
@@ -11019,11 +11094,7 @@ function startIpcWatcher(): void {
                   const caption = data.caption || undefined;
                   const fileName = data.fileName || undefined;
 
-                  isTaskIpcImage = !!(
-                    data.isScheduledTask ||
-                    data.taskId ||
-                    ipcTaskId
-                  );
+                  isTaskIpcImage = Boolean(durableTaskRun);
                   if (
                     isTaskIpcImage &&
                     durableTaskRunId &&
@@ -11101,27 +11172,23 @@ function startIpcWatcher(): void {
                   let durableScopedImage = false;
                   if (isTaskIpcImage) {
                     const imgRoutingDecision = resolveTaskRoutingDecision(
-                      data,
-                      ipcTaskId,
+                      durableTaskRun,
+                      sourceGroup,
                       !!sourceGroupEntry?.created_by,
-                      { getTaskById, getChannelType },
+                      { getChannelType },
                     );
-                    if (imgRoutingDecision.mode === 'direct') {
-                      taskImageTargetJids = [imgRoutingDecision.taskChatJid];
-                    } else if (
-                      imgRoutingDecision.mode === 'broadcast' &&
+                    if (
+                      imgRoutingDecision.mode !== 'none' &&
                       sourceGroupEntry?.created_by
                     ) {
-                      const alreadySent = new Set<string>(
-                        [data.chatJid, imgImRoute].filter(Boolean) as string[],
-                      );
-                      broadcastToOwnerIMChannels(
+                      const targetPlan = resolveTaskNotificationTargets(
                         sourceGroupEntry.created_by,
                         broadcastFolder,
-                        alreadySent,
-                        (jid) => taskImageTargetJids.push(jid),
-                        imgRoutingDecision.notifyChannels,
+                        imgRoutingDecision,
                       );
+                      taskImageTargetJids = targetPlan.targetJids;
+                      taskImageUnavailableChannels =
+                        targetPlan.unavailableChannels;
                     }
                   }
                   if (imgImRoute) {
@@ -11242,6 +11309,22 @@ function startIpcWatcher(): void {
                     });
                     for (const targetJid of taskImageTargetJids) {
                       attempts.push(imageAttempt(targetJid));
+                    }
+                    for (const channel of taskImageUnavailableChannels) {
+                      attempts.push({
+                        channel,
+                        payload: {
+                          kind: 'im_channel_image',
+                          targetChannel: channel,
+                          ownerId: sourceGroupEntry!.created_by!,
+                          workspaceFolder: sourceGroup,
+                          filePath: relativeImagePath,
+                          mimeType,
+                          caption,
+                          fileName,
+                        },
+                        deliver: async () => false,
+                      });
                     }
                     const delivery = await settleAndRecordTaskIpcDeliveries(
                       durableTaskRunId,
@@ -13770,6 +13853,26 @@ async function processTaskIpc(
         'processTaskIpc send_file reached',
       );
       if (data.chatJid && data.filePath && data.fileName) {
+        const claimsScheduledTaskOutput = Boolean(
+          extractDurableTaskRunIdFromNamespace(ipcTaskId) ||
+          data.isScheduledTask === true ||
+          (typeof data.taskId === 'string' && data.taskId) ||
+          (typeof data.scheduledTaskRunId === 'string' &&
+            data.scheduledTaskRunId),
+        );
+        const durableTaskRun = durableTaskRunId
+          ? getTaskRunById(durableTaskRunId)
+          : undefined;
+        if (
+          claimsScheduledTaskOutput &&
+          (!durableTaskRun || !sourceGroupEntry?.created_by)
+        ) {
+          finishSendFile(
+            false,
+            'Scheduled-task output is not associated with a valid durable occurrence.',
+          );
+          break;
+        }
         if (
           durableTaskRunId &&
           !taskRunAcceptsLateIpcOutput(durableTaskRunId)
@@ -13876,10 +13979,10 @@ async function processTaskIpc(
           const fileRoutingDecision = ipcAgentId
             ? { mode: 'none' as const }
             : resolveTaskRoutingDecision(
-                data,
-                ipcTaskId,
+                durableTaskRun,
+                sourceGroup,
                 !!sourceGroupEntry?.created_by,
-                { getTaskById, getChannelType },
+                { getChannelType },
               );
           const regularFileImRoute =
             fileRoutingDecision.mode === 'none'
@@ -13905,65 +14008,42 @@ async function processTaskIpc(
               break;
             }
             const imFileName = data.fileName || path.basename(resolvedPath);
-            if (fileRoutingDecision.mode === 'direct') {
-              const targetJid = fileRoutingDecision.taskChatJid;
-              const delivery = await settleAndRecordTaskIpcDeliveries(
-                durableTaskRunId,
-                [
-                  {
-                    channel: getChannelType(targetJid) ?? targetJid,
-                    payload: {
-                      kind: 'im_file',
-                      targetJid,
-                      workspaceFolder: sourceGroup,
-                      filePath: data.filePath,
-                      fileName: imFileName,
-                    },
-                    deliver: () =>
-                      sendTaskFileWithRetry(
-                        targetJid,
-                        resolvedPath,
-                        imFileName,
-                      ),
-                  },
-                ],
-              );
-              const sent =
-                delivery.accepted && delivery.receipt.status === 'success';
-              if (!sent) {
-                broadcastToWebClients(
-                  sourceGroup,
-                  `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`,
-                );
-              }
-              finishSendFile(
-                sent,
-                sent
-                  ? undefined
-                  : delivery.receipt.error || 'File delivery failed.',
-              );
-            } else if (fileRoutingDecision.mode === 'broadcast') {
-              const attempts: TaskNotificationDeliveryAttempt[] = [];
-              broadcastToOwnerIMChannels(
-                sourceGroupEntry!.created_by!,
+            if (
+              fileRoutingDecision.mode !== 'none' &&
+              sourceGroupEntry?.created_by
+            ) {
+              const targetPlan = resolveTaskNotificationTargets(
+                sourceGroupEntry.created_by,
                 broadcastFolder,
-                new Set<string>(),
-                (jid) => {
-                  attempts.push({
-                    channel: getChannelType(jid) ?? jid,
-                    payload: {
-                      kind: 'im_file',
-                      targetJid: jid,
-                      workspaceFolder: sourceGroup,
-                      filePath: data.filePath!,
-                      fileName: imFileName,
-                    },
-                    deliver: () =>
-                      sendTaskFileWithRetry(jid, resolvedPath, imFileName),
-                  });
-                },
-                fileRoutingDecision.notifyChannels,
+                fileRoutingDecision,
               );
+              const attempts: TaskNotificationDeliveryAttempt[] =
+                targetPlan.targetJids.map((targetJid) => ({
+                  channel: getChannelType(targetJid) ?? targetJid,
+                  payload: {
+                    kind: 'im_file' as const,
+                    targetJid,
+                    workspaceFolder: sourceGroup,
+                    filePath: data.filePath!,
+                    fileName: imFileName,
+                  },
+                  deliver: () =>
+                    sendTaskFileWithRetry(targetJid, resolvedPath, imFileName),
+                }));
+              for (const channel of targetPlan.unavailableChannels) {
+                attempts.push({
+                  channel,
+                  payload: {
+                    kind: 'im_channel_file',
+                    targetChannel: channel,
+                    ownerId: sourceGroupEntry.created_by,
+                    workspaceFolder: sourceGroup,
+                    filePath: data.filePath,
+                    fileName: imFileName,
+                  },
+                  deliver: async () => false,
+                });
+              }
               const delivery = await settleAndRecordTaskIpcDeliveries(
                 durableTaskRunId,
                 attempts,
@@ -13972,6 +14052,12 @@ async function processTaskIpc(
                 delivery.accepted &&
                 (delivery.receipt.status === 'success' ||
                   delivery.receipt.status === 'skipped');
+              if (!sent) {
+                broadcastToWebClients(
+                  sourceGroup,
+                  `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`,
+                );
+              }
               finishSendFile(
                 sent,
                 sent
@@ -21509,19 +21595,51 @@ async function main(): Promise<void> {
       };
     },
     retryTaskNotification: async (payload) => {
-      const targetJid =
-        'targetJid' in payload ? payload.targetJid : payload.chatJid;
-      const channel = getChannelType(targetJid) ?? targetJid;
+      let targetJid =
+        'targetJid' in payload
+          ? payload.targetJid
+          : 'chatJid' in payload
+            ? payload.chatJid
+            : null;
+      const channel =
+        'targetChannel' in payload
+          ? payload.targetChannel
+          : targetJid
+            ? (getChannelType(targetJid) ?? targetJid)
+            : 'notification';
       let success = false;
       let error: string | null = null;
       try {
+        if ('targetChannel' in payload) {
+          broadcastToOwnerIMChannels(
+            payload.ownerId,
+            payload.workspaceFolder,
+            new Set<string>(),
+            (jid) => {
+              targetJid ??= jid;
+            },
+            [payload.targetChannel],
+          );
+          if (!targetJid) {
+            throw new Error(
+              `No connected ${payload.targetChannel} binding exists for this workspace`,
+            );
+          }
+        }
         if (payload.kind === 'im_message') {
           success = await sendImWithRetry(
             payload.targetJid,
             payload.text,
             payload.localImagePaths,
           );
-        } else if (payload.kind === 'im_image' || payload.kind === 'im_file') {
+        } else if (payload.kind === 'im_channel_message') {
+          success = await sendImWithRetry(targetJid!, payload.text, []);
+        } else if (
+          payload.kind === 'im_image' ||
+          payload.kind === 'im_file' ||
+          payload.kind === 'im_channel_image' ||
+          payload.kind === 'im_channel_file'
+        ) {
           const workspaceRoot = path.resolve(
             GROUPS_DIR,
             payload.workspaceFolder,
@@ -21536,9 +21654,12 @@ async function main(): Promise<void> {
           if (!isRealpathInside(resolvedPath, workspaceRoot)) {
             throw new Error('Persisted notification file is unavailable');
           }
-          if (payload.kind === 'im_image') {
+          if (
+            payload.kind === 'im_image' ||
+            payload.kind === 'im_channel_image'
+          ) {
             success = await sendTaskImageWithRetry(
-              payload.targetJid,
+              targetJid!,
               fs.readFileSync(resolvedPath),
               payload.mimeType,
               payload.caption,
@@ -21546,7 +21667,7 @@ async function main(): Promise<void> {
             );
           } else {
             success = await sendTaskFileWithRetry(
-              payload.targetJid,
+              targetJid!,
               resolvedPath,
               payload.fileName,
             );

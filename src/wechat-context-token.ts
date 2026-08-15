@@ -20,6 +20,8 @@ export interface WeChatContextTokenRecord {
   userId: string;
   token: string;
   refreshedAtMs: number;
+  sourceMessageId?: string | null;
+  sourceSequence?: number | null;
   sendCount: number;
   lastSentAtMs: number | null;
 }
@@ -29,6 +31,7 @@ export interface WeChatContextTokenClaimInput {
   userId: string;
   expectedToken: string;
   expectedRefreshedAtMs: number;
+  expectedSourceMessageId?: string | null;
   claimCount: number;
   maxSendCount: number;
   maxAgeMs: number;
@@ -42,6 +45,8 @@ export interface WeChatContextTokenStore {
     userId: string;
     token: string;
     refreshedAtMs: number;
+    sourceMessageId?: string | null;
+    sourceSequence?: number | null;
   }): WeChatContextTokenRecord;
   claim(
     input: WeChatContextTokenClaimInput,
@@ -53,6 +58,7 @@ export interface WeChatContextTokenStore {
     userId: string;
     expectedToken?: string;
     expectedRefreshedAtMs?: number;
+    expectedSourceMessageId?: string | null;
   }): boolean;
 }
 
@@ -87,6 +93,8 @@ function fromStored(
     userId: record.user_id,
     token: record.context_token,
     refreshedAtMs: record.refreshed_at_ms,
+    sourceMessageId: record.source_message_id,
+    sourceSequence: record.source_sequence,
     sendCount: record.send_count,
     lastSentAtMs: record.last_sent_at_ms,
   };
@@ -111,6 +119,8 @@ export function createDatabaseWeChatContextTokenStore(): WeChatContextTokenStore
           userId: input.userId,
           contextToken: input.token,
           refreshedAtMs: input.refreshedAtMs,
+          sourceMessageId: input.sourceMessageId,
+          sourceSequence: input.sourceSequence,
         }),
       ),
     claim: (input) =>
@@ -120,6 +130,7 @@ export function createDatabaseWeChatContextTokenStore(): WeChatContextTokenStore
           userId: input.userId,
           expectedToken: input.expectedToken,
           expectedRefreshedAtMs: input.expectedRefreshedAtMs,
+          expectedSourceMessageId: input.expectedSourceMessageId,
           claimCount: input.claimCount,
           maxSendCount: input.maxSendCount,
           maxAgeMs: input.maxAgeMs,
@@ -132,6 +143,7 @@ export function createDatabaseWeChatContextTokenStore(): WeChatContextTokenStore
         userId: input.userId,
         expectedToken: input.expectedToken,
         expectedRefreshedAtMs: input.expectedRefreshedAtMs,
+        expectedSourceMessageId: input.expectedSourceMessageId,
       }),
   };
 }
@@ -142,6 +154,52 @@ export interface WeChatContextTokenManagerOptions {
   now?: () => number;
   maxAgeMs?: number;
   maxSendCount?: number;
+}
+
+export interface WeChatContextTokenGeneration {
+  messageId?: string;
+  sequence?: number;
+}
+
+function shouldReplaceCachedGeneration(
+  current: WeChatContextTokenRecord,
+  next: Pick<
+    WeChatContextTokenRecord,
+    'token' | 'refreshedAtMs' | 'sourceMessageId' | 'sourceSequence'
+  >,
+): boolean {
+  const currentMessageId = current.sourceMessageId ?? null;
+  const nextMessageId = next.sourceMessageId ?? null;
+  const currentSequence = current.sourceSequence ?? null;
+  const nextSequence = next.sourceSequence ?? null;
+
+  if (nextMessageId === null) {
+    return (
+      currentMessageId === null && next.refreshedAtMs > current.refreshedAtMs
+    );
+  }
+  // Stable message identity makes an exact batch replay quota-idempotent even
+  // if the upstream token or local observation time changes on the replay.
+  if (currentMessageId === nextMessageId) return false;
+  // A legacy v70 row has no message identity. At an equal timestamp, an
+  // unchanged per-message token is the only available replay signal; a changed
+  // token establishes the first durable provider generation.
+  if (currentMessageId === null) {
+    return (
+      next.refreshedAtMs > current.refreshedAtMs ||
+      (next.refreshedAtMs === current.refreshedAtMs &&
+        next.token !== current.token)
+    );
+  }
+  if (nextSequence !== null && currentSequence !== null) {
+    return nextSequence > currentSequence;
+  }
+  if (nextSequence !== null) {
+    return next.refreshedAtMs >= current.refreshedAtMs;
+  }
+  return currentSequence === null
+    ? next.refreshedAtMs >= current.refreshedAtMs
+    : next.refreshedAtMs > current.refreshedAtMs;
 }
 
 /**
@@ -176,6 +234,7 @@ export class WeChatContextTokenManager {
           userId: record.userId,
           expectedToken: record.token,
           expectedRefreshedAtMs: record.refreshedAtMs,
+          expectedSourceMessageId: record.sourceMessageId ?? null,
         });
         continue;
       }
@@ -184,9 +243,30 @@ export class WeChatContextTokenManager {
     return this.cache.size;
   }
 
-  refresh(userId: string, token: string, inboundAtMs: number): void {
+  refresh(
+    userId: string,
+    token: string,
+    inboundAtMs: number,
+    generation: WeChatContextTokenGeneration = {},
+  ): void {
     const nowMs = this.now();
     const refreshedAtMs = Math.min(nowMs, Math.max(0, inboundAtMs));
+    const sourceMessageId = generation.messageId ?? null;
+    const sourceSequence = Number.isSafeInteger(generation.sequence)
+      ? generation.sequence!
+      : null;
+    const current = this.cache.get(userId);
+    if (
+      current &&
+      !shouldReplaceCachedGeneration(current, {
+        token,
+        refreshedAtMs,
+        sourceMessageId,
+        sourceSequence,
+      })
+    ) {
+      return;
+    }
     const record =
       this.accountId && this.store
         ? this.store.upsert({
@@ -194,12 +274,16 @@ export class WeChatContextTokenManager {
             userId,
             token,
             refreshedAtMs,
+            sourceMessageId,
+            sourceSequence,
           })
         : {
             accountId: this.accountId ?? '',
             userId,
             token,
             refreshedAtMs,
+            sourceMessageId,
+            sourceSequence,
             sendCount: 0,
             lastSentAtMs: null,
           };
@@ -237,6 +321,7 @@ export class WeChatContextTokenManager {
         userId,
         expectedToken: record.token,
         expectedRefreshedAtMs: record.refreshedAtMs,
+        expectedSourceMessageId: record.sourceMessageId ?? null,
         claimCount,
         maxSendCount: this.maxSendCount,
         maxAgeMs: this.maxAgeMs,
@@ -275,7 +360,8 @@ export class WeChatContextTokenManager {
     if (
       !current ||
       current.token !== record.token ||
-      current.refreshedAtMs !== record.refreshedAtMs
+      current.refreshedAtMs !== record.refreshedAtMs ||
+      (current.sourceMessageId ?? null) !== (record.sourceMessageId ?? null)
     ) {
       return false;
     }
@@ -285,6 +371,7 @@ export class WeChatContextTokenManager {
         userId: record.userId,
         expectedToken: record.token,
         expectedRefreshedAtMs: record.refreshedAtMs,
+        expectedSourceMessageId: record.sourceMessageId ?? null,
       });
     }
     this.cache.delete(record.userId);

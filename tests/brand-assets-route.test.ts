@@ -119,7 +119,8 @@ describe('brand asset routes', () => {
     expect(appearance).toContain(
       'api.delete<{ appearance: AppearanceConfig }>',
     );
-    expect(appearance).toContain('onChange(result.appearance)');
+    expect(appearance).toContain('await executeMutation(async () =>');
+    expect(appearance).toContain('useAuthStore.setState({ appearance })');
   });
 
   test('requires an admin for writes', async () => {
@@ -171,6 +172,24 @@ describe('brand asset routes', () => {
     expect(
       (await routes.request('/brand-assets/brand-icon-00000000.png')).status,
     ).toBe(404);
+  });
+
+  test('does not follow symlinked or hardlinked public asset names', async () => {
+    const { assetsDir, routes } = createHarness();
+    fs.mkdirSync(assetsDir, { recursive: true });
+    const secret = path.join(path.dirname(assetsDir), 'secret.txt');
+    fs.writeFileSync(secret, 'TOP_SECRET_PROOF');
+    fs.symlinkSync(secret, path.join(assetsDir, 'brand-icon-00000000.png'));
+    fs.linkSync(secret, path.join(assetsDir, 'brand-banner-00000000.png'));
+
+    for (const filename of [
+      'brand-icon-00000000.png',
+      'brand-banner-00000000.png',
+    ]) {
+      const response = await routes.request(`/brand-assets/${filename}`);
+      expect(response.status).toBe(404);
+      expect(await response.text()).not.toContain('TOP_SECRET_PROOF');
+    }
   });
 
   test('returns a stable response contract when deleting an asset', async () => {

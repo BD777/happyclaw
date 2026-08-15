@@ -48,6 +48,7 @@ import {
   getProviders,
   getSystemSettings,
   getEffectiveExternalDir,
+  hasExplicitWorkspaceClaudeAuth,
   mergeClaudeEnvConfig,
   resolveProviderById,
   shellQuoteEnvLines,
@@ -223,6 +224,60 @@ function ensureSymlinkTo(localPath: string, targetPath: string): void {
       'Failed to create symlink for .claude.json, deviceId may differ',
     );
   }
+}
+
+/**
+ * Remove every session-file signal that can make Claude Code prefer OAuth.
+ * Host mode supplies a template because its session file normally symlinks to
+ * the user's global .claude.json; Docker edits only its isolated session copy.
+ */
+export function clearSessionClaudeOAuthFiles(
+  sessionDir: string,
+  claudeJsonTemplatePath?: string,
+): void {
+  const sessionClaudeJson = path.join(sessionDir, '.claude.json');
+  let sourceExists = false;
+  let claudeJson: Record<string, unknown> = {};
+  try {
+    const sourcePath = claudeJsonTemplatePath ?? sessionClaudeJson;
+    sourceExists = fs.existsSync(sourcePath);
+    if (sourceExists) {
+      const parsed = JSON.parse(fs.readFileSync(sourcePath, 'utf-8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Claude session metadata is not a JSON object');
+      }
+      claudeJson = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Invalid session metadata must not survive as an opaque OAuth signal.
+    sourceExists = true;
+    claudeJson = {};
+  }
+
+  try {
+    const stat = fs.lstatSync(sessionClaudeJson);
+    if (stat.isSymbolicLink()) fs.unlinkSync(sessionClaudeJson);
+  } catch {
+    /* not found, ok */
+  }
+  const hadOauthAccount = 'oauthAccount' in claudeJson;
+  delete claudeJson.oauthAccount;
+  if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
+    fs.writeFileSync(
+      sessionClaudeJson,
+      JSON.stringify(claudeJson, null, 2) + '\n',
+      { mode: 0o600 },
+    );
+  }
+
+  const credentialsPath = path.join(sessionDir, '.credentials.json');
+  if (fs.existsSync(credentialsPath)) fs.unlinkSync(credentialsPath);
+}
+
+/** Stable, non-secret Keychain ownership for workspace-selected credentials. */
+export function workspaceRuntimeCredentialOwnerId(folder: string): string {
+  assertValidWorkspaceFolderName(folder);
+  return `runtime-workspace-auth:${folder}`;
 }
 
 /** Required env flags for settings.json — 每次启动时强制写入，不可被宿主机配置覆盖。 */
@@ -1749,6 +1804,14 @@ export function buildVolumeMounts(
 
   // Write .credentials.json for OAuth credentials (session dir is already mounted)
   const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
+  const clearSessionOAuth =
+    !!mergedConfig.anthropicBaseUrl ||
+    hasExplicitWorkspaceClaudeAuth(containerOverride);
+  if (clearSessionOAuth) {
+    // An explicit workspace key/token is authoritative even when the endpoint
+    // remains Anthropic's official URL. A prior OAuth session must not win.
+    clearSessionClaudeOAuthFiles(groupSessionsDir);
+  }
   if (mergedConfig.claudeOAuthCredentials) {
     try {
       writeCredentialsFile(groupSessionsDir, mergedConfig);
@@ -1757,17 +1820,6 @@ export function buildVolumeMounts(
         { group: group.name, err },
         'Failed to write .credentials.json',
       );
-    }
-  }
-
-  // Third-party provider: remove any stale .credentials.json so the SDK
-  // does not detect OAuth credentials from a previous official-provider run.
-  if (mergedConfig.anthropicBaseUrl) {
-    try {
-      const staleCreds = path.join(groupSessionsDir, '.credentials.json');
-      if (fs.existsSync(staleCreds)) fs.unlinkSync(staleCreds);
-    } catch {
-      /* ignore */
     }
   }
 
@@ -3056,64 +3108,31 @@ export async function runHostAgent(
       // Path may not exist yet on first spawn; fall back to the literal path.
     }
 
-    // Third-party provider: unless this provider explicitly injects
-    // ANTHROPIC_AUTH_TOKEN (Bearer proxy mode), remove any inherited host token
-    // so API-key mode can take effect.
-    if (hostEnv['ANTHROPIC_BASE_URL']) {
+    const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
+    const clearSessionOAuth =
+      !!mergedConfig.anthropicBaseUrl ||
+      hasExplicitWorkspaceClaudeAuth(containerOverride);
+
+    // A custom endpoint or an explicit workspace key/token selects a non-OAuth
+    // authentication mode. Remove all session and Keychain OAuth state before
+    // spawning so Claude Code cannot override that selection.
+    if (clearSessionOAuth) {
       if (!injectsAnthropicAuthToken) {
         delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
       }
 
-      // Also strip oauthAccount from session .claude.json: the SDK detects
-      // OAuth credentials in .claude.json and takes the OAuth code path even
-      // when ANTHROPIC_AUTH_TOKEN is absent. This causes the same 404 on
-      // third-party endpoints. Remove the symlink and write a standalone
-      // .claude.json without oauthAccount so the SDK falls back to API key mode.
       try {
-        const sessionClaudeJson = path.join(groupSessionsDir, '.claude.json');
-        try {
-          fs.unlinkSync(sessionClaudeJson);
-        } catch {
-          /* ignore */
-        }
-        let claudeJson: Record<string, unknown> = {};
-        try {
-          claudeJson = JSON.parse(
-            fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'),
-          );
-        } catch {
-          /* ignore */
-        }
-        delete claudeJson.oauthAccount;
-        fs.writeFileSync(
-          sessionClaudeJson,
-          JSON.stringify(claudeJson, null, 2) + '\n',
-          { mode: 0o600 },
-        );
+        clearSessionClaudeOAuthFiles(groupSessionsDir, getHostClaudeJsonPath());
       } catch (err) {
         logger.error(
           { folder: group.folder, err },
-          'Failed to strip oauthAccount from session .claude.json',
+          'Failed to remove host session OAuth credentials',
         );
         return hostModeSetupError(
-          '无法清理宿主机会话 OAuth 账户信息，已阻止第三方模型启动',
+          '无法清理宿主机会话 OAuth 凭据，已阻止工作区模型启动',
         );
       }
 
-      // Also remove .credentials.json: it contains valid OAuth tokens that the
-      // SDK uses regardless of env vars, forcing the OAuth auth path.
-      try {
-        const credsPath = path.join(groupSessionsDir, '.credentials.json');
-        if (fs.existsSync(credsPath)) fs.unlinkSync(credsPath);
-      } catch (err) {
-        logger.error(
-          { folder: group.folder, err },
-          'Failed to remove .credentials.json for third-party provider',
-        );
-        return hostModeSetupError(
-          '无法清理宿主机会话 OAuth 凭据文件，已阻止第三方模型启动',
-        );
-      }
       // Same forced-OAuth hazard, second store: on macOS the CLI keeps OAuth
       // credentials in the Keychain and prefers them over the (now removed)
       // file, so the claudeAiOauth field must be stripped there as well.
@@ -3121,12 +3140,12 @@ export async function runHostAgent(
         await removeClaudeKeychainOAuth(
           resolvedSessionsDir,
           hostSelectedProfileId ??
-            `runtime-third-party:${hostEnv['ANTHROPIC_BASE_URL']}`,
+            workspaceRuntimeCredentialOwnerId(group.folder),
         );
       } catch (err) {
         logger.error(
           { folder: group.folder, err },
-          'Failed to remove macOS Keychain OAuth for third-party provider',
+          'Failed to remove macOS Keychain OAuth for workspace provider',
         );
         return hostModeSetupError(
           '无法清理 macOS Keychain OAuth 凭据，已阻止第三方模型启动',
@@ -3135,7 +3154,6 @@ export async function runHostAgent(
     }
 
     // Write .credentials.json for OAuth credentials
-    const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
     if (mergedConfig.claudeOAuthCredentials) {
       let effectiveOauth = buildClaudeAiOauthPayload(mergedConfig);
       if (!effectiveOauth) {

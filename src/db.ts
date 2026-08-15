@@ -103,7 +103,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 70;
+export const CURRENT_SCHEMA_VERSION = 71;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -707,6 +707,8 @@ export function initDatabase(): void {
       user_id TEXT NOT NULL,
       context_token TEXT NOT NULL,
       refreshed_at_ms INTEGER NOT NULL,
+      source_message_id TEXT,
+      source_sequence INTEGER,
       send_count INTEGER NOT NULL DEFAULT 0,
       last_sent_at_ms INTEGER,
       PRIMARY KEY (channel_account_id, user_id),
@@ -1237,6 +1239,12 @@ export function initDatabase(): void {
   );
   ensureColumn('usage_records', 'billed_cost_usd', 'REAL NOT NULL DEFAULT 0');
   ensureColumn('usage_records', 'usage_date', 'TEXT');
+  // v70 -> v71: distinguish an exact getUpdates replay from a different
+  // inbound message whose provider timestamp falls in the same millisecond.
+  // Unconditional ensureColumn also repairs production databases already
+  // stamped v70 before this process starts.
+  ensureColumn('wechat_context_tokens', 'source_message_id', 'TEXT');
+  ensureColumn('wechat_context_tokens', 'source_sequence', 'INTEGER');
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_event_model
       ON usage_records(event_id, model) WHERE event_id IS NOT NULL;
@@ -6621,11 +6629,40 @@ export interface TaskRunImFileNotificationPayload {
   fileName: string;
 }
 
+interface TaskRunImChannelNotificationBase {
+  /** Resolve the current binding for this channel again on durable retry. */
+  targetChannel: string;
+  ownerId: string;
+  workspaceFolder: string;
+}
+
+export interface TaskRunImChannelMessageNotificationPayload extends TaskRunImChannelNotificationBase {
+  kind: 'im_channel_message';
+  text: string;
+}
+
+export interface TaskRunImChannelImageNotificationPayload extends TaskRunImChannelNotificationBase {
+  kind: 'im_channel_image';
+  filePath: string;
+  mimeType: string;
+  caption?: string;
+  fileName?: string;
+}
+
+export interface TaskRunImChannelFileNotificationPayload extends TaskRunImChannelNotificationBase {
+  kind: 'im_channel_file';
+  filePath: string;
+  fileName: string;
+}
+
 export type TaskRunAtomicNotificationPayload =
   | TaskRunTextNotificationPayload
   | TaskRunImMessageNotificationPayload
   | TaskRunImImageNotificationPayload
-  | TaskRunImFileNotificationPayload;
+  | TaskRunImFileNotificationPayload
+  | TaskRunImChannelMessageNotificationPayload
+  | TaskRunImChannelImageNotificationPayload
+  | TaskRunImChannelFileNotificationPayload;
 
 export type TaskRunNotificationPayload =
   | TaskRunAtomicNotificationPayload
@@ -6795,7 +6832,9 @@ function notificationPayloadChannels(
       taskRunNotificationPayloadItems(payload).map((item) =>
         'targetJid' in item
           ? item.targetJid.split(':', 1)[0] || item.targetJid
-          : (item.options?.notifyChannels?.[0] ?? item.chatJid),
+          : 'targetChannel' in item
+            ? item.targetChannel
+            : (item.options?.notifyChannels?.[0] ?? item.chatJid),
       ),
     ),
   ];
@@ -10510,6 +10549,8 @@ export interface StoredWeChatContextToken {
   user_id: string;
   context_token: string;
   refreshed_at_ms: number;
+  source_message_id: string | null;
+  source_sequence: number | null;
   send_count: number;
   last_sent_at_ms: number | null;
 }
@@ -10525,7 +10566,7 @@ export function listWeChatContextTokens(
   return db
     .prepare(
       `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
-              send_count, last_sent_at_ms
+              source_message_id, source_sequence, send_count, last_sent_at_ms
        FROM wechat_context_tokens
        WHERE channel_account_id = ?`,
     )
@@ -10538,28 +10579,71 @@ export function upsertWeChatContextToken(input: {
   userId: string;
   contextToken: string;
   refreshedAtMs: number;
+  sourceMessageId?: string | null;
+  sourceSequence?: number | null;
 }): StoredWeChatContextToken {
   db.prepare(
     `INSERT INTO wechat_context_tokens (
        channel_account_id, user_id, context_token, refreshed_at_ms,
-       send_count, last_sent_at_ms
-     ) VALUES (?, ?, ?, ?, 0, NULL)
+       source_message_id, source_sequence, send_count, last_sent_at_ms
+     ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
      ON CONFLICT(channel_account_id, user_id) DO UPDATE SET
        context_token = excluded.context_token,
        refreshed_at_ms = excluded.refreshed_at_ms,
+       source_message_id = excluded.source_message_id,
+       source_sequence = excluded.source_sequence,
        send_count = 0,
        last_sent_at_ms = NULL
-     WHERE excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms`,
+     WHERE (
+       excluded.source_message_id IS NULL
+       AND wechat_context_tokens.source_message_id IS NULL
+       AND excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms
+     ) OR (
+       excluded.source_message_id IS NOT NULL
+       AND wechat_context_tokens.source_message_id IS NOT NULL
+       AND excluded.source_message_id <> wechat_context_tokens.source_message_id
+       AND (
+         (
+           excluded.source_sequence IS NOT NULL
+           AND wechat_context_tokens.source_sequence IS NOT NULL
+           AND excluded.source_sequence > wechat_context_tokens.source_sequence
+         ) OR (
+           excluded.source_sequence IS NOT NULL
+           AND wechat_context_tokens.source_sequence IS NULL
+           AND excluded.refreshed_at_ms >= wechat_context_tokens.refreshed_at_ms
+         ) OR (
+           excluded.source_sequence IS NULL
+           AND wechat_context_tokens.source_sequence IS NOT NULL
+           AND excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms
+         ) OR (
+           excluded.source_sequence IS NULL
+           AND wechat_context_tokens.source_sequence IS NULL
+           AND excluded.refreshed_at_ms >= wechat_context_tokens.refreshed_at_ms
+         )
+       )
+     ) OR (
+       excluded.source_message_id IS NOT NULL
+       AND wechat_context_tokens.source_message_id IS NULL
+       AND (
+         excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms
+         OR (
+           excluded.refreshed_at_ms = wechat_context_tokens.refreshed_at_ms
+           AND excluded.context_token <> wechat_context_tokens.context_token
+         )
+       )
+     )`,
   ).run(
     input.channelAccountId,
     input.userId,
     input.contextToken,
     input.refreshedAtMs,
+    input.sourceMessageId ?? null,
+    input.sourceSequence ?? null,
   );
   return db
     .prepare(
       `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
-              send_count, last_sent_at_ms
+              source_message_id, source_sequence, send_count, last_sent_at_ms
        FROM wechat_context_tokens
        WHERE channel_account_id = ? AND user_id = ?`,
     )
@@ -10576,6 +10660,7 @@ export function claimWeChatContextToken(input: {
   userId: string;
   expectedToken: string;
   expectedRefreshedAtMs: number;
+  expectedSourceMessageId?: string | null;
   claimCount: number;
   maxSendCount: number;
   maxAgeMs: number;
@@ -10589,7 +10674,7 @@ export function claimWeChatContextToken(input: {
       const record = db
         .prepare(
           `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
-                  send_count, last_sent_at_ms
+                  source_message_id, source_sequence, send_count, last_sent_at_ms
            FROM wechat_context_tokens
            WHERE channel_account_id = ? AND user_id = ?`,
         )
@@ -10599,7 +10684,9 @@ export function claimWeChatContextToken(input: {
       if (!record) return { status: 'missing' };
       if (
         record.context_token !== input.expectedToken ||
-        record.refreshed_at_ms !== input.expectedRefreshedAtMs
+        record.refreshed_at_ms !== input.expectedRefreshedAtMs ||
+        (input.expectedSourceMessageId !== undefined &&
+          record.source_message_id !== input.expectedSourceMessageId)
       ) {
         return { status: 'changed' };
       }
@@ -10641,6 +10728,7 @@ export function deleteWeChatContextToken(input: {
   userId: string;
   expectedToken?: string;
   expectedRefreshedAtMs?: number;
+  expectedSourceMessageId?: string | null;
 }): boolean {
   const withGeneration =
     input.expectedToken !== undefined &&
@@ -10648,9 +10736,14 @@ export function deleteWeChatContextToken(input: {
   const result = db
     .prepare(
       withGeneration
-        ? `DELETE FROM wechat_context_tokens
-           WHERE channel_account_id = ? AND user_id = ?
-             AND context_token = ? AND refreshed_at_ms = ?`
+        ? input.expectedSourceMessageId !== undefined
+          ? `DELETE FROM wechat_context_tokens
+             WHERE channel_account_id = ? AND user_id = ?
+               AND context_token = ? AND refreshed_at_ms = ?
+               AND source_message_id IS ?`
+          : `DELETE FROM wechat_context_tokens
+             WHERE channel_account_id = ? AND user_id = ?
+               AND context_token = ? AND refreshed_at_ms = ?`
         : `DELETE FROM wechat_context_tokens
            WHERE channel_account_id = ? AND user_id = ?`,
     )
@@ -10658,7 +10751,13 @@ export function deleteWeChatContextToken(input: {
       input.channelAccountId,
       input.userId,
       ...(withGeneration
-        ? [input.expectedToken, input.expectedRefreshedAtMs]
+        ? [
+            input.expectedToken,
+            input.expectedRefreshedAtMs,
+            ...(input.expectedSourceMessageId !== undefined
+              ? [input.expectedSourceMessageId]
+              : []),
+          ]
         : []),
     );
   return result.changes > 0;

@@ -174,7 +174,9 @@ export interface WeChatConnectionDeps {
 
 interface WeixinMessage {
   seq?: number;
-  message_id?: number;
+  // iLink message IDs are provider identifiers, not arithmetic values. Keep
+  // string payloads lossless when upstream represents a 64-bit ID as text.
+  message_id?: number | string;
   from_user_id?: string;
   to_user_id?: string;
   client_id?: string;
@@ -383,6 +385,21 @@ function dedupKey(msg: WeixinMessage): string {
   if (msg.seq !== undefined) return `seq:${msg.seq}`;
   // Fallback: combination of sender + timestamp + client_id
   return `fallback:${msg.from_user_id}:${msg.create_time_ms}:${msg.client_id}`;
+}
+
+function providerGenerationSequence(msg: WeixinMessage): number | undefined {
+  if (Number.isSafeInteger(msg.seq)) return msg.seq;
+  if (
+    typeof msg.message_id === 'number' &&
+    Number.isSafeInteger(msg.message_id)
+  ) {
+    return msg.message_id;
+  }
+  if (typeof msg.message_id === 'string' && /^\d+$/.test(msg.message_id)) {
+    const parsed = Number(msg.message_id);
+    if (Number.isSafeInteger(parsed)) return parsed;
+  }
+  return undefined;
 }
 
 function errorChain(error: unknown): Array<Record<string, unknown>> {
@@ -972,6 +989,18 @@ export function createWeChatConnection(
             fromUserId,
             msg.context_token,
             msg.create_time_ms ?? now(),
+            {
+              messageId:
+                msg.message_id !== undefined
+                  ? String(msg.message_id)
+                  : msg.seq !== undefined
+                    ? `seq:${msg.seq}`
+                    : undefined,
+              // seq is the provider ordering key. Older payloads can omit it;
+              // the stable numeric message_id is then the best available
+              // generation order for same-millisecond messages.
+              sequence: providerGenerationSequence(msg),
+            },
           );
         } catch (cause) {
           throw Object.assign(
@@ -1130,13 +1159,12 @@ export function createWeChatConnection(
         { err, msgId: msg.message_id },
         'Error handling WeChat message',
       );
-      if (
-        (err as { code?: unknown })?.code ===
-        'WECHAT_CONTEXT_TOKEN_PERSISTENCE_ERROR'
-      ) {
-        if (markedDedupKey) dedup.forget(markedDedupKey);
-        throw err;
-      }
+      // Every return above is an intentional terminal ignore. Reaching this
+      // catch means an infrastructure/business operation failed, so release the
+      // provisional dedup mark and reject processMessage. The batch cursor then
+      // remains at its previous durable value and the provider can replay it.
+      if (markedDedupKey) dedup.forget(markedDedupKey);
+      throw err;
     }
   }
 
