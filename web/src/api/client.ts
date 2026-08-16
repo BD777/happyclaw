@@ -15,12 +15,28 @@ export async function apiFetch<T>(
   const requestPath = /^https?:\/\//i.test(path)
     ? path
     : withBasePath(path.startsWith('/') ? path : `/${path}`);
-  const { timeoutMs: customTimeout, ...fetchOptions } = options ?? {};
+  const {
+    timeoutMs: customTimeout,
+    signal: externalSignal,
+    ...fetchOptions
+  } = options ?? {};
   const controller = new AbortController();
   const isFormData = fetchOptions.body instanceof FormData;
   const timeoutMs =
     customTimeout ?? (isFormData ? 120_000 : REQUEST_TIMEOUT_MS);
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let abortCause: 'caller' | 'timeout' | null = null;
+  const abortRequest = (cause: 'caller' | 'timeout') => {
+    if (controller.signal.aborted) return;
+    abortCause = cause;
+    controller.abort();
+  };
+  const timeout = setTimeout(() => abortRequest('timeout'), timeoutMs);
+  const abortFromCaller = () => abortRequest('caller');
+  if (externalSignal?.aborted) {
+    abortFromCaller();
+  } else {
+    externalSignal?.addEventListener('abort', abortFromCaller, { once: true });
+  }
 
   // FormData 时不设 Content-Type，让浏览器自动加 multipart boundary
   const headers = isFormData
@@ -36,12 +52,16 @@ export async function apiFetch<T>(
       signal: controller.signal,
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
+    if (abortCause === 'caller') {
+      throw { status: 499, message: 'Request cancelled' } as ApiError;
+    }
+    if (abortCause === 'timeout') {
       throw { status: 408, message: 'Request timeout' } as ApiError;
     }
     throw { status: 0, message: 'Network error' } as ApiError;
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener('abort', abortFromCaller);
   }
 
   if (res.status === 401) {
