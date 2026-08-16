@@ -94,6 +94,9 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
             <div className="flex items-center justify-between text-xs text-muted-foreground">
               <span className="truncate max-w-[60%]">
                 {uploadProgress.currentFile || '完成'}
+                {uploadProgress.attempt && uploadProgress.attempt > 1
+                  ? `（网络不稳，重试 ${uploadProgress.attempt}/3）`
+                  : ''}
               </span>
               <span>
                 {uploadProgress.completed}/{uploadProgress.total} 个文件
