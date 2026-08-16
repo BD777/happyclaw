@@ -1,6 +1,45 @@
 import { create } from 'zustand';
 import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
 
+/**
+ * 上传重试。慢速或不稳定链路上单次上传失败非常常见（反代读请求体超时 → 408，
+ * 客户端 abort → 网络错误），此前任何一次失败都会让整批上传中断、用户必须
+ * 手动从头再来。服务端按文件名 O_TRUNC 覆盖写，重传同一文件是幂等的。
+ */
+const UPLOAD_MAX_ATTEMPTS = 3;
+const UPLOAD_RETRY_DELAYS_MS = [2000, 5000];
+
+/**
+ * 只重试传输层的瞬时失败：
+ * - 0：apiFetch 归一化后的网络错误
+ * - 408：客户端超时 abort，或反向代理读请求体超时
+ * - 502/503/504：上游短暂不可用
+ * 其余（400 参数错误、403 配额或路径拒绝、413 超限、500 逻辑错误）重试没有意义，
+ * 立即失败，让用户看到真实原因而不是等三轮。
+ */
+function isRetriableUploadError(err: unknown): boolean {
+  const status = (err as { status?: number } | null)?.status;
+  return (
+    status === 0 ||
+    status === 408 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  );
+}
+
+/** apiFetch 抛出的 ApiError 是纯对象而非 Error，直接用 instanceof 会丢掉真实原因。 */
+function uploadErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  const e = err as { message?: string; status?: number } | null;
+  if (e?.message) {
+    return e.status ? `${e.message} (HTTP ${e.status})` : e.message;
+  }
+  return 'Failed to upload files';
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export interface FileEntry {
   name: string;
   path: string;
@@ -20,6 +59,8 @@ export interface UploadProgress {
   /** bytes for current batch */
   totalBytes: number;
   uploadedBytes: number;
+  /** 当前文件的重试轮次；仅在 >1 时有值，用于让 UI 区分「慢」和「卡死」。 */
+  attempt?: number;
 }
 
 interface FileState {
@@ -139,16 +180,47 @@ export const useFileStore = create<FileState>((set, get) => ({
           },
         });
 
-        const formData = new FormData();
-        formData.append('files', file);
-        if (uploadPath) formData.append('path', uploadPath);
+        // 每轮重建 FormData：body 已被上一次 fetch 消费，不能复用。
+        let lastErr: unknown;
+        for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
+          if (attempt > 1) {
+            set({
+              uploadProgress: {
+                total,
+                completed: i,
+                currentFile: file.name,
+                totalBytes,
+                uploadedBytes,
+                attempt,
+              },
+            });
+          }
 
-        await apiFetch(apiUrl, {
-          method: 'POST',
-          body: formData,
-          headers: {},
-          timeoutMs: computeUploadTimeoutMs(file.size),
-        });
+          const formData = new FormData();
+          formData.append('files', file);
+          if (uploadPath) formData.append('path', uploadPath);
+
+          try {
+            await apiFetch(apiUrl, {
+              method: 'POST',
+              body: formData,
+              headers: {},
+              timeoutMs: computeUploadTimeoutMs(file.size),
+            });
+            lastErr = undefined;
+            break;
+          } catch (err) {
+            lastErr = err;
+            if (
+              attempt === UPLOAD_MAX_ATTEMPTS ||
+              !isRetriableUploadError(err)
+            ) {
+              break;
+            }
+            await sleep(UPLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 5000);
+          }
+        }
+        if (lastErr) throw lastErr;
 
         uploadedBytes += file.size;
 
@@ -167,7 +239,7 @@ export const useFileStore = create<FileState>((set, get) => ({
       await get().loadFiles(jid, targetBase);
       return true;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to upload files';
+      const msg = uploadErrorMessage(err);
       console.error('Failed to upload files:', err);
       set({ error: msg });
       return false;
