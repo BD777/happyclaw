@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
+import { showToast } from '../utils/toast';
 
 /**
  * 上传重试。慢速或不稳定链路上单次上传失败非常常见（反代读请求体超时 → 408，
@@ -8,6 +9,8 @@ import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
  */
 const UPLOAD_MAX_ATTEMPTS = 3;
 const UPLOAD_RETRY_DELAYS_MS = [2000, 5000];
+const UPLOAD_CANCELLED = Symbol('upload-cancelled');
+let activeUploadController: AbortController | null = null;
 
 /**
  * 只重试传输层的瞬时失败：
@@ -30,15 +33,40 @@ function isRetriableUploadError(err: unknown): boolean {
 
 /** apiFetch 抛出的 ApiError 是纯对象而非 Error，直接用 instanceof 会丢掉真实原因。 */
 function uploadErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
   const e = err as { message?: string; status?: number } | null;
-  if (e?.message) {
-    return e.status ? `${e.message} (HTTP ${e.status})` : e.message;
+  if (e?.status === 0) return '网络连接失败，请检查网络后重试';
+  if (e?.status === 408) return '上传超时，请检查网络后重试';
+  if (e?.status && [502, 503, 504].includes(e.status)) {
+    return '上传服务暂时不可用，请稍后重试';
   }
-  return 'Failed to upload files';
+  if (typeof e?.message === 'string' && e.message.trim()) {
+    const message = e.message.trim().slice(0, 200);
+    return e.status ? `${message} (HTTP ${e.status})` : message;
+  }
+  if (err instanceof Error && err.message.trim()) {
+    return err.message.trim().slice(0, 200);
+  }
+  return '文件上传失败，请稍后重试';
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+function waitForUploadRetry(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(UPLOAD_CANCELLED);
+      return;
+    }
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(UPLOAD_CANCELLED);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 export interface FileEntry {
   name: string;
@@ -59,8 +87,27 @@ export interface UploadProgress {
   /** bytes for current batch */
   totalBytes: number;
   uploadedBytes: number;
-  /** 当前文件的重试轮次；仅在 >1 时有值，用于让 UI 区分「慢」和「卡死」。 */
-  attempt?: number;
+  /** 当前实际请求轮次（首轮为 1）。 */
+  attempt: number;
+  maxAttempts: number;
+  /** true 表示上轮已失败，正在等待 nextAttempt。 */
+  retrying: boolean;
+  nextAttempt?: number;
+  retryDelayMs?: number;
+}
+
+/** 两个上传入口共用此文案，避免重试轮次或最大次数展示不一致。 */
+export function formatUploadRetryStatus(
+  progress: UploadProgress,
+): string | null {
+  if (progress.retrying && progress.nextAttempt) {
+    const seconds = Math.max(1, Math.ceil((progress.retryDelayMs ?? 0) / 1000));
+    return `${seconds} 秒后重试 ${progress.nextAttempt}/${progress.maxAttempts}`;
+  }
+  if (progress.attempt > 1) {
+    return `正在重试 ${progress.attempt}/${progress.maxAttempts}`;
+  }
+  return null;
 }
 
 interface FileState {
@@ -77,6 +124,7 @@ interface FileState {
     files: File[],
     basePath?: string,
   ) => Promise<boolean>;
+  cancelUpload: () => void;
   deleteFile: (jid: string, filePath: string) => Promise<boolean>;
   createDirectory: (
     jid: string,
@@ -109,6 +157,8 @@ export const useFileStore = create<FileState>((set, get) => ({
   uploadProgress: null,
   error: null,
 
+  cancelUpload: () => activeUploadController?.abort(),
+
   loadFiles: async (jid: string, path?: string) => {
     set({ loading: true, error: null });
     try {
@@ -134,18 +184,25 @@ export const useFileStore = create<FileState>((set, get) => ({
   },
 
   uploadFiles: async (jid: string, files: File[], basePath?: string) => {
-    if (files.length === 0) return false;
+    if (files.length === 0 || get().uploading) return false;
+
+    const uploadController = new AbortController();
+    activeUploadController = uploadController;
 
     const total = files.length;
     const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
     set({
       uploading: true,
+      error: null,
       uploadProgress: {
         total,
         completed: 0,
         currentFile: files[0].name,
         totalBytes,
         uploadedBytes: 0,
+        attempt: 1,
+        maxAttempts: UPLOAD_MAX_ATTEMPTS,
+        retrying: false,
       },
     });
 
@@ -156,6 +213,7 @@ export const useFileStore = create<FileState>((set, get) => ({
 
     try {
       for (let i = 0; i < files.length; i++) {
+        if (uploadController.signal.aborted) throw UPLOAD_CANCELLED;
         const file = files[i];
 
         // For folder uploads, webkitRelativePath = "folderName/sub/file.txt"
@@ -177,24 +235,28 @@ export const useFileStore = create<FileState>((set, get) => ({
             currentFile: file.name,
             totalBytes,
             uploadedBytes,
+            attempt: 1,
+            maxAttempts: UPLOAD_MAX_ATTEMPTS,
+            retrying: false,
           },
         });
 
         // 每轮重建 FormData：body 已被上一次 fetch 消费，不能复用。
         let lastErr: unknown;
         for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
-          if (attempt > 1) {
-            set({
-              uploadProgress: {
-                total,
-                completed: i,
-                currentFile: file.name,
-                totalBytes,
-                uploadedBytes,
-                attempt,
-              },
-            });
-          }
+          if (uploadController.signal.aborted) throw UPLOAD_CANCELLED;
+          set({
+            uploadProgress: {
+              total,
+              completed: i,
+              currentFile: file.name,
+              totalBytes,
+              uploadedBytes,
+              attempt,
+              maxAttempts: UPLOAD_MAX_ATTEMPTS,
+              retrying: false,
+            },
+          });
 
           const formData = new FormData();
           formData.append('files', file);
@@ -206,10 +268,15 @@ export const useFileStore = create<FileState>((set, get) => ({
               body: formData,
               headers: {},
               timeoutMs: computeUploadTimeoutMs(file.size),
+              signal: uploadController.signal,
             });
+            if (uploadController.signal.aborted) throw UPLOAD_CANCELLED;
             lastErr = undefined;
             break;
           } catch (err) {
+            if (uploadController.signal.aborted || err === UPLOAD_CANCELLED) {
+              throw UPLOAD_CANCELLED;
+            }
             lastErr = err;
             if (
               attempt === UPLOAD_MAX_ATTEMPTS ||
@@ -217,7 +284,22 @@ export const useFileStore = create<FileState>((set, get) => ({
             ) {
               break;
             }
-            await sleep(UPLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 5000);
+            const retryDelayMs = UPLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 5000;
+            set({
+              uploadProgress: {
+                total,
+                completed: i,
+                currentFile: file.name,
+                totalBytes,
+                uploadedBytes,
+                attempt,
+                maxAttempts: UPLOAD_MAX_ATTEMPTS,
+                retrying: true,
+                nextAttempt: attempt + 1,
+                retryDelayMs,
+              },
+            });
+            await waitForUploadRetry(retryDelayMs, uploadController.signal);
           }
         }
         if (lastErr) throw lastErr;
@@ -231,20 +313,34 @@ export const useFileStore = create<FileState>((set, get) => ({
             currentFile: i + 1 < total ? files[i + 1].name : '',
             totalBytes,
             uploadedBytes,
+            attempt: 1,
+            maxAttempts: UPLOAD_MAX_ATTEMPTS,
+            retrying: false,
           },
         });
       }
 
+      // All request bodies are complete now, so hide the cancel control while
+      // retaining `uploading` as a guard against a concurrent refresh/upload.
+      set({ uploadProgress: null });
       // Reload file list
       await get().loadFiles(jid, targetBase);
       return true;
     } catch (err) {
+      if (err === UPLOAD_CANCELLED || uploadController.signal.aborted) {
+        if (uploadedBytes > 0) await get().loadFiles(jid, targetBase);
+        return false;
+      }
       const msg = uploadErrorMessage(err);
       console.error('Failed to upload files:', err);
       set({ error: msg });
+      showToast('上传失败', msg);
       return false;
     } finally {
-      set({ uploading: false, uploadProgress: null });
+      if (activeUploadController === uploadController) {
+        activeUploadController = null;
+        set({ uploading: false, uploadProgress: null });
+      }
     }
   },
 

@@ -20,8 +20,10 @@
  * 的经典写法）会把这种停顿误判成死连接并踢掉全部客户端。因此默认取 3。
  */
 
-/** 心跳只需要这三个能力，用结构类型以便测试替身注入。 */
+/** 心跳只需要这些能力，用结构类型以便测试替身注入。 */
 export interface HeartbeatSocket {
+  /** ws.OPEN === 1；测试替身可省略，此时按可用连接处理。 */
+  readonly readyState?: number;
   ping(): void;
   terminate(): void;
   on(event: 'pong', listener: () => void): unknown;
@@ -32,8 +34,26 @@ export const DEFAULT_MAX_MISSED_PONGS = 3;
 
 export interface HeartbeatOptions {
   intervalMs?: number;
-  /** 连续多少轮收不到 pong 判定连接已死。必须 >= 1。 */
+  /** 发出多少次 ping 仍收不到 pong 后判定连接已死。必须 >= 1。 */
   maxMissedPongs?: number;
+}
+
+export type HeartbeatOperation = 'ping' | 'terminate';
+
+export interface HeartbeatOperationFailure {
+  readonly operation: HeartbeatOperation;
+  readonly error: unknown;
+}
+
+export interface HeartbeatSweepResult {
+  /** 本轮成功调用 ping 的连接数。 */
+  readonly pinged: number;
+  /** 本轮成功调用 terminate 的连接数。 */
+  readonly terminated: number;
+  /** 已处于 CONNECTING/CLOSING/CLOSED 或已开始终止，因而跳过的连接数。 */
+  readonly skipped: number;
+  /** 单连接操作失败；调用方负责记录，失败不会阻断同一轮的其他连接。 */
+  readonly failures: readonly HeartbeatOperationFailure[];
 }
 
 export interface WebSocketHeartbeat {
@@ -41,8 +61,15 @@ export interface WebSocketHeartbeat {
   readonly maxMissedPongs: number;
   /** 登记一条新连接，并挂上 pong 监听。 */
   track(socket: HeartbeatSocket): void;
-  /** 执行一轮探测，返回本轮被判定为死连接并已 terminate 的数量。 */
-  sweep(sockets: Iterable<HeartbeatSocket>): number;
+  /** 执行一轮探测，返回成功计数与可观测的逐操作失败。 */
+  sweep(sockets: Iterable<HeartbeatSocket>): HeartbeatSweepResult;
+}
+
+/** WebSocketServer 心跳调度所需的最小结构。 */
+export interface HeartbeatSocketServer {
+  readonly clients: Iterable<HeartbeatSocket>;
+  once(event: 'close', listener: () => void): unknown;
+  off(event: 'close', listener: () => void): unknown;
 }
 
 export function createWebSocketHeartbeat(
@@ -55,6 +82,10 @@ export function createWebSocketHeartbeat(
   );
   // WeakMap：连接被回收后条目自动消失，不会成为新的泄漏点。
   const missedPongs = new WeakMap<HeartbeatSocket, number>();
+  // track 可能被上层重复调用；只挂一个 pong listener，避免监听器随重连路径累积。
+  const trackedSockets = new WeakSet<HeartbeatSocket>();
+  // terminate 成功后到 'close' 事件之间仍可能短暂留在 wss.clients，避免重复终止。
+  const terminatingSockets = new WeakSet<HeartbeatSocket>();
 
   return {
     intervalMs,
@@ -62,32 +93,82 @@ export function createWebSocketHeartbeat(
 
     track(socket) {
       missedPongs.set(socket, 0);
+      if (trackedSockets.has(socket)) return;
+      trackedSockets.add(socket);
       socket.on('pong', () => missedPongs.set(socket, 0));
     },
 
     sweep(sockets) {
       let terminated = 0;
+      let pinged = 0;
+      let skipped = 0;
+      const failures: HeartbeatOperationFailure[] = [];
+
       for (const socket of sockets) {
-        const missed = (missedPongs.get(socket) ?? 0) + 1;
+        // WebSocket.OPEN === 1。connection 事件交付的连接均为 OPEN；显式跳过
+        // CONNECTING/CLOSING/CLOSED，避免 close 事件尚未从 clients 移除时误报失败。
+        if (
+          (socket.readyState !== undefined && socket.readyState !== 1) ||
+          terminatingSockets.has(socket)
+        ) {
+          skipped += 1;
+          continue;
+        }
+
+        const missed = missedPongs.get(socket) ?? 0;
         if (missed >= maxMissedPongs) {
           // terminate() 会触发 'close'，由调用方既有的 close handler 完成
           // 连接表与终端会话清理。
-          terminated += 1;
           try {
             socket.terminate();
-          } catch {
-            /* ignore */
+            terminatingSockets.add(socket);
+            terminated += 1;
+          } catch (error) {
+            failures.push({ operation: 'terminate', error });
           }
           continue;
         }
-        missedPongs.set(socket, missed);
+
+        // 先记录 outstanding ping，再调用 ping：如果测试替身/实现同步触发 pong，
+        // pong listener 的清零不能被随后一次 set 覆盖。
+        missedPongs.set(socket, missed + 1);
         try {
           socket.ping();
-        } catch {
-          /* ignore */
+          pinged += 1;
+        } catch (error) {
+          failures.push({ operation: 'ping', error });
         }
       }
-      return terminated;
+
+      return { pinged, terminated, skipped, failures };
     },
   };
+}
+
+/**
+ * 启动心跳调度，并在 WebSocketServer 关闭时同步清除 interval。
+ * 返回的 stop 可用于提前停止；重复调用安全。
+ */
+export function startWebSocketHeartbeat(
+  server: HeartbeatSocketServer,
+  heartbeat: WebSocketHeartbeat,
+  onSweep: (result: HeartbeatSweepResult) => void,
+): () => void {
+  let stopped = false;
+  const timer = setInterval(() => {
+    onSweep(heartbeat.sweep(server.clients));
+  }, heartbeat.intervalMs);
+
+  // 心跳不能阻止 Node 进程自然退出。
+  timer.unref?.();
+
+  const stop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    server.off('close', stop);
+  };
+
+  server.once('close', stop);
+  return stop;
 }
