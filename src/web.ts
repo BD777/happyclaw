@@ -123,6 +123,7 @@ import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
+import { createWebSocketHeartbeat } from './ws-heartbeat.js';
 import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import { RunStreamFence } from './run-stream-fence.js';
 import {
@@ -1384,6 +1385,24 @@ function setupWebSocket(server: any): WebSocketServer {
     maxPayload: 8 * 1024 * 1024,
   });
 
+  // 心跳：保活反代/NAT 会掐掉的空闲 upgraded 连接，并回收 TCP 半开的死连接。
+  // 取值与完整背景见 src/ws-heartbeat.ts。
+  // 注意：此前死连接是靠反代的读超时（nginx 默认 60s）兜底回收的——调大
+  // proxy_read_timeout 必须在心跳上线之后做，否则死连接会堆积到新的超时时长。
+  const heartbeat = createWebSocketHeartbeat();
+  const heartbeatTimer = setInterval(() => {
+    const terminated = heartbeat.sweep(wss.clients);
+    if (terminated > 0) {
+      logger.info(
+        { terminated, maxMissedPongs: heartbeat.maxMissedPongs },
+        'WebSocket heartbeat timeout, terminated dead connections',
+      );
+    }
+  }, heartbeat.intervalMs);
+  // 不阻止进程退出；正常关闭走下面的 wss 'close'。
+  heartbeatTimer.unref?.();
+  wss.on('close', () => clearInterval(heartbeatTimer));
+
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
 
@@ -1495,6 +1514,8 @@ function setupWebSocket(server: any): WebSocketServer {
   wss.on('connection', (ws, request: any) => {
     const sessionId = request?.__happyclawSessionId as string | undefined;
     logger.info('WebSocket client connected');
+    // 心跳状态：浏览器由协议栈自动回 pong，前端无需改动。
+    heartbeat.track(ws);
     const connSession = sessionId
       ? getCachedSessionWithUser(sessionId)
       : undefined;
