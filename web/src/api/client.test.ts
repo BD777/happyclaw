@@ -121,4 +121,40 @@ describe('apiFetch cancellation', () => {
 
     await rejection;
   });
+
+  test('响应头到达后仍可取消停滞的响应体读取', async () => {
+    const controller = new AbortController();
+    globalThis.fetch = vi.fn((_input, init) => {
+      const signal = init?.signal;
+      return Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(streamController) {
+              signal?.addEventListener(
+                'abort',
+                () =>
+                  streamController.error(
+                    new DOMException('Aborted', 'AbortError'),
+                  ),
+                { once: true },
+              );
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+
+    const pending = apiFetch('/api/upload-test', {
+      signal: controller.signal,
+      timeoutMs: 60_000,
+    });
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(pending).rejects.toEqual({
+      status: 499,
+      message: 'Request cancelled',
+    });
+  });
 });

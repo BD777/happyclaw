@@ -43,51 +43,64 @@ export async function apiFetch<T>(
     ? (fetchOptions.headers ?? {})
     : { 'Content-Type': 'application/json', ...fetchOptions.headers };
 
-  let res: Response;
   try {
-    res = await fetch(requestPath, {
-      credentials: 'include',
-      ...fetchOptions,
-      headers,
-      signal: controller.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(requestPath, {
+        credentials: 'include',
+        ...fetchOptions,
+        headers,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (abortCause === 'caller') {
+        throw { status: 499, message: 'Request cancelled' } as ApiError;
+      }
+      if (abortCause === 'timeout') {
+        throw { status: 408, message: 'Request timeout' } as ApiError;
+      }
+      throw { status: 0, message: 'Network error' } as ApiError;
+    }
+
+    if (res.status === 401) {
+      // Avoid redirect loop if already on the login page
+      const currentPath = stripBasePath(window.location.pathname);
+      if (!currentPath.startsWith('/login')) {
+        replaceInApp('/login');
+      }
+      throw new Error('Unauthorized');
+    }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 403 && body.code === 'PASSWORD_CHANGE_REQUIRED') {
+        const currentPath = stripBasePath(window.location.pathname);
+        if (!currentPath.startsWith('/settings')) {
+          replaceInApp('/settings');
+        }
+      }
+      throw {
+        status: res.status,
+        message: body.error || res.statusText,
+        body,
+      } as ApiError;
+    }
+    if (res.status === 204) return undefined as T;
+    return await res.json();
   } catch (err) {
+    // Fetch resolves as soon as response headers arrive. Keep cancellation and
+    // timeout active through body consumption as well, and normalize an abort
+    // raised by response.json() the same way as an abort before headers.
     if (abortCause === 'caller') {
       throw { status: 499, message: 'Request cancelled' } as ApiError;
     }
     if (abortCause === 'timeout') {
       throw { status: 408, message: 'Request timeout' } as ApiError;
     }
-    throw { status: 0, message: 'Network error' } as ApiError;
+    throw err;
   } finally {
     clearTimeout(timeout);
     externalSignal?.removeEventListener('abort', abortFromCaller);
   }
-
-  if (res.status === 401) {
-    // Avoid redirect loop if already on the login page
-    const currentPath = stripBasePath(window.location.pathname);
-    if (!currentPath.startsWith('/login')) {
-      replaceInApp('/login');
-    }
-    throw new Error('Unauthorized');
-  }
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    if (res.status === 403 && body.code === 'PASSWORD_CHANGE_REQUIRED') {
-      const currentPath = stripBasePath(window.location.pathname);
-      if (!currentPath.startsWith('/settings')) {
-        replaceInApp('/settings');
-      }
-    }
-    throw {
-      status: res.status,
-      message: body.error || res.statusText,
-      body,
-    } as ApiError;
-  }
-  if (res.status === 204) return undefined as T;
-  return res.json();
 }
 
 /**

@@ -277,6 +277,9 @@ describe('文件上传重试', () => {
     expect(mockedApiFetch).toHaveBeenCalledTimes(1);
     expect(useFileStore.getState().error).toBeNull();
     expect(useFileStore.getState().uploading).toBe(false);
+    // The server may have committed before the aborted response reached the
+    // browser, including for the first file where uploadedBytes is still zero.
+    expect(mockedGet).toHaveBeenCalledWith('/api/groups/web%3Ag1/files?');
     expect(showToastMock).not.toHaveBeenCalled();
   });
 

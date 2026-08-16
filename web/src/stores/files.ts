@@ -210,6 +210,7 @@ export const useFileStore = create<FileState>((set, get) => ({
       basePath !== undefined ? basePath : get().currentPath[jid] || '';
     const apiUrl = `/api/groups/${encodeURIComponent(jid)}/files`;
     let uploadedBytes = 0;
+    let requestStarted = false;
 
     try {
       for (let i = 0; i < files.length; i++) {
@@ -263,6 +264,11 @@ export const useFileStore = create<FileState>((set, get) => ({
           if (uploadPath) formData.append('path', uploadPath);
 
           try {
+            // Once the request starts, aborting the browser fetch cannot prove
+            // that the server did not commit the atomic file write before its
+            // response was lost. Reconcile the directory on cancellation even
+            // when this is the first file and uploadedBytes is still zero.
+            requestStarted = true;
             await apiFetch(apiUrl, {
               method: 'POST',
               body: formData,
@@ -328,7 +334,7 @@ export const useFileStore = create<FileState>((set, get) => ({
       return true;
     } catch (err) {
       if (err === UPLOAD_CANCELLED || uploadController.signal.aborted) {
-        if (uploadedBytes > 0) await get().loadFiles(jid, targetBase);
+        if (requestStarted) await get().loadFiles(jid, targetBase);
         return false;
       }
       const msg = uploadErrorMessage(err);
