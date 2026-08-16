@@ -403,6 +403,33 @@ HappyClaw 会执行代码和访问第三方消息平台，部署前请理解以�
 
 完整接口权限见 [ACL 权限矩阵](docs/ACL-MATRIX.md)。
 
+### 反向代理配置
+
+Web 界面依赖 `/ws` 上的 WebSocket 推送流式输出和运行状态。反向代理必须放行
+Upgrade 并把该连接的读超时设得足够长，否则前端会周期性弹出「连接中断，正在重连...」。
+
+服务端已内置 30 秒心跳（ping/pong），既用于保活，也用于回收半开的死连接，
+因此代理侧只需把读超时设得高于心跳间隔即可。nginx 示例：
+
+```nginx
+location /ws {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 3600s;   # 默认 60s 会掐断长连接
+    proxy_send_timeout 3600s;
+}
+```
+
+注意 `Connection` 应固定为 `"upgrade"`，不要写成 `$http_connection`——后者依赖
+客户端如实发送该头部，行为不稳定。
+
+若代理位于 Cloudflare 等平台之后，还需确认其空闲超时高于 30 秒心跳间隔。
+上传大文件时另需放宽 `client_max_body_size`（不小于 `MAX_FILE_SIZE_MB`，并预留
+multipart 开销）与 `client_body_timeout`。
+
 ## 开发与测试
 
 ### 常用命令
