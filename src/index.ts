@@ -6573,6 +6573,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
   let streamSteered = false;
+  let runnerClosedBySteer = false;
   // 本 run 是否已进入 finally 收尾。outputChain 的迟到回调可能在 run resolve
   // 之后才执行（waitForOutputChain 30s 兜底只放行不取消）；此时绝不能再重建
   // 流式卡片——重建出的卡片永远无人 complete，成为僵尸「生成中」卡。
@@ -8842,6 +8843,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       activeTurnOutputs.unbind(mainAdmissionKey, inputTurnId, coordinator);
     }
 
+    runnerClosedBySteer =
+      output?.status === 'closed' &&
+      steeringTransitions.consumeRunnerClose(chatJid, lastProcessed.id);
+    if (runnerClosedBySteer) {
+      streamInterrupted = true;
+      streamSteered = true;
+      commitCursor(lastProcessed.id);
+      logger.info(
+        { chatJid, inputTurnId: lastProcessed.id },
+        'Container close resolved as a clean steer transition',
+      );
+    }
+
     // ── 检测中断：有累积文本但从未发送回复 ──
     const wasInterrupted =
       publishesFrameworkAnswer(interactionMode) &&
@@ -8958,8 +8972,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             : false;
           if (!notified) channelManualNoticesAcknowledged = false;
           terminal = settled;
-        } else if (explicitDiscard) {
-          settled = runtime.cancel('Input discarded by explicit stop');
+        } else if (explicitDiscard || runnerClosedBySteer) {
+          settled = runtime.cancel(
+            runnerClosedBySteer
+              ? 'Input superseded by explicit steer'
+              : 'Input discarded by explicit stop',
+          );
           terminal = settled;
         } else if (
           healthyInputCompleted &&
@@ -9196,6 +9214,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   if (output.status === 'closed') {
+    if (runnerClosedBySteer) {
+      await clearProcessingIndicatorForInput(ipcReplyTurnTracker.inputTurnId);
+      return true;
+    }
     const activeInputHealthy = healthyCompletedInputTurns.has(
       ipcReplyTurnTracker.inputTurnId,
     );
@@ -15076,6 +15098,7 @@ async function processAgentConversation(
   // the container drained mid-query so the finally block finalizes the card as
   // "reconnecting" instead of leaving a zombie 生成中 card.
   let agentClosed = false;
+  let runnerClosedBySteer = false;
   // ── 卡片挂起完成机制（与主路径 runContainerAgent 对齐）──
   // Sub-Agent 路径首条回复后本就不再向 IM 发消息（isFirstReply 门控），挂起
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
@@ -16887,6 +16910,24 @@ async function processAgentConversation(
       );
     }
 
+    runnerClosedBySteer =
+      output.status === 'closed' &&
+      steeringTransitions.consumeRunnerClose(
+        virtualChatJid,
+        output.turnId || activeAgentInputTurnId,
+      );
+    if (runnerClosedBySteer) {
+      agentClosed = false;
+      agentStreamInterrupted = true;
+      agentStreamSteered = true;
+      commitCursor(activeAgentInputTurnId);
+      retryUnfinishedTurn = false;
+      logger.info(
+        { chatJid, agentId, inputTurnId: activeAgentInputTurnId },
+        'Conversation agent close resolved as a clean steer transition',
+      );
+    }
+
     // Finalize session
     if (
       output.newSessionId &&
@@ -16973,7 +17014,7 @@ async function processAgentConversation(
         { chatJid, agentId, turnOutcome },
         'Explicit stop discarded the interrupted agent input without replay',
       );
-    } else if (output.status === 'closed') {
+    } else if (output.status === 'closed' && !runnerClosedBySteer) {
       const turnOutcome = resolveTurnOutcome({
         status: output.status,
         healthyInputTurnCompleted: activeAgentInputHealthy,
@@ -17061,6 +17102,10 @@ async function processAgentConversation(
           } else {
             await agentStreamingSession.abort('已停止').catch(() => {});
           }
+        } else if (runnerClosedBySteer) {
+          await agentStreamingSession
+            .complete(agentStreamingAccText)
+            .catch(() => {});
         } else if (agentClosed) {
           // Container drained/_closed the in-flight query; the message will be
           // retried, so just finalize the card (区别于"已中断"：系统侧打断重试).
@@ -17137,8 +17182,12 @@ async function processAgentConversation(
             : false;
           if (!notified) allAgentManualNoticesAcknowledged = false;
           terminal = settled;
-        } else if (explicitDiscard) {
-          settled = runtime.cancel('Input discarded by explicit stop');
+        } else if (explicitDiscard || runnerClosedBySteer) {
+          settled = runtime.cancel(
+            runnerClosedBySteer
+              ? 'Input superseded by explicit steer'
+              : 'Input discarded by explicit stop',
+          );
           terminal = settled;
         } else if (agentDeterministicTerminalError) {
           settled = runtime.fail(agentDeterministicTerminalError);
