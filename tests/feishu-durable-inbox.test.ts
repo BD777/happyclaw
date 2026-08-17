@@ -335,6 +335,13 @@ describe('Feishu durable Inbox and cursor integration', () => {
     const executed = vi.fn();
     const connected = await connect(accountId, executed, {
       shouldProcessGroupMessage: () => true,
+      resolveEffectiveChatJid: (jid, meta) => ({
+        effectiveJid: meta?.threadId
+          ? 'web:durable-feishu-test#agent:break-thread-agent'
+          : 'web:durable-feishu-test',
+        agentId: meta?.threadId ? 'break-thread-agent' : null,
+        sourceJid: jid,
+      }),
       onSessionBreak,
     });
     const createTime = Date.now();
@@ -345,6 +352,9 @@ describe('Feishu durable Inbox and cursor integration', () => {
         ...event('om_real_break', createTime, '').message,
         chat_id: 'oc_break_group',
         chat_type: 'group',
+        root_id: 'om_break_root',
+        parent_id: 'om_break_root',
+        thread_id: 'omt_break_thread',
         content: JSON.stringify({ text: '@_user_1 /break' }),
         mentions: [
           {
@@ -358,13 +368,13 @@ describe('Feishu durable Inbox and cursor integration', () => {
 
     expect(onSessionBreak).toHaveBeenCalledWith({
       sourceJid: 'feishu:oc_break_group',
-      targetJid: 'web:durable-feishu-test',
+      targetJid: 'web:durable-feishu-test#agent:break-thread-agent',
       senderImId: 'ou_durable_user',
     });
     expect(executed).not.toHaveBeenCalledWith('om_real_break');
-    expect(controls.messageCreate).toHaveBeenCalledTimes(1);
+    expect(controls.messageReply).toHaveBeenCalledTimes(1);
 
-    controls.messageCreate.mockClear();
+    controls.messageReply.mockClear();
     await connected.handler({
       ...event('om_fake_break', createTime + 1, ''),
       message: {
@@ -378,16 +388,25 @@ describe('Feishu durable Inbox and cursor integration', () => {
 
     expect(onSessionBreak).toHaveBeenCalledTimes(1);
     expect(executed).toHaveBeenCalledWith('om_fake_break');
-    expect(controls.messageCreate).not.toHaveBeenCalled();
+    expect(controls.messageReply).not.toHaveBeenCalled();
   });
 
   test('only a real Bot mention can execute exact lowercase /clear', async () => {
     const accountId = `account-clear-command-${Date.now()}`;
-    const onCommand = vi.fn().mockResolvedValue('Session context cleared.');
+    const onSessionClear = vi
+      .fn()
+      .mockResolvedValue('Session context cleared.');
     const executed = vi.fn();
     const connected = await connect(accountId, executed, {
       shouldProcessGroupMessage: () => true,
-      onCommand,
+      resolveEffectiveChatJid: (jid, meta) => ({
+        effectiveJid: meta?.threadId
+          ? 'web:durable-feishu-test#agent:thread-agent'
+          : 'web:durable-feishu-test',
+        agentId: meta?.threadId ? 'thread-agent' : null,
+        sourceJid: jid,
+      }),
+      onSessionClear,
     });
     const createTime = Date.now();
     const mentioned = {
@@ -402,21 +421,23 @@ describe('Feishu durable Inbox and cursor integration', () => {
         ...event('om_real_clear', createTime, '').message,
         chat_id: 'oc_clear_group',
         chat_type: 'group',
+        root_id: 'om_clear_root',
+        parent_id: 'om_clear_root',
+        thread_id: 'omt_clear_thread',
         content: JSON.stringify({ text: '@_user_1 /clear' }),
         mentions: [mentioned],
       },
     });
 
-    expect(onCommand).toHaveBeenCalledWith(
-      'feishu:oc_clear_group',
-      'clear',
-      'ou_durable_user',
-      [mentioned],
-    );
+    expect(onSessionClear).toHaveBeenCalledWith({
+      sourceJid: 'feishu:oc_clear_group',
+      targetJid: 'web:durable-feishu-test#agent:thread-agent',
+      senderImId: 'ou_durable_user',
+    });
     expect(executed).not.toHaveBeenCalledWith('om_real_clear');
-    expect(controls.messageCreate).toHaveBeenCalledTimes(1);
+    expect(controls.messageReply).toHaveBeenCalledTimes(1);
 
-    controls.messageCreate.mockClear();
+    controls.messageReply.mockClear();
     await connected.handler({
       ...event('om_fake_clear', createTime + 1, ''),
       message: {
@@ -428,9 +449,9 @@ describe('Feishu durable Inbox and cursor integration', () => {
       },
     });
 
-    expect(onCommand).toHaveBeenCalledTimes(1);
+    expect(onSessionClear).toHaveBeenCalledTimes(1);
     expect(executed).toHaveBeenCalledWith('om_fake_clear');
-    expect(controls.messageCreate).not.toHaveBeenCalled();
+    expect(controls.messageReply).not.toHaveBeenCalled();
   });
 
   test('bootstraps the first P2P DM after an account-scoped route rejection', async () => {

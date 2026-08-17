@@ -155,6 +155,11 @@ export interface ConnectOptions {
     targetJid?: string;
     senderImId: string;
   }) => Promise<string>;
+  onSessionClear?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
   /** Handle buttons from legacy queued-message cards sent by older versions. */
   onFollowUpCardAction?: (input: {
     sourceJid: string;
@@ -1983,6 +1988,7 @@ export function createFeishuConnection(
       onAgentMessage,
       onFollowUpMessage,
       onSessionBreak,
+      onSessionClear,
       shouldProcessGroupMessage,
       resolveFeishuConversationPlan,
       isGroupOwnerMessage,
@@ -2084,6 +2090,16 @@ export function createFeishuConnection(
         chatJid,
         rawMessageMeta,
       );
+      const routedMessageMeta: FeishuMessageMeta = {
+        ...rawMessageMeta,
+        nativeContextType:
+          conversationPlan?.independentContext ||
+          (!conversationPlan && !!threadId)
+            ? 'thread'
+            : undefined,
+        contextId: conversationPlan?.contextId || threadId,
+        rootId: conversationPlan?.rootMessageId || rootId,
+      };
       const rootMessageId =
         conversationPlan?.rootMessageId || rootId || messageId;
       const deliveryRootMessageId = conversationPlan?.independentContext
@@ -2254,7 +2270,10 @@ export function createFeishuConnection(
               );
               return;
             }
-            if (runtimeControl?.kind === 'break') {
+            if (
+              runtimeControl?.kind === 'break' ||
+              runtimeControl?.kind === 'clear'
+            ) {
               let targetJid: string | undefined;
               // Group routes are already registered and may carry a native
               // thread/topic target. A first-contact P2P route is deliberately
@@ -2264,20 +2283,30 @@ export function createFeishuConnection(
                 try {
                   targetJid = resolveEffectiveChatJid(
                     chatJid,
-                    rawMessageMeta,
+                    routedMessageMeta,
                   )?.effectiveJid;
                 } catch (error) {
                   if (!(error instanceof ChannelRouteRejectedError))
                     throw error;
                 }
               }
-              reply = onSessionBreak
-                ? await onSessionBreak({
-                    sourceJid: chatJid,
-                    targetJid,
-                    senderImId: senderOpenId,
-                  })
-                : '当前运行环境不支持 /break。';
+              if (runtimeControl?.kind === 'break') {
+                reply = onSessionBreak
+                  ? await onSessionBreak({
+                      sourceJid: chatJid,
+                      targetJid,
+                      senderImId: senderOpenId,
+                    })
+                  : '当前运行环境不支持 /break。';
+              } else {
+                reply = onSessionClear
+                  ? await onSessionClear({
+                      sourceJid: chatJid,
+                      targetJid,
+                      senderImId: senderOpenId,
+                    })
+                  : '当前运行环境不支持 /clear。';
+              }
             } else {
               reply = await onCommand!(
                 chatJid,
@@ -2562,22 +2591,7 @@ export function createFeishuConnection(
       const admittedRoute = resolveAdmittedChannelRoute<FeishuMessageMeta>(
         chatJid,
         resolveEffectiveChatJid,
-        {
-          provider: 'feishu',
-          chatType: normalizedChatType,
-          mentionedBot,
-          nativeContextType:
-            conversationPlan?.independentContext ||
-            (!conversationPlan && !!threadId)
-              ? 'thread'
-              : undefined,
-          contextId: conversationPlan?.contextId || threadId,
-          threadId,
-          rootId: conversationPlan?.rootMessageId || rootId,
-          parentId,
-          messageId,
-          text,
-        },
+        { ...routedMessageMeta, text },
       );
       if (!admittedRoute) {
         logger.warn(

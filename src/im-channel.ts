@@ -166,6 +166,11 @@ export interface IMChannelConnectOpts {
     targetJid?: string;
     senderImId: string;
   }) => Promise<string>;
+  onSessionClear?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
   onFollowUpCardAction?: (input: {
     sourceJid: string;
     targetJid: string;
@@ -321,6 +326,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onAgentMessage: opts.onAgentMessage,
         onFollowUpMessage: opts.onFollowUpMessage,
         onSessionBreak: opts.onSessionBreak,
+        onSessionClear: opts.onSessionClear,
         onFollowUpCardAction: opts.onFollowUpCardAction,
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,

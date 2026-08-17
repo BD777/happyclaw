@@ -19737,6 +19737,46 @@ async function handleFeishuSessionBreak(input: {
     : 'No active task to stop.';
 }
 
+async function handleFeishuSessionClear(input: {
+  sourceJid: string;
+  targetJid?: string;
+  senderImId: string;
+}): Promise<string> {
+  const targetJid = input.targetJid;
+  const runtime = targetJid ? resolveFollowUpRuntime(targetJid) : null;
+  if (!targetJid || !runtime) {
+    return '当前绑定目标不存在，无法执行 /clear。';
+  }
+  try {
+    await executeSessionReset(
+      runtime.baseChatJid,
+      runtime.effectiveGroup.folder,
+      {
+        queue,
+        sessions,
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: setCursors,
+      },
+      runtime.agentId ?? undefined,
+    );
+    logger.info(
+      {
+        sourceJid: input.sourceJid,
+        targetJid,
+        senderImId: input.senderImId,
+      },
+      'Feishu session clear processed',
+    );
+    return 'Session context cleared.';
+  } catch (err) {
+    logger.error(
+      { err, sourceJid: input.sourceJid, targetJid },
+      'Feishu session clear failed',
+    );
+    return 'Failed to clear the session context. Please try again.';
+  }
+}
+
 function resolveChannelAccountWorkspace(account: ChannelAccount): {
   jid: string;
   folder: string;
@@ -19842,6 +19882,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
             ),
           onFollowUpMessage: handleIncomingFollowUp,
           onSessionBreak: handleFeishuSessionBreak,
+          onSessionClear: handleFeishuSessionClear,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
           onP2pSender: (senderOpenId: string) => {
@@ -20763,6 +20804,7 @@ async function main(): Promise<void> {
               isSenderAllowedInGroup(jid, sender, getReloadOwnerOpenId),
             onFollowUpMessage: handleIncomingFollowUp,
             onSessionBreak: handleFeishuSessionBreak,
+            onSessionClear: handleFeishuSessionClear,
             onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
             onP2pSender: onReloadP2pSender,
