@@ -125,7 +125,7 @@ function runSafeWorkspaceMutation(request: SafeWorkspaceMutationRequest): void {
       if (!existing.isFile()) {
         throw new Error('Target is not a regular file');
       }
-      existingMode = existing.mode & 0o7777;
+      existingMode = existing.mode & 0o700;
     }
     const temporary = `${target}.happyclaw-${process.pid}-${Date.now()}.tmp`;
     try {
