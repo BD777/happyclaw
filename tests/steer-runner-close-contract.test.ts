@@ -11,6 +11,9 @@ describe('steer runner-close orchestration contract', () => {
       /if \(runnerClosedBySteer\) \{\s+await clearProcessingIndicatorForInput[\s\S]{0,180}return true/,
     );
     expect(main).toMatch(/output\.status === 'closed' && !runnerClosedBySteer/);
+    expect(
+      main.match(/runnerClosedBySteer\) \{[\s\S]{0,320}markRunnerQueryIdle/g),
+    ).toHaveLength(2);
   });
 
   test('durable channel turns cancel the superseded input on both paths', () => {

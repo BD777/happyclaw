@@ -8850,6 +8850,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       streamInterrupted = true;
       streamSteered = true;
       commitCursor(lastProcessed.id);
+      queue.markRunnerQueryIdle(chatJid);
       logger.info(
         { chatJid, inputTurnId: lastProcessed.id },
         'Container close resolved as a clean steer transition',
@@ -16922,6 +16923,7 @@ async function processAgentConversation(
       agentStreamSteered = true;
       commitCursor(activeAgentInputTurnId);
       retryUnfinishedTurn = false;
+      queue.markRunnerQueryIdle(virtualJid);
       logger.info(
         { chatJid, agentId, inputTurnId: activeAgentInputTurnId },
         'Conversation agent close resolved as a clean steer transition',
