@@ -61,6 +61,11 @@ import { resolveTurnOutcome } from './turn-outcome.js';
 import { finalizeChannelCardAfterDelivery } from './channel-card-finalization.js';
 import { resolveContainerOutputInputTurnId } from './channel-output-correlation.js';
 import { SteeringTransitionRegistry } from './steering-transition.js';
+import {
+  selectBatchProcessingIndicatorOwners,
+  type ProcessingIndicatorInput,
+  type ProcessingIndicatorOwner,
+} from './processing-indicator-batch.js';
 import { resolveFeishuFollowUpMode } from './follow-up-policy.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
 import {
@@ -1703,6 +1708,7 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
   }
   broadcastFollowUpUpdate(chatJid);
 
+  let prePublishedIndicatorOwners: ProcessingIndicatorOwner[] = [];
   try {
     const prepared = await prepareFollowUp(items);
     if (items.some((queued) => !getQueuedFollowUp(chatJid, queued.id))) {
@@ -1746,11 +1752,28 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
       queue.releaseQueryReservation(chatJid, reservedRunId, true);
       return;
     }
+    prePublishedIndicatorOwners = selectBatchProcessingIndicatorOwners(
+      agentItems.map((queued) => ({
+        id: queued.id,
+        sourceJid: queued.source_jid,
+      })),
+      getChannelType(chatJid) ? chatJid : null,
+    );
+    await beginBatchAckReactions(chatJid, prePublishedIndicatorOwners);
     const result = injectPreparedFollowUp(agentItems, prepared, reservedRunId);
+    if (result === 'sent') {
+      // The active main/agent admission map now owns terminal cleanup.
+      prePublishedIndicatorOwners = [];
+    } else {
+      await clearUntrackedBatchAckReactions(prePublishedIndicatorOwners);
+      prePublishedIndicatorOwners = [];
+    }
     if (result !== 'sent') {
       queue.releaseQueryReservation(chatJid, reservedRunId);
     }
   } catch (err) {
+    await clearUntrackedBatchAckReactions(prePublishedIndicatorOwners);
+    prePublishedIndicatorOwners = [];
     const remaining = items.filter((queued) =>
       getQueuedFollowUp(chatJid, queued.id),
     );
@@ -1926,6 +1949,42 @@ function interruptAndRunFollowUp(
     state: 'interrupting',
     message: '正在根据这条消息调整当前任务。',
     item: first,
+  };
+}
+
+/**
+ * `/steer` is a durable direction change, not a single-message queue barrier.
+ * The command stays in arrival order with the Session's existing pending
+ * inputs; after the current generation is interrupted, the next snapshot
+ * drains them as one batch.
+ */
+function steerQueuedFollowUpBatch(
+  chatJid: string,
+  messageId: string,
+): FollowUpActionResult {
+  const item = getQueuedFollowUp(chatJid, messageId);
+  if (!item) {
+    return { ok: false, message: '这条引导消息已被处理或取消。' };
+  }
+  const activeRunId = queue.getActiveQueryId(chatJid);
+  if (activeRunId) markSteeringInterrupt(chatJid);
+  if (!activeRunId || !queue.interruptQuery(chatJid, activeRunId)) {
+    clearSteeringInterrupt(chatJid);
+    dispatchQueuedFollowUpFamily(chatJid);
+    return {
+      ok: true,
+      state: 'queued',
+      message: '当前回复已结束，引导将随下一批消息处理。',
+      item,
+    };
+  }
+  void clearTrackedProcessingIndicators(chatJid);
+  broadcastFollowUpUpdate(chatJid);
+  return {
+    ok: true,
+    state: 'interrupting',
+    message: '正在根据新指令调整当前任务。',
+    item,
   };
 }
 
@@ -3685,7 +3744,7 @@ async function handleClearCommand(chatJid: string): Promise<string> {
       },
       target.agentId ?? undefined,
     );
-    return '已清除对话上下文 ✓';
+    return 'Session context cleared.';
   } catch (err) {
     logger.error(
       {
@@ -4740,6 +4799,54 @@ function trackProcessingIndicator(
     trackedProcessingIndicators.set(logicalJid, inputs);
   }
   inputs.set(inputTurnId, transportJid);
+}
+
+async function activateBatchProcessingIndicators(
+  logicalJid: string,
+  inputs: ProcessingIndicatorInput[],
+  fallbackTransportJid?: string | null,
+): Promise<ProcessingIndicatorOwner[]> {
+  const owners = selectBatchProcessingIndicatorOwners(
+    inputs,
+    fallbackTransportJid,
+  );
+  await beginBatchAckReactions(logicalJid, owners);
+  for (const owner of owners) {
+    trackProcessingIndicator(logicalJid, owner.inputTurnId, owner.transportJid);
+  }
+  return owners;
+}
+
+async function beginBatchAckReactions(
+  logicalJid: string,
+  owners: ProcessingIndicatorOwner[],
+): Promise<void> {
+  await Promise.all(
+    owners.map(async (owner) => {
+      if (getChannelType(owner.transportJid) === 'feishu') {
+        await imManager
+          .beginAckReaction(owner.transportJid, owner.inputTurnId)
+          .catch((err) => {
+            logger.warn(
+              { err, logicalJid, ...owner },
+              'Failed to add active batch acknowledgement reaction',
+            );
+          });
+      }
+    }),
+  );
+}
+
+async function clearUntrackedBatchAckReactions(
+  owners: ProcessingIndicatorOwner[],
+): Promise<void> {
+  await Promise.allSettled(
+    owners
+      .filter((owner) => getChannelType(owner.transportJid) === 'feishu')
+      .map((owner) =>
+        imManager.clearAckReaction(owner.transportJid, owner.inputTurnId),
+      ),
+  );
 }
 
 function untrackProcessingIndicator(
@@ -6023,6 +6130,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       ? lastProcessed.source_jid
       : replySourceImJid;
   const initialTypingTransportJid = initialProcessingIndicatorJid ?? chatJid;
+  const initialProcessingIndicatorOwners =
+    await activateBatchProcessingIndicators(
+      chatJid,
+      missedMessages.map((message) => ({
+        id: message.id,
+        sourceJid: message.source_jid,
+      })),
+      null,
+    );
   const initialTypingReady = setTyping(
     chatJid,
     true,
@@ -6057,28 +6173,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const queryTaskIds = new Set<string>();
   const healthyCompletedInputTurns = new Set<string>();
   const processingIndicatorJidsByInput = new Map<string, string>();
-  // One cold SDK turn may cover several rapidly-arriving DB inputs. Each
-  // provider reaction is owned by the original DB message id, while the SDK
-  // completion is correlated to the batch's terminal input id.
+  // One cold SDK turn may cover several rapidly-arriving DB inputs. The
+  // provider reaction belongs to this active batch's selected message, while
+  // the SDK completion is correlated to the batch's terminal input id.
   const processingIndicatorInputsByCompletion = new Map<string, string[]>([
     [
       lastProcessed.id,
-      [...new Set(missedMessages.map((message) => message.id))],
+      initialProcessingIndicatorOwners.map((owner) => owner.inputTurnId),
     ],
   ]);
   const processingTypingLeaseIdsByCompletion = new Map<string, string>([
     [lastProcessed.id, lastProcessed.id],
   ]);
-  for (const message of missedMessages) {
-    const indicatorJid =
-      message.source_jid && getChannelType(message.source_jid)
-        ? message.source_jid
-        : directImReply
-          ? chatJid
-          : null;
-    if (!indicatorJid) continue;
-    processingIndicatorJidsByInput.set(message.id, indicatorJid);
-    trackProcessingIndicator(chatJid, message.id, indicatorJid);
+  for (const owner of initialProcessingIndicatorOwners) {
+    processingIndicatorJidsByInput.set(owner.inputTurnId, owner.transportJid);
   }
   const clearProcessingIndicatorForInput = async (
     inputTurnId: string,
@@ -6757,27 +6865,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         coveredInputs && coveredInputs.length > 0
           ? coveredInputs
           : [{ id: inputTurnId, sourceJid: newSourceJid ?? undefined }];
-      const exactInputIds = [...new Set(exactInputs.map((input) => input.id))];
-      processingIndicatorInputsByCompletion.set(inputTurnId, exactInputIds);
-      processingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
       const fallbackProcessingIndicatorJid =
         newSourceJid && getChannelType(newSourceJid) ? newSourceJid : newImJid;
-      for (const exactInput of exactInputs) {
-        const processingIndicatorJid =
-          exactInput.sourceJid && getChannelType(exactInput.sourceJid)
-            ? exactInput.sourceJid
-            : fallbackProcessingIndicatorJid;
-        if (processingIndicatorJid) {
-          processingIndicatorJidsByInput.set(
-            exactInput.id,
-            processingIndicatorJid,
-          );
-          trackProcessingIndicator(
-            chatJid,
-            exactInput.id,
-            processingIndicatorJid,
-          );
-        }
+      const selectedIndicatorOwners = selectBatchProcessingIndicatorOwners(
+        exactInputs.map((input) => ({
+          id: input.id,
+          sourceJid: input.sourceJid,
+        })),
+        fallbackProcessingIndicatorJid,
+      );
+      processingIndicatorInputsByCompletion.set(
+        inputTurnId,
+        selectedIndicatorOwners.map((owner) => owner.inputTurnId),
+      );
+      processingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
+      for (const owner of selectedIndicatorOwners) {
+        processingIndicatorJidsByInput.set(
+          owner.inputTurnId,
+          owner.transportJid,
+        );
+        trackProcessingIndicator(
+          chatJid,
+          owner.inputTurnId,
+          owner.transportJid,
+        );
       }
       // This runs in GroupQueue's beforePublish hook, before the IPC temp file
       // is atomically renamed into the runner-visible inbox. A host runner can
@@ -14619,23 +14730,29 @@ async function processAgentConversation(
     : undefined;
   const healthyAgentCompletedInputTurns = new Set<string>();
   const agentProcessingIndicatorJidsByInput = new Map<string, string>();
+  const initialAgentProcessingIndicatorOwners =
+    await activateBatchProcessingIndicators(
+      virtualChatJid,
+      missedMessages.map((message) => ({
+        id: message.id,
+        sourceJid: message.source_jid,
+      })),
+      null,
+    );
   const agentProcessingIndicatorInputsByCompletion = new Map<string, string[]>([
     [
       lastProcessed.id,
-      [...new Set(missedMessages.map((message) => message.id))],
+      initialAgentProcessingIndicatorOwners.map((owner) => owner.inputTurnId),
     ],
   ]);
   const agentProcessingTypingLeaseIdsByCompletion = new Map<string, string>([
     [lastProcessed.id, lastProcessed.id],
   ]);
-  for (const message of missedMessages) {
-    const indicatorJid =
-      message.source_jid && getChannelType(message.source_jid)
-        ? message.source_jid
-        : replySourceImJid;
-    if (!indicatorJid) continue;
-    agentProcessingIndicatorJidsByInput.set(message.id, indicatorJid);
-    trackProcessingIndicator(virtualChatJid, message.id, indicatorJid);
+  for (const owner of initialAgentProcessingIndicatorOwners) {
+    agentProcessingIndicatorJidsByInput.set(
+      owner.inputTurnId,
+      owner.transportJid,
+    );
   }
   const clearAgentProcessingIndicatorForInput = async (
     inputTurnId: string,
@@ -15235,32 +15352,32 @@ async function processAgentConversation(
         coveredInputs && coveredInputs.length > 0
           ? coveredInputs
           : [{ id: inputTurnId, sourceJid: newSourceJid ?? undefined }];
-      const exactInputIds = [...new Set(exactInputs.map((input) => input.id))];
-      agentProcessingIndicatorInputsByCompletion.set(
-        inputTurnId,
-        exactInputIds,
-      );
-      agentProcessingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
       const fallbackProcessingIndicatorJid =
         newSourceJid && getChannelType(newSourceJid)
           ? newSourceJid
           : targetSourceJid;
-      for (const exactInput of exactInputs) {
-        const processingIndicatorJid =
-          exactInput.sourceJid && getChannelType(exactInput.sourceJid)
-            ? exactInput.sourceJid
-            : fallbackProcessingIndicatorJid;
-        if (processingIndicatorJid) {
-          agentProcessingIndicatorJidsByInput.set(
-            exactInput.id,
-            processingIndicatorJid,
-          );
-          trackProcessingIndicator(
-            virtualChatJid,
-            exactInput.id,
-            processingIndicatorJid,
-          );
-        }
+      const selectedIndicatorOwners = selectBatchProcessingIndicatorOwners(
+        exactInputs.map((input) => ({
+          id: input.id,
+          sourceJid: input.sourceJid,
+        })),
+        fallbackProcessingIndicatorJid,
+      );
+      agentProcessingIndicatorInputsByCompletion.set(
+        inputTurnId,
+        selectedIndicatorOwners.map((owner) => owner.inputTurnId),
+      );
+      agentProcessingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
+      for (const owner of selectedIndicatorOwners) {
+        agentProcessingIndicatorJidsByInput.set(
+          owner.inputTurnId,
+          owner.transportJid,
+        );
+        trackProcessingIndicator(
+          virtualChatJid,
+          owner.inputTurnId,
+          owner.transportJid,
+        );
       }
       return {
         rollback: () => {
@@ -19401,11 +19518,7 @@ function handleIncomingFollowUp(input: {
     runId: activeRunId,
   });
   if (mode === 'steer') {
-    const result = promoteFollowUp(
-      input.targetJid,
-      input.messageId,
-      activeRunId,
-    );
+    const result = steerQueuedFollowUpBatch(input.targetJid, input.messageId);
     if (result.ok) {
       return { disposition: 'steered', runId: activeRunId };
     }
@@ -19564,8 +19677,8 @@ async function handleFeishuSessionBreak(input: {
     'Feishu session break processed',
   );
   return interrupted || cancelled.length > 0
-    ? '已停止当前任务，并取消此前排队的消息。'
-    : '当前没有正在执行或排队的任务。';
+    ? 'Current task stopped.'
+    : 'No active task to stop.';
 }
 
 function resolveChannelAccountWorkspace(account: ChannelAccount): {

@@ -217,6 +217,8 @@ export interface FeishuConnection {
     fileName?: string,
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
+  /** Add the "OnIt" reaction for the one message that owns an active batch. */
+  beginAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   /** Clear the "OnIt" ack reaction owned by one exact inbound input. */
   clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
@@ -258,6 +260,7 @@ const FEISHU_INBOX_GATE_RETRY_DELAY_MS = 250;
 const FEISHU_INBOX_RECOVERY_LIMIT = 500;
 const FEISHU_RESOURCE_REQUEST_TIMEOUT_MS = 15_000;
 const FEISHU_RESOURCE_STREAM_TIMEOUT_MS = 30_000;
+const FEISHU_ACK_REACTION_TIMEOUT_MS = 10_000;
 const FEISHU_CURSOR_SCOPE = 'chat_messages';
 // 启动期 bot info 拉取的最大重试次数（指数退避 1s/2s/4s）
 const BOT_INFO_FETCH_MAX_ATTEMPTS = 4;
@@ -1707,17 +1710,41 @@ export function createFeishuConnection(
     return senderNameCache.get(openId) || openId;
   }
 
+  function withAckReactionTimeout<T>(
+    operation: 'add' | 'remove',
+    request: Promise<T>,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Feishu ${operation} reaction timed out`)),
+        FEISHU_ACK_REACTION_TIMEOUT_MS,
+      );
+      timer.unref();
+      request.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
   async function addReaction(
     messageId: string,
     emojiType: string,
   ): Promise<string | null> {
     try {
-      const res = (await client!.im.messageReaction.create({
+      const request = client!.im.messageReaction.create({
         path: { message_id: messageId },
-        data: {
-          reaction_type: { emoji_type: emojiType },
-        },
-      })) as { data?: { reaction_id?: string } };
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+      const res = (await withAckReactionTimeout('add', request)) as {
+        data?: { reaction_id?: string };
+      };
       return res.data?.reaction_id || null;
     } catch (err) {
       logger.debug({ err, messageId, emojiType }, 'Failed to add reaction');
@@ -1729,9 +1756,10 @@ export function createFeishuConnection(
     messageId: string,
     reactionId: string,
   ): Promise<void> {
-    await client!.im.messageReaction.delete({
+    const request = client!.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     });
+    await withAckReactionTimeout('remove', request);
   }
 
   function clearAckForInput(
@@ -1741,6 +1769,22 @@ export function createFeishuConnection(
     const target = parseFeishuRouteTarget(rawTarget);
     return ackReactions.clear(
       processingIndicatorKey(target.raw, inputMessageId),
+    );
+  }
+
+  function beginAckForInput(
+    rawTarget: string,
+    inputMessageId: string,
+  ): Promise<void> {
+    const target = parseFeishuRouteTarget(rawTarget);
+    return ackReactions.attach(
+      processingIndicatorKey(target.raw, inputMessageId),
+      async () => {
+        const reactionId = await addReaction(inputMessageId, 'OnIt');
+        return reactionId ? { messageId: inputMessageId, reactionId } : null;
+      },
+      ({ messageId, reactionId }) =>
+        removeReactionStrict(messageId, reactionId),
     );
   }
 
@@ -2106,11 +2150,8 @@ export function createFeishuConnection(
           Boolean(extracted.fileInfos?.length) ||
           (messageType !== 'text' && messageType !== 'post'),
       });
-      if (
-        runtimeControl?.kind === 'queue' ||
-        runtimeControl?.kind === 'steer'
-      ) {
-        requestedFollowUpMode = runtimeControl.kind;
+      if (runtimeControl?.kind === 'steer') {
+        requestedFollowUpMode = 'steer';
         text = runtimeControl.text;
         textForSlash = runtimeControl.text;
       }
@@ -2119,7 +2160,9 @@ export function createFeishuConnection(
       if (
         slashMatch &&
         !requestedFollowUpMode &&
-        (runtimeControl?.kind === 'break' || (onCommand && !runtimeControlLike))
+        (runtimeControl?.kind === 'break' ||
+          runtimeControl?.kind === 'clear' ||
+          (onCommand && !runtimeControlLike))
       ) {
         const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
         const persistedCommand = parseFeishuSlashCommandCheckpoint(
@@ -2852,27 +2895,6 @@ export function createFeishuConnection(
           ? feishuRouteToJid(messageRouteTarget, chatJid)
           : chatJid);
 
-      // ── Ack Reaction：确认已收到消息（在 mention 过滤之后，避免对未处理的消息加表情） ──
-      if (source === 'ws') {
-        // The registry is owned by one channel-account instance. Keep its key
-        // provider-native on both attach and clear; account scoping belongs to
-        // ImManager's instance lookup, not to the provider target.
-        const ackTarget = parseFeishuRouteTarget(
-          extractProviderTarget(routeSourceJid),
-        );
-        ackReactions
-          .attach(
-            processingIndicatorKey(ackTarget.raw, messageId),
-            async () => {
-              const reactionId = await addReaction(messageId, 'OnIt');
-              return reactionId ? { messageId, reactionId } : null;
-            },
-            ({ messageId: ackMessageId, reactionId }) =>
-              removeReactionStrict(ackMessageId, reactionId),
-          )
-          .catch(() => {});
-      }
-
       // Store message and broadcast to WebSocket clients
       const targetJid = admittedRoute.targetJid;
 
@@ -3517,6 +3539,11 @@ export function createFeishuConnection(
             logger.error({ err }, 'Error handling Feishu message');
           }
         },
+        // The Bot's own create/delete calls are echoed as events. Registering
+        // no-op handlers prevents the Lark SDK from logging one warning per
+        // processing indicator mutation.
+        'im.message.reaction.created_v1': () => undefined,
+        'im.message.reaction.deleted_v1': () => undefined,
         'im.chat.member.bot.added_v1': async (data) => {
           try {
             const chatId = data.chat_id;
@@ -3906,6 +3933,10 @@ export function createFeishuConnection(
         );
         throw err;
       }
+    },
+
+    beginAckReaction(chatId: string, inputMessageId: string): Promise<void> {
+      return beginAckForInput(chatId, inputMessageId);
     },
 
     clearAckReaction(chatId: string, inputMessageId: string): Promise<void> {

@@ -232,6 +232,8 @@ export interface IMChannel {
     fileName?: string,
   ): Promise<void>;
   setTyping(chatId: string, isTyping: boolean, leaseId?: string): Promise<void>;
+  /** Add an ack reaction for the one exact input that owns an active batch. */
+  beginAckReaction?(chatId: string, inputMessageId: string): Promise<void>;
   /** Clear the ack reaction owned by one exact inbound input. */
   clearAckReaction?(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
@@ -375,9 +377,15 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
     },
 
     async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
-      // Feishu's inbound exact-input OnIt reaction is the sole processing
-      // indicator owner. The former chat-level reaction was keyed only by
-      // route, so turn A could remove turn B's reaction and leak A's handle.
+      // Feishu uses the active batch's exact-input OnIt reaction instead.
+    },
+
+    async beginAckReaction(
+      chatId: string,
+      inputMessageId: string,
+    ): Promise<void> {
+      if (!inner) return;
+      await inner.beginAckReaction(chatId, inputMessageId);
     },
 
     async clearAckReaction(

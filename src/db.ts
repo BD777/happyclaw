@@ -3198,12 +3198,12 @@ export function claimNextQueuedFollowUp(
 /**
  * Atomically snapshot the next durable follow-up turn.
  *
- * Normal queued messages are drained together in the user-visible queue order
- * so a burst received while an Agent loop is active becomes one subsequent
- * Agent turn.  A steer is an explicit priority hand-off and therefore remains
- * a single-message barrier; later queued messages wait for the turn after it.
- * Rows admitted after this transaction are intentionally left for the next
- * snapshot.
+ * All messages waiting in one Session are drained together in the user-visible
+ * queue order so a burst received while an Agent loop is active becomes one
+ * subsequent Agent turn. A `/steer` changes the active generation, not this
+ * batching rule: messages already pending at the cutoff remain in the same
+ * next batch. Rows admitted after this transaction are intentionally left for
+ * the next snapshot.
  */
 export function claimNextQueuedFollowUpBatch(
   chatJid: string,
@@ -3223,17 +3223,7 @@ export function claimNextQueuedFollowUpBatch(
   return db.transaction(() => {
     const rows = select.all(chatJid) as Array<Record<string, unknown>>;
     if (rows.length === 0) return [];
-    const queued = rows.map(normalizeQueuedFollowUpRow);
-    const firstSteerIndex = queued.findIndex(
-      (item) => item.delivery_mode === 'steer',
-    );
-    const claimed =
-      firstSteerIndex === 0
-        ? queued.slice(0, 1)
-        : queued.slice(
-            0,
-            firstSteerIndex === -1 ? queued.length : firstSteerIndex,
-          );
+    const claimed = rows.map(normalizeQueuedFollowUpRow);
     const updatedAt = new Date().toISOString();
     for (const item of claimed) {
       const result = update.run(runId, updatedAt, chatJid, item.id);

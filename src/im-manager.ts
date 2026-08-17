@@ -957,6 +957,22 @@ export class IMConnectionManager {
   }
 
   /**
+   * Add the ack reaction for the exact provider message that owns an active
+   * processing batch. Unsupported channels keep their existing native typing
+   * or ingress acknowledgement behaviour.
+   */
+  async beginAckReaction(jid: string, inputMessageId: string): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return;
+
+    const chatId = extractProviderTarget(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.beginAckReaction) {
+      await channel.beginAckReaction(chatId, inputMessageId);
+    }
+  }
+
+  /**
    * Clear the ack reaction for a chat (e.g. when streaming card handled the reply).
    */
   async clearAckReaction(jid: string, inputMessageId: string): Promise<void> {
