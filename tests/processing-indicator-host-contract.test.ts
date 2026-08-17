@@ -74,6 +74,12 @@ describe('exact processing indicator host contract', () => {
     );
   });
 
+  test('queued batch hand-off waits for old provider cleanup before adding the next reaction', () => {
+    expect(main).toMatch(
+      /await clearTrackedProcessingIndicators\(chatJid\);\s+await beginBatchAckReactions\(chatJid, prePublishedIndicatorOwners\)/,
+    );
+  });
+
   test('native message delivery itself does not clear a turn indicator', () => {
     for (const file of [
       'src/feishu.ts',

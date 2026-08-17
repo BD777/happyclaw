@@ -1759,6 +1759,11 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
       })),
       getChannelType(chatJid) ? chatJid : null,
     );
+    // GroupQueue can announce idle while the old turn's provider cleanup is
+    // still settling. Fence the hand-off so Feishu observes delete(A) before
+    // add(B), matching the Session batch lifecycle instead of allowing even a
+    // sub-millisecond overlap.
+    await clearTrackedProcessingIndicators(chatJid);
     await beginBatchAckReactions(chatJid, prePublishedIndicatorOwners);
     const result = injectPreparedFollowUp(agentItems, prepared, reservedRunId);
     if (result === 'sent') {
