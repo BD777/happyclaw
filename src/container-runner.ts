@@ -68,8 +68,8 @@ import {
   type WorkspaceMemoryCapabilityScope,
 } from './workspace-memory-capability.js';
 import { releaseHappyClawOwnerIntroductionLease } from './owner-profile-store.js';
+import { applyProviderSwitchToInput } from './provider-switch-context.js';
 import {
-  deleteSession,
   getUserById,
   getSessionProviderId,
   setSessionProviderId,
@@ -2184,26 +2184,7 @@ export async function runContainerAgent(
   let providerFailureTerminal: boolean | undefined;
   let providerFailureMaintenance = false;
   let healthyInputTurnCompleted = false;
-  if (poolResult?.resetSession && input.sessionId) {
-    logger.info(
-      {
-        groupFolder: group.folder,
-        agentId: sessionAgentId || null,
-        previousProviderId: poolResult.previousProviderId,
-        providerId: selectedProfileId,
-      },
-      'Clearing Claude session after switching providers',
-    );
-    // deleteSession removes the whole sessions row, including the provider_id
-    // binding trySelectPoolProvider just wrote. Re-bind the freshly-selected
-    // provider so the next turn stays sticky to it instead of degrading to a
-    // fresh pool pick.
-    deleteSession(group.folder, sessionAgentId);
-    if (selectedProfileId) {
-      setSessionProviderId(group.folder, sessionAgentId, selectedProfileId);
-    }
-    input = { ...input, sessionId: undefined };
-  }
+  input = applyProviderSwitchToInput(input, poolResult, sessionAgentId);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
     groupFolder: group.folder,
@@ -3031,25 +3012,7 @@ export async function runHostAgent(
   let hostProviderFailureTerminal: boolean | undefined;
   let hostProviderFailureMaintenance = false;
   let hostHealthyInputTurnCompleted = false;
-  if (hostPoolResult?.resetSession && input.sessionId) {
-    logger.info(
-      {
-        groupFolder: group.folder,
-        agentId: sessionAgentId || null,
-        previousProviderId: hostPoolResult.previousProviderId,
-        providerId: hostSelectedProfileId,
-      },
-      'Clearing Claude session after switching providers',
-    );
-    // deleteSession removes the whole sessions row, including the provider_id
-    // binding trySelectPoolProvider just wrote. Re-bind so the next turn stays
-    // sticky to the freshly-selected provider (mirrors the container path).
-    deleteSession(group.folder, sessionAgentId);
-    if (hostSelectedProfileId) {
-      setSessionProviderId(group.folder, sessionAgentId, hostSelectedProfileId);
-    }
-    input = { ...input, sessionId: undefined };
-  }
+  input = applyProviderSwitchToInput(input, hostPoolResult, sessionAgentId);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
     groupFolder: group.folder,
