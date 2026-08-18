@@ -70,6 +70,7 @@ import {
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 import { channelConversationJid } from './channel-address.js';
+import { resolveChannelConversationKind } from './channel-conversation-kind.js';
 import { getChannelFromJid } from './channel-prefixes.js';
 import { parseAudienceMode } from './im-audience-policy.js';
 import { parseContainerConfig } from './mount-security.js';
@@ -103,7 +104,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 72;
+export const CURRENT_SCHEMA_VERSION = 73;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -2513,6 +2514,20 @@ export function initDatabase(): void {
     migrateWecomDirectWorkspaceMountsToSessions();
   }
 
+  // v72 -> v73: #654 already made new registration kind-aware and migrated
+  // leftover WeCom DMs. Pre-#654 chats on other JID-classifiable channels
+  // (QQ / DingTalk / Discord / WhatsApp / Telegram / WeChat) can still sit
+  // on target_main_jid and share channel_session_owner:{folder}:main with a
+  // group in the same workspace — including a WeChat DM stealing owner from
+  // a group on another channel. Classify from the JID only; Feishu stays
+  // unknown here and is not migrated. Do not rewrite the v72 WeCom block.
+  const classifiableDirectMountSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (classifiableDirectMountSchemaVersion < 73) {
+    migrateClassifiableDirectWorkspaceMountsToSessions();
+  }
+
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
@@ -2596,6 +2611,92 @@ export function migrateWecomDirectWorkspaceMountsToSessions(): number {
         logger.info(
           { migrated },
           'Migrated WeCom direct chats off shared workspace main mounts',
+        );
+      }
+      return migrated;
+    })
+    .immediate();
+}
+
+/**
+ * Move leftover JID-classifiable DMs off a shared workspace main mount.
+ * Same skip rules as v72: already-bound sessions (manual or v72 WeCom),
+ * groups, unknown/unclassifiable JIDs (including Feishu without metadata),
+ * and missing workspaces stay untouched. If the workspace main owner still
+ * points at the DM, clear it so a later group message cannot keep
+ * delivering into that private chat.
+ */
+export function migrateClassifiableDirectWorkspaceMountsToSessions(): number {
+  return db
+    .transaction(() => {
+      const groups = getAllRegisteredGroups();
+      let migrated = 0;
+
+      for (const [jid, group] of Object.entries(groups)) {
+        if (resolveChannelConversationKind(jid) !== 'direct') continue;
+        if (!group.target_main_jid || group.target_agent_id) continue;
+
+        const workspaceJid = resolveWorkspaceJidForMount(group.target_main_jid);
+        if (!workspaceJid) continue;
+        const workspace = getRegisteredGroup(workspaceJid);
+        if (!workspace) continue;
+
+        const conversationJid = channelConversationJid(jid);
+        const reusable = listAgentsByJid(workspaceJid).find(
+          (agent) =>
+            agent.source_kind === 'channel_direct' &&
+            agent.last_im_jid &&
+            (agent.last_im_jid === conversationJid ||
+              channelConversationJid(agent.last_im_jid) === conversationJid),
+        );
+
+        const now = new Date().toISOString();
+        const agent =
+          reusable ??
+          (() => {
+            const created: SubAgent = {
+              id: crypto.randomUUID(),
+              group_folder: workspace.folder,
+              chat_jid: workspaceJid,
+              name: group.name || conversationJid,
+              prompt: '',
+              status: 'idle',
+              kind: 'conversation',
+              created_by: group.created_by ?? workspace.created_by ?? null,
+              created_at: now,
+              completed_at: null,
+              result_summary: null,
+              last_im_jid: conversationJid,
+              spawned_from_jid: null,
+              source_kind: 'channel_direct',
+              last_active_at: now,
+            };
+            createAgent(created);
+            const virtualChatJid = `${workspaceJid}#agent:${created.id}`;
+            ensureChatExists(virtualChatJid);
+            updateChatName(virtualChatJid, created.name);
+            return created;
+          })();
+
+        setRegisteredGroup(jid, {
+          ...group,
+          target_agent_id: agent.id,
+          target_main_jid: undefined,
+          binding_mode: 'single_context',
+        });
+
+        const ownerJid = getSessionChannelOwner(workspace.folder, null);
+        if (ownerJid && channelConversationJid(ownerJid) === conversationJid) {
+          clearSessionChannelOwner(workspace.folder, null);
+        }
+
+        migrated += 1;
+      }
+
+      if (migrated > 0) {
+        logger.info(
+          { migrated },
+          'Migrated classifiable direct chats off shared workspace main mounts',
         );
       }
       return migrated;
