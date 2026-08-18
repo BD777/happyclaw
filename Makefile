@@ -257,6 +257,11 @@ backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 	  "$$TMP_ROOT/data/db/messages.db"; \
 	for DIR in config groups sessions skills mcp-servers plugins memory avatars extra builtin-skills; do \
 	  if [ -d "$(RUNTIME_DATA_DIR)/$$DIR" ]; then \
+	    SOURCE_HARDLINK=$$(find "$(RUNTIME_DATA_DIR)/$$DIR" -type f -links +1 -print -quit); \
+	    if [ -n "$$SOURCE_HARDLINK" ]; then \
+	      echo "❌ 运行时数据包含硬链接文件，复制工具在不同平台可能拆散链接并绕过归档校验，拒绝创建：$$SOURCE_HARDLINK"; \
+	      exit 1; \
+	    fi; \
 	    mkdir -p "$$TMP_ROOT/data/$$DIR"; \
 	    cp -a "$(RUNTIME_DATA_DIR)/$$DIR/." "$$TMP_ROOT/data/$$DIR/"; \
 	  fi; \
