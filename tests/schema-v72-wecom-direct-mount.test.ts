@@ -125,7 +125,9 @@ describe('schema v72 WeCom direct workspace-mount migration', () => {
     ).toHaveLength(0);
     expect(db.getSessionChannelOwner('wecom-legacy-ws')).toBe(dmJid);
     expect(db.getSession('wecom-legacy-ws')).toBe('contaminated-wecom-main');
-    expect(db.getConversationHistoryCutoff(workspaceJid)).toBeUndefined();
+    expect(
+      db.getConversationHistoryIsolationMarker(workspaceJid),
+    ).toBeUndefined();
 
     const triggerCleanup = new Database(databasePath);
     triggerCleanup.exec('DROP TRIGGER fail_wecom_direct_mount_update');
@@ -147,7 +149,7 @@ describe('schema v72 WeCom direct workspace-mount migration', () => {
     expect(db.getSession('wecom-legacy-ws')).toBeUndefined();
     expect(db.getWorkspaceRuntimeSession('wecom-legacy-ws')).toBeUndefined();
     expect(db.getSessionChannelOwner('wecom-legacy-ws')).toBeUndefined();
-    expect(db.getConversationHistoryCutoff(workspaceJid)).toBeTruthy();
+    expect(db.getConversationHistoryIsolationMarker(workspaceJid)).toBeTruthy();
 
     expect(db.getRegisteredGroup(groupJid)).toMatchObject({
       target_main_jid: workspaceJid,

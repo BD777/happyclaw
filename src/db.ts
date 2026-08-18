@@ -140,8 +140,14 @@ function stmts() {
         `INSERT OR REPLACE INTO messages (
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
           attachments, token_usage, channel_context, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id,
-          delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at,
+          history_recovery_allowed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          COALESCE((
+            SELECT history_recovery_allowed FROM messages
+            WHERE id = ? AND chat_jid = ?
+          ), 1)
+        )`,
       ),
       insertUsageInsert: db.prepare(
         `INSERT INTO usage_records (id, event_id, user_id, group_folder, agent_id, message_id, model,
@@ -566,6 +572,7 @@ export function initDatabase(): void {
       delivery_run_id TEXT,
       delivery_priority INTEGER NOT NULL DEFAULT 0,
       delivery_updated_at TEXT,
+      history_recovery_allowed INTEGER NOT NULL DEFAULT 1,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -1442,9 +1449,19 @@ export function initDatabase(): void {
   ensureColumn('messages', 'delivery_run_id', 'TEXT');
   ensureColumn('messages', 'delivery_priority', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('messages', 'delivery_updated_at', 'TEXT');
+  // v72 -> v73: fence legacy workspace transcript rows that mixed private and
+  // group messages without trusting provider-controlled timestamps. Existing
+  // rows can be disabled for model recovery while future rows default to safe.
+  ensureColumn(
+    'messages',
+    'history_recovery_allowed',
+    'INTEGER NOT NULL DEFAULT 1',
+  );
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_follow_up_queue
       ON messages(chat_jid, delivery_status, delivery_priority, timestamp, id);
+    CREATE INDEX IF NOT EXISTS idx_messages_history_recovery
+      ON messages(chat_jid, history_recovery_allowed, timestamp);
   `);
   // A process may have crashed after reserving a queued message for a card
   // action but before injecting it. Reservations are process-local, so make
@@ -2709,6 +2726,7 @@ export function migrateClassifiableDirectWorkspaceMountsToSessions(): number {
       // session. Do not infer contamination merely from a dedicated session:
       // require a persisted inbound row whose workspace chat_jid and direct
       // source_jid prove that this DM previously entered main history.
+      const persistedSourcesByWorkspace = new Map<string, Set<string>>();
       for (const [jid, group] of Object.entries(groups)) {
         if (resolveChannelConversationKind(jid) !== 'direct') continue;
         if (!group.target_agent_id || group.target_main_jid) continue;
@@ -2718,17 +2736,20 @@ export function migrateClassifiableDirectWorkspaceMountsToSessions(): number {
         const workspace = getRegisteredGroup(workspaceJid);
         if (!workspace) continue;
         const conversationJid = channelConversationJid(jid);
-        const persistedSources = db
-          .prepare(
-            `SELECT DISTINCT source_jid FROM messages
-             WHERE chat_jid = ? AND is_from_me = 0 AND source_jid IS NOT NULL`,
-          )
-          .all(workspaceJid) as Array<{ source_jid: string }>;
-        if (
-          persistedSources.some(
-            (row) => channelConversationJid(row.source_jid) === conversationJid,
-          )
-        ) {
+        let persistedSources = persistedSourcesByWorkspace.get(workspaceJid);
+        if (!persistedSources) {
+          const rows = db
+            .prepare(
+              `SELECT DISTINCT source_jid FROM messages
+               WHERE chat_jid = ? AND is_from_me = 0 AND source_jid IS NOT NULL`,
+            )
+            .all(workspaceJid) as Array<{ source_jid: string }>;
+          persistedSources = new Set(
+            rows.map((row) => channelConversationJid(row.source_jid)),
+          );
+          persistedSourcesByWorkspace.set(workspaceJid, persistedSources);
+        }
+        if (persistedSources.has(conversationJid)) {
           affectedWorkspaces.set(workspaceJid, workspace);
         }
       }
@@ -2999,6 +3020,8 @@ export function storeMessageDirect(
     meta?.deliveryRunId ?? null,
     meta?.deliveryPriority ?? 0,
     meta?.deliveryUpdatedAt ?? null,
+    effectiveMsgId,
+    chatJid,
   );
   return effectiveMsgId;
 }
@@ -8359,36 +8382,40 @@ function sessionChannelOwnerKey(
   return `channel_session_owner:${groupFolder}:${agentId || 'main'}`;
 }
 
-const CONVERSATION_HISTORY_CUTOFF_PREFIX = 'conversation_history_cutoff:';
+const CONVERSATION_HISTORY_ISOLATION_PREFIX = 'conversation_history_isolation:';
 
 /**
- * Earliest persisted message timestamp that may be replayed into a fresh SDK
- * session for this logical chat. A cutoff is written when a legacy direct
- * mount proves the workspace main history may contain private conversation
- * content. The Web transcript remains intact; only model-context recovery is
- * fenced.
+ * Durable marker written after a legacy direct mount proves the workspace main
+ * history may contain private conversation content. The Web transcript remains
+ * intact; affected rows are unavailable only to model-context recovery.
  */
-export function getConversationHistoryCutoff(
+export function getConversationHistoryIsolationMarker(
   chatJid: string,
 ): string | undefined {
-  return getRouterState(`${CONVERSATION_HISTORY_CUTOFF_PREFIX}${chatJid}`);
+  return getRouterState(`${CONVERSATION_HISTORY_ISOLATION_PREFIX}${chatJid}`);
 }
 
 /**
- * Atomically invalidate a workspace main resume lifecycle once. The cutoff is
- * the durable idempotency marker: a later retry must not delete a clean session
- * that the workspace created after this migration completed.
+ * Atomically invalidate a workspace main resume lifecycle once. The marker
+ * makes this idempotent: a later retry must not delete a clean session that the
+ * workspace created after this migration completed.
  */
 function isolateLegacyDirectWorkspaceMain(
   workspaceJid: string,
   groupFolder: string,
-  cutoff: string,
+  isolationStartedAt: string,
 ): boolean {
   const inserted = db
     .prepare('INSERT OR IGNORE INTO router_state (key, value) VALUES (?, ?)')
-    .run(`${CONVERSATION_HISTORY_CUTOFF_PREFIX}${workspaceJid}`, cutoff);
+    .run(
+      `${CONVERSATION_HISTORY_ISOLATION_PREFIX}${workspaceJid}`,
+      isolationStartedAt,
+    );
   if (inserted.changes === 0) return false;
 
+  db.prepare(
+    'UPDATE messages SET history_recovery_allowed = 0 WHERE chat_jid = ?',
+  ).run(workspaceJid);
   db.prepare(
     "DELETE FROM sessions WHERE group_folder = ? AND agent_id = ''",
   ).run(groupFolder);
@@ -12451,6 +12478,36 @@ export function getMessagesPage(
     NewMessage & { is_from_me: number }
   >;
 
+  return rows.map((row) => normalizeMessageRow(row));
+}
+
+/**
+ * Recent persisted messages that are safe to replay into a fresh model
+ * session. Privacy migrations leave the Web transcript untouched and fence
+ * only legacy mixed-history rows. Current cold-run messages are excluded in
+ * SQL so a large pending batch cannot consume the entire recovery window.
+ */
+export function getConversationHistoryMessagesPage(
+  chatJid: string,
+  excludedMessageIds: ReadonlySet<string>,
+  limit = 50,
+): Array<NewMessage & { is_from_me: boolean }> {
+  const excluded = [...excludedMessageIds].filter(Boolean);
+  const safeLimit = Math.min(200, Math.max(1, Math.floor(limit)));
+  const rows = db
+    .prepare(
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
+       FROM messages
+       WHERE chat_jid = ? AND history_recovery_allowed = 1
+         AND id NOT IN (SELECT value FROM json_each(?))
+       ORDER BY timestamp DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(chatJid, JSON.stringify(excluded), safeLimit) as Array<
+    NewMessage & { is_from_me: number }
+  >;
   return rows.map((row) => normalizeMessageRow(row));
 }
 

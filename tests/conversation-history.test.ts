@@ -1,13 +1,11 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  getMessagesPage: vi.fn(),
-  getConversationHistoryCutoff: vi.fn(),
+  getConversationHistoryMessagesPage: vi.fn(),
 }));
 
 vi.mock('../src/db.js', () => ({
-  getMessagesPage: mocks.getMessagesPage,
-  getConversationHistoryCutoff: mocks.getConversationHistoryCutoff,
+  getConversationHistoryMessagesPage: mocks.getConversationHistoryMessagesPage,
 }));
 
 const { buildRecentConversationHistoryContext } =
@@ -15,12 +13,11 @@ const { buildRecentConversationHistoryContext } =
 
 describe('conversation history recovery context', () => {
   beforeEach(() => {
-    mocks.getMessagesPage.mockReset();
-    mocks.getConversationHistoryCutoff.mockReset();
+    mocks.getConversationHistoryMessagesPage.mockReset();
   });
 
   test('returns stable message IDs and tags every recovered turn', () => {
-    mocks.getMessagesPage.mockReturnValue([
+    mocks.getConversationHistoryMessagesPage.mockReturnValue([
       {
         id: 'assistant-1',
         content: '收到',
@@ -51,7 +48,7 @@ describe('conversation history recovery context', () => {
   });
 
   test('excludes the pending turn from both context and known IDs', () => {
-    mocks.getMessagesPage.mockReturnValue([
+    mocks.getConversationHistoryMessagesPage.mockReturnValue([
       {
         id: 'pending-1',
         content: '当前消息',
@@ -76,42 +73,29 @@ describe('conversation history recovery context', () => {
     expect(result?.context).not.toContain('id="pending-1"');
   });
 
-  test('does not replay messages at or before a persisted isolation cutoff', () => {
-    mocks.getConversationHistoryCutoff.mockReturnValue(
-      '2026-08-19T01:00:00.000Z',
-    );
-    mocks.getMessagesPage.mockReturnValue([
+  test('uses the recovery-safe DB page and forwards the full pending-ID exclusion', () => {
+    mocks.getConversationHistoryMessagesPage.mockReturnValue([
       {
-        id: 'safe-after-cutoff',
+        id: 'safe-history',
         content: '新的群聊消息',
         sender_name: 'Bob',
         is_from_me: false,
-        timestamp: '2026-08-19T01:00:00.001Z',
-      },
-      {
-        id: 'private-at-cutoff',
-        content: '旧私聊秘密',
-        sender_name: 'Alice',
-        is_from_me: false,
-        timestamp: '2026-08-19T01:00:00.000Z',
-      },
-      {
-        id: 'private-before-cutoff',
-        content: '更早的私聊秘密',
-        sender_name: 'Alice',
-        is_from_me: false,
-        timestamp: '2026-08-19T00:59:59.999Z',
       },
     ]);
 
-    const result = buildRecentConversationHistoryContext(
-      'web:main',
-      new Set(),
-      { intro: '恢复上下文' },
+    const pending = new Set(
+      Array.from({ length: 30 }, (_, index) => `pending-${index}`),
     );
+    const result = buildRecentConversationHistoryContext('web:main', pending, {
+      intro: '恢复上下文',
+    });
 
-    expect(result?.messageIds).toEqual(['safe-after-cutoff']);
+    expect(mocks.getConversationHistoryMessagesPage).toHaveBeenCalledWith(
+      'web:main',
+      pending,
+      30,
+    );
+    expect(result?.messageIds).toEqual(['safe-history']);
     expect(result?.context).toContain('新的群聊消息');
-    expect(result?.context).not.toContain('旧私聊秘密');
   });
 });

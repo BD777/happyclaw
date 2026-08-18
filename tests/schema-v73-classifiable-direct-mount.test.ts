@@ -219,7 +219,9 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     expect(db.getWorkspaceRuntimeSession('legacy-shared-ws')).toMatchObject({
       sdk_session_id: 'contaminated-main-session',
     });
-    expect(db.getConversationHistoryCutoff(workspaceJid)).toBeUndefined();
+    expect(
+      db.getConversationHistoryIsolationMarker(workspaceJid),
+    ).toBeUndefined();
 
     const triggerCleanup = new Database(databasePath);
     triggerCleanup.exec('DROP TRIGGER fail_classifiable_direct_session_delete');
@@ -232,8 +234,9 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
       'manual-session-sdk',
     );
     expect(db.getSessionChannelOwner('legacy-shared-ws')).toBeUndefined();
-    const isolationCutoff = db.getConversationHistoryCutoff(workspaceJid);
-    expect(isolationCutoff).toBeTruthy();
+    const isolationMarker =
+      db.getConversationHistoryIsolationMarker(workspaceJid);
+    expect(isolationMarker).toBeTruthy();
 
     // Re-running the migration must not erase a clean main session/owner that
     // was established after the one-shot isolation completed.
@@ -244,7 +247,9 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     expect(db.migrateClassifiableDirectWorkspaceMountsToSessions()).toBe(0);
     expect(db.getSession('legacy-shared-ws')).toBe('clean-main-session');
     expect(db.getSessionChannelOwner('legacy-shared-ws')).toBe(qqGroupJid);
-    expect(db.getConversationHistoryCutoff(workspaceJid)).toBe(isolationCutoff);
+    expect(db.getConversationHistoryIsolationMarker(workspaceJid)).toBe(
+      isolationMarker,
+    );
 
     const migratedQq = db.getRegisteredGroup(qqDmJid)!;
     expect(migratedQq.target_main_jid).toBeUndefined();
@@ -394,6 +399,16 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
       false,
       { sourceJid: waGroupJid },
     );
+    db.storeMessageDirect(
+      'wa-private-future-clock-before-v73',
+      waWorkspaceJid,
+      waDirectJids[0],
+      'Private Alice',
+      'future-clock private value that must never be replayed',
+      '2099-01-01T00:00:00.000Z',
+      false,
+      { sourceJid: waDirectJids[0] },
+    );
 
     // Reproduce the old v72 WeCom migration shape: the mount is already a
     // channel_direct session, but the workspace main transcript still proves
@@ -496,20 +511,24 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     expect(db.getWorkspaceRuntimeSession(waFolder)).toBeUndefined();
     expect(db.getSessionChannelOwner(waFolder)).toBeUndefined();
     expect(db.getSession(repairedFolder)).toBeUndefined();
-    expect(db.getConversationHistoryCutoff(repairedWorkspaceJid)).toBeTruthy();
+    expect(
+      db.getConversationHistoryIsolationMarker(repairedWorkspaceJid),
+    ).toBeTruthy();
     expect(db.getSession(cleanFolder)).toBe(`${cleanFolder}-main-session`);
-    expect(db.getConversationHistoryCutoff(cleanWorkspaceJid)).toBeUndefined();
+    expect(
+      db.getConversationHistoryIsolationMarker(cleanWorkspaceJid),
+    ).toBeUndefined();
 
-    const cutoff = db.getConversationHistoryCutoff(waWorkspaceJid);
-    expect(cutoff).toBeTruthy();
-    const afterCutoff = new Date(Date.parse(cutoff!) + 1).toISOString();
+    const isolationMarker =
+      db.getConversationHistoryIsolationMarker(waWorkspaceJid);
+    expect(isolationMarker).toBeTruthy();
     db.storeMessageDirect(
       'wa-safe-after-v73',
       waWorkspaceJid,
       waGroupJid,
       'Group Bob',
       'safe group context after migration',
-      afterCutoff,
+      '2026-08-18T00:00:00.002Z',
       false,
       { sourceJid: waGroupJid },
     );
@@ -523,8 +542,43 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     expect(history?.context).not.toContain(
       'private value that must never be replayed',
     );
+    expect(history?.context).not.toContain(
+      'future-clock private value that must never be replayed',
+    );
+    const oversizedPendingSet = new Set(
+      Array.from({ length: 40_000 }, (_, index) => `pending-${index}`),
+    );
+    expect(
+      db
+        .getConversationHistoryMessagesPage(
+          waWorkspaceJid,
+          oversizedPendingSet,
+          30,
+        )
+        .map((message) => message.id),
+    ).toEqual(['wa-safe-after-v73']);
 
-    // A schema retry observes the cutoff marker and preserves the clean main
+    // Replacing an old row must preserve its recovery fence.
+    db.storeMessageDirect(
+      'wa-private-before-v73',
+      waWorkspaceJid,
+      waDirectJids[0],
+      'Private Alice',
+      'replaced private value that must still stay fenced',
+      '2099-01-02T00:00:00.000Z',
+      false,
+      { sourceJid: waDirectJids[0] },
+    );
+    const historyAfterReplace = buildRecentConversationHistoryContext(
+      waWorkspaceJid,
+      new Set(),
+      { intro: 'recovery' },
+    );
+    expect(historyAfterReplace?.context).not.toContain(
+      'replaced private value that must still stay fenced',
+    );
+
+    // A schema retry observes the isolation marker and preserves the clean main
     // lifecycle instead of invalidating the workspace a second time.
     db.setSession(waFolder, 'clean-wa-main');
     db.setSessionChannelOwnerOnce(waFolder, null, waGroupJid);
@@ -539,6 +593,8 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     db.initDatabase();
     expect(db.getSession(waFolder)).toBe('clean-wa-main');
     expect(db.getSessionChannelOwner(waFolder)).toBe(waGroupJid);
-    expect(db.getConversationHistoryCutoff(waWorkspaceJid)).toBe(cutoff);
+    expect(db.getConversationHistoryIsolationMarker(waWorkspaceJid)).toBe(
+      isolationMarker,
+    );
   });
 });
