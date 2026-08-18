@@ -2545,6 +2545,8 @@ export function migrateWecomDirectWorkspaceMountsToSessions(): number {
     .transaction(() => {
       const groups = getAllRegisteredGroups();
       let migrated = 0;
+      const affectedWorkspaces = new Map<string, RegisteredGroup>();
+      const cutoff = new Date().toISOString();
 
       for (const [jid, group] of Object.entries(groups)) {
         if (!jid.startsWith('wecom:c2c:')) continue;
@@ -2599,17 +2601,27 @@ export function migrateWecomDirectWorkspaceMountsToSessions(): number {
           binding_mode: 'single_context',
         });
 
-        const ownerJid = getSessionChannelOwner(workspace.folder, null);
-        if (ownerJid && channelConversationJid(ownerJid) === conversationJid) {
-          clearSessionChannelOwner(workspace.folder, null);
-        }
+        affectedWorkspaces.set(workspaceJid, workspace);
 
         migrated += 1;
       }
 
+      let isolated = 0;
+      for (const [workspaceJid, workspace] of affectedWorkspaces) {
+        if (
+          isolateLegacyDirectWorkspaceMain(
+            workspaceJid,
+            workspace.folder,
+            cutoff,
+          )
+        ) {
+          isolated += 1;
+        }
+      }
+
       if (migrated > 0) {
         logger.info(
-          { migrated },
+          { migrated, isolatedWorkspaces: isolated },
           'Migrated WeCom direct chats off shared workspace main mounts',
         );
       }
@@ -2631,6 +2643,8 @@ export function migrateClassifiableDirectWorkspaceMountsToSessions(): number {
     .transaction(() => {
       const groups = getAllRegisteredGroups();
       let migrated = 0;
+      const affectedWorkspaces = new Map<string, RegisteredGroup>();
+      const cutoff = new Date().toISOString();
 
       for (const [jid, group] of Object.entries(groups)) {
         if (resolveChannelConversationKind(jid) !== 'direct') continue;
@@ -2685,17 +2699,56 @@ export function migrateClassifiableDirectWorkspaceMountsToSessions(): number {
           binding_mode: 'single_context',
         });
 
-        const ownerJid = getSessionChannelOwner(workspace.folder, null);
-        if (ownerJid && channelConversationJid(ownerJid) === conversationJid) {
-          clearSessionChannelOwner(workspace.folder, null);
-        }
+        affectedWorkspaces.set(workspaceJid, workspace);
 
         migrated += 1;
       }
 
-      if (migrated > 0) {
+      // A database already stamped v72 may have had its WeCom mount moved by
+      // the old migration without invalidating the contaminated main SDK
+      // session. Do not infer contamination merely from a dedicated session:
+      // require a persisted inbound row whose workspace chat_jid and direct
+      // source_jid prove that this DM previously entered main history.
+      for (const [jid, group] of Object.entries(groups)) {
+        if (resolveChannelConversationKind(jid) !== 'direct') continue;
+        if (!group.target_agent_id || group.target_main_jid) continue;
+        const agent = getAgent(group.target_agent_id);
+        if (!agent || agent.source_kind !== 'channel_direct') continue;
+        const workspaceJid = agent.chat_jid;
+        const workspace = getRegisteredGroup(workspaceJid);
+        if (!workspace) continue;
+        const conversationJid = channelConversationJid(jid);
+        const persistedSources = db
+          .prepare(
+            `SELECT DISTINCT source_jid FROM messages
+             WHERE chat_jid = ? AND is_from_me = 0 AND source_jid IS NOT NULL`,
+          )
+          .all(workspaceJid) as Array<{ source_jid: string }>;
+        if (
+          persistedSources.some(
+            (row) => channelConversationJid(row.source_jid) === conversationJid,
+          )
+        ) {
+          affectedWorkspaces.set(workspaceJid, workspace);
+        }
+      }
+
+      let isolated = 0;
+      for (const [workspaceJid, workspace] of affectedWorkspaces) {
+        if (
+          isolateLegacyDirectWorkspaceMain(
+            workspaceJid,
+            workspace.folder,
+            cutoff,
+          )
+        ) {
+          isolated += 1;
+        }
+      }
+
+      if (migrated > 0 || isolated > 0) {
         logger.info(
-          { migrated },
+          { migrated, isolatedWorkspaces: isolated },
           'Migrated classifiable direct chats off shared workspace main mounts',
         );
       }
@@ -8304,6 +8357,48 @@ function sessionChannelOwnerKey(
   agentId?: string | null,
 ): string {
   return `channel_session_owner:${groupFolder}:${agentId || 'main'}`;
+}
+
+const CONVERSATION_HISTORY_CUTOFF_PREFIX = 'conversation_history_cutoff:';
+
+/**
+ * Earliest persisted message timestamp that may be replayed into a fresh SDK
+ * session for this logical chat. A cutoff is written when a legacy direct
+ * mount proves the workspace main history may contain private conversation
+ * content. The Web transcript remains intact; only model-context recovery is
+ * fenced.
+ */
+export function getConversationHistoryCutoff(
+  chatJid: string,
+): string | undefined {
+  return getRouterState(`${CONVERSATION_HISTORY_CUTOFF_PREFIX}${chatJid}`);
+}
+
+/**
+ * Atomically invalidate a workspace main resume lifecycle once. The cutoff is
+ * the durable idempotency marker: a later retry must not delete a clean session
+ * that the workspace created after this migration completed.
+ */
+function isolateLegacyDirectWorkspaceMain(
+  workspaceJid: string,
+  groupFolder: string,
+  cutoff: string,
+): boolean {
+  const inserted = db
+    .prepare('INSERT OR IGNORE INTO router_state (key, value) VALUES (?, ?)')
+    .run(`${CONVERSATION_HISTORY_CUTOFF_PREFIX}${workspaceJid}`, cutoff);
+  if (inserted.changes === 0) return false;
+
+  db.prepare(
+    "DELETE FROM sessions WHERE group_folder = ? AND agent_id = ''",
+  ).run(groupFolder);
+  db.prepare(
+    "DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ''",
+  ).run(groupFolder);
+  db.prepare('DELETE FROM router_state WHERE key = ?').run(
+    sessionChannelOwnerKey(groupFolder, null),
+  );
+  return true;
 }
 
 /** The first native transport that owns a logical warm Session. */

@@ -27,6 +27,8 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const db = await import('../src/db.js');
+const { buildRecentConversationHistoryContext } =
+  await import('../src/conversation-history.js');
 
 const now = '2026-08-18T00:00:00.000Z';
 const workspaceJid = 'web:legacy-shared-ws';
@@ -183,12 +185,14 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     expect(
       db.setSessionChannelOwnerOnce('legacy-shared-ws', null, qqDmJid),
     ).toBe(qqDmJid);
+    db.setSession('legacy-shared-ws', 'contaminated-main-session');
+    db.setSession('legacy-shared-ws', 'manual-session-sdk', 'manual-session');
 
     const failureInjector = new Database(databasePath);
     failureInjector.exec(`
-      CREATE TRIGGER fail_classifiable_direct_mount_update
-      BEFORE UPDATE OF target_agent_id ON registered_groups
-      WHEN OLD.jid = '${qqDmJid}'
+      CREATE TRIGGER fail_classifiable_direct_session_delete
+      BEFORE DELETE ON sessions
+      WHEN OLD.group_folder = 'legacy-shared-ws' AND OLD.agent_id = ''
       BEGIN
         SELECT RAISE(ABORT, 'injected migration failure');
       END;
@@ -211,13 +215,36 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
         ),
     ).toHaveLength(0);
     expect(db.getSessionChannelOwner('legacy-shared-ws')).toBe(qqDmJid);
+    expect(db.getSession('legacy-shared-ws')).toBe('contaminated-main-session');
+    expect(db.getWorkspaceRuntimeSession('legacy-shared-ws')).toMatchObject({
+      sdk_session_id: 'contaminated-main-session',
+    });
+    expect(db.getConversationHistoryCutoff(workspaceJid)).toBeUndefined();
 
     const triggerCleanup = new Database(databasePath);
-    triggerCleanup.exec('DROP TRIGGER fail_classifiable_direct_mount_update');
+    triggerCleanup.exec('DROP TRIGGER fail_classifiable_direct_session_delete');
     triggerCleanup.close();
 
     expect(db.migrateClassifiableDirectWorkspaceMountsToSessions()).toBe(4);
+    expect(db.getSession('legacy-shared-ws')).toBeUndefined();
+    expect(db.getWorkspaceRuntimeSession('legacy-shared-ws')).toBeUndefined();
+    expect(db.getSession('legacy-shared-ws', 'manual-session')).toBe(
+      'manual-session-sdk',
+    );
+    expect(db.getSessionChannelOwner('legacy-shared-ws')).toBeUndefined();
+    const isolationCutoff = db.getConversationHistoryCutoff(workspaceJid);
+    expect(isolationCutoff).toBeTruthy();
+
+    // Re-running the migration must not erase a clean main session/owner that
+    // was established after the one-shot isolation completed.
+    db.setSession('legacy-shared-ws', 'clean-main-session');
+    expect(
+      db.setSessionChannelOwnerOnce('legacy-shared-ws', null, qqGroupJid),
+    ).toBe(qqGroupJid);
     expect(db.migrateClassifiableDirectWorkspaceMountsToSessions()).toBe(0);
+    expect(db.getSession('legacy-shared-ws')).toBe('clean-main-session');
+    expect(db.getSessionChannelOwner('legacy-shared-ws')).toBe(qqGroupJid);
+    expect(db.getConversationHistoryCutoff(workspaceJid)).toBe(isolationCutoff);
 
     const migratedQq = db.getRegisteredGroup(qqDmJid)!;
     expect(migratedQq.target_main_jid).toBeUndefined();
@@ -250,8 +277,6 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     const migratedWecomLeftover = db.getRegisteredGroup(wecomLeftoverJid)!;
     expect(migratedWecomLeftover.target_main_jid).toBeUndefined();
     expect(migratedWecomLeftover.target_agent_id).toBeTruthy();
-
-    expect(db.getSessionChannelOwner('legacy-shared-ws')).toBeUndefined();
 
     expect(db.getRegisteredGroup(qqGroupJid)).toMatchObject({
       target_main_jid: workspaceJid,
@@ -310,5 +335,210 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     expect(db.getRegisteredGroup(feishuUnknownJid)?.target_main_jid).toBe(
       workspaceJid,
     );
+  });
+
+  test('first v72-to-v73 startup migrates real WhatsApp LID forms per account and fences contaminated history', () => {
+    const waWorkspaceJid = 'web:wa-lid-upgrade';
+    const waFolder = 'wa-lid-upgrade';
+    const waGroupJid = 'whatsapp:120363000000000000@g.us#account:bot-a';
+    const waDirectJids = [
+      'whatsapp:123456789012345@lid#account:bot-a',
+      'whatsapp:123456789012345@lid#account:bot-b',
+      'whatsapp:15551230000@hosted#account:bot-a',
+      'whatsapp:15551230001@hosted.lid#account:bot-a',
+    ];
+    db.setRegisteredGroup(waWorkspaceJid, {
+      name: 'WhatsApp upgrade workspace',
+      folder: waFolder,
+      added_at: now,
+      created_by: 'owner-wa',
+    });
+    db.setRegisteredGroup(waGroupJid, {
+      name: 'WhatsApp group',
+      folder: 'wa-group',
+      added_at: now,
+      created_by: 'owner-wa',
+      channel_account_id: 'bot-a',
+      target_main_jid: waWorkspaceJid,
+    });
+    for (const [index, jid] of waDirectJids.entries()) {
+      db.setRegisteredGroup(jid, {
+        name: `WhatsApp direct ${index}`,
+        folder: `wa-direct-${index}`,
+        added_at: now,
+        created_by: 'owner-wa',
+        channel_account_id: index === 1 ? 'bot-b' : 'bot-a',
+        target_main_jid: waWorkspaceJid,
+      });
+    }
+    db.setSession(waFolder, 'contaminated-wa-main');
+    db.setSessionChannelOwnerOnce(waFolder, null, waGroupJid);
+    db.ensureChatExists(waWorkspaceJid);
+    db.storeMessageDirect(
+      'wa-private-before-v73',
+      waWorkspaceJid,
+      waDirectJids[0],
+      'Private Alice',
+      'private value that must never be replayed',
+      now,
+      false,
+      { sourceJid: waDirectJids[0] },
+    );
+    db.storeMessageDirect(
+      'wa-group-before-v73',
+      waWorkspaceJid,
+      waGroupJid,
+      'Group Bob',
+      'old group context before the privacy boundary',
+      '2026-08-18T00:00:00.001Z',
+      false,
+      { sourceJid: waGroupJid },
+    );
+
+    // Reproduce the old v72 WeCom migration shape: the mount is already a
+    // channel_direct session, but the workspace main transcript still proves
+    // that private input was persisted there. A sibling with no such row must
+    // not be invalidated merely because it has a channel_direct mount.
+    const repairedWorkspaceJid = 'web:v72-wecom-contaminated';
+    const repairedFolder = 'v72-wecom-contaminated';
+    const repairedDirectJid = 'wecom:c2c:v72-alice#account:wecom-a';
+    const cleanWorkspaceJid = 'web:v72-wecom-no-evidence';
+    const cleanFolder = 'v72-wecom-no-evidence';
+    const cleanDirectJid = 'wecom:c2c:v72-bob#account:wecom-a';
+    for (const [workspace, folder] of [
+      [repairedWorkspaceJid, repairedFolder],
+      [cleanWorkspaceJid, cleanFolder],
+    ] as const) {
+      db.setRegisteredGroup(workspace, {
+        name: workspace,
+        folder,
+        added_at: now,
+        created_by: 'owner-wecom',
+      });
+      db.ensureChatExists(workspace);
+    }
+    for (const [id, jid, workspace, folder] of [
+      [
+        'v72-repaired-direct-session',
+        repairedDirectJid,
+        repairedWorkspaceJid,
+        repairedFolder,
+      ],
+      [
+        'v72-clean-direct-session',
+        cleanDirectJid,
+        cleanWorkspaceJid,
+        cleanFolder,
+      ],
+    ] as const) {
+      db.createAgent({
+        id,
+        group_folder: folder,
+        chat_jid: workspace,
+        name: jid,
+        prompt: '',
+        status: 'idle',
+        kind: 'conversation',
+        created_by: 'owner-wecom',
+        created_at: now,
+        completed_at: null,
+        result_summary: null,
+        last_im_jid: jid,
+        spawned_from_jid: null,
+        source_kind: 'channel_direct',
+      });
+      db.setRegisteredGroup(jid, {
+        name: jid,
+        folder: `${folder}-direct`,
+        added_at: now,
+        created_by: 'owner-wecom',
+        channel_account_id: 'wecom-a',
+        target_agent_id: id,
+      });
+      db.setSession(folder, `${folder}-main-session`);
+    }
+    db.storeMessageDirect(
+      'v72-wecom-private-evidence',
+      repairedWorkspaceJid,
+      repairedDirectJid,
+      'Private Alice',
+      'old v72 private evidence',
+      now,
+      false,
+      { sourceJid: repairedDirectJid },
+    );
+
+    // Reproduce a database whose v73 migration has genuinely never run.
+    db.closeDatabase();
+    const stamped = new Database(databasePath);
+    stamped
+      .prepare(
+        "UPDATE router_state SET value = '72' WHERE key = 'schema_version'",
+      )
+      .run();
+    stamped.close();
+    db.initDatabase();
+
+    const migratedAgentIds = waDirectJids.map((jid) => {
+      const group = db.getRegisteredGroup(jid)!;
+      expect(group.target_main_jid).toBeUndefined();
+      expect(group.target_agent_id).toBeTruthy();
+      expect(db.getAgent(group.target_agent_id!)?.source_kind).toBe(
+        'channel_direct',
+      );
+      return group.target_agent_id!;
+    });
+    expect(new Set(migratedAgentIds).size).toBe(waDirectJids.length);
+    expect(db.getRegisteredGroup(waGroupJid)).toMatchObject({
+      target_main_jid: waWorkspaceJid,
+    });
+    expect(db.getSession(waFolder)).toBeUndefined();
+    expect(db.getWorkspaceRuntimeSession(waFolder)).toBeUndefined();
+    expect(db.getSessionChannelOwner(waFolder)).toBeUndefined();
+    expect(db.getSession(repairedFolder)).toBeUndefined();
+    expect(db.getConversationHistoryCutoff(repairedWorkspaceJid)).toBeTruthy();
+    expect(db.getSession(cleanFolder)).toBe(`${cleanFolder}-main-session`);
+    expect(db.getConversationHistoryCutoff(cleanWorkspaceJid)).toBeUndefined();
+
+    const cutoff = db.getConversationHistoryCutoff(waWorkspaceJid);
+    expect(cutoff).toBeTruthy();
+    const afterCutoff = new Date(Date.parse(cutoff!) + 1).toISOString();
+    db.storeMessageDirect(
+      'wa-safe-after-v73',
+      waWorkspaceJid,
+      waGroupJid,
+      'Group Bob',
+      'safe group context after migration',
+      afterCutoff,
+      false,
+      { sourceJid: waGroupJid },
+    );
+    const history = buildRecentConversationHistoryContext(
+      waWorkspaceJid,
+      new Set(),
+      { intro: 'recovery' },
+    );
+    expect(history?.messageIds).toEqual(['wa-safe-after-v73']);
+    expect(history?.context).toContain('safe group context after migration');
+    expect(history?.context).not.toContain(
+      'private value that must never be replayed',
+    );
+
+    // A schema retry observes the cutoff marker and preserves the clean main
+    // lifecycle instead of invalidating the workspace a second time.
+    db.setSession(waFolder, 'clean-wa-main');
+    db.setSessionChannelOwnerOnce(waFolder, null, waGroupJid);
+    db.closeDatabase();
+    const retryStamp = new Database(databasePath);
+    retryStamp
+      .prepare(
+        "UPDATE router_state SET value = '72' WHERE key = 'schema_version'",
+      )
+      .run();
+    retryStamp.close();
+    db.initDatabase();
+    expect(db.getSession(waFolder)).toBe('clean-wa-main');
+    expect(db.getSessionChannelOwner(waFolder)).toBe(waGroupJid);
+    expect(db.getConversationHistoryCutoff(waWorkspaceJid)).toBe(cutoff);
   });
 });

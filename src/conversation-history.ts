@@ -1,4 +1,4 @@
-import { getMessagesPage } from './db.js';
+import { getConversationHistoryCutoff, getMessagesPage } from './db.js';
 import { escapeXml } from './message-prompt.js';
 
 /**
@@ -24,8 +24,10 @@ export function buildRecentConversationHistoryContext(
   },
 ): { context: string; count: number; messageIds: string[] } | null {
   const recentHistory = getMessagesPage(chatJid, undefined, opts.limit ?? 30);
+  const historyCutoff = getConversationHistoryCutoff(chatJid);
   const historyMsgs = recentHistory
     .reverse()
+    .filter((m) => !historyCutoff || m.timestamp > historyCutoff)
     .filter((m) => !pendingMessageIds.has(m.id))
     .filter((m) => m.content.trim().length > 0);
 
