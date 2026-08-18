@@ -66,6 +66,7 @@ export function resolveChannelConversationKind(
     // `@g.us`. Do not guess other suffixes as groups.
     if (
       baseJid.endsWith('@s.whatsapp.net') ||
+      baseJid.endsWith('@hosted.lid') ||
       baseJid.endsWith('@lid') ||
       baseJid.endsWith('@hosted')
     ) {
