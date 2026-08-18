@@ -8816,6 +8816,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       currentSourceJid,
       currentChannelContext,
       agentProfile,
+      missedMessages.map((message) => message.id),
     );
   } finally {
     runEnded = true;
@@ -9727,6 +9728,7 @@ async function runAgent(
   currentSourceJid?: string,
   channelContext?: ChannelTurnContext,
   agentProfile?: AgentProfile,
+  currentBatchMessageIds?: readonly string[],
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   const owner = group.created_by ? getUserById(group.created_by) : undefined;
@@ -9920,6 +9922,7 @@ async function runAgent(
           prompt,
           sessionId,
           turnId,
+          currentBatchMessageIds,
           queryRunId: queue.getActiveQueryId(chatJid) ?? undefined,
           groupFolder: group.folder,
           chatJid,
@@ -9949,6 +9952,7 @@ async function runAgent(
           prompt,
           sessionId,
           turnId,
+          currentBatchMessageIds,
           queryRunId: queue.getActiveQueryId(chatJid) ?? undefined,
           groupFolder: group.folder,
           chatJid,
@@ -16826,6 +16830,7 @@ async function processAgentConversation(
       prompt,
       sessionId,
       turnId: lastProcessed.id,
+      currentBatchMessageIds: missedMessages.map((message) => message.id),
       queryRunId: queue.getActiveQueryId(virtualJid) ?? undefined,
       groupFolder: effectiveGroup.folder,
       chatJid,

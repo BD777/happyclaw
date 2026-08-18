@@ -90,6 +90,7 @@ function conversationInput(opts?: {
   sessionId?: string;
   chatJid?: string;
   turnId?: string;
+  currentBatchMessageIds?: readonly string[];
   isScheduledTask?: boolean;
   agentId?: string;
   groupFolder?: string;
@@ -100,6 +101,7 @@ function conversationInput(opts?: {
     groupFolder: opts?.groupFolder ?? 'failover-keep-context',
     chatJid: opts?.chatJid ?? 'web:failover-keep-context',
     turnId: opts?.turnId ?? 'pending-now',
+    currentBatchMessageIds: opts?.currentBatchMessageIds,
     isScheduledTask: opts?.isScheduledTask,
     agentId: opts?.agentId,
     isMain: true,
@@ -190,6 +192,58 @@ describe('provider failover keeps conversation context', () => {
     expect(prepared.sessionId).toBe('sess-keep');
     expect(prepared.prompt).toBe('只问这一句');
     expect(prepared.prompt).not.toContain('<system_context>');
+  });
+
+  test('excludes every pending message in a cold-run batch while preserving the original prompt', () => {
+    const groupFolder = 'failover-pending-batch';
+    const chatJid = 'web:failover-pending-batch';
+    const currentPrompt = 'Dennis: 第一条当前消息\nDennis: 第二条当前消息';
+    persistTurn(
+      chatJid,
+      'hist-user',
+      '需要保留的历史消息',
+      false,
+      '2026-08-18T10:30:00.000Z',
+    );
+    persistTurn(
+      chatJid,
+      'pending-first',
+      '第一条当前消息',
+      false,
+      '2026-08-18T10:30:01.000Z',
+    );
+    persistTurn(
+      chatJid,
+      'pending-last',
+      '第二条当前消息',
+      false,
+      '2026-08-18T10:30:02.000Z',
+    );
+
+    const prepared = applyProviderSwitchToInput(
+      conversationInput({
+        groupFolder,
+        chatJid,
+        turnId: 'pending-last',
+        currentBatchMessageIds: ['pending-first', 'pending-last'],
+        prompt: currentPrompt,
+      }),
+      {
+        profileId: created[1],
+        previousProviderId: created[0],
+        resetSession: true,
+      },
+      null,
+    );
+
+    const historyBlock = prepared.prompt.slice(
+      0,
+      prepared.prompt.indexOf('</system_context>'),
+    );
+    expect(historyBlock).toContain('需要保留的历史消息');
+    expect(historyBlock).not.toContain('第一条当前消息');
+    expect(historyBlock).not.toContain('第二条当前消息');
+    expect(prepared.prompt.endsWith(currentPrompt)).toBe(true);
   });
 
   test('does not double-inject when orchestration already seeded history', () => {

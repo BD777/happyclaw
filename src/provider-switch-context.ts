@@ -7,6 +7,8 @@ export interface ProviderSwitchInput {
   groupFolder: string;
   chatJid: string;
   turnId?: string;
+  /** Persisted message IDs already represented by this cold-run prompt. */
+  readonly currentBatchMessageIds?: readonly string[];
   isScheduledTask?: boolean;
   agentId?: string;
 }
@@ -36,7 +38,7 @@ function seedPromptWithPersistedHistory<T extends ProviderSwitchInput>(
   // Orchestration may already have prepended recovery/provider-switch history.
   if (input.prompt.includes('<system_context>')) return input;
 
-  const pendingMessageIds = new Set<string>();
+  const pendingMessageIds = new Set(input.currentBatchMessageIds);
   if (input.turnId) pendingMessageIds.add(input.turnId);
 
   const chatJid = conversationHistoryChatJid(input);

@@ -429,6 +429,8 @@ export interface ContainerInput {
   /** @deprecated Use isHome + isAdminHome instead */
   isMain: boolean;
   turnId?: string;
+  /** Persisted message IDs already represented by this cold-run prompt. */
+  readonly currentBatchMessageIds?: readonly string[];
   isHome?: boolean;
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
