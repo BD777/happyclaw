@@ -349,6 +349,20 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
     const fileList = Array.isArray(files) ? files : [files];
     const workspaceRoot = path.resolve(getFileRoot(group.folder, rootOverride));
 
+    if (!fs.existsSync(workspaceRoot)) {
+      logger.error(
+        { jid, folder: group.folder, workspaceRoot },
+        'Workspace directory missing on disk during upload',
+      );
+      return c.json(
+        {
+          error:
+            'Workspace directory not initialized yet. Please try again in a moment, or re-login and retry.',
+        },
+        409,
+      );
+    }
+
     return await withUploadMutationLock(workspaceRoot, async () => {
       const uploads: Array<{ file: File; relativePath: string }> = [];
       const quotaTargets = new Map<
