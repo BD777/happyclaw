@@ -146,9 +146,7 @@ describe('WhatsApp LID/hosted self identity', () => {
       '123456789012345@lid',
     );
     expect(canonicalizeWhatsAppUserJid(LID)).toBe('123456789012345@lid');
-    expect(canonicalizeWhatsAppUserJid(PN)).toBe(
-      '15551234567@s.whatsapp.net',
-    );
+    expect(canonicalizeWhatsAppUserJid(PN)).toBe('15551234567@s.whatsapp.net');
     expect(canonicalizeWhatsAppUserJid(PN)).not.toBe(
       canonicalizeWhatsAppUserJid(LID),
     );
@@ -159,9 +157,7 @@ describe('WhatsApp LID/hosted self identity', () => {
       '123456789012345@lid',
       '15551234567@s.whatsapp.net',
     ]);
-    expect(collectWhatsAppSelfJids(PN)).toEqual([
-      '15551234567@s.whatsapp.net',
-    ]);
+    expect(collectWhatsAppSelfJids(PN)).toEqual(['15551234567@s.whatsapp.net']);
   });
 
   test('membership matches when only the other identity is on the event row', () => {
@@ -169,7 +165,10 @@ describe('WhatsApp LID/hosted self identity', () => {
     // self missed PN-bearing rows and a PN self missed LID-only rows.
     expect(
       isWhatsAppSelfParticipant(
-        { id: '123456789012345@lid', phoneNumber: '15551234567@s.whatsapp.net' },
+        {
+          id: '123456789012345@lid',
+          phoneNumber: '15551234567@s.whatsapp.net',
+        },
         { lid: LID },
       ),
     ).toBe(true);
@@ -358,11 +357,10 @@ describe('stripLeadingWhatsAppBotMention', () => {
       },
     } as proto.IMessage;
     expect(
-      stripLeadingWhatsAppBotMention(
-        '@123456789012345 确认发布',
-        lidMention,
-        { id: SELF, lid: '123456789012345:12@lid' },
-      ),
+      stripLeadingWhatsAppBotMention('@123456789012345 确认发布', lidMention, {
+        id: SELF,
+        lid: '123456789012345:12@lid',
+      }),
     ).toBe('确认发布');
   });
 

@@ -1384,9 +1384,7 @@ export function isMentioningBot(
     content.audioMessage?.contextInfo;
   const mentioned = ctx?.mentionedJid;
   if (!mentioned || mentioned.length === 0) return false;
-  return mentioned.some((m) =>
-    identities.has(canonicalizeWhatsAppUserJid(m)),
-  );
+  return mentioned.some((m) => identities.has(canonicalizeWhatsAppUserJid(m)));
 }
 
 /** Remove a leading WhatsApp display token only when trusted message metadata
