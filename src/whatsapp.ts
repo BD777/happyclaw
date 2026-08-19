@@ -511,12 +511,8 @@ export function createWhatsAppConnection(
     nextSock.ev.on('group-participants.update', async (update) => {
       if (generation !== socketGeneration || sock !== nextSock) return;
       try {
-        const selfJid = sock?.user?.id ? jidNormalizedUser(sock.user.id) : null;
-        if (!selfJid) return;
-        const involvesSelf = update.participants.some(
-          (participant) =>
-            jidNormalizedUser(participant.phoneNumber ?? participant.id) ===
-            selfJid,
+        const involvesSelf = update.participants.some((participant) =>
+          isWhatsAppSelfParticipant(participant, sock?.user),
         );
         if (!involvesSelf) return;
 
@@ -764,7 +760,7 @@ export function createWhatsAppConnection(
           return;
         }
 
-        const isBotMentioned = isMentioningBot(inner, sock?.user?.id);
+        const isBotMentioned = isMentioningBot(inner, sock?.user);
         if (
           opts.shouldProcessGroupMessage &&
           !isBotMentioned &&
@@ -788,7 +784,7 @@ export function createWhatsAppConnection(
           return;
         }
         if (isBotMentioned && text) {
-          text = stripLeadingWhatsAppBotMention(text, inner, sock?.user?.id);
+          text = stripLeadingWhatsAppBotMention(text, inner, sock?.user);
         }
       }
 
@@ -1298,22 +1294,88 @@ export function stripChannelPrefix(chatId: string): string {
 }
 
 /**
+ * Baileys `sock.user` after the LID migration may expose both a phone-number
+ * JID (`id`) and a LID (`lid`). Group mentions and participant rows can use
+ * either form, plus hosted aliases (`@hosted` / `@hosted.lid`).
+ */
+export interface WhatsAppSelfIdentity {
+  id?: string | null;
+  lid?: string | null;
+}
+
+export type WhatsAppSelfRef = string | WhatsAppSelfIdentity | null | undefined;
+
+/**
+ * Collapse hosted aliases onto the corresponding PN/LID identity.
+ * Do not equate LID with PN: those user numbers are different ID spaces.
+ */
+export function canonicalizeWhatsAppUserJid(jid: string): string {
+  const norm = jidNormalizedUser(jid);
+  if (!norm) return '';
+  if (norm.endsWith('@hosted.lid')) {
+    return `${norm.slice(0, -'@hosted.lid'.length)}@lid`;
+  }
+  if (norm.endsWith('@hosted')) {
+    return `${norm.slice(0, -'@hosted'.length)}@s.whatsapp.net`;
+  }
+  return norm;
+}
+
+export function collectWhatsAppSelfJids(self: WhatsAppSelfRef): string[] {
+  const raws: Array<string | null | undefined> =
+    self && typeof self === 'object' ? [self.id, self.lid] : [self];
+  const identities = new Set<string>();
+  for (const raw of raws) {
+    if (!raw) continue;
+    const key = canonicalizeWhatsAppUserJid(raw);
+    if (key) identities.add(key);
+  }
+  return [...identities];
+}
+
+export function isWhatsAppSelfJid(
+  candidate: string | null | undefined,
+  self: WhatsAppSelfRef,
+): boolean {
+  if (!candidate) return false;
+  const key = canonicalizeWhatsAppUserJid(candidate);
+  if (!key) return false;
+  return collectWhatsAppSelfJids(self).includes(key);
+}
+
+/** Membership events expose LID on `id` and PN on `phoneNumber` independently. */
+export function isWhatsAppSelfParticipant(
+  participant: { id?: string | null; phoneNumber?: string | null },
+  self: WhatsAppSelfRef,
+): boolean {
+  const identities = new Set(collectWhatsAppSelfJids(self));
+  if (identities.size === 0) return false;
+  for (const raw of [participant.id, participant.phoneNumber]) {
+    if (!raw) continue;
+    const key = canonicalizeWhatsAppUserJid(raw);
+    if (key && identities.has(key)) return true;
+  }
+  return false;
+}
+
+/**
  * Check if a baileys message @mentions the bot itself.
  *
  * Mentioning lives in `extendedTextMessage.contextInfo.mentionedJid` (string[]).
  * Self jid format from sock.user.id includes a device suffix
- * (e.g. `15551234567:42@s.whatsapp.net`) — normalize both sides before compare.
+ * (e.g. `15551234567:42@s.whatsapp.net`). Compare every known self identity
+ * after normalizing device suffixes and hosted aliases.
  */
 export function isMentioningBot(
   content: proto.IMessage,
-  selfJid: string | null | undefined,
+  self: WhatsAppSelfRef,
 ): boolean {
-  // Fail closed: 当 selfJid 暂时不可用（reconnect 间隙、auth 状态未就绪），
+  // Fail closed: 当 self 暂时不可用（reconnect 间隙、auth 状态未就绪），
   // 从前的 fail-open 让 require_mention 模式短暂被绕过——攻击者可在 socket
   // 启动毫秒级窗口中把所有群消息都被处理。一致性优先：没法确认时按"未被
   // mention"处理，主消息处理流会丢弃。和 feishu 实现的语义对齐。
-  if (!selfJid) return false;
-  const selfNorm = jidNormalizedUser(selfJid);
+  const identities = new Set(collectWhatsAppSelfJids(self));
+  if (identities.size === 0) return false;
   const ctx =
     content.extendedTextMessage?.contextInfo ||
     content.imageMessage?.contextInfo ||
@@ -1322,7 +1384,9 @@ export function isMentioningBot(
     content.audioMessage?.contextInfo;
   const mentioned = ctx?.mentionedJid;
   if (!mentioned || mentioned.length === 0) return false;
-  return mentioned.some((m) => jidNormalizedUser(m) === selfNorm);
+  return mentioned.some((m) =>
+    identities.has(canonicalizeWhatsAppUserJid(m)),
+  );
 }
 
 /** Remove a leading WhatsApp display token only when trusted message metadata
@@ -1331,18 +1395,26 @@ export function isMentioningBot(
 export function stripLeadingWhatsAppBotMention(
   text: string,
   content: proto.IMessage,
-  selfJid: string | null | undefined,
+  self: WhatsAppSelfRef,
 ): string {
-  if (!selfJid || !isMentioningBot(content, selfJid)) return text;
-  const selfSubject = jidNormalizedUser(selfJid).split('@', 1)[0];
-  if (!selfSubject) return text;
+  if (!isMentioningBot(content, self)) return text;
+  const subjects = [
+    ...new Set(
+      collectWhatsAppSelfJids(self)
+        .map((jid) => jid.split('@', 1)[0])
+        .filter(Boolean),
+    ),
+  ].sort((left, right) => right.length - left.length);
   const normalized = text.trimStart();
-  const displayToken = `@${selfSubject}`;
-  if (!normalized.startsWith(displayToken)) return text;
-  const next = normalized.charAt(displayToken.length);
-  if (next && !/\s/.test(next)) return text;
-  const remainder = normalized.slice(displayToken.length).trimStart();
-  return remainder || text;
+  for (const subject of subjects) {
+    const displayToken = `@${subject}`;
+    if (!normalized.startsWith(displayToken)) continue;
+    const next = normalized.charAt(displayToken.length);
+    if (next && !/\s/.test(next)) continue;
+    const remainder = normalized.slice(displayToken.length).trimStart();
+    return remainder || text;
+  }
+  return text;
 }
 
 /**
