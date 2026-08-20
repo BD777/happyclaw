@@ -268,6 +268,8 @@ make dev
 | `make docker-pull`                              | 拉取 GitHub Actions 发布的最新 Agent 镜像             |
 | `make install-host-tools`                       | 安装 Host 工具并刷新 Host/Container 共用的内置 Skills |
 | `make backup`                                   | 创建一致性运行数据备份                                |
+| `make leftover-direct-mounts`                   | 诊断仍挂在 workspace main 上的可判定私聊（默认只读）  |
+| `make leftover-direct-mounts APPLY=1`           | 将上述私聊改挂到 `channel_direct` 并重置隔离代        |
 | `make restore FILE=happyclaw-backup-xxx.tar.gz` | 停止服务后恢复指定备份                                |
 | `make help`                                     | 查看完整命令列表                                      |
 
