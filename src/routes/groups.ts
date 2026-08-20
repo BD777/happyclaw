@@ -2452,9 +2452,19 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
 
 // DELETE /api/groups/:jid/messages/:messageId - 删除单条消息
 groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
+  // Runtime session messages are stored under the virtual chat JID
+  // `{workspaceJid}#agent:{sessionId}`, which is not a registered group. The
+  // client sends the message's own chat_jid, so resolve the owning workspace
+  // before the access check and keep deleting from the virtual JID the row
+  // actually lives in.
+  const chatJid = c.req.param('jid');
   const messageId = c.req.param('messageId');
-  const group = getRegisteredGroup(jid);
+  const agentSep = chatJid.indexOf('#agent:');
+  const groupJid = agentSep >= 0 ? chatJid.slice(0, agentSep) : chatJid;
+  const agentId =
+    agentSep >= 0 ? chatJid.slice(agentSep + '#agent:'.length) : null;
+
+  const group = getRegisteredGroup(groupJid);
   if (!group) {
     return c.json({ error: 'Group not found' }, 404);
   }
@@ -2464,8 +2474,15 @@ groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
     return c.json({ error: 'Group not found' }, 404);
   }
 
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.chat_jid !== groupJid) {
+      return c.json({ error: 'Message not found' }, 404);
+    }
+  }
+
   // Ownership check: admin can delete any message, non-admin can only delete their own
-  const msg = getMessage(jid, messageId);
+  const msg = getMessage(chatJid, messageId);
   if (!msg) {
     return c.json({ error: 'Message not found' }, 404);
   }
@@ -2477,7 +2494,7 @@ groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
     }
   }
 
-  const deleted = deleteMessage(jid, messageId);
+  const deleted = deleteMessage(chatJid, messageId);
   if (!deleted) {
     return c.json({ error: 'Message not found' }, 404);
   }

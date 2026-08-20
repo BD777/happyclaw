@@ -2280,12 +2280,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await api.delete(
         `/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`,
       );
-      set((s) => ({
-        messages: {
-          ...s.messages,
-          [jid]: (s.messages[jid] || []).filter((m) => m.id !== messageId),
-        },
-      }));
+      // `jid` is the message's own chat_jid, which is not always the key the
+      // bubble is rendered from: runtime session messages live in
+      // agentMessages[agentId], and a merged Home view renders sibling-JID
+      // messages under the Home JID. Message ids are unique, so drop the id
+      // from every bucket that still holds it instead of only messages[jid].
+      set((s) => {
+        const messages = { ...s.messages };
+        for (const [key, list] of Object.entries(messages)) {
+          if (list.some((m) => m.id === messageId)) {
+            messages[key] = list.filter((m) => m.id !== messageId);
+          }
+        }
+        const agentMessages = { ...s.agentMessages };
+        for (const [key, list] of Object.entries(agentMessages)) {
+          if (list.some((m) => m.id === messageId)) {
+            agentMessages[key] = list.filter((m) => m.id !== messageId);
+          }
+        }
+        return { messages, agentMessages };
+      });
       return true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
