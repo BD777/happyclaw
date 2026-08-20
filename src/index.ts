@@ -107,6 +107,7 @@ import {
   getAllChats,
   getAllChatJids,
   getAllRegisteredGroups,
+  migrateLegacyWhatsAppRegisteredGroupJidAlias,
   getAllSessions,
   hasContainerModeGroups,
   getAllTasks,
@@ -281,6 +282,10 @@ import {
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
+import {
+  canonicalizeWhatsAppConversationJid,
+  findLegacyWhatsAppConversationAliases,
+} from './whatsapp-jid.js';
 import {
   appendStreamingSessionAnswer,
   getChannelType,
@@ -19796,6 +19801,43 @@ function resolveChannelAccountWorkspace(account: ChannelAccount): {
   });
 }
 
+/**
+ * Preserve an existing WhatsApp pairing when a legacy raw `@c.us` identity is
+ * first observed through the canonical `@s.whatsapp.net` transport boundary.
+ * The DB move keeps the mount unchanged; privacy repair for a legacy
+ * target_main_jid remains the explicit #664 diagnostic/apply workflow.
+ */
+function normalizeWhatsAppInboundConversationJid(jid: string): string {
+  const canonicalJid = canonicalizeWhatsAppConversationJid(jid);
+  const aliases = findLegacyWhatsAppConversationAliases(
+    canonicalJid,
+    Object.keys(registeredGroups),
+  );
+  for (const legacyJid of aliases) {
+    const result = migrateLegacyWhatsAppRegisteredGroupJidAlias(
+      legacyJid,
+      canonicalJid,
+    );
+    if (result === 'migrated') {
+      const migrated = getRegisteredGroup(canonicalJid);
+      delete registeredGroups[legacyJid];
+      if (migrated) registeredGroups[canonicalJid] = migrated;
+      logger.info(
+        { legacyJid, canonicalJid },
+        'Canonicalized legacy WhatsApp direct-chat identity',
+      );
+      continue;
+    }
+    if (result === 'canonical_exists') {
+      logger.warn(
+        { legacyJid, canonicalJid },
+        'Preserved duplicate legacy WhatsApp identity for operator repair',
+      );
+    }
+  }
+  return canonicalJid;
+}
+
 async function disconnectChannelAccountById(accountId: string): Promise<void> {
   const account = getChannelAccount(accountId);
   if (!account) return;
@@ -20197,6 +20239,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
         onNewChat,
         {
           ...common,
+          normalizeIncomingJid: normalizeWhatsAppInboundConversationJid,
           isChatAuthorized: buildIsChatAuthorized(
             account.owner_user_id,
             account.id,

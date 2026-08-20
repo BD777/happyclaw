@@ -13,6 +13,12 @@ import {
   stripChannelPrefix,
   stripLeadingWhatsAppBotMention,
 } from '../src/whatsapp.js';
+import {
+  canonicalizeWhatsAppConversationJid,
+  canonicalizeWhatsAppProviderConversationJid,
+  findLegacyWhatsAppConversationAliases,
+  isLegacyWhatsAppDirectConversationJid,
+} from '../src/whatsapp-jid.js';
 
 describe('extractMessageText', () => {
   test('plain conversation', () => {
@@ -130,6 +136,41 @@ describe('stripChannelPrefix', () => {
 
   test('passes through when no prefix', () => {
     expect(stripChannelPrefix('123@g.us')).toBe('123@g.us');
+  });
+});
+
+describe('WhatsApp durable conversation JID canonicalization', () => {
+  test('folds legacy and device PN forms without changing groups', () => {
+    expect(
+      canonicalizeWhatsAppProviderConversationJid('15551234567@c.us'),
+    ).toBe('15551234567@s.whatsapp.net');
+    expect(
+      canonicalizeWhatsAppProviderConversationJid('15551234567:14@c.us'),
+    ).toBe('15551234567@s.whatsapp.net');
+    expect(
+      canonicalizeWhatsAppProviderConversationJid(
+        '15551234567:14@s.whatsapp.net',
+      ),
+    ).toBe('15551234567@s.whatsapp.net');
+    expect(
+      canonicalizeWhatsAppProviderConversationJid('120363012345678901@g.us'),
+    ).toBe('120363012345678901@g.us');
+  });
+
+  test('preserves account scope and finds only aliases from the same bot', () => {
+    const canonical = 'whatsapp:15551234567@s.whatsapp.net#account:bot-a';
+    const legacy = 'whatsapp:15551234567:14@c.us#account:bot-a';
+    expect(canonicalizeWhatsAppConversationJid(legacy)).toBe(canonical);
+    expect(isLegacyWhatsAppDirectConversationJid(legacy)).toBe(true);
+    expect(isLegacyWhatsAppDirectConversationJid(canonical)).toBe(false);
+    expect(
+      findLegacyWhatsAppConversationAliases(canonical, [
+        legacy,
+        'whatsapp:15551234567@c.us#account:bot-b',
+        'whatsapp:19990001111@c.us#account:bot-a',
+        canonical,
+      ]),
+    ).toEqual([legacy]);
   });
 });
 

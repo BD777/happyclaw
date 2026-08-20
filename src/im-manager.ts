@@ -363,13 +363,19 @@ export class IMConnectionManager {
         return false;
       }
     };
+    const normalizeIncomingJid = (jid: string) => {
+      const scoped = scope(jid);
+      return inboundAllowed()
+        ? (opts.normalizeIncomingJid?.(scoped) ?? scoped)
+        : scoped;
+    };
     return {
       ...opts,
       shouldDeferInbound: () =>
         this.inboundDeferred ||
         this.inboundPaused ||
         opts.shouldDeferInbound?.() === true,
-      normalizeIncomingJid: scope,
+      normalizeIncomingJid,
       onNewChat: (jid, name) => {
         if (inboundAllowed()) opts.onNewChat(scope(jid), name);
       },
@@ -1646,6 +1652,7 @@ export class IMConnectionManager {
         chatJid: string,
         senderImId?: string,
       ) => boolean;
+      normalizeIncomingJid?: (jid: string) => string;
       onConnectionUpdate?: (
         userId: string,
         accountId: string,
@@ -1692,6 +1699,7 @@ export class IMConnectionManager {
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
         isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+        normalizeIncomingJid: options?.normalizeIncomingJid,
       },
       options?.accountId,
       options?.scopeIncomingJids,
