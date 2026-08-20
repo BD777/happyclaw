@@ -119,7 +119,7 @@ export interface WhatsAppConnectOpts {
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** WhatsApp 专属：连接状态变化回调（QR 出现、connected、断线等） */
   onConnectionUpdate?: (state: WhatsAppConnectionState) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface WhatsAppConnection {
@@ -282,10 +282,10 @@ export function createWhatsAppConnection(
         groupNameCache.set(remoteJid, subject);
         try {
           const rawJid = `${CHANNEL_PREFIX}${remoteJid}`;
-          updateChatName(
-            opts?.normalizeIncomingJid?.(rawJid) ?? rawJid,
-            subject,
-          );
+          const normalizedJid = opts?.normalizeIncomingJid
+            ? opts.normalizeIncomingJid(rawJid)
+            : rawJid;
+          if (normalizedJid) updateChatName(normalizedJid, subject);
         } catch (err) {
           logger.debug({ err, remoteJid }, 'Failed to persist group name');
         }
@@ -518,7 +518,10 @@ export function createWhatsAppConnection(
         if (!involvesSelf) return;
 
         const rawJid = `${CHANNEL_PREFIX}${update.id}`;
-        const chatJid = opts?.normalizeIncomingJid?.(rawJid) ?? rawJid;
+        const chatJid = opts?.normalizeIncomingJid
+          ? opts.normalizeIncomingJid(rawJid)
+          : rawJid;
+        if (!chatJid) return;
         if (update.action === 'add') {
           let chatName = update.id;
           try {
@@ -710,7 +713,16 @@ export function createWhatsAppConnection(
       const inner = unwrapMessageContent(content);
       let text = extractMessageText(inner);
       const rawChatJid = `${CHANNEL_PREFIX}${logicalRemoteJid}`;
-      const chatJid = opts.normalizeIncomingJid?.(rawChatJid) ?? rawChatJid;
+      const chatJid = opts.normalizeIncomingJid
+        ? opts.normalizeIncomingJid(rawChatJid)
+        : rawChatJid;
+      if (!chatJid) {
+        logger.warn(
+          { remoteJid, msgId: key.id },
+          'WhatsApp inbound identity rejected before admission',
+        );
+        return;
+      }
       const isGroup = remoteJid.endsWith('@g.us');
       const senderRaw = isGroup ? key.participant || remoteJid : remoteJid;
       const senderImId = jidNormalizedUser(senderRaw);

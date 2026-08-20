@@ -58,6 +58,12 @@ const db = vi.hoisted(() => ({
   storeChatMetadata: vi.fn(),
   storeMessageDirect: vi.fn(),
   updateChatName: vi.fn(),
+  getRegisteredGroup: vi.fn(),
+  getDefaultChannelAccount: vi.fn(),
+  getLegacyChannelAccount: vi.fn(),
+  getChannelAccount: vi.fn(),
+  getUserById: vi.fn(),
+  isDatabaseInitialized: vi.fn(() => false),
 }));
 vi.mock('../src/db.js', () => db);
 vi.mock('../src/message-notifier.js', () => ({
@@ -90,8 +96,11 @@ vi.mock('proxy-agent', () => ({
 }));
 
 const { createWhatsAppConnection } = await import('../src/whatsapp.js');
-const { resolveWhatsAppConversationAlias } =
-  await import('../src/whatsapp-jid.js');
+const {
+  resolveWhatsAppConversationAlias,
+  resolveWhatsAppConversationAliasFromGroups,
+} = await import('../src/whatsapp-jid.js');
+const { IMConnectionManager } = await import('../src/im-manager.js');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whatsapp-cus-transport-'));
 
@@ -284,6 +293,82 @@ describe('WhatsApp legacy @c.us transport identity', () => {
       expect(call[2]).toBe('whatsapp:15551234567@s.whatsapp.net');
       expect(call[7]).toMatchObject({ sourceJid: legacy });
     }
+  });
+
+  test('manager account scoping preserves alias-conflict denial before /pair or writes', async () => {
+    const first = 'whatsapp:15551234567:14@c.us#account:bot-a';
+    const second = 'whatsapp:15551234567@c.us#account:bot-a';
+    const base = {
+      folder: 'home-owner',
+      created_by: 'owner-a',
+      channel_account_id: 'bot-a',
+      owner_im_id: '15551234567@s.whatsapp.net',
+      owner_claim_source: 'trusted_direct',
+    };
+    const normalizeIncomingJid = vi.fn((jid: string) => {
+      const resolved = resolveWhatsAppConversationAliasFromGroups(jid, {
+        [first]: { ...base, target_agent_id: 'session-a' },
+        [second]: { ...base, target_agent_id: 'session-b' },
+      });
+      return resolved.jid;
+    });
+    const isChatAuthorized = vi.fn(() => true);
+    const onPairAttempt = vi.fn(async () => true);
+    const onNewChat = vi.fn();
+    const resolveEffectiveChatJid = vi.fn(() => ({
+      effectiveJid: 'must-not-route',
+      agentId: null,
+    }));
+    const connection = createWhatsAppConnection({
+      accountId: 'bot-a',
+      authDir: path.join(root, 'manager-conflict'),
+    });
+    const channel = {
+      channelType: 'whatsapp',
+      async connect(opts: Parameters<typeof connection.connect>[0]) {
+        await connection.connect(opts);
+        return true;
+      },
+      async disconnect() {
+        await connection.disconnect();
+      },
+      async sendMessage() {},
+      async setTyping() {},
+      isConnected: () => true,
+    };
+    const manager = new IMConnectionManager();
+    await manager.connectChannel(
+      'owner-a',
+      'whatsapp',
+      channel,
+      {
+        onReady: vi.fn(),
+        onNewChat,
+        isChatAuthorized,
+        onPairAttempt,
+        resolveEffectiveChatJid,
+        normalizeIncomingJid,
+      },
+      'bot-a',
+    );
+    const socket = harness.sockets.at(-1)!;
+    await socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [message('15551234567:14@c.us', 'conflict-pair', '/pair code')],
+    });
+
+    expect(normalizeIncomingJid).toHaveBeenCalledWith(
+      'whatsapp:15551234567@s.whatsapp.net#account:bot-a',
+    );
+    expect(isChatAuthorized).not.toHaveBeenCalled();
+    expect(onPairAttempt).not.toHaveBeenCalled();
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(resolveEffectiveChatJid).not.toHaveBeenCalled();
+    expect(db.storeChatMetadata).not.toHaveBeenCalled();
+    expect(db.updateChatName).not.toHaveBeenCalled();
+    expect(db.storeMessageDirect).not.toHaveBeenCalled();
+    expect(socket.sendMessage).not.toHaveBeenCalled();
+    await manager.disconnectAll();
   });
 
   test('uses canonical identity for pairing but replies through the raw SDK target', async () => {

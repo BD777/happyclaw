@@ -365,8 +365,9 @@ export class IMConnectionManager {
     };
     const normalizeIncomingJid = (jid: string) => {
       const scoped = scope(jid);
-      return inboundAllowed()
-        ? (opts.normalizeIncomingJid?.(scoped) ?? scoped)
+      if (!inboundAllowed()) return null;
+      return opts.normalizeIncomingJid
+        ? opts.normalizeIncomingJid(scoped)
         : scoped;
     };
     return {
@@ -1652,7 +1653,7 @@ export class IMConnectionManager {
         chatJid: string,
         senderImId?: string,
       ) => boolean;
-      normalizeIncomingJid?: (jid: string) => string;
+      normalizeIncomingJid?: (jid: string) => string | null;
       onConnectionUpdate?: (
         userId: string,
         accountId: string,

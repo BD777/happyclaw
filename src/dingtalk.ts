@@ -90,7 +90,7 @@ export interface DingTalkConnectOpts {
   resolveRegisteredGroup?: (
     jid: string,
   ) => { activation_mode?: string } | undefined;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface DingTalkConnection {

@@ -283,7 +283,6 @@ import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
   canonicalizeWhatsAppConversationJid,
-  failClosedWhatsAppAliasConflictJid,
   resolveWhatsAppConversationAliasFromGroups,
 } from './whatsapp-jid.js';
 import {
@@ -19805,7 +19804,7 @@ function resolveChannelAccountWorkspace(account: ChannelAccount): {
  * Resolve a canonical WhatsApp transport identity onto an existing legacy key
  * without changing durable data. Authorization still runs after this lookup.
  */
-function normalizeWhatsAppInboundConversationJid(jid: string): string {
+function normalizeWhatsAppInboundConversationJid(jid: string): string | null {
   const canonicalJid = canonicalizeWhatsAppConversationJid(jid);
   const resolved = resolveWhatsAppConversationAliasFromGroups(
     canonicalJid,
@@ -19816,9 +19815,7 @@ function normalizeWhatsAppInboundConversationJid(jid: string): string {
       { canonicalJid, aliases: resolved.aliases },
       'Rejected ambiguous legacy WhatsApp aliases; run offline repair',
     );
-    // A deliberately non-matching account scope makes both ordinary admission
-    // and `/pair` fail closed, including legacy-default account flows.
-    return failClosedWhatsAppAliasConflictJid(canonicalJid);
+    return null;
   }
   return resolved.jid;
 }

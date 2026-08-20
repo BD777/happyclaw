@@ -16,15 +16,11 @@ import {
 import {
   canonicalizeWhatsAppConversationJid,
   canonicalizeWhatsAppProviderConversationJid,
-  failClosedWhatsAppAliasConflictJid,
   findLegacyWhatsAppConversationAliases,
   isLegacyWhatsAppDirectConversationJid,
   resolveWhatsAppConversationAlias,
   resolveWhatsAppConversationAliasFromGroups,
-  WHATSAPP_ALIAS_CONFLICT_ACCOUNT_ID,
 } from '../src/whatsapp-jid.js';
-import { parseChannelAddress } from '../src/channel-address.js';
-import { matchesChannelPairTarget } from '../src/channel-admission.js';
 
 describe('extractMessageText', () => {
   test('plain conversation', () => {
@@ -205,16 +201,6 @@ describe('WhatsApp durable conversation JID canonicalization', () => {
       jid: null,
       aliases: [legacy, 'whatsapp:15551234567@c.us#account:bot-a'],
     });
-    const conflictJid = failClosedWhatsAppAliasConflictJid(canonical);
-    const conflictAccount = parseChannelAddress(conflictJid)?.channelAccountId;
-    expect(conflictAccount).toBe(WHATSAPP_ALIAS_CONFLICT_ACCOUNT_ID);
-    expect(
-      matchesChannelPairTarget({
-        scopedAccountId: conflictAccount,
-        expectedAccountId: 'bot-a',
-        allowLegacyUnscoped: true,
-      }),
-    ).toBe(false);
   });
 
   test('accepts deterministically only when repaired legacy aliases have equivalent routing and permissions', () => {

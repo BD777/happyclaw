@@ -1,11 +1,9 @@
 import { jidNormalizedUser } from 'baileys';
 
-import { parseChannelAddress, scopeChannelJid } from './channel-address.js';
+import { parseChannelAddress } from './channel-address.js';
 
 const WHATSAPP_PREFIX = 'whatsapp:';
 const LEGACY_USER_SUFFIX = '@c.us';
-export const WHATSAPP_ALIAS_CONFLICT_ACCOUNT_ID =
-  '__happyclaw_whatsapp_alias_conflict__';
 const DIRECT_USER_SUFFIXES = [
   '@s.whatsapp.net',
   '@hosted.lid',
@@ -167,12 +165,4 @@ export function resolveWhatsAppConversationAliasFromGroups(
     };
   }
   return { status: 'conflict', jid: null, aliases };
-}
-
-/** Return a valid-shaped but deliberately unauthorized key for ambiguity. */
-export function failClosedWhatsAppAliasConflictJid(jid: string): string {
-  return scopeChannelJid(
-    canonicalizeWhatsAppConversationJid(jid),
-    WHATSAPP_ALIAS_CONFLICT_ACCOUNT_ID,
-  );
 }

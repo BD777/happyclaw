@@ -64,7 +64,7 @@ describe('IM manager account lifecycle', () => {
     normalizeIncomingJid.mockClear();
     expect(
       connected.normalizeIncomingJid?.('whatsapp:15550001111@s.whatsapp.net'),
-    ).toBe('whatsapp:15550001111@s.whatsapp.net#account:normalize-account');
+    ).toBeNull();
     expect(normalizeIncomingJid).not.toHaveBeenCalled();
     await manager.disconnectAll();
   });
