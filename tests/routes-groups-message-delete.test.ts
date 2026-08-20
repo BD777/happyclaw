@@ -231,3 +231,81 @@ describe('DELETE /:jid/messages/:messageId', () => {
     expect(db.getMessage(VIRTUAL_JID, 'msg-runtime-ai')).not.toBeNull();
   });
 });
+
+/**
+ * GET /:jid/messages and POST /:jid/clear-history both gate host workspaces on
+ * the admin role, but the single-message delete never did. An owner who is no
+ * longer admin could therefore delete a host workspace's messages one by one
+ * while being unable to read or bulk-clear them.
+ */
+describe('DELETE /:jid/messages/:messageId host execution gate', () => {
+  const HOST_JID = 'web:msgdel-host-workspace';
+  const HOST_FOLDER = 'msgdel-host-workspace';
+  const HOST_SESSION_ID = 'session-msgdel-host';
+  const HOST_VIRTUAL_JID = `${HOST_JID}#agent:${HOST_SESSION_ID}`;
+
+  beforeEach(() => {
+    db.setRegisteredGroup(HOST_JID, {
+      name: 'Host Workspace',
+      folder: HOST_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'host',
+      created_by: OWNER_ID,
+      is_home: false,
+    } as any);
+    db.createAgent({
+      id: HOST_SESSION_ID,
+      group_folder: HOST_FOLDER,
+      chat_jid: HOST_JID,
+      name: 'Host Session',
+      prompt: '',
+      status: 'completed',
+      kind: 'conversation',
+      created_by: OWNER_ID,
+      created_at: new Date().toISOString(),
+    } as any);
+  });
+
+  afterEach(() => {
+    try {
+      db.deleteAgent(HOST_SESSION_ID);
+    } catch {
+      /* ignore */
+    }
+    try {
+      db.deleteRegisteredGroup(HOST_JID);
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('a non-admin owner is denied on the workspace JID', async () => {
+    seedMessage('msg-host-1', HOST_JID, OWNER_ID);
+    asUser(OWNER_ID, 'member');
+
+    const res = await del(HOST_JID, 'msg-host-1');
+
+    expect(res.status).toBe(403);
+    expect(db.getMessage(HOST_JID, 'msg-host-1')).not.toBeNull();
+  });
+
+  test('a non-admin owner is denied on a runtime session JID', async () => {
+    seedMessage('msg-host-2', HOST_VIRTUAL_JID, OWNER_ID);
+    asUser(OWNER_ID, 'member');
+
+    const res = await del(HOST_VIRTUAL_JID, 'msg-host-2');
+
+    expect(res.status).toBe(403);
+    expect(db.getMessage(HOST_VIRTUAL_JID, 'msg-host-2')).not.toBeNull();
+  });
+
+  test('an admin owner can still delete', async () => {
+    seedMessage('msg-host-3', HOST_VIRTUAL_JID, OWNER_ID);
+    asUser(OWNER_ID, 'admin');
+
+    const res = await del(HOST_VIRTUAL_JID, 'msg-host-3');
+
+    expect(res.status).toBe(200);
+    expect(db.getMessage(HOST_VIRTUAL_JID, 'msg-host-3')).toBeNull();
+  });
+});

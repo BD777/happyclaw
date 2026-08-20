@@ -2473,6 +2473,15 @@ groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
+  // Same host-execution gate as GET /:jid/messages and POST /:jid/clear-history:
+  // a user who owns a host workspace but is no longer admin can neither read
+  // nor bulk-clear its history, so single-message deletes must not stay open.
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
 
   if (agentId) {
     const agent = getAgent(agentId);
