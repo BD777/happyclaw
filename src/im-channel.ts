@@ -205,8 +205,8 @@ export interface IMChannelConnectOpts {
   ) => FollowUpActionResult;
   /** P2P（私聊）消息到达时调用，用于自动检测 owner open_id（仅飞书） */
   onP2pSender?: (senderOpenId: string) => void;
-  /** Canonicalize an inbound provider JID before persistence/callbacks. */
-  normalizeIncomingJid?: (jid: string) => string;
+  /** Canonicalize an inbound provider JID; null rejects it before admission. */
+  normalizeIncomingJid?: (jid: string) => string | null;
   /** Persist the provider event but postpone policy/routing execution. */
   shouldDeferInbound?: () => boolean;
   /** WeChat iLink authorization/transport lifecycle. */

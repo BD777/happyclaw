@@ -900,6 +900,15 @@ export type WsMessageOut =
       source?: string;
     }
   | {
+      type: 'message_deleted';
+      /** Workspace JID used to route the event in the Web client. */
+      chatJid: string;
+      /** Exact composite-key chat_jid of the deleted SQLite row. */
+      messageChatJid: string;
+      messageId: string;
+      agentId?: string;
+    }
+  | {
       type: 'agent_reply';
       chatJid: string;
       text: string;

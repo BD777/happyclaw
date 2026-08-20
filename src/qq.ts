@@ -291,7 +291,7 @@ export interface QQConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface QQConnection {
