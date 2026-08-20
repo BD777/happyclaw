@@ -526,19 +526,22 @@ Claude Code，并把实际版本写入
 </details>
 
 <details>
-<summary><strong>曾部署过非正式的 v73 中间提交，如何检查私聊挂载？</strong></summary>
+<summary><strong>如何检查旧版本遗留的私聊挂载？</strong></summary>
 
-正式发布的 `main` 不会产生此状态。只有曾在 #659 的 WhatsApp LID 分类修复之前
-单独部署或 cherry-pick #655/schema v73 的实例，才需要运行
-`make leftover-direct-mounts`。诊断严格只读，并且只接受当前 schema；发现残留时以
-退出码 2 返回。为保证读取完整且绝不创建 SQLite sidecar，诊断前也必须先干净停止
-HappyClaw。
+两类旧安装可能需要此工具：一是 #666 之前的受支持版本曾把 WhatsApp `@c.us`
+及 device `@c.us` 私聊留在 workspace main；二是曾在 #659 的 WhatsApp LID 分类
+修复之前单独部署或 cherry-pick #655/schema v73 的非正式安装。升级到当前版本后运行
+`make leftover-direct-mounts`。诊断严格只读，并且只接受当前 schema；发现残留或
+存在无法自动判定的 WhatsApp alias 路由冲突时以退出码 2 返回。为保证读取完整且绝不
+创建 SQLite sidecar，诊断前也必须先干净停止 HappyClaw。
 
 修复前还必须停止 launchd/systemd 等进程守护，然后运行
 `make leftover-direct-mounts APPLY=1`。修复会把可判定私聊迁到独立
 `channel_direct` session，并永久清除受污染 workspace main 的模型恢复资格和
 SDK/runtime session；不会创建备份，也不能安全撤销。工具若无法确认数据库无人占用，
-会拒绝执行。
+会拒绝执行。如果同一 WhatsApp canonical 用户的多个 alias 指向不同 owner、workspace
+或 session，工具会 fail closed；请按诊断输出人工解绑冲突 alias 后重试，不会自动猜测
+应保留哪条路由。
 
 </details>
 

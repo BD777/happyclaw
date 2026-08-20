@@ -332,44 +332,58 @@ function printDiagnosis(diagnosis: LeftoverDirectMountDiagnosis): void {
     console.log(
       'No leftover JID-classifiable DMs are bound to target_main_jid.',
     );
-    return;
-  }
-
-  console.log(
-    `Found ${diagnosis.leftovers.length} leftover direct mount(s) on workspace main:`,
-  );
-  for (const [index, leftover] of diagnosis.leftovers.entries()) {
-    console.log('');
-    console.log(`${index + 1}. ${leftover.channelJid}`);
+  } else {
     console.log(
-      `   workspace: ${leftover.workspaceJid} (${leftover.workspaceFolder})`,
+      `Found ${diagnosis.leftovers.length} leftover direct mount(s) on workspace main:`,
     );
-    if (leftover.channelAccountId) {
-      console.log(`   channel account: ${leftover.channelAccountId}`);
+    for (const [index, leftover] of diagnosis.leftovers.entries()) {
+      console.log('');
+      console.log(`${index + 1}. ${leftover.channelJid}`);
+      console.log(
+        `   workspace: ${leftover.workspaceJid} (${leftover.workspaceFolder})`,
+      );
+      if (leftover.channelAccountId) {
+        console.log(`   channel account: ${leftover.channelAccountId}`);
+      }
+      console.log(`   main owner: ${leftover.mainOwnerJid ?? '(none)'}`);
+      console.log(
+        `   main owner is this chat: ${leftover.mainOwnerIsThisChat}`,
+      );
+      console.log(`   main session: ${leftover.mainSessionId ?? '(none)'}`);
+      console.log(
+        `   isolation marker: ${leftover.existingIsolationMarker ?? '(none)'}`,
+      );
+      console.log(
+        `   recoverable inbound from this chat: ${leftover.recoverableInboundFromThisChat}`,
+      );
     }
-    console.log(`   main owner: ${leftover.mainOwnerJid ?? '(none)'}`);
-    console.log(`   main owner is this chat: ${leftover.mainOwnerIsThisChat}`);
-    console.log(`   main session: ${leftover.mainSessionId ?? '(none)'}`);
-    console.log(
-      `   isolation marker: ${leftover.existingIsolationMarker ?? '(none)'}`,
-    );
-    console.log(
-      `   recoverable inbound from this chat: ${leftover.recoverableInboundFromThisChat}`,
-    );
   }
 
-  console.log('');
-  console.log(
-    'Affected workspaces (a repair would reset isolation generation):',
-  );
-  for (const workspace of diagnosis.affectedWorkspaces) {
+  if (diagnosis.aliasConflicts.length > 0) {
+    console.log('');
     console.log(
-      `- ${workspace.workspaceJid} leftovers=${workspace.leftoverCount} marker=${
-        workspace.existingIsolationMarker ?? '(none)'
-      } recoverable_leaks=${workspace.recoverableInboundFromLeftovers} main_session=${
-        workspace.mainSessionId ?? '(none)'
-      }`,
+      'WhatsApp alias routing conflicts require manual unbind; automatic repair will not guess an owner, workspace, or session:',
     );
+    for (const conflict of diagnosis.aliasConflicts) {
+      console.log(`- ${conflict.canonicalJid}: ${conflict.aliases.join(', ')}`);
+      console.log(`  action: ${conflict.manualAction}`);
+    }
+  }
+
+  if (diagnosis.affectedWorkspaces.length > 0) {
+    console.log('');
+    console.log(
+      'Affected workspaces (a repair would reset isolation generation):',
+    );
+    for (const workspace of diagnosis.affectedWorkspaces) {
+      console.log(
+        `- ${workspace.workspaceJid} leftovers=${workspace.leftoverCount} marker=${
+          workspace.existingIsolationMarker ?? '(none)'
+        } recoverable_leaks=${workspace.recoverableInboundFromLeftovers} main_session=${
+          workspace.mainSessionId ?? '(none)'
+        }`,
+      );
+    }
   }
 }
 
@@ -404,7 +418,11 @@ async function main(): Promise<void> {
     const diagnosis = readSideEffectFreeDiagnosis();
     console.log('Mode: dry-run (strictly read-only; no writes)');
     printDiagnosis(diagnosis);
-    if (diagnosis.leftovers.length === 0) return;
+    if (
+      diagnosis.leftovers.length === 0 &&
+      diagnosis.aliasConflicts.length === 0
+    )
+      return;
     console.log('');
     console.log(
       'No changes written. Re-run with --apply to remount onto channel_direct and reset isolation/recovery state with a new generation.',
@@ -422,6 +440,11 @@ async function main(): Promise<void> {
     const before = readSideEffectFreeDiagnosis();
     console.log('Mode: apply');
     printDiagnosis(before);
+    if (before.aliasConflicts.length > 0) {
+      throw new Error(
+        'Refusing automatic repair while WhatsApp alias routes conflict; manually unbind the listed aliases and rerun the diagnostic.',
+      );
+    }
     if (before.leftovers.length === 0) return;
 
     // The schema was verified through the side-effect-free repository before

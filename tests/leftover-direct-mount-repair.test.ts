@@ -31,6 +31,8 @@ const {
   diagnoseLeftoverClassifiableDirectWorkspaceMounts,
   repairLeftoverClassifiableDirectWorkspaceMounts,
 } = await import('../src/leftover-direct-mount-repair.js');
+const { resolveWhatsAppConversationAliasFromGroups } =
+  await import('../src/whatsapp-jid.js');
 
 const now = '2026-08-18T00:00:00.000Z';
 const oldIsolationAt = '2026-08-18T00:00:00.000Z';
@@ -46,6 +48,24 @@ const waLidJid = 'whatsapp:123456789012345@lid#account:bot-a';
 const waHostedJid = 'whatsapp:15551230000@hosted#account:bot-a';
 const waHostedLidJid = 'whatsapp:15551230001@hosted.lid#account:bot-a';
 const waPnJid = 'whatsapp:15551230002@s.whatsapp.net#account:bot-a';
+const waLegacyCusJid = 'whatsapp:15559870000@c.us#account:bot-a';
+const waDeviceCusJid = 'whatsapp:15559870000:14@c.us#account:bot-a';
+const waCanonicalAliasPnJid =
+  'whatsapp:15559870000@s.whatsapp.net#account:bot-a';
+const waCanonicalAliasJids = [
+  waLegacyCusJid,
+  waDeviceCusJid,
+  waCanonicalAliasPnJid,
+] as const;
+const waLegacyOnlyCusJid = 'whatsapp:15559871111@c.us#account:legacy-only-bot';
+const waLegacyOnlyDeviceCusJid =
+  'whatsapp:15559871111:21@c.us#account:legacy-only-bot';
+const waLegacyOnlyCanonicalJid =
+  'whatsapp:15559871111@s.whatsapp.net#account:legacy-only-bot';
+const waLegacyOnlyAliases = [
+  waLegacyOnlyCusJid,
+  waLegacyOnlyDeviceCusJid,
+] as const;
 const waGroupJid = 'whatsapp:120363000000000000@g.us#account:bot-a';
 const feishuUnknownJid = 'feishu:oc_opaque#account:bot-a';
 const leftoverDirectJids = [
@@ -55,6 +75,8 @@ const leftoverDirectJids = [
   waHostedJid,
   waHostedLidJid,
   waPnJid,
+  ...waCanonicalAliasJids,
+  ...waLegacyOnlyAliases,
 ] as const;
 
 afterAll(() => {
@@ -76,13 +98,20 @@ function seedLeftoverDirectState(): void {
     [waHostedJid, 'WhatsApp hosted leftover DM'],
     [waHostedLidJid, 'WhatsApp hosted.lid leftover DM'],
     [waPnJid, 'WhatsApp PN leftover DM'],
+    [waLegacyCusJid, 'WhatsApp legacy c.us leftover DM'],
+    [waDeviceCusJid, 'WhatsApp device c.us leftover DM'],
+    [waCanonicalAliasPnJid, 'WhatsApp canonical PN leftover DM'],
+    [waLegacyOnlyCusJid, 'WhatsApp legacy-only c.us leftover DM'],
+    [waLegacyOnlyDeviceCusJid, 'WhatsApp legacy-only device c.us leftover DM'],
   ] as const) {
     db.setRegisteredGroup(jid, {
       name,
       folder: `${folder}-direct`,
       added_at: now,
       created_by: 'owner-a',
-      channel_account_id: 'bot-a',
+      channel_account_id: jid.includes('#account:legacy-only-bot')
+        ? 'legacy-only-bot'
+        : 'bot-a',
       target_main_jid: workspaceJid,
     });
   }
@@ -149,6 +178,28 @@ function seedLeftoverDirectState(): void {
     false,
     { sourceJid: waGroupJid },
   );
+  for (const [index, sourceJid] of waCanonicalAliasJids.entries()) {
+    db.storeMessageDirect(
+      `post-marker-cus-alias-${index}`,
+      workspaceJid,
+      sourceJid,
+      'Private CUS Alice',
+      `post-marker canonical alias leak ${index}`,
+      `2026-08-19T00:00:0${index + 2}.000Z`,
+      false,
+      { sourceJid },
+    );
+  }
+  db.storeMessageDirect(
+    'post-marker-other-account-cus',
+    workspaceJid,
+    'whatsapp:15559870000@c.us#account:bot-b',
+    'Other account Alice',
+    'same PN from another account must not count as this alias',
+    '2026-08-19T00:00:09.000Z',
+    false,
+    { sourceJid: 'whatsapp:15559870000@c.us#account:bot-b' },
+  );
 }
 
 describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
@@ -161,6 +212,7 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
 
     const diagnosis = diagnoseLeftoverClassifiableDirectWorkspaceMounts();
     expect(diagnosis.schemaVersion).toBe(String(db.CURRENT_SCHEMA_VERSION));
+    expect(diagnosis.aliasConflicts).toEqual([]);
     expect(diagnosis.leftovers.map((item) => item.channelJid).sort()).toEqual(
       [...leftoverDirectJids].sort(),
     );
@@ -174,6 +226,11 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
       existingIsolationMarker: oldIsolationAt,
       recoverableInboundFromThisChat: 3,
     });
+    for (const alias of waCanonicalAliasJids) {
+      expect(
+        diagnosis.leftovers.find((item) => item.channelJid === alias),
+      ).toMatchObject({ recoverableInboundFromThisChat: 3 });
+    }
     expect(diagnosis.affectedWorkspaces).toEqual([
       expect.objectContaining({
         workspaceJid,
@@ -181,7 +238,7 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
         existingIsolationMarker: oldIsolationAt,
         mainSessionId: 'contaminated-main-session',
         mainOwnerJid: waLidJid,
-        recoverableInboundFromLeftovers: 3,
+        recoverableInboundFromLeftovers: 6,
       }),
     ]);
 
@@ -240,6 +297,35 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
         session_id: group.target_agent_id,
       });
     }
+    const canonicalAliasSessionIds = waCanonicalAliasJids.map(
+      (jid) => db.getRegisteredGroup(jid)!.target_agent_id,
+    );
+    expect(new Set(canonicalAliasSessionIds)).toHaveLength(1);
+    expect(
+      resolveWhatsAppConversationAliasFromGroups(
+        waCanonicalAliasPnJid,
+        db.getAllRegisteredGroups(),
+      ),
+    ).toEqual({
+      status: 'canonical',
+      jid: waCanonicalAliasPnJid,
+      aliases: [],
+    });
+    const legacyOnlySessionIds = waLegacyOnlyAliases.map(
+      (jid) => db.getRegisteredGroup(jid)!.target_agent_id,
+    );
+    expect(new Set(legacyOnlySessionIds)).toHaveLength(1);
+    const sortedLegacyOnlyAliases = [...waLegacyOnlyAliases].sort();
+    expect(
+      resolveWhatsAppConversationAliasFromGroups(
+        waLegacyOnlyCanonicalJid,
+        db.getAllRegisteredGroups(),
+      ),
+    ).toEqual({
+      status: 'legacy_equivalent',
+      jid: sortedLegacyOnlyAliases[0],
+      aliases: sortedLegacyOnlyAliases,
+    });
 
     expect(db.getRegisteredGroup(qqGroupJid)).toMatchObject({
       target_main_jid: workspaceJid,
@@ -320,6 +406,102 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
     expect(db.getRouterState('schema_version')).toBe(
       String(db.CURRENT_SCHEMA_VERSION),
     );
+  });
+
+  test('conflicting canonical WhatsApp aliases fail closed for manual unbind', () => {
+    const firstWorkspace = 'web:alias-conflict-a';
+    const secondWorkspace = 'web:alias-conflict-b';
+    const firstFolder = 'alias-conflict-a';
+    const secondFolder = 'alias-conflict-b';
+    const firstAlias = 'whatsapp:16660001111:7@c.us#account:conflict-bot';
+    const secondAlias = 'whatsapp:16660001111@c.us#account:conflict-bot';
+    const canonical =
+      'whatsapp:16660001111@s.whatsapp.net#account:conflict-bot';
+    db.setRegisteredGroup(firstWorkspace, {
+      name: 'Alias conflict A',
+      folder: firstFolder,
+      added_at: now,
+      created_by: 'owner-a',
+    });
+    db.setRegisteredGroup(secondWorkspace, {
+      name: 'Alias conflict B',
+      folder: secondFolder,
+      added_at: now,
+      created_by: 'owner-b',
+    });
+    db.setRegisteredGroup(firstAlias, {
+      name: 'First conflicting alias',
+      folder: `${firstFolder}-direct`,
+      added_at: now,
+      created_by: 'owner-a',
+      channel_account_id: 'conflict-bot',
+      target_main_jid: firstWorkspace,
+    });
+    db.setRegisteredGroup(secondAlias, {
+      name: 'Second conflicting alias',
+      folder: `${secondFolder}-direct`,
+      added_at: now,
+      created_by: 'owner-b',
+      channel_account_id: 'conflict-bot',
+      target_main_jid: secondWorkspace,
+    });
+
+    expect(
+      resolveWhatsAppConversationAliasFromGroups(
+        canonical,
+        db.getAllRegisteredGroups(),
+      ),
+    ).toMatchObject({ status: 'conflict', jid: null });
+    const diagnosis = diagnoseLeftoverClassifiableDirectWorkspaceMounts();
+    expect(diagnosis.aliasConflicts).toEqual([
+      expect.objectContaining({
+        canonicalJid: canonical,
+        aliases: [secondAlias, firstAlias].sort(),
+        reason: 'routing_metadata_mismatch',
+      }),
+    ]);
+    expect(() =>
+      repairLeftoverClassifiableDirectWorkspaceMounts({ apply: true }),
+    ).toThrow(/require manual unbind/);
+    expect(db.getRegisteredGroup(firstAlias)).toMatchObject({
+      target_main_jid: firstWorkspace,
+    });
+    expect(db.getRegisteredGroup(secondAlias)).toMatchObject({
+      target_main_jid: secondWorkspace,
+    });
+    expect(db.listAgentsByJid(firstWorkspace)).toEqual([]);
+    expect(db.listAgentsByJid(secondWorkspace)).toEqual([]);
+
+    for (const [jid, sessionId] of [
+      [firstAlias, 'conflicting-session-a'],
+      [secondAlias, 'conflicting-session-b'],
+    ] as const) {
+      db.setRegisteredGroup(jid, {
+        name: jid,
+        folder: 'shared-conflict-direct',
+        added_at: now,
+        created_by: 'owner-a',
+        channel_account_id: 'conflict-bot',
+        target_agent_id: sessionId,
+      });
+    }
+    expect(
+      resolveWhatsAppConversationAliasFromGroups(
+        canonical,
+        db.getAllRegisteredGroups(),
+      ),
+    ).toMatchObject({ status: 'conflict', jid: null });
+    expect(
+      diagnoseLeftoverClassifiableDirectWorkspaceMounts().aliasConflicts,
+    ).toHaveLength(1);
+    expect(() =>
+      repairLeftoverClassifiableDirectWorkspaceMounts({ apply: true }),
+    ).toThrow(/require manual unbind/);
+
+    db.deleteRegisteredGroup(firstAlias);
+    db.deleteRegisteredGroup(secondAlias);
+    db.deleteRegisteredGroup(firstWorkspace);
+    db.deleteRegisteredGroup(secondWorkspace);
   });
 
   test('schema v73 remount-only leaves post-marker leaks recoverable, which is why this is not a migration', () => {

@@ -119,7 +119,9 @@ export function resolveWhatsAppConversationAlias(
   return { status: 'new', jid: canonical, aliases: [] };
 }
 
-function aliasRoutingSignature(group: WhatsAppAliasRoutingMetadata): string {
+export function whatsAppAliasRoutingSignature(
+  group: WhatsAppAliasRoutingMetadata,
+): string {
   return JSON.stringify({
     folder: group.folder,
     created_by: group.created_by ?? null,
@@ -151,7 +153,7 @@ export function resolveWhatsAppConversationAliasFromGroups(
   const aliases = [...resolved.aliases].sort();
   const signatures = aliases.map((alias) => {
     const group = groups[alias];
-    return group ? aliasRoutingSignature(group) : null;
+    return group ? whatsAppAliasRoutingSignature(group) : null;
   });
   if (
     signatures.length > 0 &&

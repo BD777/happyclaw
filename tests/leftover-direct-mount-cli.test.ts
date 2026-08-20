@@ -62,9 +62,18 @@ function createDiagnosticDatabase(
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       folder TEXT NOT NULL,
+      created_by TEXT,
       channel_account_id TEXT,
       target_agent_id TEXT,
-      target_main_jid TEXT
+      target_main_jid TEXT,
+      owner_im_id TEXT,
+      owner_claim_source TEXT,
+      binding_mode TEXT,
+      reply_policy TEXT,
+      require_mention INTEGER,
+      activation_mode TEXT,
+      audience_mode TEXT,
+      sender_allowlist TEXT
     );
     CREATE TABLE messages (
       id TEXT,
@@ -536,7 +545,47 @@ describe.sequential('leftover direct mount maintenance CLI', () => {
     );
     expect(ownersAfterSignal.status).toBe(1);
     expect(ownersAfterSignal.stdout).toBe('');
-  }, 20_000);
+
+    db.initDatabase();
+    const conflictCanonical =
+      'whatsapp:17770001111@s.whatsapp.net#account:conflict-bot';
+    const conflictAliases = [
+      'whatsapp:17770001111:8@c.us#account:conflict-bot',
+      'whatsapp:17770001111@c.us#account:conflict-bot',
+    ];
+    for (const [suffix, owner] of [
+      ['a', 'owner-a'],
+      ['b', 'owner-b'],
+    ] as const) {
+      db.setRegisteredGroup(`web:cli-conflict-${suffix}`, {
+        name: `CLI conflict ${suffix}`,
+        folder: `cli-conflict-${suffix}`,
+        added_at: '2026-08-20T00:00:00.000Z',
+        created_by: owner,
+      });
+      db.setRegisteredGroup(conflictAliases[suffix === 'a' ? 0 : 1]!, {
+        name: `CLI conflict alias ${suffix}`,
+        folder: `cli-conflict-${suffix}-direct`,
+        added_at: '2026-08-20T00:00:00.000Z',
+        created_by: owner,
+        channel_account_id: 'conflict-bot',
+        target_main_jid: `web:cli-conflict-${suffix}`,
+      });
+    }
+    db.closeDatabase();
+
+    const conflictDiagnosis = runCli(instance);
+    expect(conflictDiagnosis.status).toBe(2);
+    expect(conflictDiagnosis.stdout).toContain(conflictCanonical);
+    expect(conflictDiagnosis.stdout).toContain(
+      'require manual unbind; automatic repair will not guess',
+    );
+    const conflictApply = runCli(instance, ['--apply']);
+    expect(conflictApply.status).toBe(1);
+    expect(conflictApply.stderr).toContain(
+      'Refusing automatic repair while WhatsApp alias routes conflict',
+    );
+  }, 30_000);
 
   test('Make resolves WEB_PORT from .env instead of masking it with 3000', () => {
     const instance = instanceRoot('make-port');

@@ -26,8 +26,10 @@ import {
 } from './db.js';
 import { DATA_DIR } from './config.js';
 import {
+  findWhatsAppAliasRoutingConflicts,
   sourceMatchesChannelConversation,
   type AffectedLeftoverWorkspace,
+  type LeftoverDirectAliasConflict,
   type LeftoverDirectMountDiagnosis,
   type LeftoverDirectWorkspaceMount,
 } from './leftover-direct-mount-diagnostic.js';
@@ -35,6 +37,7 @@ import type { RegisteredGroup, SubAgent } from './types.js';
 
 export type {
   AffectedLeftoverWorkspace,
+  LeftoverDirectAliasConflict,
   LeftoverDirectMountDiagnosis,
   LeftoverDirectWorkspaceMount,
 } from './leftover-direct-mount-diagnostic.js';
@@ -83,6 +86,24 @@ function countRecoverableInboundFromChat(
   ]);
 }
 
+function countRecoverableInboundFromChats(
+  workspaceJid: string,
+  channelJids: readonly string[],
+): number {
+  const knownSources = listRecoverableInboundSourceJids(workspaceJid).filter(
+    (sourceJid) =>
+      channelJids.some((channelJid) =>
+        sourceMatchesConversation(sourceJid, channelJid),
+      ),
+  );
+  return countRecoverableInboundMessagesFromSources(workspaceJid, [
+    ...channelJids.flatMap((channelJid) => [
+      ...conversationAliases(channelJid),
+    ]),
+    ...knownSources,
+  ]);
+}
+
 /**
  * JID-classifiable DMs still bound to workspace main. Feishu stays unknown
  * without metadata and is never selected — that path remains auto_im.
@@ -123,6 +144,9 @@ export function findLeftoverClassifiableDirectWorkspaceMounts(): LeftoverDirectW
 
 export function diagnoseLeftoverClassifiableDirectWorkspaceMounts(): LeftoverDirectMountDiagnosis {
   const leftovers = findLeftoverClassifiableDirectWorkspaceMounts();
+  const aliasConflicts = findWhatsAppAliasRoutingConflicts(
+    getAllRegisteredGroups(),
+  );
   const byWorkspace = new Map<string, LeftoverDirectWorkspaceMount[]>();
   for (const leftover of leftovers) {
     const bucket = byWorkspace.get(leftover.workspaceJid) ?? [];
@@ -142,9 +166,9 @@ export function diagnoseLeftoverClassifiableDirectWorkspaceMounts(): LeftoverDir
       mainSessionId: getSession(folder),
       mainRuntimeSessionId: getWorkspaceRuntimeSession(folder)?.sdk_session_id,
       mainOwnerJid: getSessionChannelOwner(folder, null),
-      recoverableInboundFromLeftovers: mounts.reduce(
-        (sum, mount) => sum + mount.recoverableInboundFromThisChat,
-        0,
+      recoverableInboundFromLeftovers: countRecoverableInboundFromChats(
+        workspaceJid,
+        mounts.map((mount) => mount.channelJid),
       ),
     });
   }
@@ -154,6 +178,7 @@ export function diagnoseLeftoverClassifiableDirectWorkspaceMounts(): LeftoverDir
       getRouterState('schema_version') ?? String(CURRENT_SCHEMA_VERSION),
     leftovers,
     affectedWorkspaces,
+    aliasConflicts,
   };
 }
 
@@ -208,6 +233,16 @@ export function repairLeftoverClassifiableDirectWorkspaceMounts(
   } = {},
 ): LeftoverDirectMountRepairResult {
   const diagnosis = diagnoseLeftoverClassifiableDirectWorkspaceMounts();
+  if (options.apply && diagnosis.aliasConflicts.length > 0) {
+    throw new Error(
+      `Conflicting WhatsApp aliases require manual unbind before repair: ${diagnosis.aliasConflicts
+        .map(
+          (conflict) =>
+            `${conflict.canonicalJid} [${conflict.aliases.join(', ')}]`,
+        )
+        .join('; ')}`,
+    );
+  }
   if (!options.apply || diagnosis.leftovers.length === 0) {
     return {
       ...diagnosis,
