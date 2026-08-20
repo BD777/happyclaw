@@ -2334,6 +2334,30 @@ export function broadcastNewMessage(
   safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
 }
 
+/** Broadcast one committed message-row deletion by its full composite key. */
+export function broadcastMessageDeleted(
+  messageChatJid: string,
+  messageId: string,
+): void {
+  const markerIndex = messageChatJid.indexOf('#agent:');
+  const baseChatJid =
+    markerIndex >= 0 ? messageChatJid.slice(0, markerIndex) : messageChatJid;
+  const agentId =
+    markerIndex >= 0
+      ? messageChatJid.slice(markerIndex + '#agent:'.length)
+      : undefined;
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const wsMsg: WsMessageOut = {
+    type: 'message_deleted',
+    chatJid: jid,
+    messageChatJid,
+    messageId,
+    ...(agentId ? { agentId } : {}),
+  };
+  safeBroadcast(wsMsg, isHostGroupJid(jid), allowedUserIds);
+}
+
 export function broadcastFollowUpUpdate(
   chatJid: string,
   transition?: FollowUpTransition,

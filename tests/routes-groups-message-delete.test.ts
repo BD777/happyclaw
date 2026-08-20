@@ -65,8 +65,13 @@ vi.mock('../src/middleware/auth.ts', () => ({
   },
 }));
 
+const { broadcastMessageDeletedMock } = vi.hoisted(() => ({
+  broadcastMessageDeletedMock: vi.fn(),
+}));
+
 vi.mock('../src/web.js', () => ({
   broadcastNewMessage: () => {},
+  broadcastMessageDeleted: broadcastMessageDeletedMock,
   invalidateAllowedUserCache: () => {},
 }));
 
@@ -124,6 +129,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  broadcastMessageDeletedMock.mockReset();
   db.setRegisteredGroup(JID, {
     name: 'Msg Delete Workspace',
     folder: FOLDER,
@@ -169,6 +175,10 @@ describe('DELETE /:jid/messages/:messageId', () => {
 
     expect(res.status).toBe(200);
     expect(db.getMessage(VIRTUAL_JID, 'msg-runtime-1')).toBeNull();
+    expect(broadcastMessageDeletedMock).toHaveBeenCalledWith(
+      VIRTUAL_JID,
+      'msg-runtime-1',
+    );
   });
 
   test('still deletes a main session message addressed by the workspace JID', async () => {
@@ -243,6 +253,9 @@ describe('DELETE /:jid/messages/:messageId host execution gate', () => {
   const HOST_FOLDER = 'msgdel-host-workspace';
   const HOST_SESSION_ID = 'session-msgdel-host';
   const HOST_VIRTUAL_JID = `${HOST_JID}#agent:${HOST_SESSION_ID}`;
+  const HOST_IM_JID = 'feishu:msgdel-host-home-sibling';
+  const BOUND_HOST_IM_JID = 'telegram:msgdel-bound-host-workspace';
+  const CROSS_OWNER_IM_JID = 'qq:msgdel-cross-owner-host-workspace';
 
   beforeEach(() => {
     db.setRegisteredGroup(HOST_JID, {
@@ -251,7 +264,33 @@ describe('DELETE /:jid/messages/:messageId host execution gate', () => {
       added_at: new Date().toISOString(),
       executionMode: 'host',
       created_by: OWNER_ID,
+      is_home: true,
+    } as any);
+    db.setRegisteredGroup(HOST_IM_JID, {
+      name: 'Host Home IM sibling',
+      folder: HOST_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
       is_home: false,
+    } as any);
+    db.setRegisteredGroup(BOUND_HOST_IM_JID, {
+      name: 'Bound host workspace IM',
+      folder: 'channel-owner-folder',
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: false,
+      target_main_jid: HOST_JID,
+    } as any);
+    db.setRegisteredGroup(CROSS_OWNER_IM_JID, {
+      name: 'Cross-owner host workspace IM',
+      folder: 'other-channel-owner-folder',
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OTHER_ID,
+      is_home: false,
+      target_main_jid: HOST_JID,
     } as any);
     db.createAgent({
       id: HOST_SESSION_ID,
@@ -277,6 +316,13 @@ describe('DELETE /:jid/messages/:messageId host execution gate', () => {
     } catch {
       /* ignore */
     }
+    for (const jid of [HOST_IM_JID, BOUND_HOST_IM_JID, CROSS_OWNER_IM_JID]) {
+      try {
+        db.deleteRegisteredGroup(jid);
+      } catch {
+        /* ignore */
+      }
+    }
   });
 
   test('a non-admin owner is denied on the workspace JID', async () => {
@@ -297,6 +343,41 @@ describe('DELETE /:jid/messages/:messageId host execution gate', () => {
 
     expect(res.status).toBe(403);
     expect(db.getMessage(HOST_VIRTUAL_JID, 'msg-host-2')).not.toBeNull();
+  });
+
+  test('a non-admin owner is denied through a container-default Home IM sibling', async () => {
+    seedMessage('msg-host-home-im', HOST_IM_JID, OWNER_ID);
+    asUser(OWNER_ID, 'member');
+
+    const res = await del(HOST_IM_JID, 'msg-host-home-im');
+
+    expect(res.status).toBe(403);
+    expect(db.getMessage(HOST_IM_JID, 'msg-host-home-im')).not.toBeNull();
+  });
+
+  test('a non-admin owner is denied through an IM chat bound to a host workspace', async () => {
+    seedMessage('msg-host-bound-im', BOUND_HOST_IM_JID, OWNER_ID);
+    asUser(OWNER_ID, 'member');
+
+    const res = await del(BOUND_HOST_IM_JID, 'msg-host-bound-im');
+
+    expect(res.status).toBe(403);
+    expect(
+      db.getMessage(BOUND_HOST_IM_JID, 'msg-host-bound-im'),
+    ).not.toBeNull();
+  });
+
+  test('a workspace admin cannot delete a physical IM row owned by another user', async () => {
+    seedMessage('msg-cross-owner-im', CROSS_OWNER_IM_JID, OTHER_ID);
+    asUser(OWNER_ID, 'admin');
+
+    const res = await del(CROSS_OWNER_IM_JID, 'msg-cross-owner-im');
+
+    expect(res.status).toBe(404);
+    expect(
+      db.getMessage(CROSS_OWNER_IM_JID, 'msg-cross-owner-im'),
+    ).not.toBeNull();
+    expect(broadcastMessageDeletedMock).not.toHaveBeenCalled();
   });
 
   test('an admin owner can still delete', async () => {
