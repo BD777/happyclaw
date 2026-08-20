@@ -1,7 +1,7 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
-       backup restore help _ensure-docker-image docker-pull logs status stop \
+       backup restore leftover-direct-mounts help _ensure-docker-image docker-pull logs status stop \
        _check-sync _ensure-builtin-skills _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
 
 # ─── Runtime ────────────────────────────────────────────────
@@ -9,7 +9,11 @@
 # 原因：主服务的 WebSocket 走 `ws` 包 + @hono/node-server 的 `server.on('upgrade')`
 # 握手，该模式在 bun 的 HTTP server 下不触发，会导致 WS 全部握手失败（HTTP/接口正常，
 # 但前端实时流式卡片/通知全失效，飞书等 stdout 通道不受影响）。
-PORT    ?= $(or $(WEB_PORT),3000)
+# Resolve .env before choosing the Make-level default. Without this, exporting
+# WEB_PORT=3000 here masks a custom .env port in every child process, including
+# maintenance safety checks.
+DOTENV_WEB_PORT := $(shell node -e "try { process.loadEnvFile(); } catch {} process.stdout.write(process.env.WEB_PORT || '')")
+PORT    ?= $(or $(WEB_PORT),$(DOTENV_WEB_PORT),3000)
 export WEB_PORT := $(PORT)
 PKG     := npm
 RUN     := npx
@@ -287,6 +291,9 @@ backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 	mv "$$TMP_FILE" "$$FILE"; \
 	chmod 600 "$$FILE"; \
 	echo "✅ 备份完成：$$FILE ($$(du -sh "$$FILE" | cut -f1))"
+
+leftover-direct-mounts: ## 诊断仍挂在 workspace main 上的可判定私聊（默认 dry-run；APPLY=1 才修复并重置隔离代）
+	$(RUN) tsx scripts/repair-leftover-direct-mounts.ts $(if $(filter 1 yes true,$(APPLY)),--apply,)
 
 restore: ## 从 happyclaw-backup-*.tar.gz 恢复数据（用法：make restore 或 make restore FILE=xxx.tar.gz）
 	@set -eu; \
