@@ -107,7 +107,6 @@ import {
   getAllChats,
   getAllChatJids,
   getAllRegisteredGroups,
-  migrateLegacyWhatsAppRegisteredGroupJidAlias,
   getAllSessions,
   hasContainerModeGroups,
   getAllTasks,
@@ -284,7 +283,8 @@ import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
   canonicalizeWhatsAppConversationJid,
-  findLegacyWhatsAppConversationAliases,
+  failClosedWhatsAppAliasConflictJid,
+  resolveWhatsAppConversationAliasFromGroups,
 } from './whatsapp-jid.js';
 import {
   appendStreamingSessionAnswer,
@@ -19802,40 +19802,25 @@ function resolveChannelAccountWorkspace(account: ChannelAccount): {
 }
 
 /**
- * Preserve an existing WhatsApp pairing when a legacy raw `@c.us` identity is
- * first observed through the canonical `@s.whatsapp.net` transport boundary.
- * The DB move keeps the mount unchanged; privacy repair for a legacy
- * target_main_jid remains the explicit #664 diagnostic/apply workflow.
+ * Resolve a canonical WhatsApp transport identity onto an existing legacy key
+ * without changing durable data. Authorization still runs after this lookup.
  */
 function normalizeWhatsAppInboundConversationJid(jid: string): string {
   const canonicalJid = canonicalizeWhatsAppConversationJid(jid);
-  const aliases = findLegacyWhatsAppConversationAliases(
+  const resolved = resolveWhatsAppConversationAliasFromGroups(
     canonicalJid,
-    Object.keys(registeredGroups),
+    registeredGroups,
   );
-  for (const legacyJid of aliases) {
-    const result = migrateLegacyWhatsAppRegisteredGroupJidAlias(
-      legacyJid,
-      canonicalJid,
+  if (resolved.status === 'conflict') {
+    logger.warn(
+      { canonicalJid, aliases: resolved.aliases },
+      'Rejected ambiguous legacy WhatsApp aliases; run offline repair',
     );
-    if (result === 'migrated') {
-      const migrated = getRegisteredGroup(canonicalJid);
-      delete registeredGroups[legacyJid];
-      if (migrated) registeredGroups[canonicalJid] = migrated;
-      logger.info(
-        { legacyJid, canonicalJid },
-        'Canonicalized legacy WhatsApp direct-chat identity',
-      );
-      continue;
-    }
-    if (result === 'canonical_exists') {
-      logger.warn(
-        { legacyJid, canonicalJid },
-        'Preserved duplicate legacy WhatsApp identity for operator repair',
-      );
-    }
+    // A deliberately non-matching account scope makes both ordinary admission
+    // and `/pair` fail closed, including legacy-default account flows.
+    return failClosedWhatsAppAliasConflictJid(canonicalJid);
   }
-  return canonicalJid;
+  return resolved.jid;
 }
 
 async function disconnectChannelAccountById(accountId: string): Promise<void> {

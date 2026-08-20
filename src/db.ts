@@ -72,10 +72,6 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 import { channelConversationJid } from './channel-address.js';
 import { resolveChannelConversationKind } from './channel-conversation-kind.js';
-import {
-  canonicalizeWhatsAppConversationJid,
-  isLegacyWhatsAppDirectConversationJid,
-} from './whatsapp-jid.js';
 import { getChannelFromJid } from './channel-prefixes.js';
 import { parseAudienceMode } from './im-audience-policy.js';
 import { parseContainerConfig } from './mount-security.js';
@@ -11330,114 +11326,6 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       syncAgentChannelMountsForWorkspaceJid(jid);
     }
   })();
-}
-
-export type LegacyWhatsAppJidAliasMigrationResult =
-  | 'migrated'
-  | 'missing'
-  | 'canonical_exists'
-  | 'invalid';
-
-/**
- * Rename one account-scoped legacy WhatsApp direct-chat identity without
- * changing its mount. This is intentionally a runtime alias reconciliation,
- * not a schema migration: a raw `@c.us` notify may have been admitted after a
- * v73 database was already stamped, and bumping the schema would also trigger
- * the owner's explicitly-disabled migration backup path.
- *
- * A canonical row always wins. We never merge two independently configured
- * rows here; the leftover-mount diagnostic/repair flow can inspect that state
- * explicitly. The common legacy-only case is moved atomically before admission
- * so the existing pairing and channel_direct mount remain valid.
- */
-export function migrateLegacyWhatsAppRegisteredGroupJidAlias(
-  legacyJid: string,
-  canonicalJid: string,
-): LegacyWhatsAppJidAliasMigrationResult {
-  if (
-    legacyJid === canonicalJid ||
-    !isLegacyWhatsAppDirectConversationJid(legacyJid) ||
-    canonicalizeWhatsAppConversationJid(legacyJid) !== canonicalJid ||
-    canonicalizeWhatsAppConversationJid(canonicalJid) !== canonicalJid
-  ) {
-    return 'invalid';
-  }
-
-  return db
-    .transaction((): LegacyWhatsAppJidAliasMigrationResult => {
-      const legacy = db
-        .prepare('SELECT 1 FROM registered_groups WHERE jid = ?')
-        .get(legacyJid);
-      if (!legacy) return 'missing';
-      const canonical = db
-        .prepare('SELECT 1 FROM registered_groups WHERE jid = ?')
-        .get(canonicalJid);
-      if (canonical) return 'canonical_exists';
-
-      const legacyAddress = parseChannelAddressForAliasMigration(legacyJid);
-      const canonicalAddress =
-        parseChannelAddressForAliasMigration(canonicalJid);
-
-      db.prepare('UPDATE registered_groups SET jid = ? WHERE jid = ?').run(
-        canonicalJid,
-        legacyJid,
-      );
-      db.prepare(
-        'UPDATE channel_mounts SET channel_jid = ? WHERE channel_jid = ?',
-      ).run(canonicalJid, legacyJid);
-      db.prepare(
-        'UPDATE agent_channel_mounts SET channel_jid = ? WHERE channel_jid = ?',
-      ).run(canonicalJid, legacyJid);
-      db.prepare(
-        'UPDATE im_context_bindings SET source_jid = ? WHERE source_jid = ?',
-      ).run(canonicalJid, legacyJid);
-      db.prepare('UPDATE messages SET source_jid = ? WHERE source_jid = ?').run(
-        canonicalJid,
-        legacyJid,
-      );
-      db.prepare('UPDATE agents SET last_im_jid = ? WHERE last_im_jid = ?').run(
-        canonicalJid,
-        legacyJid,
-      );
-      db.prepare(
-        "UPDATE router_state SET value = ? WHERE value = ? AND key LIKE 'channel_session_owner:%'",
-      ).run(canonicalJid, legacyJid);
-      db.prepare(
-        `INSERT OR IGNORE INTO user_pinned_groups (user_id, jid, pinned_at)
-         SELECT user_id, ?, pinned_at FROM user_pinned_groups WHERE jid = ?`,
-      ).run(canonicalJid, legacyJid);
-      db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(legacyJid);
-
-      if (legacyAddress && canonicalAddress) {
-        db.prepare('UPDATE messages SET sender = ? WHERE sender = ?').run(
-          canonicalAddress,
-          legacyAddress,
-        );
-      }
-
-      // Source-chat metadata has no routing authority. Preserve a historical
-      // legacy chat row if messages use it as chat_jid; otherwise fold its name
-      // and timestamp into the canonical key without deleting message history.
-      db.prepare(
-        `INSERT OR IGNORE INTO chats (jid, name, last_message_time)
-         SELECT ?, name, last_message_time FROM chats WHERE jid = ?`,
-      ).run(canonicalJid, legacyJid);
-      db.prepare(
-        `DELETE FROM chats
-         WHERE jid = ? AND NOT EXISTS (
-           SELECT 1 FROM messages WHERE chat_jid = ?
-         )`,
-      ).run(legacyJid, legacyJid);
-      return 'migrated';
-    })
-    .immediate();
-}
-
-function parseChannelAddressForAliasMigration(jid: string): string | null {
-  const prefix = 'whatsapp:';
-  if (!jid.startsWith(prefix)) return null;
-  const end = jid.indexOf('#');
-  return `${prefix}${jid.slice(prefix.length, end >= 0 ? end : undefined)}`;
 }
 
 /**

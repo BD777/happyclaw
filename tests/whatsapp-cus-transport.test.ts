@@ -90,6 +90,8 @@ vi.mock('proxy-agent', () => ({
 }));
 
 const { createWhatsAppConnection } = await import('../src/whatsapp.js');
+const { resolveWhatsAppConversationAlias } =
+  await import('../src/whatsapp-jid.js');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whatsapp-cus-transport-'));
 
@@ -193,6 +195,95 @@ describe('WhatsApp legacy @c.us transport identity', () => {
       'whatsapp:15551234567@s.whatsapp.net#account:bot-b',
       'Legacy contact',
     );
+  });
+
+  test('unauthorized legacy inbound performs no persistence or routing writes', async () => {
+    const onNewChat = vi.fn();
+    const resolveEffectiveChatJid = vi.fn(() => ({
+      effectiveJid: 'must-not-route',
+      agentId: null,
+    }));
+    const isChatAuthorized = vi.fn(() => false);
+    const connection = createWhatsAppConnection({
+      accountId: 'bot-denied',
+      authDir: path.join(root, 'bot-denied'),
+    });
+    await connection.connect({
+      onNewChat,
+      isChatAuthorized,
+      resolveEffectiveChatJid,
+      normalizeIncomingJid: (jid) => `${jid}#account:bot-denied`,
+    });
+    const socket = harness.sockets.at(-1)!;
+    await socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [message('15551234567:14@c.us', 'denied-1')],
+    });
+
+    expect(isChatAuthorized).toHaveBeenCalledWith(
+      'whatsapp:15551234567@s.whatsapp.net#account:bot-denied',
+    );
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(resolveEffectiveChatJid).not.toHaveBeenCalled();
+    expect(db.storeChatMetadata).not.toHaveBeenCalled();
+    expect(db.updateChatName).not.toHaveBeenCalled();
+    expect(db.storeMessageDirect).not.toHaveBeenCalled();
+  });
+
+  test('a unique legacy pairing keeps its exact active route without re-pairing', async () => {
+    const legacy = 'whatsapp:15551234567:14@c.us#account:bot-a';
+    const onNewChat = vi.fn();
+    const onPairAttempt = vi.fn(async () => false);
+    const onAgentMessage = vi.fn();
+    const isChatAuthorized = vi.fn((jid: string) => jid === legacy);
+    const resolveEffectiveChatJid = vi.fn(() => ({
+      effectiveJid: 'web:existing-workspace#agent:existing-session',
+      agentId: 'existing-session',
+    }));
+    const connection = createWhatsAppConnection({
+      accountId: 'bot-a',
+      authDir: path.join(root, 'bot-a-legacy'),
+    });
+    await connection.connect({
+      onNewChat,
+      onPairAttempt,
+      onAgentMessage,
+      isChatAuthorized,
+      resolveEffectiveChatJid,
+      normalizeIncomingJid: (jid) => {
+        const scoped = `${jid}#account:bot-a`;
+        const resolved = resolveWhatsAppConversationAlias(scoped, [legacy]);
+        if (resolved.status === 'conflict') throw new Error('unexpected');
+        return resolved.jid;
+      },
+    });
+    const socket = harness.sockets.at(-1)!;
+    for (const [remoteJid, id] of [
+      ['15551234567:14@c.us', 'legacy-route-1'],
+      ['15551234567@s.whatsapp.net', 'legacy-route-2'],
+    ]) {
+      await socket.emit('messages.upsert', {
+        type: 'notify',
+        messages: [message(remoteJid, id)],
+      });
+    }
+
+    expect(isChatAuthorized.mock.calls.map(([jid]) => jid)).toEqual([
+      legacy,
+      legacy,
+    ]);
+    expect(onPairAttempt).not.toHaveBeenCalled();
+    expect(onNewChat.mock.calls.map(([jid]) => jid)).toEqual([legacy, legacy]);
+    expect(resolveEffectiveChatJid.mock.calls.map(([jid]) => jid)).toEqual([
+      legacy,
+      legacy,
+    ]);
+    expect(onAgentMessage).toHaveBeenCalledTimes(2);
+    for (const call of db.storeMessageDirect.mock.calls) {
+      expect(call[1]).toBe('web:existing-workspace#agent:existing-session');
+      expect(call[2]).toBe('whatsapp:15551234567@s.whatsapp.net');
+      expect(call[7]).toMatchObject({ sourceJid: legacy });
+    }
   });
 
   test('uses canonical identity for pairing but replies through the raw SDK target', async () => {

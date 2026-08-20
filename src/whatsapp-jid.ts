@@ -1,9 +1,11 @@
 import { jidNormalizedUser } from 'baileys';
 
-import { parseChannelAddress } from './channel-address.js';
+import { parseChannelAddress, scopeChannelJid } from './channel-address.js';
 
 const WHATSAPP_PREFIX = 'whatsapp:';
 const LEGACY_USER_SUFFIX = '@c.us';
+export const WHATSAPP_ALIAS_CONFLICT_ACCOUNT_ID =
+  '__happyclaw_whatsapp_alias_conflict__';
 const DIRECT_USER_SUFFIXES = [
   '@s.whatsapp.net',
   '@hosted.lid',
@@ -70,4 +72,107 @@ export function findLegacyWhatsAppConversationAliases(
     }
   }
   return aliases;
+}
+
+export type WhatsAppConversationAliasResolution =
+  | { status: 'canonical' | 'new'; jid: string; aliases: [] }
+  | { status: 'legacy'; jid: string; aliases: [string] }
+  | { status: 'legacy_equivalent'; jid: string; aliases: string[] }
+  | { status: 'conflict'; jid: null; aliases: string[] };
+
+export interface WhatsAppAliasRoutingMetadata {
+  folder: string;
+  created_by?: string;
+  channel_account_id?: string;
+  target_main_jid?: string;
+  target_agent_id?: string;
+  owner_im_id?: string;
+  owner_claim_source?: string;
+  binding_mode?: string;
+  reply_policy?: string;
+  require_mention?: boolean;
+  activation_mode?: string;
+  audience_mode?: string;
+  sender_allowlist?: readonly string[] | null;
+}
+
+/**
+ * Resolve an inbound logical identity without mutating persisted data. A lone
+ * legacy alias keeps its exact key so pairing, active turns, and route lookups
+ * remain stable. Once a canonical row exists it wins. Multiple legacy rows are
+ * ambiguous and must be repaired offline instead of guessing online.
+ */
+export function resolveWhatsAppConversationAlias(
+  jid: string,
+  candidates: Iterable<string>,
+): WhatsAppConversationAliasResolution {
+  const canonical = canonicalizeWhatsAppConversationJid(jid);
+  const existing = new Set(candidates);
+  if (existing.has(canonical)) {
+    return { status: 'canonical', jid: canonical, aliases: [] };
+  }
+  const aliases = findLegacyWhatsAppConversationAliases(canonical, existing);
+  if (aliases.length === 1) {
+    return { status: 'legacy', jid: aliases[0]!, aliases: [aliases[0]!] };
+  }
+  if (aliases.length > 1) {
+    return { status: 'conflict', jid: null, aliases };
+  }
+  return { status: 'new', jid: canonical, aliases: [] };
+}
+
+function aliasRoutingSignature(group: WhatsAppAliasRoutingMetadata): string {
+  return JSON.stringify({
+    folder: group.folder,
+    created_by: group.created_by ?? null,
+    channel_account_id: group.channel_account_id ?? null,
+    target_main_jid: group.target_main_jid ?? null,
+    target_agent_id: group.target_agent_id ?? null,
+    owner_im_id: group.owner_im_id ?? null,
+    owner_claim_source: group.owner_claim_source ?? null,
+    binding_mode: group.binding_mode ?? 'single_context',
+    reply_policy: group.reply_policy ?? 'source_only',
+    require_mention: group.require_mention === true,
+    activation_mode: group.activation_mode ?? 'auto',
+    audience_mode: group.audience_mode ?? 'everyone',
+    sender_allowlist: [...(group.sender_allowlist ?? [])].sort(),
+  });
+}
+
+/**
+ * Production resolver with enough metadata to recognize aliases already made
+ * equivalent by the offline repair. Identity-only callers remain conservative
+ * and receive `conflict` for every multi-alias set.
+ */
+export function resolveWhatsAppConversationAliasFromGroups(
+  jid: string,
+  groups: Readonly<Record<string, WhatsAppAliasRoutingMetadata>>,
+): WhatsAppConversationAliasResolution {
+  const resolved = resolveWhatsAppConversationAlias(jid, Object.keys(groups));
+  if (resolved.status !== 'conflict') return resolved;
+  const aliases = [...resolved.aliases].sort();
+  const signatures = aliases.map((alias) => {
+    const group = groups[alias];
+    return group ? aliasRoutingSignature(group) : null;
+  });
+  if (
+    signatures.length > 0 &&
+    signatures[0] !== null &&
+    signatures.every((signature) => signature === signatures[0])
+  ) {
+    return {
+      status: 'legacy_equivalent',
+      jid: aliases[0]!,
+      aliases,
+    };
+  }
+  return { status: 'conflict', jid: null, aliases };
+}
+
+/** Return a valid-shaped but deliberately unauthorized key for ambiguity. */
+export function failClosedWhatsAppAliasConflictJid(jid: string): string {
+  return scopeChannelJid(
+    canonicalizeWhatsAppConversationJid(jid),
+    WHATSAPP_ALIAS_CONFLICT_ACCOUNT_ID,
+  );
 }
