@@ -13,6 +13,14 @@ import {
   stripChannelPrefix,
   stripLeadingWhatsAppBotMention,
 } from '../src/whatsapp.js';
+import {
+  canonicalizeWhatsAppConversationJid,
+  canonicalizeWhatsAppProviderConversationJid,
+  findLegacyWhatsAppConversationAliases,
+  isLegacyWhatsAppDirectConversationJid,
+  resolveWhatsAppConversationAlias,
+  resolveWhatsAppConversationAliasFromGroups,
+} from '../src/whatsapp-jid.js';
 
 describe('extractMessageText', () => {
   test('plain conversation', () => {
@@ -130,6 +138,122 @@ describe('stripChannelPrefix', () => {
 
   test('passes through when no prefix', () => {
     expect(stripChannelPrefix('123@g.us')).toBe('123@g.us');
+  });
+});
+
+describe('WhatsApp durable conversation JID canonicalization', () => {
+  test('folds legacy and device PN forms without changing groups', () => {
+    expect(
+      canonicalizeWhatsAppProviderConversationJid('15551234567@c.us'),
+    ).toBe('15551234567@s.whatsapp.net');
+    expect(
+      canonicalizeWhatsAppProviderConversationJid('15551234567:14@c.us'),
+    ).toBe('15551234567@s.whatsapp.net');
+    expect(
+      canonicalizeWhatsAppProviderConversationJid(
+        '15551234567:14@s.whatsapp.net',
+      ),
+    ).toBe('15551234567@s.whatsapp.net');
+    expect(
+      canonicalizeWhatsAppProviderConversationJid('120363012345678901@g.us'),
+    ).toBe('120363012345678901@g.us');
+  });
+
+  test('preserves account scope and finds only aliases from the same bot', () => {
+    const canonical = 'whatsapp:15551234567@s.whatsapp.net#account:bot-a';
+    const legacy = 'whatsapp:15551234567:14@c.us#account:bot-a';
+    expect(canonicalizeWhatsAppConversationJid(legacy)).toBe(canonical);
+    expect(isLegacyWhatsAppDirectConversationJid(legacy)).toBe(true);
+    expect(isLegacyWhatsAppDirectConversationJid(canonical)).toBe(false);
+    expect(
+      findLegacyWhatsAppConversationAliases(canonical, [
+        legacy,
+        'whatsapp:15551234567@c.us#account:bot-b',
+        'whatsapp:19990001111@c.us#account:bot-a',
+        canonical,
+      ]),
+    ).toEqual([legacy]);
+  });
+
+  test('keeps one legacy route stable, prefers canonical, and fails closed on ambiguity', () => {
+    const canonical = 'whatsapp:15551234567@s.whatsapp.net#account:bot-a';
+    const legacy = 'whatsapp:15551234567:14@c.us#account:bot-a';
+    expect(resolveWhatsAppConversationAlias(canonical, [legacy])).toEqual({
+      status: 'legacy',
+      jid: legacy,
+      aliases: [legacy],
+    });
+    expect(
+      resolveWhatsAppConversationAlias(canonical, [legacy, canonical]),
+    ).toEqual({ status: 'canonical', jid: canonical, aliases: [] });
+    expect(
+      resolveWhatsAppConversationAlias(canonical, [
+        'whatsapp:15551234567@c.us#account:bot-b',
+      ]),
+    ).toEqual({ status: 'new', jid: canonical, aliases: [] });
+    expect(
+      resolveWhatsAppConversationAlias(canonical, [
+        legacy,
+        'whatsapp:15551234567@c.us#account:bot-a',
+      ]),
+    ).toEqual({
+      status: 'conflict',
+      jid: null,
+      aliases: [legacy, 'whatsapp:15551234567@c.us#account:bot-a'],
+    });
+  });
+
+  test('accepts deterministically only when repaired legacy aliases have equivalent routing and permissions', () => {
+    const canonical = 'whatsapp:15551234567@s.whatsapp.net#account:bot-a';
+    const first = 'whatsapp:15551234567:14@c.us#account:bot-a';
+    const second = 'whatsapp:15551234567@c.us#account:bot-a';
+    const equivalent = {
+      folder: 'home-owner',
+      created_by: 'owner-a',
+      channel_account_id: 'bot-a',
+      target_agent_id: 'same-repaired-session',
+      owner_im_id: '15551234567@s.whatsapp.net',
+      owner_claim_source: 'trusted_direct',
+      activation_mode: 'auto',
+      audience_mode: 'everyone',
+    };
+    expect(
+      resolveWhatsAppConversationAliasFromGroups(canonical, {
+        [second]: { ...equivalent },
+        [first]: { ...equivalent },
+      }),
+    ).toEqual({
+      status: 'legacy_equivalent',
+      jid: first,
+      aliases: [first, second],
+    });
+
+    for (const groups of [
+      {
+        [first]: { ...equivalent, target_agent_id: 'session-a' },
+        [second]: { ...equivalent, target_agent_id: 'session-b' },
+      },
+      {
+        [first]: {
+          ...equivalent,
+          target_agent_id: undefined,
+          target_main_jid: 'web:workspace-a',
+        },
+        [second]: {
+          ...equivalent,
+          target_agent_id: undefined,
+          target_main_jid: 'web:workspace-b',
+        },
+      },
+      {
+        [first]: { ...equivalent, owner_im_id: 'owner-a@s.whatsapp.net' },
+        [second]: { ...equivalent, owner_im_id: 'owner-b@s.whatsapp.net' },
+      },
+    ]) {
+      expect(
+        resolveWhatsAppConversationAliasFromGroups(canonical, groups),
+      ).toMatchObject({ status: 'conflict', jid: null });
+    }
   });
 });
 

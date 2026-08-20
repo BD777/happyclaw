@@ -1,3 +1,5 @@
+import { isWhatsAppDirectProviderJid } from './whatsapp-jid.js';
+
 /**
  * Provider-neutral classification for an external channel conversation.
  *
@@ -61,15 +63,11 @@ export function resolveChannelConversationKind(
 
   if (baseJid.startsWith('whatsapp:')) {
     // Live JIDs are `whatsapp:${remoteJid}` from Baileys. User chats are PN
-    // (`@s.whatsapp.net`, including device-suffixed `user:device@…`), LID
+    // (`@s.whatsapp.net`, including device-suffixed `user:device@…`), legacy
+    // PN (`@c.us`, still used for official-biz / PSA / older devices), LID
     // (`@lid`), and hosted PN/LID (`@hosted`, `@hosted.lid`). Groups stay
     // `@g.us`. Do not guess other suffixes as groups.
-    if (
-      baseJid.endsWith('@s.whatsapp.net') ||
-      baseJid.endsWith('@hosted.lid') ||
-      baseJid.endsWith('@lid') ||
-      baseJid.endsWith('@hosted')
-    ) {
+    if (isWhatsAppDirectProviderJid(baseJid.slice('whatsapp:'.length))) {
       return 'direct';
     }
     if (baseJid.endsWith('@g.us')) return 'group';

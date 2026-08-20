@@ -282,6 +282,10 @@ import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
+  canonicalizeWhatsAppConversationJid,
+  resolveWhatsAppConversationAliasFromGroups,
+} from './whatsapp-jid.js';
+import {
   appendStreamingSessionAnswer,
   getChannelType,
   extractChatId,
@@ -19796,6 +19800,26 @@ function resolveChannelAccountWorkspace(account: ChannelAccount): {
   });
 }
 
+/**
+ * Resolve a canonical WhatsApp transport identity onto an existing legacy key
+ * without changing durable data. Authorization still runs after this lookup.
+ */
+function normalizeWhatsAppInboundConversationJid(jid: string): string | null {
+  const canonicalJid = canonicalizeWhatsAppConversationJid(jid);
+  const resolved = resolveWhatsAppConversationAliasFromGroups(
+    canonicalJid,
+    registeredGroups,
+  );
+  if (resolved.status === 'conflict') {
+    logger.warn(
+      { canonicalJid, aliases: resolved.aliases },
+      'Rejected ambiguous legacy WhatsApp aliases; run offline repair',
+    );
+    return null;
+  }
+  return resolved.jid;
+}
+
 async function disconnectChannelAccountById(accountId: string): Promise<void> {
   const account = getChannelAccount(accountId);
   if (!account) return;
@@ -20197,6 +20221,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
         onNewChat,
         {
           ...common,
+          normalizeIncomingJid: normalizeWhatsAppInboundConversationJid,
           isChatAuthorized: buildIsChatAuthorized(
             account.owner_user_id,
             account.id,

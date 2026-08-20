@@ -47,6 +47,7 @@ import {
   evaluateChannelAdmission,
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
+import { canonicalizeWhatsAppProviderConversationJid } from './whatsapp-jid.js';
 
 const CHANNEL_PREFIX = 'whatsapp:';
 /** WhatsApp text message safe limit. Baileys allows up to 64KB but UX clamps far below. */
@@ -118,7 +119,7 @@ export interface WhatsAppConnectOpts {
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** WhatsApp 专属：连接状态变化回调（QR 出现、connected、断线等） */
   onConnectionUpdate?: (state: WhatsAppConnectionState) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface WhatsAppConnection {
@@ -281,10 +282,10 @@ export function createWhatsAppConnection(
         groupNameCache.set(remoteJid, subject);
         try {
           const rawJid = `${CHANNEL_PREFIX}${remoteJid}`;
-          updateChatName(
-            opts?.normalizeIncomingJid?.(rawJid) ?? rawJid,
-            subject,
-          );
+          const normalizedJid = opts?.normalizeIncomingJid
+            ? opts.normalizeIncomingJid(rawJid)
+            : rawJid;
+          if (normalizedJid) updateChatName(normalizedJid, subject);
         } catch (err) {
           logger.debug({ err, remoteJid }, 'Failed to persist group name');
         }
@@ -517,7 +518,10 @@ export function createWhatsAppConnection(
         if (!involvesSelf) return;
 
         const rawJid = `${CHANNEL_PREFIX}${update.id}`;
-        const chatJid = opts?.normalizeIncomingJid?.(rawJid) ?? rawJid;
+        const chatJid = opts?.normalizeIncomingJid
+          ? opts.normalizeIncomingJid(rawJid)
+          : rawJid;
+        if (!chatJid) return;
         if (update.action === 'add') {
           let chatName = update.id;
           try {
@@ -653,6 +657,13 @@ export function createWhatsAppConnection(
       return;
     }
 
+    // Baileys normally normalizes legacy PN JIDs before `messages.upsert`, but
+    // placeholder-resend and other synthetic notify paths can retain raw
+    // `user:device@c.us`. Keep `remoteJid` untouched for provider acks/replies,
+    // while every HappyClaw identity uses one stable canonical conversation.
+    const logicalRemoteJid =
+      canonicalizeWhatsAppProviderConversationJid(remoteJid);
+
     // Global stale-message drop (>30min). Independent of reconnect filter
     // below; handles edge cases like webhook retries delivering an hour late.
     const tsMs = normalizeTimestamp(messageTimestamp);
@@ -665,10 +676,11 @@ export function createWhatsAppConnection(
     }
 
     // LRU dedup + in-flight lock: skip duplicates that re-arrive at reconnect
-    // / stream-switch boundaries. Keyed by (remoteJid, key.id) because Baileys
-    // reuses key.id across chats. Messages without key.id bypass both checks
-    // (no way to address them reliably).
-    const dedupKey = key.id ? `${remoteJid}|${key.id}` : '';
+    // / stream-switch boundaries. Keyed by (canonical remote JID, key.id) so a
+    // placeholder resend cannot bypass dedup by changing `@c.us` into
+    // `@s.whatsapp.net`; Baileys also reuses key.id across unrelated chats.
+    // Messages without key.id bypass both checks (no reliable address).
+    const dedupKey = key.id ? `${logicalRemoteJid}|${key.id}` : '';
     if (dedupKey) {
       if (isDuplicate(dedupKey)) {
         logger.debug(
@@ -700,12 +712,21 @@ export function createWhatsAppConnection(
       // detection all see the real inner message (they otherwise diverge).
       const inner = unwrapMessageContent(content);
       let text = extractMessageText(inner);
-      const rawChatJid = `${CHANNEL_PREFIX}${remoteJid}`;
-      const chatJid = opts.normalizeIncomingJid?.(rawChatJid) ?? rawChatJid;
+      const rawChatJid = `${CHANNEL_PREFIX}${logicalRemoteJid}`;
+      const chatJid = opts.normalizeIncomingJid
+        ? opts.normalizeIncomingJid(rawChatJid)
+        : rawChatJid;
+      if (!chatJid) {
+        logger.warn(
+          { remoteJid, msgId: key.id },
+          'WhatsApp inbound identity rejected before admission',
+        );
+        return;
+      }
       const isGroup = remoteJid.endsWith('@g.us');
       const senderRaw = isGroup ? key.participant || remoteJid : remoteJid;
       const senderImId = jidNormalizedUser(senderRaw);
-      const senderId = `${CHANNEL_PREFIX}${senderRaw}`;
+      const senderId = `${CHANNEL_PREFIX}${senderImId || senderRaw}`;
       const senderName = pushName || (isGroup ? '群成员' : remoteJid);
       const chatName =
         groupNameCache.get(remoteJid) || (isGroup ? remoteJid : senderName);

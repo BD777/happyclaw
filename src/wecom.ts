@@ -75,7 +75,7 @@ export interface WeComConnectOpts {
     sourceJid?: string;
   } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
@@ -337,7 +337,9 @@ export function createWeComConnection(
       }
 
       let jid = conversation.jid;
-      if (opts?.normalizeIncomingJid) jid = opts.normalizeIncomingJid(jid);
+      if (opts?.normalizeIncomingJid) {
+        jid = opts.normalizeIncomingJid(jid) ?? jid;
+      }
       const fromUserId = body.from?.userid;
       if (!fromUserId) return;
       const senderName = fromUserId;

@@ -191,7 +191,7 @@ export interface ConnectOptions {
   ) => FollowUpActionResult;
   /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
   onP2pSender?: (senderOpenId: string) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
   /** Recovery gate: durable Inbox remains replayable instead of ignored. */
   shouldDeferInbound?: () => boolean;
 }

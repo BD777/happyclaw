@@ -82,7 +82,7 @@ export interface TelegramConnectOpts {
     chatJid: string,
     contextType: 'thread',
   ) => boolean | void | Promise<boolean | void>;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 /**

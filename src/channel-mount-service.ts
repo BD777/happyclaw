@@ -14,6 +14,7 @@ import {
 } from './channel-address.js';
 import { applyChannelAccountRegistrationFallback } from './channel-account-routing.js';
 import { resolveChannelConversationKind } from './channel-conversation-kind.js';
+import { canonicalizeWhatsAppConversationJid } from './whatsapp-jid.js';
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
 import { requiresMention as feishuRequiresMention } from './feishu-conversation-policy.js';
 import {
@@ -334,9 +335,12 @@ function matchesDirectConversationJid(
   conversationJid: string,
 ): boolean {
   if (!lastImJid) return false;
+  const canonicalConversation = canonicalizeWhatsAppConversationJid(
+    channelConversationJid(conversationJid),
+  );
   return (
-    lastImJid === conversationJid ||
-    channelConversationJid(lastImJid) === conversationJid
+    canonicalizeWhatsAppConversationJid(channelConversationJid(lastImJid)) ===
+    canonicalConversation
   );
 }
 
