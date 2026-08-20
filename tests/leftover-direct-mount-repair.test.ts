@@ -130,6 +130,16 @@ function seedLeftoverDirectState(): void {
     { sourceJid: waLidJid },
   );
   db.storeMessageDirect(
+    'post-marker-legacy-unscoped-private-leak',
+    workspaceJid,
+    'whatsapp:123456789012345@lid',
+    'Private Alice',
+    'legacy unscoped LID alias that must be fenced with the scoped mount',
+    '2026-08-19T00:00:00.500Z',
+    false,
+    { sourceJid: 'whatsapp:123456789012345@lid' },
+  );
+  db.storeMessageDirect(
     'post-marker-group',
     workspaceJid,
     waGroupJid,
@@ -162,7 +172,7 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
       mainOwnerIsThisChat: true,
       mainSessionId: 'contaminated-main-session',
       existingIsolationMarker: oldIsolationAt,
-      recoverableInboundFromThisChat: 2,
+      recoverableInboundFromThisChat: 3,
     });
     expect(diagnosis.affectedWorkspaces).toEqual([
       expect.objectContaining({
@@ -171,7 +181,7 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
         existingIsolationMarker: oldIsolationAt,
         mainSessionId: 'contaminated-main-session',
         mainOwnerJid: waLidJid,
-        recoverableInboundFromLeftovers: 2,
+        recoverableInboundFromLeftovers: 3,
       }),
     ]);
 
@@ -376,5 +386,124 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
     expect(db.getRouterState('schema_version')).toBe(
       String(db.CURRENT_SCHEMA_VERSION),
     );
+  });
+
+  test('failed repair rolls back DB state and removes only newly created Agent directories', () => {
+    const rollbackWorkspaceJid = 'web:rollback-repair-ws';
+    const rollbackFolder = 'rollback-repair-ws';
+    const rollbackDmJid = 'qq:c2c:rollback-user#account:bot-a';
+    db.setRegisteredGroup(rollbackWorkspaceJid, {
+      name: 'Rollback repair workspace',
+      folder: rollbackFolder,
+      added_at: now,
+      created_by: 'owner-a',
+    });
+    db.setRegisteredGroup(rollbackDmJid, {
+      name: 'Rollback private DM',
+      folder: `${rollbackFolder}-direct`,
+      added_at: now,
+      created_by: 'owner-a',
+      channel_account_id: 'bot-a',
+      target_main_jid: rollbackWorkspaceJid,
+    });
+    const preservedDirectories = [
+      path.join(dataDir, 'ipc', rollbackFolder, 'agents', 'preexisting-agent'),
+      path.join(
+        dataDir,
+        'sessions',
+        rollbackFolder,
+        'agents',
+        'preexisting-agent',
+      ),
+    ];
+    for (const directory of preservedDirectories) {
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, 'sentinel'), 'preserve me');
+    }
+
+    expect(() =>
+      repairLeftoverClassifiableDirectWorkspaceMounts({
+        apply: true,
+        beforeIsolationReset: () => {
+          throw new Error('injected repair failure');
+        },
+      }),
+    ).toThrow('injected repair failure');
+
+    expect(db.getRegisteredGroup(rollbackDmJid)).toMatchObject({
+      target_main_jid: rollbackWorkspaceJid,
+    });
+    expect(db.listAgentsByJid(rollbackWorkspaceJid)).toEqual([]);
+    for (const parent of [
+      path.join(dataDir, 'ipc', rollbackFolder, 'agents'),
+      path.join(dataDir, 'sessions', rollbackFolder, 'agents'),
+    ]) {
+      expect(fs.readdirSync(parent)).toEqual(['preexisting-agent']);
+      expect(
+        fs.readFileSync(
+          path.join(parent, 'preexisting-agent', 'sentinel'),
+          'utf8',
+        ),
+      ).toBe('preserve me');
+    }
+    db.deleteRegisteredGroup(rollbackDmJid);
+    db.deleteRegisteredGroup(rollbackWorkspaceJid);
+  });
+
+  test('cleanup lookup errors preserve the original failure and do not stop later compensation', () => {
+    const lookupWorkspaceJid = 'web:lookup-failure-ws';
+    const lookupFolder = 'lookup-failure-ws';
+    const lookupDms = [
+      'qq:c2c:lookup-first#account:bot-a',
+      'qq:c2c:lookup-second#account:bot-a',
+    ];
+    db.setRegisteredGroup(lookupWorkspaceJid, {
+      name: 'Lookup failure workspace',
+      folder: lookupFolder,
+      added_at: now,
+      created_by: 'owner-a',
+    });
+    for (const jid of lookupDms) {
+      db.setRegisteredGroup(jid, {
+        name: jid,
+        folder: `${lookupFolder}-direct`,
+        added_at: now,
+        created_by: 'owner-a',
+        channel_account_id: 'bot-a',
+        target_main_jid: lookupWorkspaceJid,
+      });
+    }
+
+    let lookupCalls = 0;
+    expect(() =>
+      repairLeftoverClassifiableDirectWorkspaceMounts({
+        apply: true,
+        beforeIsolationReset: () => {
+          throw new Error('primary injected failure');
+        },
+        cleanupAgentLookup: (agentId) => {
+          lookupCalls += 1;
+          if (lookupCalls === 1)
+            throw new Error(`lookup failed for ${agentId}`);
+          return undefined;
+        },
+      }),
+    ).toThrow(
+      /repair failed \(primary injected failure\).*could not determine whether Agent remains committed/,
+    );
+
+    expect(lookupCalls).toBe(2);
+    expect(db.listAgentsByJid(lookupWorkspaceJid)).toEqual([]);
+    const ipcAgentDirs = fs.readdirSync(
+      path.join(dataDir, 'ipc', lookupFolder, 'agents'),
+    );
+    const sessionAgentDirs = fs.readdirSync(
+      path.join(dataDir, 'sessions', lookupFolder, 'agents'),
+    );
+    expect(ipcAgentDirs).toHaveLength(1);
+    expect(sessionAgentDirs).toEqual(ipcAgentDirs);
+
+    for (const jid of lookupDms) db.deleteRegisteredGroup(jid);
+    db.deleteRegisteredGroup(lookupWorkspaceJid);
   });
 });

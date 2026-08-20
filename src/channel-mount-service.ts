@@ -327,6 +327,8 @@ export interface EnsureDirectChannelSessionMountParams {
   /** Remount even when the chat already has a workspace or session bind. */
   force?: boolean;
   mountOptions?: ChannelMountUpdateOptions;
+  /** Called before a newly allocated Agent is persisted or creates directories. */
+  onCreating?: (agent: SubAgent, workspaceJid: string) => void;
   onCreated?: (agent: SubAgent, workspaceJid: string) => void;
 }
 
@@ -398,6 +400,7 @@ export function ensureDirectChannelSessionMount(
         source_kind: 'channel_direct',
         last_active_at: now,
       };
+      params.onCreating?.(created, params.workspaceJid);
       createAgent(created);
       ensureAgentDirectories(workspace.folder, created.id);
       const virtualChatJid = `${params.workspaceJid}#agent:${created.id}`;

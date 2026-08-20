@@ -268,8 +268,6 @@ make dev
 | `make docker-pull`                              | 拉取 GitHub Actions 发布的最新 Agent 镜像             |
 | `make install-host-tools`                       | 安装 Host 工具并刷新 Host/Container 共用的内置 Skills |
 | `make backup`                                   | 创建一致性运行数据备份                                |
-| `make leftover-direct-mounts`                   | 诊断仍挂在 workspace main 上的可判定私聊（默认只读）  |
-| `make leftover-direct-mounts APPLY=1`           | 将上述私聊改挂到 `channel_direct` 并重置隔离代        |
 | `make restore FILE=happyclaw-backup-xxx.tar.gz` | 停止服务后恢复指定备份                                |
 | `make help`                                     | 查看完整命令列表                                      |
 
@@ -524,6 +522,23 @@ Claude Code，并把实际版本写入
 <summary><strong>如何修改服务端口？</strong></summary>
 
 生产模式运行 `WEB_PORT=8080 make start`。开发模式需要同时设置后端端口和 Vite 的 API/WebSocket 代理目标。
+
+</details>
+
+<details>
+<summary><strong>曾部署过非正式的 v73 中间提交，如何检查私聊挂载？</strong></summary>
+
+正式发布的 `main` 不会产生此状态。只有曾在 #659 的 WhatsApp LID 分类修复之前
+单独部署或 cherry-pick #655/schema v73 的实例，才需要运行
+`make leftover-direct-mounts`。诊断严格只读，并且只接受当前 schema；发现残留时以
+退出码 2 返回。为保证读取完整且绝不创建 SQLite sidecar，诊断前也必须先干净停止
+HappyClaw。
+
+修复前还必须停止 launchd/systemd 等进程守护，然后运行
+`make leftover-direct-mounts APPLY=1`。修复会把可判定私聊迁到独立
+`channel_direct` session，并永久清除受污染 workspace main 的模型恢复资格和
+SDK/runtime session；不会创建备份，也不能安全撤销。工具若无法确认数据库无人占用，
+会拒绝执行。
 
 </details>
 

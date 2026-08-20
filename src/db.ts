@@ -80,6 +80,8 @@ import {
   normalizeAgentProfilePrompts,
   promptModeFromLegacyPreset,
 } from './agent-profile-prompts.js';
+import { assertDatabaseMaintenanceAccess } from './database-maintenance.js';
+import { CURRENT_SCHEMA_VERSION } from './schema-version.js';
 import {
   bindChannelReliabilityDatabase,
   createChannelReliabilitySchema,
@@ -105,7 +107,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 73;
+export { CURRENT_SCHEMA_VERSION };
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -473,15 +475,36 @@ function enforcePreMigrationBackup(dbPath: string): void {
   }
 }
 
-export function initDatabase(): void {
+export function initDatabase(
+  options: { requireCurrentSchema?: boolean } = {},
+): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
+  assertDatabaseMaintenanceAccess(dbPath);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  try {
+    // Close the check→open race with the repair CLI: if it acquired its guard
+    // after our first check, this process must close the just-opened handle
+    // before the repair's lsof preflight can proceed.
+    assertDatabaseMaintenanceAccess(dbPath);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 
   db.exec('PRAGMA busy_timeout = 5000');
   const rawSchemaVersionBeforeInit =
     getRouterStateInternal('schema_version') ?? null;
+  if (
+    options.requireCurrentSchema &&
+    rawSchemaVersionBeforeInit !== String(CURRENT_SCHEMA_VERSION)
+  ) {
+    db.close();
+    throw new Error(
+      `Database must already be schema v${CURRENT_SCHEMA_VERSION}; refusing maintenance bootstrap for ${rawSchemaVersionBeforeInit === null ? 'an unversioned database' : `schema v${rawSchemaVersionBeforeInit}`}`,
+    );
+  }
   try {
     enforcePreMigrationBackup(dbPath);
   } catch (error) {

@@ -149,6 +149,25 @@ describe('database upgrade safety gate', () => {
     afterFailure.close();
 
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
+    const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
+    expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
+      'Database must already be schema v73',
+    );
+    expect(fs.readdirSync(migrationBackups)).toEqual(
+      backupsBeforeCurrentOnlyRefusal,
+    );
+    const afterCurrentOnlyRefusal = new Database(dbPath, { readonly: true });
+    expect(
+      (
+        afterCurrentOnlyRefusal
+          .prepare(
+            "SELECT value FROM router_state WHERE key = 'schema_version'",
+          )
+          .get() as { value: string }
+      ).value,
+    ).toBe('50');
+    afterCurrentOnlyRefusal.close();
+
     db.initDatabase();
     db.closeDatabase();
     const backupCountAfterRetry = fs.readdirSync(migrationBackups).length;

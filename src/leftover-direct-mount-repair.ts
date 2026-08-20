@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { channelConversationJid } from './channel-address.js';
 import { resolveChannelConversationKind } from './channel-conversation-kind.js';
 import {
@@ -8,6 +11,7 @@ import {
 import {
   CURRENT_SCHEMA_VERSION,
   countRecoverableInboundMessagesFromSources,
+  getAgent,
   getAllRegisteredGroups,
   getConversationHistoryIsolationMarker,
   getJidsByFolder,
@@ -20,36 +24,20 @@ import {
   resetWorkspaceMainIsolationGeneration,
   runImmediateTransaction,
 } from './db.js';
-import type { RegisteredGroup } from './types.js';
+import { DATA_DIR } from './config.js';
+import {
+  sourceMatchesChannelConversation,
+  type AffectedLeftoverWorkspace,
+  type LeftoverDirectMountDiagnosis,
+  type LeftoverDirectWorkspaceMount,
+} from './leftover-direct-mount-diagnostic.js';
+import type { RegisteredGroup, SubAgent } from './types.js';
 
-export interface LeftoverDirectWorkspaceMount {
-  channelJid: string;
-  workspaceJid: string;
-  workspaceFolder: string;
-  channelAccountId?: string;
-  mainOwnerJid?: string;
-  mainOwnerIsThisChat: boolean;
-  mainSessionId?: string;
-  existingIsolationMarker?: string;
-  recoverableInboundFromThisChat: number;
-}
-
-export interface AffectedLeftoverWorkspace {
-  workspaceJid: string;
-  workspaceFolder: string;
-  leftoverCount: number;
-  existingIsolationMarker?: string;
-  mainSessionId?: string;
-  mainRuntimeSessionId?: string;
-  mainOwnerJid?: string;
-  recoverableInboundFromLeftovers: number;
-}
-
-export interface LeftoverDirectMountDiagnosis {
-  schemaVersion: string;
-  leftovers: LeftoverDirectWorkspaceMount[];
-  affectedWorkspaces: AffectedLeftoverWorkspace[];
-}
+export type {
+  AffectedLeftoverWorkspace,
+  LeftoverDirectMountDiagnosis,
+  LeftoverDirectWorkspaceMount,
+} from './leftover-direct-mount-diagnostic.js';
 
 export interface LeftoverDirectMountRepairResult extends LeftoverDirectMountDiagnosis {
   applied: boolean;
@@ -66,11 +54,7 @@ function sourceMatchesConversation(
   sourceJid: string,
   conversationJid: string,
 ): boolean {
-  return (
-    conversationAliases(conversationJid).has(sourceJid) ||
-    channelConversationJid(sourceJid) ===
-      channelConversationJid(conversationJid)
-  );
+  return sourceMatchesChannelConversation(sourceJid, conversationJid);
 }
 
 function resolveMountedWorkspace(
@@ -173,7 +157,10 @@ export function diagnoseLeftoverClassifiableDirectWorkspaceMounts(): LeftoverDir
   };
 }
 
-function remountLeftoverDirect(leftover: LeftoverDirectWorkspaceMount): void {
+function remountLeftoverDirect(
+  leftover: LeftoverDirectWorkspaceMount,
+  onCreating: (agent: SubAgent, workspaceJid: string) => void,
+): void {
   const group = getRegisteredGroup(leftover.channelJid);
   const workspace = getRegisteredGroup(leftover.workspaceJid);
   if (!group || !workspace) {
@@ -189,6 +176,7 @@ function remountLeftoverDirect(leftover: LeftoverDirectWorkspaceMount): void {
     userId: group.created_by ?? workspace.created_by ?? '',
     force: true,
     mountOptions: { replyPolicy: 'source_only' },
+    onCreating,
   });
   if (!mounted.target_agent_id || mounted.target_main_jid) {
     throw new Error(
@@ -210,7 +198,14 @@ function remountLeftoverDirect(leftover: LeftoverDirectWorkspaceMount): void {
  * recoverable unless a new generation fences them together.
  */
 export function repairLeftoverClassifiableDirectWorkspaceMounts(
-  options: { apply?: boolean; isolationStartedAt?: string } = {},
+  options: {
+    apply?: boolean;
+    isolationStartedAt?: string;
+    /** Fault-injection/embedding hook; runs inside the DB transaction. */
+    beforeIsolationReset?: () => void;
+    /** Test/embedding override for rollback compensation ownership checks. */
+    cleanupAgentLookup?: typeof getAgent;
+  } = {},
 ): LeftoverDirectMountRepairResult {
   const diagnosis = diagnoseLeftoverClassifiableDirectWorkspaceMounts();
   if (!options.apply || diagnosis.leftovers.length === 0) {
@@ -225,46 +220,93 @@ export function repairLeftoverClassifiableDirectWorkspaceMounts(
 
   const isolationStartedAt =
     options.isolationStartedAt ?? new Date().toISOString();
-  return runImmediateTransaction(() => {
-    for (const leftover of diagnosis.leftovers) {
-      remountLeftoverDirect(leftover);
-    }
+  const createdAgents: Array<{ folder: string; id: string }> = [];
+  try {
+    return runImmediateTransaction(() => {
+      for (const leftover of diagnosis.leftovers) {
+        remountLeftoverDirect(leftover, (agent) => {
+          createdAgents.push({ folder: agent.group_folder, id: agent.id });
+        });
+      }
 
-    const isolationMarkers: Record<string, string> = {};
-    for (const workspace of diagnosis.affectedWorkspaces) {
-      isolationMarkers[workspace.workspaceJid] =
-        resetWorkspaceMainIsolationGeneration(
-          workspace.workspaceJid,
-          workspace.workspaceFolder,
-          isolationStartedAt,
+      options.beforeIsolationReset?.();
+
+      const isolationMarkers: Record<string, string> = {};
+      for (const workspace of diagnosis.affectedWorkspaces) {
+        isolationMarkers[workspace.workspaceJid] =
+          resetWorkspaceMainIsolationGeneration(
+            workspace.workspaceJid,
+            workspace.workspaceFolder,
+            isolationStartedAt,
+          );
+      }
+
+      const after = diagnoseLeftoverClassifiableDirectWorkspaceMounts();
+      if (after.leftovers.length > 0) {
+        throw new Error(
+          `Leftover direct mounts remain after repair: ${after.leftovers
+            .map((item) => item.channelJid)
+            .join(', ')}`,
         );
-    }
+      }
 
-    const after = diagnoseLeftoverClassifiableDirectWorkspaceMounts();
-    if (after.leftovers.length > 0) {
+      return {
+        ...diagnosis,
+        schemaVersion: after.schemaVersion,
+        leftovers: [],
+        affectedWorkspaces: diagnosis.affectedWorkspaces.map((workspace) => ({
+          ...workspace,
+          existingIsolationMarker: isolationMarkers[workspace.workspaceJid],
+          mainSessionId: undefined,
+          mainRuntimeSessionId: undefined,
+          mainOwnerJid: undefined,
+          recoverableInboundFromLeftovers: 0,
+        })),
+        applied: true,
+        remounted: diagnosis.leftovers.length,
+        isolationGenerationsReset: diagnosis.affectedWorkspaces.length,
+        isolationMarkers,
+      };
+    });
+  } catch (error) {
+    const cleanupErrors: string[] = [];
+    const originalError =
+      error instanceof Error ? error.message : String(error);
+    const lookupAgent = options.cleanupAgentLookup ?? getAgent;
+    for (const created of createdAgents) {
+      // A committed Agent owns these paths. Only compensate IDs absent after
+      // the DB transaction rolled back; never touch reused or committed data.
+      let agentStillCommitted: boolean;
+      try {
+        agentStillCommitted = Boolean(lookupAgent(created.id));
+      } catch (lookupError) {
+        // Do not guess ownership and delete this directory, but keep probing
+        // and compensating every other Agent created by the failed repair.
+        cleanupErrors.push(
+          `${created.id}: could not determine whether Agent remains committed: ${lookupError instanceof Error ? lookupError.message : String(lookupError)}`,
+        );
+        continue;
+      }
+      if (agentStillCommitted) continue;
+      for (const directory of [
+        path.join(DATA_DIR, 'ipc', created.folder, 'agents', created.id),
+        path.join(DATA_DIR, 'sessions', created.folder, 'agents', created.id),
+      ]) {
+        try {
+          fs.rmSync(directory, { recursive: true, force: true });
+        } catch (cleanupError) {
+          cleanupErrors.push(
+            `${directory}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+          );
+        }
+      }
+    }
+    if (cleanupErrors.length > 0) {
       throw new Error(
-        `Leftover direct mounts remain after repair: ${after.leftovers
-          .map((item) => item.channelJid)
-          .join(', ')}`,
+        `Leftover direct mount repair failed (${originalError}) and could not fully clean newly created Agent directories: ${cleanupErrors.join('; ')}`,
+        { cause: error },
       );
     }
-
-    return {
-      ...diagnosis,
-      schemaVersion: after.schemaVersion,
-      leftovers: [],
-      affectedWorkspaces: diagnosis.affectedWorkspaces.map((workspace) => ({
-        ...workspace,
-        existingIsolationMarker: isolationMarkers[workspace.workspaceJid],
-        mainSessionId: undefined,
-        mainRuntimeSessionId: undefined,
-        mainOwnerJid: undefined,
-        recoverableInboundFromLeftovers: 0,
-      })),
-      applied: true,
-      remounted: diagnosis.leftovers.length,
-      isolationGenerationsReset: diagnosis.affectedWorkspaces.length,
-      isolationMarkers,
-    };
-  });
+    throw error;
+  }
 }

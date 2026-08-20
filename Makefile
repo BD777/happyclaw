@@ -9,7 +9,11 @@
 # 原因：主服务的 WebSocket 走 `ws` 包 + @hono/node-server 的 `server.on('upgrade')`
 # 握手，该模式在 bun 的 HTTP server 下不触发，会导致 WS 全部握手失败（HTTP/接口正常，
 # 但前端实时流式卡片/通知全失效，飞书等 stdout 通道不受影响）。
-PORT    ?= $(or $(WEB_PORT),3000)
+# Resolve .env before choosing the Make-level default. Without this, exporting
+# WEB_PORT=3000 here masks a custom .env port in every child process, including
+# maintenance safety checks.
+DOTENV_WEB_PORT := $(shell node -e "try { process.loadEnvFile(); } catch {} process.stdout.write(process.env.WEB_PORT || '')")
+PORT    ?= $(or $(WEB_PORT),$(DOTENV_WEB_PORT),3000)
 export WEB_PORT := $(PORT)
 PKG     := npm
 RUN     := npx
