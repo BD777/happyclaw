@@ -2,10 +2,13 @@ import { describe, expect, test } from 'vitest';
 import type { proto } from 'baileys';
 
 import {
+  canonicalizeWhatsAppUserJid,
+  collectWhatsAppSelfJids,
   extractMessageText,
   extFromMime,
   guessMimeType,
   isMentioningBot,
+  isWhatsAppSelfParticipant,
   normalizeTimestamp,
   stripChannelPrefix,
   stripLeadingWhatsAppBotMention,
@@ -130,8 +133,67 @@ describe('stripChannelPrefix', () => {
   });
 });
 
+describe('WhatsApp LID/hosted self identity', () => {
+  const PN = '15551234567:42@s.whatsapp.net';
+  const LID = '123456789012345:12@lid';
+  const SELF = { id: PN, lid: LID };
+
+  test('canonicalizes hosted aliases without equating LID to PN', () => {
+    expect(canonicalizeWhatsAppUserJid('15551234567@hosted')).toBe(
+      '15551234567@s.whatsapp.net',
+    );
+    expect(canonicalizeWhatsAppUserJid('123456789012345@hosted.lid')).toBe(
+      '123456789012345@lid',
+    );
+    expect(canonicalizeWhatsAppUserJid(LID)).toBe('123456789012345@lid');
+    expect(canonicalizeWhatsAppUserJid(PN)).toBe('15551234567@s.whatsapp.net');
+    expect(canonicalizeWhatsAppUserJid(PN)).not.toBe(
+      canonicalizeWhatsAppUserJid(LID),
+    );
+  });
+
+  test('collects both sock.user.id and sock.user.lid', () => {
+    expect(collectWhatsAppSelfJids(SELF).sort()).toEqual([
+      '123456789012345@lid',
+      '15551234567@s.whatsapp.net',
+    ]);
+    expect(collectWhatsAppSelfJids(PN)).toEqual(['15551234567@s.whatsapp.net']);
+  });
+
+  test('membership matches when only the other identity is on the event row', () => {
+    // Old code compared `phoneNumber ?? id` to sock.user.id only, so a LID
+    // self missed PN-bearing rows and a PN self missed LID-only rows.
+    expect(
+      isWhatsAppSelfParticipant(
+        {
+          id: '123456789012345@lid',
+          phoneNumber: '15551234567@s.whatsapp.net',
+        },
+        { lid: LID },
+      ),
+    ).toBe(true);
+    expect(
+      isWhatsAppSelfParticipant(
+        { id: '123456789012345@lid' },
+        { id: PN, lid: LID },
+      ),
+    ).toBe(true);
+    expect(
+      isWhatsAppSelfParticipant({ id: '123456789012345@lid' }, { id: PN }),
+    ).toBe(false);
+    expect(
+      isWhatsAppSelfParticipant(
+        { id: '999@lid', phoneNumber: '15550001111@s.whatsapp.net' },
+        SELF,
+      ),
+    ).toBe(false);
+  });
+});
+
 describe('isMentioningBot', () => {
   const SELF = '15551234567:42@s.whatsapp.net';
+  const LID = '123456789012345:12@lid';
+  const BOTH = { id: SELF, lid: LID };
 
   test('returns false when mentions empty', () => {
     expect(
@@ -205,6 +267,67 @@ describe('isMentioningBot', () => {
       ),
     ).toBe(false);
   });
+
+  test('PN-only self does not guess a LID mention as the same person', () => {
+    // Old exact jidNormalizedUser compare also failed here. We still must not
+    // equate the two ID spaces when sock.user.lid is missing.
+    expect(
+      isMentioningBot(
+        {
+          extendedTextMessage: {
+            contextInfo: { mentionedJid: ['123456789012345@lid'] },
+          },
+        } as proto.IMessage,
+        SELF,
+      ),
+    ).toBe(false);
+  });
+
+  test('matches a LID mention when sock.user also exposes lid', () => {
+    expect(
+      isMentioningBot(
+        {
+          extendedTextMessage: {
+            contextInfo: { mentionedJid: ['123456789012345@lid'] },
+          },
+        } as proto.IMessage,
+        BOTH,
+      ),
+    ).toBe(true);
+    expect(
+      isMentioningBot(
+        {
+          extendedTextMessage: {
+            contextInfo: { mentionedJid: ['15551234567@s.whatsapp.net'] },
+          },
+        } as proto.IMessage,
+        BOTH,
+      ),
+    ).toBe(true);
+  });
+
+  test('matches hosted aliases of the same PN or LID', () => {
+    expect(
+      isMentioningBot(
+        {
+          extendedTextMessage: {
+            contextInfo: { mentionedJid: ['15551234567@hosted'] },
+          },
+        } as proto.IMessage,
+        SELF,
+      ),
+    ).toBe(true);
+    expect(
+      isMentioningBot(
+        {
+          extendedTextMessage: {
+            contextInfo: { mentionedJid: ['123456789012345@hosted.lid'] },
+          },
+        } as proto.IMessage,
+        BOTH,
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('stripLeadingWhatsAppBotMention', () => {
@@ -224,6 +347,21 @@ describe('stripLeadingWhatsAppBotMention', () => {
         SELF,
       ),
     ).toBe('确认发布 AGENT-A1B2C3D4');
+  });
+
+  test('strips a leading LID display token when the bot was mentioned as LID', () => {
+    const lidMention = {
+      extendedTextMessage: {
+        text: '@123456789012345 确认发布',
+        contextInfo: { mentionedJid: ['123456789012345@lid'] },
+      },
+    } as proto.IMessage;
+    expect(
+      stripLeadingWhatsAppBotMention('@123456789012345 确认发布', lidMention, {
+        id: SELF,
+        lid: '123456789012345:12@lid',
+      }),
+    ).toBe('确认发布');
   });
 
   test('keeps untrusted, non-leading, prefix-collision, and mention-only text', () => {
