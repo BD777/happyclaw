@@ -6,6 +6,7 @@ import path from 'path';
 import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { normalizeAgentEffort } from './agent-effort.js';
 import { logger } from './logger.js';
+import { isValidWorkspaceFolderName } from './workspace-folder.js';
 import {
   AgentProfile,
   AgentBuilderDefinition,
@@ -11992,6 +11993,26 @@ export function getUserHomeGroup(
 }
 
 /**
+ * Ensure the on-disk workspace directory for a group folder exists, mirroring
+ * what registerGroup() does for non-home workspaces. Home groups created via
+ * ensureUserHomeGroup() historically only wrote the DB row, which left
+ * ENOENT traps for any filesystem access (e.g. file uploads) before the
+ * first Agent run lazily created the directory. Failure here must not block
+ * the login/registration path that calls this, so it only warns.
+ */
+function ensureGroupDirExists(folder: string): void {
+  if (!isValidWorkspaceFolderName(folder)) {
+    logger.warn({ folder }, 'Skipping group dir creation: invalid folder name');
+    return;
+  }
+  try {
+    fs.mkdirSync(path.join(GROUPS_DIR, folder, 'logs'), { recursive: true });
+  } catch (err) {
+    logger.warn({ err, folder }, 'Failed to ensure group directory exists');
+  }
+}
+
+/**
  * Ensure a user has a home group. If not, create one.
  * The first admin keeps the legacy web:main home. Every other account gets an
  * owner-specific home workspace. Admin homes use host execution; member homes
@@ -12005,6 +12026,7 @@ export function ensureUserHomeGroup(
 ): string {
   const existing = getUserHomeGroup(userId);
   if (existing) {
+    ensureGroupDirExists(existing.folder);
     assignWorkspaceAgentProfile(
       existing.folder,
       getOrCreateDefaultAgentProfile(userId).id,
@@ -12031,6 +12053,7 @@ export function ensureUserHomeGroup(
   };
 
   setRegisteredGroup(jid, group);
+  ensureGroupDirExists(folder);
   assignWorkspaceAgentProfile(
     folder,
     getOrCreateDefaultAgentProfile(userId).id,
