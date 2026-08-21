@@ -43,7 +43,6 @@ import {
   clearInheritedClaudeProviderEnv,
   getClaudeProviderConfig,
   getContainerEnvConfig,
-  getDefaultProviderId,
   getEnabledProviders,
   getBalancingConfig,
   getProviders,
@@ -864,13 +863,10 @@ function getAgentProfileMcpPolicyMode(
  * owns exactly one complete model configuration and must never be rerouted to a
  * different gateway or subscription.
  *
- * An auto-resolved `defaultProviderId` is NOT the same thing.
- * `resolveDefaultProviderId()` always falls back to the first enabled provider,
- * so every installation has one — treating that as a pin silently disables the
- * pool for everyone, including multi-account setups that rely on round-robin to
- * spread quota and to route around an account that hit its limit. When no Agent
- * asked for a specific configuration and more than one provider is enabled,
- * fall through to the pool.
+ * With no Agent-level choice, every enabled configuration belongs to the
+ * automatic pool. A single enabled configuration is treated as pinned only to
+ * keep the existing single-provider lifecycle efficient; multiple enabled
+ * configurations must fall through to balancing.
  *
  * Every decision derived from "is selection pinned?" must call this, or the
  * sites disagree: selection would rotate while failure handling still treats
@@ -934,8 +930,8 @@ function resolvePinnedModelConfigId(
   modelConfigId?: string | null,
 ): string | null {
   if (modelConfigId) return modelConfigId;
-  if (getEnabledProviders().length > 1) return null;
-  return getDefaultProviderId();
+  const enabledProviders = getEnabledProviders();
+  return enabledProviders.length === 1 ? enabledProviders[0].id : null;
 }
 
 /** Whether a completed user turn must release its runner for the next pick. */
@@ -1083,7 +1079,7 @@ export function trySelectPoolProvider(
   const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
-    // Agent/default selection is authoritative. Workspace credentials must
+    // Agent/single-enabled selection is authoritative. Workspace credentials must
     // never move a Workspace away from the model configuration selected for
     // its top-level Agent. `enabled` only controls the global automatic pool;
     // an Agent may explicitly bind any saved model configuration.

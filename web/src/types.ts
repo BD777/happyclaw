@@ -66,7 +66,7 @@ export interface AgentProfile {
   avatar_emoji: string | null;
   avatar_color: string | null;
   avatar_url: string | null;
-  /** Null means inherit the system default model configuration. */
+  /** Null means select automatically from enabled model configurations. */
   model_config_id: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   /** Policy after applying system defaults and current authorization. */
@@ -85,7 +85,6 @@ export interface ModelConfigOption {
   type: 'official' | 'third_party';
   enabled: boolean;
   anthropic_model: string;
-  is_default: boolean;
 }
 
 export type AgentProfilePromptMode = 'append' | 'replace';
