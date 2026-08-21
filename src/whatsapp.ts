@@ -1,9 +1,9 @@
 /**
- * WhatsApp Channel — Baileys integration (M1: QR login + connection state)
+ * WhatsApp Channel — Baileys integration
  *
  * 基于 OpenClaw 同版本的 baileys 7.0.0-rc13 接入 WhatsApp Web 协议。
  *
- * M1 范围（本提交）：
+ * Supported behavior:
  *  - useMultiFileAuthState 持久化登录态（多文件 auth state，存在 authDir 下）
  *  - makeWASocket 建立 WebSocket 长连接到 Meta
  *  - 监听 connection.update：将 status / QR 串通过 onConnectionUpdate 推到上层
@@ -11,15 +11,10 @@
  *  - disconnect 优雅关闭、isConnected 反映真实状态
  *  - 自动重连：被 Meta 主动断开（非 logged out）时延迟 3s 重连
  *
- * M2/M3 待补：messages.upsert 转发到 onMessage、sendMessage / sendImage / sendFile
- * 实际投递（目前仍 throw NOT_IMPLEMENTED 占位）。
- *
  * 风险：Baileys 是逆向 WhatsApp Web 协议的社区方案，封号率随 Meta 风控收紧上升。
  * 商用场景应使用官方 Cloud API。
  */
 import { mkdir, chmod } from 'node:fs/promises';
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 import qrcode from 'qrcode';
 import {
@@ -39,7 +34,6 @@ import { readFile } from 'node:fs/promises';
 import { logger } from './logger.js';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
 import { saveDownloadedFile, FileTooLargeError } from './im-downloader.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
@@ -48,6 +42,10 @@ import {
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
 import { canonicalizeWhatsAppProviderConversationJid } from './whatsapp-jid.js';
+export {
+  getWhatsAppAuthDir,
+  migrateLegacyWhatsAppAuthDir,
+} from './whatsapp-auth.js';
 
 const CHANNEL_PREFIX = 'whatsapp:';
 /** WhatsApp text message safe limit. Baileys allows up to 64KB but UX clamps far below. */
@@ -107,6 +105,7 @@ export interface WhatsAppConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
   /** Bot added to a new group */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot removed from a group / group dissolved */
@@ -905,7 +904,7 @@ export function createWhatsAppConnection(
         { attachments: attachmentsJson, sourceJid: chatJid },
       );
 
-      broadcastNewMessage(
+      opts.onMessagePersisted?.(
         targetJid,
         {
           id,
@@ -1103,71 +1102,6 @@ export function createWhatsAppConnection(
       return currentState;
     },
   };
-}
-
-/** Compute the auth state directory for a given user / account. */
-const SAFE_AUTH_PATH_SEGMENT = /^[A-Za-z0-9_-]{1,64}$/;
-
-function safeAuthPathSegment(
-  value: string | undefined,
-  fallback?: string,
-): string {
-  const resolved = value || fallback;
-  if (!resolved || !SAFE_AUTH_PATH_SEGMENT.test(resolved)) {
-    throw new Error('Invalid WhatsApp auth path segment');
-  }
-  return resolved;
-}
-
-export function getWhatsAppAuthDir(
-  dataDir: string,
-  userId: string,
-  accountId = 'default',
-): string {
-  const safeUserId = safeAuthPathSegment(userId);
-  const safeAccountId = safeAuthPathSegment(accountId, 'default');
-  const root = path.resolve(
-    dataDir,
-    'config',
-    'user-im',
-    safeUserId,
-    'whatsapp-auth',
-  );
-  const candidate = path.resolve(root, safeAccountId);
-  if (!candidate.startsWith(`${root}${path.sep}`)) {
-    throw new Error('WhatsApp auth directory escaped its account root');
-  }
-  return candidate;
-}
-
-/** Move a legacy singleton auth state to the immutable channel-account id. */
-export function migrateLegacyWhatsAppAuthDir(
-  dataDir: string,
-  userId: string,
-  legacyAccountId: string | undefined,
-  channelAccountId: string,
-): boolean {
-  if (!legacyAccountId || legacyAccountId === channelAccountId) return false;
-  let source: string;
-  let destination: string;
-  try {
-    source = getWhatsAppAuthDir(dataDir, userId, legacyAccountId);
-    destination = getWhatsAppAuthDir(dataDir, userId, channelAccountId);
-  } catch {
-    // Legacy config is untrusted. Invalid paths are ignored without touching
-    // any filesystem location, especially paths outside the auth root.
-    return false;
-  }
-  if (!fs.existsSync(source) || fs.existsSync(destination)) return false;
-  fs.mkdirSync(path.dirname(destination), { recursive: true });
-  try {
-    fs.renameSync(source, destination);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
-    fs.cpSync(source, destination, { recursive: true });
-    fs.rmSync(source, { recursive: true, force: true });
-  }
-  return true;
 }
 
 /**

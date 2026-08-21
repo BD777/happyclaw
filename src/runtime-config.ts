@@ -7,7 +7,6 @@ import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
 
 const MAX_FIELD_LENGTH = 2000;
-const CURRENT_CONFIG_VERSION = 3;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
 const DEFAULT_THIRD_PARTY_PROFILE_NAME = '默认第三方';
 const OFFICIAL_CLAUDE_PROFILE_ID = '__official__';
@@ -85,7 +84,7 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'HAPPYCLAW_FALLBACK_MODEL',
 ]);
 
-export const CLAUDE_ENDPOINT_KIND_ENV = 'HAPPYCLAW_CLAUDE_ENDPOINT_KIND';
+const CLAUDE_ENDPOINT_KIND_ENV = 'HAPPYCLAW_CLAUDE_ENDPOINT_KIND';
 
 const INHERITED_CLAUDE_PROVIDER_ENV_KEYS = [
   CLAUDE_ENDPOINT_KIND_ENV,
@@ -208,8 +207,6 @@ function isDangerousEnvKey(key: string): boolean {
 const MAX_CUSTOM_ENV_ENTRIES = 50;
 const MAX_THIRD_PARTY_PROFILES = 20;
 
-type ClaudeProviderMode = 'official' | 'third_party';
-
 // Fallback scopes for .credentials.json when stored credentials lack scopes.
 // Differs from OAUTH_SCOPES in routes/config.ts (the authorize-flow request):
 // authorize requests org:create_api_key; credential files need user:sessions:claude_code.
@@ -277,17 +274,6 @@ export interface ClaudeThirdPartyProfile {
   anthropicAuthToken: string;
   anthropicModel: string;
   updatedAt: string | null;
-  customEnv: Record<string, string>;
-}
-
-export interface ClaudeThirdPartyProfilePublic {
-  id: string;
-  name: string;
-  anthropicBaseUrl: string;
-  anthropicModel: string;
-  updatedAt: string | null;
-  hasAnthropicAuthToken: boolean;
-  anthropicAuthTokenMasked: string | null;
   customEnv: Record<string, string>;
 }
 
@@ -408,13 +394,6 @@ interface ClaudeStoredStateV3Resolved {
   officialSecrets: SecretPayload;
   officialUpdatedAt: string | null;
   officialCustomEnv: Record<string, string>;
-}
-
-interface ClaudeStoredProfileResolved {
-  mode: ClaudeProviderMode;
-  profile: ClaudeThirdPartyProfile | null;
-  officialSecrets: SecretPayload;
-  officialUpdatedAt: string | null;
 }
 
 // ─── V5 模型配置（每项都是一套完整 Provider 运行环境）──────────
@@ -896,23 +875,6 @@ function isOfficialClaudeMode(activeProfileId: string): boolean {
   return activeProfileId === OFFICIAL_CLAUDE_PROFILE_ID;
 }
 
-function buildOfficialClaudeProviderConfig(
-  officialSecrets: SecretPayload,
-  officialUpdatedAt: string | null,
-): ClaudeProviderConfig {
-  return buildConfig(
-    {
-      anthropicBaseUrl: '',
-      anthropicAuthToken: '',
-      anthropicApiKey: officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials: officialSecrets.claudeOAuthCredentials ?? null,
-      anthropicModel: '',
-    },
-    officialUpdatedAt,
-  );
-}
-
 function normalizeStoredState(
   state: ClaudeStoredStateV3Resolved,
 ): ClaudeStoredStateV3Resolved {
@@ -1097,31 +1059,6 @@ function readStoredState(): ClaudeStoredStateV3Resolved | null {
     );
     return null;
   }
-}
-
-function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
-  const normalized = normalizeStoredState(state);
-  const payload: StoredClaudeProviderConfigV3 = {
-    version: CURRENT_CONFIG_VERSION,
-    activeProfileId: normalized.activeProfileId,
-    profiles: normalized.profiles,
-    official: {
-      updatedAt: normalized.officialUpdatedAt || new Date().toISOString(),
-      secrets: encryptSecrets({
-        anthropicAuthToken: '',
-        anthropicApiKey: normalized.officialSecrets.anthropicApiKey,
-        claudeCodeOauthToken: normalized.officialSecrets.claudeCodeOauthToken,
-        claudeOAuthCredentials:
-          normalized.officialSecrets.claudeOAuthCredentials,
-      }),
-      ...(Object.keys(normalized.officialCustomEnv || {}).length > 0
-        ? { customEnv: normalized.officialCustomEnv }
-        : {}),
-    },
-  };
-
-  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
 }
 
 // ─── V5 模型配置 Read / Write / CRUD ───────────────────────────
@@ -1695,12 +1632,6 @@ export function setProviderEnabled(
   return state.providers[idx];
 }
 
-export function toggleProvider(id: string): UnifiedProvider {
-  const provider = getProviders().find((item) => item.id === id);
-  if (!provider) throw new Error('未找到指定供应商');
-  return setProviderEnabled(id, !provider.enabled);
-}
-
 export function deleteProvider(id: string): void {
   const state = readStoredStateV4();
   if (!state) throw new Error('Claude 配置不存在');
@@ -1801,66 +1732,6 @@ export function resolveProviderById(providerId: string): {
     config: providerToConfig(provider),
     customEnv: provider.customEnv,
   };
-}
-
-// ─── V3 compat layer (used by remaining V3 code paths) ───────────
-
-function resolveActiveProfile(
-  state: ClaudeStoredStateV3Resolved,
-): ClaudeStoredProfileResolved {
-  if (isOfficialClaudeMode(state.activeProfileId)) {
-    return {
-      mode: 'official',
-      profile: null,
-      officialSecrets: state.officialSecrets,
-      officialUpdatedAt: state.officialUpdatedAt,
-    };
-  }
-
-  const active =
-    state.profiles.find((item) => item.id === state.activeProfileId) ||
-    state.profiles[0];
-  if (!active) {
-    return {
-      mode: 'official',
-      profile: null,
-      officialSecrets: state.officialSecrets,
-      officialUpdatedAt: state.officialUpdatedAt,
-    };
-  }
-
-  const profile = fromStoredProfile(active);
-  return {
-    mode: 'third_party',
-    profile,
-    officialSecrets: state.officialSecrets,
-    officialUpdatedAt: state.officialUpdatedAt,
-  };
-}
-
-function readStoredConfig(): ClaudeProviderConfig | null {
-  const state = readStoredState();
-  if (!state) return null;
-  const resolved = resolveActiveProfile(state);
-  if (resolved.mode === 'official' || !resolved.profile) {
-    return buildOfficialClaudeProviderConfig(
-      resolved.officialSecrets,
-      resolved.officialUpdatedAt,
-    );
-  }
-
-  return buildConfig(
-    {
-      anthropicBaseUrl: resolved.profile.anthropicBaseUrl,
-      anthropicAuthToken: resolved.profile.anthropicAuthToken,
-      anthropicApiKey: resolved.officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: resolved.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials:
-        resolved.officialSecrets.claudeOAuthCredentials ?? null,
-      anthropicModel: resolved.profile.anthropicModel,
-    },
-    resolved.profile.updatedAt || resolved.officialUpdatedAt,
-  );
 }
 
 function defaultsFromEnv(): ClaudeProviderConfig {
@@ -2108,29 +1979,6 @@ export function toPublicClaudeProviderConfig(
   };
 }
 
-export function validateClaudeProviderConfig(
-  config: ClaudeProviderConfig,
-): string[] {
-  const errors: string[] = [];
-
-  if (config.anthropicAuthToken && !config.anthropicBaseUrl) {
-    errors.push('使用 ANTHROPIC_AUTH_TOKEN 时必须配置 ANTHROPIC_BASE_URL');
-  }
-
-  if (config.anthropicBaseUrl) {
-    try {
-      const parsed = new URL(config.anthropicBaseUrl);
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        errors.push('ANTHROPIC_BASE_URL 必须是 http 或 https 地址');
-      }
-    } catch {
-      errors.push('ANTHROPIC_BASE_URL 格式不正确');
-    }
-  }
-
-  return errors;
-}
-
 export function getClaudeProviderConfig(): ClaudeProviderConfig {
   try {
     const state = readStoredStateV4();
@@ -2145,431 +1993,6 @@ export function getClaudeProviderConfig(): ClaudeProviderConfig {
     // ignore corrupted file and use env fallback
   }
   return defaultsFromEnv();
-}
-
-export function saveClaudeProviderConfig(
-  next: Omit<ClaudeProviderConfig, 'updatedAt'>,
-  options?: { mode?: ClaudeProviderMode },
-): ClaudeProviderConfig {
-  const normalized = buildConfig(next, new Date().toISOString());
-  const errors = validateClaudeProviderConfig(normalized);
-  if (errors.length > 0) {
-    throw new Error(errors.join('；'));
-  }
-
-  const mode =
-    options?.mode ?? (normalized.anthropicBaseUrl ? 'third_party' : 'official');
-  const existing = readStoredState();
-  const baseState: ClaudeStoredStateV3Resolved = existing || {
-    activeProfileId:
-      mode === 'official'
-        ? OFFICIAL_CLAUDE_PROFILE_ID
-        : DEFAULT_THIRD_PARTY_PROFILE_ID,
-    profiles:
-      mode === 'official'
-        ? []
-        : [
-            toStoredProfile(
-              makeDefaultThirdPartyProfile({
-                anthropicBaseUrl: normalized.anthropicBaseUrl,
-                anthropicAuthToken: normalized.anthropicAuthToken,
-                anthropicApiKey: normalized.anthropicApiKey,
-                claudeCodeOauthToken: normalized.claudeCodeOauthToken,
-                claudeOAuthCredentials: normalized.claudeOAuthCredentials,
-                anthropicModel: normalized.anthropicModel,
-                updatedAt: normalized.updatedAt,
-              }),
-            ),
-          ],
-    officialSecrets: {
-      anthropicAuthToken: '',
-      anthropicApiKey: '',
-      claudeCodeOauthToken: '',
-      claudeOAuthCredentials: null,
-    },
-    officialUpdatedAt: normalized.updatedAt,
-    officialCustomEnv: {},
-  };
-
-  if (mode === 'official') {
-    const officialSecrets = normalizeOfficialSecrets({
-      anthropicAuthToken: '',
-      anthropicApiKey: normalized.anthropicApiKey,
-      claudeCodeOauthToken: normalized.claudeCodeOauthToken,
-      claudeOAuthCredentials: normalized.claudeOAuthCredentials,
-    });
-
-    writeStoredState({
-      ...baseState,
-      activeProfileId: OFFICIAL_CLAUDE_PROFILE_ID,
-      officialSecrets,
-      officialUpdatedAt: normalized.updatedAt,
-    });
-
-    return buildOfficialClaudeProviderConfig(
-      officialSecrets,
-      normalized.updatedAt,
-    );
-  }
-
-  const activeId = isOfficialClaudeMode(baseState.activeProfileId)
-    ? null
-    : baseState.activeProfileId;
-  const activeStored =
-    (activeId
-      ? baseState.profiles.find((item) => item.id === activeId)
-      : undefined) || baseState.profiles[0];
-
-  const activeProfile = activeStored
-    ? fromStoredProfile(activeStored)
-    : makeDefaultThirdPartyProfile(normalized);
-
-  const updatedProfile: ClaudeThirdPartyProfile = {
-    ...activeProfile,
-    anthropicBaseUrl: normalized.anthropicBaseUrl,
-    anthropicAuthToken: normalized.anthropicAuthToken,
-    anthropicModel: normalized.anthropicModel,
-    updatedAt: normalized.updatedAt,
-  };
-
-  const updatedProfiles = baseState.profiles.length
-    ? baseState.profiles.map((item) =>
-        item.id === updatedProfile.id ? toStoredProfile(updatedProfile) : item,
-      )
-    : [toStoredProfile(updatedProfile)];
-
-  writeStoredState({
-    activeProfileId: updatedProfile.id,
-    profiles: updatedProfiles,
-    officialSecrets: normalizeOfficialSecrets({
-      anthropicAuthToken: '',
-      anthropicApiKey: normalized.anthropicApiKey,
-      claudeCodeOauthToken: normalized.claudeCodeOauthToken,
-      claudeOAuthCredentials: normalized.claudeOAuthCredentials,
-    }),
-    officialUpdatedAt: normalized.updatedAt,
-    officialCustomEnv: baseState.officialCustomEnv,
-  });
-
-  return normalized;
-}
-
-export function saveClaudeOfficialProviderSecrets(
-  next: Pick<
-    ClaudeProviderConfig,
-    'anthropicApiKey' | 'claudeCodeOauthToken' | 'claudeOAuthCredentials'
-  >,
-  options?: { activateOfficial?: boolean },
-): ClaudeProviderConfig {
-  const updatedAt = new Date().toISOString();
-  const officialSecrets = normalizeOfficialSecrets({
-    anthropicAuthToken: '',
-    anthropicApiKey: next.anthropicApiKey,
-    claudeCodeOauthToken: next.claudeCodeOauthToken,
-    claudeOAuthCredentials: next.claudeOAuthCredentials,
-  });
-
-  const existing = readStoredState();
-  const baseState: ClaudeStoredStateV3Resolved = existing || {
-    activeProfileId: OFFICIAL_CLAUDE_PROFILE_ID,
-    profiles: [],
-    officialSecrets: {
-      anthropicAuthToken: '',
-      anthropicApiKey: '',
-      claudeCodeOauthToken: '',
-      claudeOAuthCredentials: null,
-    },
-    officialUpdatedAt: null,
-    officialCustomEnv: {},
-  };
-
-  writeStoredState({
-    ...baseState,
-    activeProfileId: options?.activateOfficial
-      ? OFFICIAL_CLAUDE_PROFILE_ID
-      : baseState.activeProfileId,
-    officialSecrets,
-    officialUpdatedAt: updatedAt,
-  });
-
-  return getClaudeProviderConfig();
-}
-
-export function listClaudeThirdPartyProfiles(): {
-  activeProfileId: string;
-  profiles: ClaudeThirdPartyProfile[];
-} {
-  const state = readStoredState();
-  if (!state) {
-    const fallback = defaultsFromEnv();
-    const profile = makeDefaultThirdPartyProfile(fallback);
-    return {
-      activeProfileId: profile.id,
-      profiles: [profile],
-    };
-  }
-
-  return {
-    activeProfileId: state.activeProfileId,
-    profiles: state.profiles.map((item) => fromStoredProfile(item)),
-  };
-}
-
-export function toPublicClaudeThirdPartyProfile(
-  profile: ClaudeThirdPartyProfile,
-): ClaudeThirdPartyProfilePublic {
-  return {
-    id: profile.id,
-    name: profile.name,
-    anthropicBaseUrl: profile.anthropicBaseUrl,
-    anthropicModel: profile.anthropicModel,
-    updatedAt: profile.updatedAt,
-    hasAnthropicAuthToken: !!profile.anthropicAuthToken,
-    anthropicAuthTokenMasked: maskSecret(profile.anthropicAuthToken),
-    customEnv: profile.customEnv || {},
-  };
-}
-
-function randomProfileId(): string {
-  return crypto.randomBytes(8).toString('hex');
-}
-
-export function createClaudeThirdPartyProfile(input: {
-  name: string;
-  anthropicBaseUrl: string;
-  anthropicAuthToken: string;
-  anthropicModel?: string;
-  customEnv?: Record<string, string>;
-}): ClaudeThirdPartyProfile {
-  const state = readStoredState() || {
-    activeProfileId: DEFAULT_THIRD_PARTY_PROFILE_ID,
-    profiles: [],
-    officialSecrets: {
-      anthropicAuthToken: '',
-      anthropicApiKey: '',
-      claudeCodeOauthToken: '',
-      claudeOAuthCredentials: null,
-    },
-    officialUpdatedAt: null,
-    officialCustomEnv: {},
-  };
-
-  if (state.profiles.length >= MAX_THIRD_PARTY_PROFILES) {
-    throw new Error(`最多只能创建 ${MAX_THIRD_PARTY_PROFILES} 个第三方配置`);
-  }
-
-  const now = new Date().toISOString();
-  const profile: ClaudeThirdPartyProfile = {
-    id: randomProfileId(),
-    name: normalizeProfileName(input.name),
-    anthropicBaseUrl: normalizeBaseUrl(input.anthropicBaseUrl),
-    anthropicAuthToken: normalizeSecret(
-      input.anthropicAuthToken,
-      'anthropicAuthToken',
-    ),
-    anthropicModel: normalizeModel(input.anthropicModel ?? ''),
-    updatedAt: now,
-    customEnv: sanitizeCustomEnvMap(input.customEnv || {}, {
-      skipReservedClaudeKeys: true,
-    }),
-  };
-
-  const merged = buildConfig(
-    {
-      anthropicBaseUrl: profile.anthropicBaseUrl,
-      anthropicAuthToken: profile.anthropicAuthToken,
-      anthropicApiKey: state.officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials:
-        state.officialSecrets.claudeOAuthCredentials ?? null,
-      anthropicModel: profile.anthropicModel,
-    },
-    now,
-  );
-  const errors = validateClaudeProviderConfig(merged);
-  if (errors.length > 0) {
-    throw new Error(errors.join('；'));
-  }
-
-  writeStoredState({
-    ...state,
-    activeProfileId:
-      state.profiles.length === 0 ? profile.id : state.activeProfileId,
-    profiles: [...state.profiles, toStoredProfile(profile)],
-  });
-
-  return profile;
-}
-
-export function updateClaudeThirdPartyProfile(
-  profileId: string,
-  patch: {
-    name?: string;
-    anthropicBaseUrl?: string;
-    anthropicModel?: string;
-    customEnv?: Record<string, string>;
-  },
-): ClaudeThirdPartyProfile {
-  const state = readStoredState();
-  if (!state) throw new Error('Claude 配置不存在');
-
-  const id = normalizeProfileId(profileId);
-  const current = state.profiles.find((item) => item.id === id);
-  if (!current) throw new Error('未找到指定第三方配置');
-
-  const decoded = fromStoredProfile(current);
-  const next: ClaudeThirdPartyProfile = {
-    ...decoded,
-    name:
-      patch.name !== undefined
-        ? normalizeProfileName(patch.name)
-        : decoded.name,
-    anthropicBaseUrl:
-      patch.anthropicBaseUrl !== undefined
-        ? normalizeBaseUrl(patch.anthropicBaseUrl)
-        : decoded.anthropicBaseUrl,
-    anthropicModel:
-      patch.anthropicModel !== undefined
-        ? normalizeModel(patch.anthropicModel)
-        : decoded.anthropicModel,
-    customEnv:
-      patch.customEnv !== undefined
-        ? sanitizeCustomEnvMap(patch.customEnv, {
-            skipReservedClaudeKeys: true,
-          })
-        : decoded.customEnv,
-    updatedAt: new Date().toISOString(),
-  };
-
-  const merged = buildConfig(
-    {
-      anthropicBaseUrl: next.anthropicBaseUrl,
-      anthropicAuthToken: next.anthropicAuthToken,
-      anthropicApiKey: state.officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials:
-        state.officialSecrets.claudeOAuthCredentials ?? null,
-      anthropicModel: next.anthropicModel,
-    },
-    next.updatedAt,
-  );
-  const errors = validateClaudeProviderConfig(merged);
-  if (errors.length > 0) {
-    throw new Error(errors.join('；'));
-  }
-
-  writeStoredState({
-    ...state,
-    profiles: state.profiles.map((item) =>
-      item.id === id ? toStoredProfile(next) : item,
-    ),
-  });
-
-  return next;
-}
-
-export function updateClaudeThirdPartyProfileSecret(
-  profileId: string,
-  patch: {
-    anthropicAuthToken?: string;
-    clearAnthropicAuthToken?: boolean;
-  },
-): ClaudeThirdPartyProfile {
-  const state = readStoredState();
-  if (!state) throw new Error('Claude 配置不存在');
-
-  const id = normalizeProfileId(profileId);
-  const current = state.profiles.find((item) => item.id === id);
-  if (!current) throw new Error('未找到指定第三方配置');
-
-  const decoded = fromStoredProfile(current);
-  const nextToken =
-    typeof patch.anthropicAuthToken === 'string'
-      ? normalizeSecret(patch.anthropicAuthToken, 'anthropicAuthToken')
-      : patch.clearAnthropicAuthToken
-        ? ''
-        : decoded.anthropicAuthToken;
-
-  const next: ClaudeThirdPartyProfile = {
-    ...decoded,
-    anthropicAuthToken: nextToken,
-    updatedAt: new Date().toISOString(),
-  };
-
-  const merged = buildConfig(
-    {
-      anthropicBaseUrl: next.anthropicBaseUrl,
-      anthropicAuthToken: next.anthropicAuthToken,
-      anthropicApiKey: state.officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials:
-        state.officialSecrets.claudeOAuthCredentials ?? null,
-      anthropicModel: next.anthropicModel,
-    },
-    next.updatedAt,
-  );
-  const errors = validateClaudeProviderConfig(merged);
-  if (errors.length > 0) {
-    throw new Error(errors.join('；'));
-  }
-
-  writeStoredState({
-    ...state,
-    profiles: state.profiles.map((item) =>
-      item.id === id ? toStoredProfile(next) : item,
-    ),
-  });
-
-  return next;
-}
-
-export function activateClaudeThirdPartyProfile(
-  profileId: string,
-): ClaudeProviderConfig {
-  const state = readStoredState();
-  if (!state) throw new Error('Claude 配置不存在');
-
-  const id = normalizeProfileId(profileId);
-  const target = state.profiles.find((item) => item.id === id);
-  if (!target) throw new Error('未找到指定第三方配置');
-
-  writeStoredState({
-    ...state,
-    activeProfileId: id,
-  });
-
-  return getClaudeProviderConfig();
-}
-
-export function deleteClaudeThirdPartyProfile(profileId: string): {
-  activeProfileId: string;
-  deletedProfileId: string;
-} {
-  const state = readStoredState();
-  if (!state) throw new Error('Claude 配置不存在');
-
-  const id = normalizeProfileId(profileId);
-  if (!state.profiles.some((item) => item.id === id)) {
-    throw new Error('未找到指定第三方配置');
-  }
-  if (state.profiles.length <= 1) {
-    throw new Error('至少需要保留一个第三方配置');
-  }
-
-  const profiles = state.profiles.filter((item) => item.id !== id);
-  const activeProfileId =
-    state.activeProfileId === id ? profiles[0].id : state.activeProfileId;
-
-  writeStoredState({
-    ...state,
-    activeProfileId,
-    profiles,
-  });
-
-  return {
-    activeProfileId,
-    deletedProfileId: id,
-  };
 }
 
 /** Strip control characters from a value before writing to env file (defense-in-depth) */
@@ -2702,106 +2125,6 @@ export function getActiveProfileCustomEnv(): Record<string, string> {
   return sanitizeCustomEnvMap(selected.customEnv || {}, {
     skipReservedClaudeKeys: true,
   });
-}
-
-/**
- * Resolve any profileId to a full ClaudeProviderConfig.
- * Used by ProviderPool to build env for a non-active profile.
- */
-export function resolveProfileToConfig(
-  profileId: string,
-): ClaudeProviderConfig {
-  const state = readStoredState();
-  if (!state) return defaultsFromEnv();
-
-  if (isOfficialClaudeMode(profileId)) {
-    return buildOfficialClaudeProviderConfig(
-      state.officialSecrets,
-      state.officialUpdatedAt,
-    );
-  }
-
-  const stored = state.profiles.find((p) => p.id === profileId);
-  if (!stored) {
-    // Profile not found — fallback to current active config
-    logger.warn(
-      { profileId },
-      'resolveProfileToConfig: profile not found, falling back to active',
-    );
-    return getClaudeProviderConfig();
-  }
-
-  const profile = fromStoredProfile(stored);
-  return buildConfig(
-    {
-      anthropicBaseUrl: profile.anthropicBaseUrl,
-      anthropicAuthToken: profile.anthropicAuthToken,
-      anthropicApiKey: state.officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials:
-        state.officialSecrets.claudeOAuthCredentials ?? null,
-      anthropicModel: profile.anthropicModel,
-    },
-    profile.updatedAt || state.officialUpdatedAt,
-  );
-}
-
-/**
- * Get customEnv for a specific profileId (not necessarily the active one).
- */
-export function getCustomEnvForProfile(
-  profileId: string,
-): Record<string, string> {
-  const state = readStoredState();
-  if (!state) return {};
-
-  if (isOfficialClaudeMode(profileId)) {
-    return sanitizeCustomEnvMap(state.officialCustomEnv || {}, {
-      skipReservedClaudeKeys: true,
-    });
-  }
-
-  const exact = state.profiles.find((p) => p.id === profileId);
-  if (!exact) {
-    logger.warn(
-      { profileId },
-      'getCustomEnvForProfile: profile not found, falling back to active',
-    );
-  }
-  const profile = exact || state.profiles[0];
-  if (!profile) return {};
-
-  const resolved = fromStoredProfile(profile);
-  return sanitizeCustomEnvMap(resolved.customEnv || {}, {
-    skipReservedClaudeKeys: true,
-  });
-}
-
-/**
- * Resolve config AND customEnv for a profileId in a single disk read.
- * Used by container-runner to avoid double readStoredState() calls.
- */
-/** @deprecated Use resolveProviderById instead. Kept for backward compat. */
-export function resolveProfileFull(profileId: string): {
-  config: ClaudeProviderConfig;
-  customEnv: Record<string, string>;
-} {
-  return resolveProviderById(profileId);
-}
-
-export function saveOfficialCustomEnv(
-  customEnv: Record<string, string>,
-): Record<string, string> {
-  const sanitized = sanitizeCustomEnvMap(customEnv, {
-    skipReservedClaudeKeys: true,
-  });
-  const state = readStoredState();
-  if (!state) throw new Error('Claude 配置不存在');
-  writeStoredState({
-    ...state,
-    officialCustomEnv: sanitized,
-  });
-  return sanitized;
 }
 
 export function appendClaudeConfigAudit(
@@ -3272,103 +2595,6 @@ export function updateAllSessionCredentials(
   // Host mode uses CLAUDE_CONFIG_DIR=data/sessions/{folder}/.claude for isolation,
   // so we must NOT touch ~/.claude/.credentials.json to avoid interfering with
   // the user's local Claude Code installation.
-}
-
-// ─── Local Claude Code detection ──────────────────────────────────
-
-export interface LocalClaudeCodeStatus {
-  detected: boolean;
-  hasCredentials: boolean;
-  expiresAt: number | null;
-  accessTokenMasked: string | null;
-}
-
-/**
- * Read and parse OAuth credentials from ~/.claude/.credentials.json.
- * Returns the raw oauth object with accessToken, refreshToken, expiresAt, scopes,
- * or null if the file is missing / invalid / incomplete.
- */
-function readLocalOAuthCredentials(): {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt?: number;
-  scopes?: string[];
-  subscriptionType?: string;
-} | null {
-  const homeDir = process.env.HOME || '/root';
-  const credFile = path.join(homeDir, '.claude', '.credentials.json');
-
-  try {
-    if (!fs.existsSync(credFile)) return null;
-
-    const content = JSON.parse(fs.readFileSync(credFile, 'utf-8'));
-    const oauth = content?.claudeAiOauth;
-
-    if (oauth?.accessToken && oauth?.refreshToken) {
-      return {
-        accessToken: oauth.accessToken,
-        refreshToken: oauth.refreshToken,
-        expiresAt:
-          typeof oauth.expiresAt === 'number' ? oauth.expiresAt : undefined,
-        scopes: Array.isArray(oauth.scopes) ? oauth.scopes : undefined,
-        subscriptionType:
-          typeof oauth.subscriptionType === 'string'
-            ? oauth.subscriptionType
-            : undefined,
-      };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Detect if the host machine has a valid ~/.claude/.credentials.json
- * (i.e. user has logged into Claude Code locally).
- */
-export function detectLocalClaudeCode(): LocalClaudeCodeStatus {
-  const oauth = readLocalOAuthCredentials();
-
-  if (oauth) {
-    return {
-      detected: true,
-      hasCredentials: true,
-      expiresAt: oauth.expiresAt ?? null,
-      accessTokenMasked: maskSecret(oauth.accessToken),
-    };
-  }
-
-  // Check if the file exists at all (detected but no valid credentials)
-  const homeDir = process.env.HOME || '/root';
-  const credFile = path.join(homeDir, '.claude', '.credentials.json');
-  const fileExists = fs.existsSync(credFile);
-
-  return {
-    detected: fileExists,
-    hasCredentials: false,
-    expiresAt: null,
-    accessTokenMasked: null,
-  };
-}
-
-/**
- * Read local ~/.claude/.credentials.json and return parsed OAuth credentials.
- * Returns null if not found or invalid.
- */
-export function importLocalClaudeCredentials(): ClaudeOAuthCredentials | null {
-  const oauth = readLocalOAuthCredentials();
-  if (!oauth) return null;
-
-  return {
-    accessToken: oauth.accessToken,
-    refreshToken: oauth.refreshToken,
-    expiresAt: oauth.expiresAt ?? Date.now() + 8 * 3600_000,
-    scopes: oauth.scopes ?? [],
-    ...(oauth.subscriptionType
-      ? { subscriptionType: oauth.subscriptionType }
-      : {}),
-  };
 }
 
 // ─── Appearance config (plain JSON, no encryption) ────────────────

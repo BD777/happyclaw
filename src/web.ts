@@ -14,13 +14,11 @@ import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import {
   type WebDeps,
   type Variables,
-  type WsClientInfo,
   setWebDeps,
   getWebDeps,
   wsClients,
   lastActiveCache,
   LAST_ACTIVE_DEBOUNCE_MS,
-  parseCookie,
   isHostExecutionGroup,
   hasHostExecutionPermission,
   canAccessGroup,
@@ -101,7 +99,6 @@ import type {
   NewMessage,
   FollowUpMode,
   FollowUpTransition,
-  QueuedFollowUp,
   WsMessageOut,
   WsMessageIn,
   AuthUser,
@@ -3317,6 +3314,10 @@ let wss: WebSocketServer | null = null;
  * needs only `queue.stopGroup` / `getSessions` / `setLastAgentTimestamp`.
  */
 export function createAppForTest(webDeps: WebDeps): typeof app {
+  webDeps.broadcastNewMessage = broadcastNewMessage;
+  webDeps.broadcastMessageDeleted = broadcastMessageDeleted;
+  webDeps.broadcastAgentStatus = broadcastAgentStatus;
+  webDeps.broadcastAgentRemoved = broadcastAgentRemoved;
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
@@ -3329,6 +3330,10 @@ export function createAppForTest(webDeps: WebDeps): typeof app {
 }
 
 export function startWebServer(webDeps: WebDeps): void {
+  webDeps.broadcastNewMessage = broadcastNewMessage;
+  webDeps.broadcastMessageDeleted = broadcastMessageDeleted;
+  webDeps.broadcastAgentStatus = broadcastAgentStatus;
+  webDeps.broadcastAgentRemoved = broadcastAgentRemoved;
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);

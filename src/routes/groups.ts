@@ -28,6 +28,8 @@ import {
   canDeleteGroup,
   MAX_GROUP_NAME_LEN,
   getWebDeps,
+  projectWebMessageDeleted,
+  projectWebNewMessage,
 } from '../web-context.js';
 import {
   clearSessionChannelOwner,
@@ -112,8 +114,6 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
-import { z } from 'zod';
-import { broadcastMessageDeleted, broadcastNewMessage } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
 import { attachSessionWorkflowRuns } from '../session-workflows.js';
 import {
@@ -2005,7 +2005,7 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
         timestamp,
         true,
       );
-      broadcastNewMessage(jid, {
+      projectWebNewMessage(jid, {
         id: messageId,
         chat_jid: jid,
         sender: '__system__',
@@ -2137,7 +2137,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
       true,
     );
 
-    broadcastNewMessage(targetJid, {
+    projectWebNewMessage(targetJid, {
       id: dividerMessageId,
       chat_jid: targetJid,
       sender: '__system__',
@@ -2563,7 +2563,7 @@ groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
     return c.json({ error: 'Message not found' }, 404);
   }
 
-  broadcastMessageDeleted(chatJid, messageId);
+  projectWebMessageDeleted(chatJid, messageId);
 
   return c.json({ success: true });
 });

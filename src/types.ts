@@ -1226,13 +1226,6 @@ export interface RedeemCode {
   created_at: string;
 }
 
-export interface RedeemCodeUsage {
-  id: number;
-  code: string;
-  user_id: string;
-  redeemed_at: string;
-}
-
 export type BillingAuditEventType =
   | 'plan_created'
   | 'plan_updated'

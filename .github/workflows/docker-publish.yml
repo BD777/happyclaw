@@ -88,10 +88,25 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      - name: Start candidate and probe Chromium over HTTP
+      - name: Smoke immutable runner and lazy Chromium
         env:
           IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
         run: ./scripts/smoke-agent-image.sh "$IMAGE_REF" "${{ matrix.arch }}"
+
+      - name: Set up Node for image contract tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install image contract test dependencies
+        run: npm ci
+
+      - name: Verify container permission contract against candidate
+        env:
+          HAPPYCLAW_CONTAINER_PERMISSION_TEST_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: npx vitest run tests/container-session-permissions.test.ts
 
       - name: Record verified digest
         env:

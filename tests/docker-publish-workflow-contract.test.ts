@@ -26,6 +26,12 @@ describe('Docker image distribution contract', () => {
       './scripts/smoke-agent-image.sh "$IMAGE_REF" "${{ matrix.arch }}"',
     );
     expect(workflow).toContain(
+      'HAPPYCLAW_CONTAINER_PERMISSION_TEST_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}',
+    );
+    expect(workflow).toContain(
+      'npx vitest run tests/container-session-permissions.test.ts',
+    );
+    expect(workflow).toContain(
       '[[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]',
     );
     expect(workflow).toContain('needs: build-and-smoke');
@@ -115,7 +121,7 @@ describe('Docker image distribution contract', () => {
     }
   });
 
-  test('smoke helper exercises the production entrypoint and real HTTP endpoint', () => {
+  test('smoke helper exercises the immutable runner and lazy browser endpoint', () => {
     const smoke = read('scripts/smoke-agent-image.sh');
 
     expect(smoke).toContain('docker run --detach --interactive');
@@ -143,6 +149,12 @@ describe('Docker image distribution contract', () => {
     );
     expect(smoke).toContain('curl --noproxy');
     expect(smoke).toContain('http://127.0.0.1:9222/json/version');
+    expect(smoke).toContain('test -f /opt/happyclaw-agent/dist/index.js');
+    expect(smoke).toContain('test ! -e /tmp/dist/index.js');
+    expect(smoke).toContain(
+      '/app/node_modules/.bin/agent-browser open about:blank',
+    );
+    expect(smoke).toContain("grep -q 'phase=chromium_ready'");
     expect(smoke).toContain('docker rm -f "$SMOKE_CONTAINER_NAME"');
   });
 });

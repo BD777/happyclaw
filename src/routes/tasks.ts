@@ -24,7 +24,6 @@ import {
   permanentlyDeleteTasksWithRevisions,
   getTaskRunById,
   getActiveTaskRunForTask,
-  getTaskRunsForTask,
   getRegisteredGroup,
   getAllRegisteredGroups,
   getUserHomeGroup,

@@ -11,7 +11,6 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   STORE_DIR,
-  MAIN_GROUP_FOLDER,
   CONVERSATION_AGENT_ARCHIVE_DAYS,
   POLL_INTERVAL,
   TIMEZONE,
@@ -101,7 +100,6 @@ import {
   createTask,
   deleteExpiredSessions,
   getExpiredSessionIds,
-  deleteTask,
   ensureChatExists,
   ensureUserHomeGroup,
   getAllChats,
@@ -127,13 +125,10 @@ import {
   getTaskById,
   getTaskRunById,
   getActiveTaskRunForTask,
-  getTaskRunsForTask,
   finalizeDeliveredGroupTaskRun,
   recordGroupWorkspaceProjectionFailureAndFinalize,
   recordTaskRunNotificationReceipt,
   finalizeTaskRunNotificationIfPending,
-  type TaskRunAtomicNotificationPayload,
-  type TaskRunNotificationPayload,
   type TaskRunNotificationReceipt,
   getUserHomeGroup,
   forceActiveAdminRuntimesToHost,
@@ -280,7 +275,7 @@ import {
 } from './channel-reliability-store.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
-import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
+import { migrateLegacyWhatsAppAuthDir } from './whatsapp-auth.js';
 import {
   canonicalizeWhatsAppConversationJid,
   resolveWhatsAppConversationAliasFromGroups,
@@ -288,7 +283,6 @@ import {
 import {
   appendStreamingSessionAnswer,
   getChannelType,
-  extractChatId,
   isStreamingSessionSettled,
   type StreamingSession,
   type ChannelMessageDeliveryOptions,
@@ -404,7 +398,6 @@ import {
 import {
   loadChannelAccountSecret,
   saveChannelAccountSecret,
-  type ChannelAccountSecret,
 } from './channel-account-secrets.js';
 import {
   ensureLegacyDefaultChannelAccount,
@@ -433,7 +426,6 @@ import {
   saveFeishuOwnerOpenId,
   saveUserTelegramConfig,
   saveUserWeChatConfig,
-  updateAllSessionCredentials,
 } from './runtime-config.js';
 import {
   MAX_TASK_PROMPT_LENGTH,
@@ -491,7 +483,6 @@ import {
 } from './billing.js';
 import { recordUsageEvent } from './usage-service.js';
 import {
-  AgentStatus,
   AgentProfile,
   ChannelMessageMeta,
   ChannelTurnContext,
@@ -3354,16 +3345,6 @@ async function settleAndRecordTaskIpcDeliveries(
     );
   }
   return { accepted: true, receipt: outcome.receipt };
-}
-
-/** Fire-and-forget wrapper for sendImWithRetry (used in non-await contexts). */
-function sendImWithFailTracking(
-  imJid: string,
-  text: string,
-  localImagePaths: string[],
-  outbox?: ChannelOutboxDeliveryRef,
-): void {
-  sendImWithRetry(imJid, text, localImagePaths, outbox).catch(() => {});
 }
 
 export function isCursorAfter(
@@ -19894,6 +19875,8 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
     accountId: account.id,
     scopeIncomingJids: !account.is_legacy_default,
     ignoreMessagesBefore: Date.now(),
+    onMessagePersisted: broadcastNewMessage,
+    onFollowUpsChanged: broadcastFollowUpUpdate,
     onCommand: handleCommand,
     resolveGroupFolder: (jid: string) => resolveEffectiveFolder(jid),
     resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
@@ -20831,6 +20814,8 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
+            onFollowUpsChanged: broadcastFollowUpUpdate,
             ignoreMessagesBefore,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
@@ -20880,6 +20865,7 @@ async function main(): Promise<void> {
           buildIsChatAuthorized(userId),
           buildOnPairAttempt(userId),
           {
+            onMessagePersisted: broadcastNewMessage,
             onCommand: handleCommand,
             ignoreMessagesBefore,
             resolveGroupFolder: (chatJid: string) =>
@@ -20915,6 +20901,7 @@ async function main(): Promise<void> {
           buildIsChatAuthorized(userId),
           buildOnPairAttempt(userId),
           {
+            onMessagePersisted: broadcastNewMessage,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
@@ -20941,6 +20928,7 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore,
@@ -20973,6 +20961,7 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore,
@@ -21016,6 +21005,7 @@ async function main(): Promise<void> {
           },
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             // With a durable cursor, replay is intentional recovery and must
@@ -21059,6 +21049,7 @@ async function main(): Promise<void> {
           },
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore: Date.now(),

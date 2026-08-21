@@ -666,6 +666,16 @@ export interface VolumeMount {
   readonly: boolean;
 }
 
+export type AgentRunnerMode = 'image' | 'development';
+
+export function resolveAgentRunnerMode(
+  value = process.env.HAPPYCLAW_AGENT_RUNNER_MODE,
+): AgentRunnerMode {
+  if (!value || value === 'image') return 'image';
+  if (value === 'development') return 'development';
+  throw new Error('HAPPYCLAW_AGENT_RUNNER_MODE must be image or development');
+}
+
 /**
  * Create an owner-only directory for a writable container mount. The container
  * entrypoint applies the selected identity bridge; host code must never make
@@ -1497,7 +1507,6 @@ export function buildVolumeMounts(
   const mounts: VolumeMount[] = [];
   let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
   const projectRoot = process.cwd();
-  const groupDir = path.join(GROUPS_DIR, group.folder);
   const ownerId = group.created_by;
 
   if (isAdminHome) {
@@ -1825,31 +1834,19 @@ export function buildVolumeMounts(
     }
   }
 
-  // Mount agent-runner source from host — recompiled on container startup.
-  // Bypasses Docker 镜像构建缓存，确保代码变更生效。
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  mounts.push({
-    hostPath: agentRunnerSrc,
-    containerPath: '/app/src',
-    readonly: true,
-  });
-
-  // Prompts must ride along with the source for the same reason: the image
-  // bakes a copy at build time, so a prompt file added after the last image
-  // build (e.g. identity.happyclaw.md) is missing inside the container while
-  // the freshly-mounted runner code already requires it — every container
-  // startup then dies with ENOENT. The entrypoint's /tmp/prompts symlink
-  // resolves through this mount.
-  mounts.push({
-    hostPath: path.join(projectRoot, 'container', 'agent-runner', 'prompts'),
-    containerPath: '/app/prompts',
-    readonly: true,
-  });
+  if (resolveAgentRunnerMode() === 'development') {
+    // Explicit hot-reload mode compiles the checked-out source at startup.
+    mounts.push({
+      hostPath: path.join(projectRoot, 'container', 'agent-runner', 'src'),
+      containerPath: '/app/src',
+      readonly: true,
+    });
+    mounts.push({
+      hostPath: path.join(projectRoot, 'container', 'agent-runner', 'prompts'),
+      containerPath: '/app/prompts',
+      readonly: true,
+    });
+  }
 
   // Native Claude user config overlays the isolated session config. Workspace
   // remains the SDK cwd; these read-only mounts provide the same user-level
@@ -2124,6 +2121,7 @@ export function buildContainerArgs(
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
+  args.push('-e', `HAPPYCLAW_AGENT_RUNNER_MODE=${resolveAgentRunnerMode()}`);
   args.push('-e', `HAPPYCLAW_HOST_IDENTITY_MODE=${hostIdentity.mode}`);
   if (hostIdentity.mode === 'direct') {
     if (isPositiveUnixId(hostIdentity.uid)) {

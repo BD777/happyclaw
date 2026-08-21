@@ -9,6 +9,8 @@ import {
 } from './group-queue.js';
 import type {
   AuthUser,
+  AgentKind,
+  AgentStatus,
   NewMessage,
   MessageCursor,
   UserSessionWithUser,
@@ -239,6 +241,29 @@ export interface WebDeps {
     messageId: string,
     expectedRunId: string,
   ) => FollowUpActionResult;
+  /** Web projection is injected so route modules do not import the Web gateway. */
+  broadcastNewMessage?: (
+    chatJid: string,
+    message: NewMessage & { is_from_me?: boolean },
+    agentId?: string,
+    source?: string,
+  ) => void;
+  broadcastMessageDeleted?: (chatJid: string, messageId: string) => void;
+  broadcastAgentStatus?: (
+    chatJid: string,
+    agentId: string,
+    status: AgentStatus,
+    name: string,
+    prompt: string,
+    resultSummary?: string,
+    kind?: AgentKind,
+    titleGenerating?: boolean,
+  ) => void;
+  broadcastAgentRemoved?: (
+    chatJid: string,
+    agentId: string,
+    name: string,
+  ) => void;
 }
 
 export type Variables = {
@@ -255,6 +280,64 @@ export function setWebDeps(d: WebDeps): void {
 }
 export function getWebDeps(): WebDeps | null {
   return deps;
+}
+
+function missingProjection(name: string): never {
+  throw new Error(`Web projection is not initialized: ${name}`);
+}
+
+export function projectWebNewMessage(
+  chatJid: string,
+  message: NewMessage & { is_from_me?: boolean },
+  agentId?: string,
+  source?: string,
+): void {
+  const project = deps?.broadcastNewMessage;
+  if (!project) missingProjection('broadcastNewMessage');
+  project(chatJid, message, agentId, source);
+}
+
+export function projectWebMessageDeleted(
+  chatJid: string,
+  messageId: string,
+): void {
+  const project = deps?.broadcastMessageDeleted;
+  if (!project) missingProjection('broadcastMessageDeleted');
+  project(chatJid, messageId);
+}
+
+export function projectWebAgentStatus(
+  chatJid: string,
+  agentId: string,
+  status: AgentStatus,
+  name: string,
+  prompt: string,
+  resultSummary?: string,
+  kind?: AgentKind,
+  titleGenerating?: boolean,
+): void {
+  const project = deps?.broadcastAgentStatus;
+  if (!project) missingProjection('broadcastAgentStatus');
+  project(
+    chatJid,
+    agentId,
+    status,
+    name,
+    prompt,
+    resultSummary,
+    kind,
+    titleGenerating,
+  );
+}
+
+export function projectWebAgentRemoved(
+  chatJid: string,
+  agentId: string,
+  name: string,
+): void {
+  const project = deps?.broadcastAgentRemoved;
+  if (!project) missingProjection('broadcastAgentRemoved');
+  project(chatJid, agentId, name);
 }
 
 // lastActiveCache - 5 min debounce for session activity tracking

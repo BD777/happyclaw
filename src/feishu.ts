@@ -20,12 +20,8 @@ import {
   FileTooLargeError,
 } from './im-downloader.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastFollowUpUpdate, broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
-import {
-  resolveJidByMessageId,
-  getStreamingSession,
-} from './feishu-streaming-card.js';
+import { resolveJidByMessageId } from './feishu-streaming-card.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
@@ -41,11 +37,7 @@ import {
   resolveAdmittedChannelRoute,
   ChannelRouteRejectedError,
 } from './channel-admission.js';
-import {
-  extractProviderTarget,
-  parseChannelAddress,
-  scopeChannelJid,
-} from './channel-address.js';
+import { parseChannelAddress, scopeChannelJid } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
   isFeishuRuntimeControlLike,
@@ -140,6 +132,8 @@ export interface ConnectOptions {
   } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
+  onFollowUpsChanged?: import('./im-channel.js').IMChannelConnectOpts['onFollowUpsChanged'];
   /** Decide whether an inbound message starts now, queues, or steers. */
   onFollowUpMessage?: (input: {
     targetJid: string;
@@ -1986,6 +1980,8 @@ export function createFeishuConnection(
       resolveGroupFolder,
       resolveEffectiveChatJid,
       onAgentMessage,
+      onMessagePersisted,
+      onFollowUpsChanged,
       onFollowUpMessage,
       onSessionBreak,
       onSessionClear,
@@ -3060,7 +3056,7 @@ export function createFeishuConnection(
                 delivery_updated_at: timestamp,
               }
             : {};
-      broadcastNewMessage(
+      onMessagePersisted?.(
         targetJid,
         {
           id: messageId,
@@ -3091,7 +3087,7 @@ export function createFeishuConnection(
         return;
       }
       if (followUp.disposition === 'queued') {
-        broadcastFollowUpUpdate(targetJid);
+        onFollowUpsChanged?.(targetJid);
         logger.info(
           {
             chatJid,

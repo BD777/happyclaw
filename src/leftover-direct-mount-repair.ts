@@ -29,7 +29,6 @@ import {
   findWhatsAppAliasRoutingConflicts,
   sourceMatchesChannelConversation,
   type AffectedLeftoverWorkspace,
-  type LeftoverDirectAliasConflict,
   type LeftoverDirectMountDiagnosis,
   type LeftoverDirectWorkspaceMount,
 } from './leftover-direct-mount-diagnostic.js';

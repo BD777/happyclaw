@@ -557,55 +557,6 @@ export function resolveWorkspaceJid(
   return null;
 }
 
-export function normalizeChannelMountFromGroup(
-  channelJid: string,
-  group: RegisteredGroup,
-  deps: ChannelMountResolutionDeps,
-  now = new Date().toISOString(),
-): Omit<ChannelMount, 'created_at' | 'updated_at'> | null {
-  if (!isImChannelJid(channelJid)) return null;
-
-  const channelType = getChannelType(channelJid);
-  if (!channelType) return null;
-
-  if (group.target_agent_id) {
-    const session = deps.getAgent(group.target_agent_id);
-    if (!session?.chat_jid) return null;
-    return {
-      channel_jid: channelJid,
-      channel_account_id: group.channel_account_id ?? null,
-      channel_type: channelType,
-      workspace_jid: session.chat_jid,
-      session_id: group.target_agent_id,
-      routing_mode: 'single_session',
-      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
-      activation_mode: group.activation_mode ?? 'auto',
-      audience_mode: group.audience_mode ?? 'everyone',
-      owner_im_id: group.owner_im_id ?? null,
-    };
-  }
-
-  if (group.target_main_jid) {
-    const workspaceJid = resolveWorkspaceJid(group.target_main_jid, deps);
-    if (!workspaceJid) return null;
-    return {
-      channel_jid: channelJid,
-      channel_account_id: group.channel_account_id ?? null,
-      channel_type: channelType,
-      workspace_jid: workspaceJid,
-      session_id: null,
-      routing_mode: toRoutingMode(group),
-      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
-      activation_mode: group.activation_mode ?? 'auto',
-      audience_mode: group.audience_mode ?? 'everyone',
-      owner_im_id: group.owner_im_id ?? null,
-    };
-  }
-
-  void now;
-  return null;
-}
-
 export function resolveChannelMountTarget(
   mount: Pick<ChannelMount, 'session_id' | 'workspace_jid'>,
   deps: Pick<ChannelMountResolutionDeps, 'getAgent' | 'getRegisteredGroup'>,

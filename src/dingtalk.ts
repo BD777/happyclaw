@@ -19,11 +19,9 @@ import {
   TOPIC_ROBOT,
   type RobotMessage as DTRobotMessage,
   type DWClientDownStream,
-  EventAck,
 } from 'dingtalk-stream';
-import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
+import { storeChatMetadata, storeMessageDirect } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { GROUPS_DIR } from './config.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
@@ -82,6 +80,7 @@ export interface DingTalkConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
@@ -374,7 +373,6 @@ export function createDingTalkConnection(
   // SDK client state
   let client: DWClient | null = null;
   let stopping = false;
-  let readyFired = false;
 
   // Token state for REST API
   let tokenInfo: DingTalkAccessToken | null = null;
@@ -392,7 +390,6 @@ export function createDingTalkConnection(
 
   // Session webhook expiry per chat
   const sessionWebhookExpiry = new Map<string, number>();
-  const SESSION_WEBHOOK_TTL = 5 * 60 * 1000; // 5 minutes
 
   // Sender ID per chat (for sending files back to user)
   const lastSenderIds = new Map<string, string>();
@@ -1932,7 +1929,7 @@ export function createDingTalkConnection(
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
-        broadcastNewMessage(
+        opts.onMessagePersisted?.(
           targetJid,
           {
             id,
@@ -1990,7 +1987,6 @@ export function createDingTalkConnection(
       }
 
       stopping = false;
-      readyFired = false;
 
       try {
         // 🔧 Fix proxy issue: dingtalk-stream SDK uses axios internally, which can be
@@ -2057,7 +2053,6 @@ export function createDingTalkConnection(
         // disconnect-reconnect loop every 15 seconds, killing working connections.
         // Removed the monitor — the SDK is self-healing.
 
-        readyFired = true;
         opts.onReady?.();
         return true;
       } catch (err) {

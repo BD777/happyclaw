@@ -196,10 +196,12 @@ sync-types: ## 同步 shared/ 下的类型定义到各子项目
 update-sdk: ## 显式更新 agent-runner + 主服务的 Claude Agent SDK 到最新版本
 	@SDK_LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000); \
 	CLI_LATEST=$$(npm view @anthropic-ai/claude-code version --fetch-timeout=5000); \
-	echo "🔄 更新 Agent SDK → $$SDK_LATEST，Claude Code → $$CLI_LATEST"; \
+	BROWSER_LATEST=$$(npm view agent-browser version --fetch-timeout=5000); \
+	echo "🔄 更新 Agent SDK → $$SDK_LATEST，Claude Code → $$CLI_LATEST，agent-browser → $$BROWSER_LATEST"; \
 	$(PKG) --prefix container/agent-runner install --save-exact \
 	  @anthropic-ai/claude-agent-sdk@$$SDK_LATEST \
-	  @anthropic-ai/claude-code@$$CLI_LATEST; \
+	  @anthropic-ai/claude-code@$$CLI_LATEST \
+	  agent-browser@$$BROWSER_LATEST; \
 	$(PKG) install --save-exact @anthropic-ai/claude-agent-sdk@$$SDK_LATEST; \
 	$(PKG) --prefix container/agent-runner run build; \
 	echo "✅ SDK/CLI 与 runner lockfile 已更新。请运行 make typecheck && make test 验证。"
@@ -208,12 +210,14 @@ ensure-latest-sdk: ## 只读检查 SDK/CLI 最新版本（兼容旧工作流）
 	@LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
 	ROOT_LOCAL=$$(node -p "require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
 	CLI_LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-code/package.json').version" 2>/dev/null || echo "0.0.0"); \
+	BROWSER_LOCAL=$$(node -p "require('./container/agent-runner/node_modules/agent-browser/package.json').version" 2>/dev/null || echo "0.0.0"); \
 	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	CLI_LATEST=$$(npm view @anthropic-ai/claude-code version --fetch-timeout=5000 2>/dev/null || echo "$$CLI_LOCAL"); \
-	if [ "$$LOCAL" = "$$LATEST" ] && [ "$$ROOT_LOCAL" = "$$LATEST" ] && [ "$$CLI_LOCAL" = "$$CLI_LATEST" ]; then \
-		echo "✅ Agent SDK/CLI 已是最新（SDK $$LOCAL，CLI $$CLI_LOCAL）"; \
+	BROWSER_LATEST=$$(npm view agent-browser version --fetch-timeout=5000 2>/dev/null || echo "$$BROWSER_LOCAL"); \
+	if [ "$$LOCAL" = "$$LATEST" ] && [ "$$ROOT_LOCAL" = "$$LATEST" ] && [ "$$CLI_LOCAL" = "$$CLI_LATEST" ] && [ "$$BROWSER_LOCAL" = "$$BROWSER_LATEST" ]; then \
+		echo "✅ Agent SDK/CLI/agent-browser 已是最新（SDK $$LOCAL，CLI $$CLI_LOCAL，agent-browser $$BROWSER_LOCAL）"; \
 	else \
-		echo "ℹ️  可更新：runner SDK $$LOCAL、host SDK $$ROOT_LOCAL → $$LATEST；CLI $$CLI_LOCAL → $$CLI_LATEST"; \
+		echo "ℹ️  可更新：runner SDK $$LOCAL、host SDK $$ROOT_LOCAL → $$LATEST；CLI $$CLI_LOCAL → $$CLI_LATEST；agent-browser $$BROWSER_LOCAL → $$BROWSER_LATEST"; \
 		echo "   请显式执行 make update-sdk，验证后提交 package.json 与 lockfile。"; \
 	fi
 

@@ -5,7 +5,6 @@ import {
   LAST_ACTIVE_DEBOUNCE_MS,
   getCachedSessionWithUser,
   invalidateSessionCache,
-  type Variables,
 } from '../web-context.js';
 import { updateSessionLastActive, deleteUserSession } from '../db.js';
 import {

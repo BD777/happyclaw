@@ -97,9 +97,21 @@ describe('exact processing indicator host contract', () => {
   });
 
   test('provider registry keys omit HappyClaw account scoping on attach', () => {
-    for (const file of ['src/feishu.ts', 'src/discord.ts', 'src/dingtalk.ts']) {
-      expect(fs.readFileSync(file, 'utf8')).toMatch(/extractProviderTarget/);
-    }
+    const manager = fs.readFileSync('src/im-manager.ts', 'utf8');
+    const attach = sourceBetween(
+      manager,
+      'async beginAckReaction(',
+      'async clearAckReaction(',
+    );
+    const clear = sourceBetween(
+      manager,
+      'async clearAckReaction(',
+      'async createStreamingSession(',
+    );
+    expect(attach).toMatch(/const chatId = extractProviderTarget\(jid\)/);
+    expect(clear).toMatch(/const chatId = extractProviderTarget\(jid\)/);
+    expect(attach).not.toMatch(/scopeChannelJid/);
+    expect(clear).not.toMatch(/scopeChannelJid/);
   });
 
   test('ack provider release failures propagate back to the ownership registry', () => {
