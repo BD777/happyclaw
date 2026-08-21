@@ -290,7 +290,7 @@ export interface QQConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   normalizeIncomingJid?: (jid: string) => string | null;
 }
 

@@ -3606,20 +3606,6 @@ export function restorePromotingFollowUpBatch(
   }
 }
 
-export function beginPromotingFollowUp(
-  chatJid: string,
-  messageId: string,
-): QueuedFollowUp | null {
-  return transitionFollowUp(chatJid, messageId, ['queued'], 'promoting');
-}
-
-export function restorePromotingFollowUp(
-  chatJid: string,
-  messageId: string,
-): QueuedFollowUp | null {
-  return transitionFollowUp(chatJid, messageId, ['promoting'], 'queued');
-}
-
 export function cancelQueuedFollowUp(
   chatJid: string,
   messageId: string,
@@ -4520,15 +4506,6 @@ export function getTaskById(id: string): ScheduledTask | undefined {
   return row ? mapTaskRow(row) : undefined;
 }
 
-export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
-  return db
-    .prepare(
-      'SELECT * FROM scheduled_tasks WHERE group_folder = ? AND deleted_at IS NULL ORDER BY created_at DESC',
-    )
-    .all(groupFolder)
-    .map(mapTaskRow);
-}
-
 export function getAllTasks(): ScheduledTask[] {
   return db
     .prepare(
@@ -4997,27 +4974,6 @@ export function deleteTask(id: string): void {
   db.prepare('DELETE FROM task_runs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
-}
-
-export function deleteTasksForGroup(groupFolder: string): void {
-  const tx = db.transaction((folder: string) => {
-    db.prepare(
-      `DELETE FROM task_runs
-       WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)`,
-    ).run(folder);
-    db.prepare(
-      `
-      DELETE FROM task_run_logs
-      WHERE task_id IN (
-        SELECT id FROM scheduled_tasks WHERE group_folder = ?
-      )
-      `,
-    ).run(folder);
-    db.prepare('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(
-      folder,
-    );
-  });
-  tx(groupFolder);
 }
 
 export function getDueTasks(): ScheduledTask[] {
@@ -11453,13 +11409,6 @@ export function getChannelMount(channelJid: string): ChannelMount | undefined {
   return row ? parseChannelMountRow(row) : undefined;
 }
 
-export function listChannelMounts(): ChannelMount[] {
-  const rows = db
-    .prepare('SELECT * FROM channel_mounts ORDER BY updated_at DESC')
-    .all() as ChannelMountRow[];
-  return rows.map(parseChannelMountRow);
-}
-
 export function listChannelMountsByWorkspace(
   workspaceJid: string,
 ): ChannelMount[] {
@@ -11612,12 +11561,6 @@ export function listImContextBindingsByAgent(
   return rows.map(mapImContextBindingRow);
 }
 
-export function deleteImContextBindingsByWorkspace(workspaceJid: string): void {
-  db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
-    workspaceJid,
-  );
-}
-
 export function deleteImContextBindingsByAgent(agentId: string): void {
   db.prepare('DELETE FROM im_context_bindings WHERE agent_id = ?').run(agentId);
 }
@@ -11632,16 +11575,6 @@ export function touchImContextBindingActivity(
   db.prepare(
     'UPDATE im_context_bindings SET last_active_at = ?, updated_at = ? WHERE source_jid = ? AND context_type = ? AND context_id = ?',
   ).run(lastActiveAt, lastActiveAt, sourceJid, contextType, contextId);
-}
-
-/** List native-thread agent IDs for a workspace JID (legacy Feishu included). */
-export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
-  const rows = db
-    .prepare(
-      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind IN ('native_thread', 'feishu_thread')",
-    )
-    .all(workspaceJid) as { id: string }[];
-  return rows.map((r) => r.id);
 }
 
 /**
@@ -12344,35 +12277,6 @@ export function getTaskRunLogs(taskId: string, limit = 20): TaskRunLog[] {
   `,
     )
     .all(taskId, limit) as TaskRunLog[];
-}
-
-// ===================== Daily Summary Queries =====================
-
-/**
- * Get messages for a chat within a time range, ordered by timestamp ASC.
- */
-export function getMessagesByTimeRange(
-  chatJid: string,
-  startTs: number,
-  endTs: number,
-  limit = 500,
-): Array<NewMessage & { is_from_me: boolean }> {
-  const startIso = new Date(startTs).toISOString();
-  const endIso = new Date(endTs).toISOString();
-  const rows = db
-    .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
-       FROM messages
-       WHERE chat_jid = ? AND timestamp >= ? AND timestamp < ?
-       ORDER BY timestamp ASC
-       LIMIT ?`,
-    )
-    .all(chatJid, startIso, endIso, limit) as Array<
-    NewMessage & { is_from_me: number }
-  >;
-
-  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -13318,48 +13222,6 @@ export function queryAuthAuditLogs(
   return { logs, total, limit, offset };
 }
 
-export function getAuthAuditLogs(limit = 100, offset = 0): AuthAuditLog[] {
-  return queryAuthAuditLogs({ limit, offset }).logs;
-}
-
-export function checkLoginRateLimitFromAudit(
-  username: string,
-  ip: string,
-  maxAttempts: number,
-  lockoutMinutes: number,
-): { allowed: boolean; retryAfterSeconds?: number; attempts: number } {
-  if (maxAttempts <= 0) return { allowed: true, attempts: 0 };
-  const windowStart = new Date(
-    Date.now() - lockoutMinutes * 60 * 1000,
-  ).toISOString();
-  const rows = db
-    .prepare(
-      `
-      SELECT created_at
-      FROM auth_audit_log
-      WHERE event_type = 'login_failed'
-        AND username = ?
-        AND ip_address = ?
-        AND created_at >= ?
-        AND (details IS NULL OR details NOT LIKE '%"reason":"rate_limited"%')
-      ORDER BY created_at ASC
-      `,
-    )
-    .all(username, ip, windowStart) as Array<{ created_at: string }>;
-
-  const attempts = rows.length;
-  if (attempts < maxAttempts) return { allowed: true, attempts };
-
-  const oldest = rows[0]?.created_at;
-  const oldestTs = oldest ? Date.parse(oldest) : Date.now();
-  const retryAt = oldestTs + lockoutMinutes * 60 * 1000;
-  const retryAfterSeconds = Math.max(
-    1,
-    Math.ceil((retryAt - Date.now()) / 1000),
-  );
-  return { allowed: false, retryAfterSeconds, attempts };
-}
-
 // ===================== Sub-Agent CRUD =====================
 
 export function createAgent(agent: SubAgent): void {
@@ -13394,15 +13256,6 @@ export function getAgent(id: string): SubAgent | undefined {
     | undefined;
   if (!row) return undefined;
   return mapAgentRow(row);
-}
-
-export function listAgentsByFolder(folder: string): SubAgent[] {
-  const rows = db
-    .prepare(
-      'SELECT * FROM agents WHERE group_folder = ? ORDER BY created_at DESC',
-    )
-    .all(folder) as Array<Record<string, unknown>>;
-  return rows.map(mapAgentRow);
 }
 
 export function listAgentsByJid(chatJid: string): SubAgent[] {
@@ -14194,18 +14047,6 @@ export function expireSubscriptions(): number {
   return result.changes + renewed;
 }
 
-export function updateSubscriptionAutoRenew(
-  userId: string,
-  autoRenew: boolean,
-): boolean {
-  const result = db
-    .prepare(
-      "UPDATE user_subscriptions SET auto_renew = ? WHERE user_id = ? AND status = 'active'",
-    )
-    .run(autoRenew ? 1 : 0, userId);
-  return result.changes > 0;
-}
-
 function mapSubscriptionRow(row: Record<string, unknown>): UserSubscription {
   return {
     id: String(row.id),
@@ -14570,16 +14411,6 @@ export function createRedeemCode(code: RedeemCode): void {
     code.batch_id,
     code.created_at,
   );
-}
-
-export function incrementRedeemCodeUsage(code: string, userId: string): void {
-  const now = new Date().toISOString();
-  db.prepare(
-    'UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = ?',
-  ).run(code);
-  db.prepare(
-    'INSERT INTO redeem_code_usage (code, user_id, redeemed_at) VALUES (?, ?, ?)',
-  ).run(code, userId, now);
 }
 
 export function deleteRedeemCode(code: string): boolean {
@@ -15074,15 +14905,6 @@ export function batchAssignPlan(
   });
   txn();
   return count;
-}
-
-export function getPlanSubscriberCount(planId: string): number {
-  const row = db
-    .prepare(
-      "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ? AND status = 'active'",
-    )
-    .get(planId) as { cnt: number };
-  return row.cnt;
 }
 
 export function getAllPlanSubscriberCounts(): Record<string, number> {

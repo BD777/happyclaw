@@ -18,7 +18,7 @@ import type { AuthUser, RegisteredGroup } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { GROUPS_DIR } from '../config.js';
 import { validateSafeHttpsUrl } from '../url-safety.js';
-import { canAccessGroup, canModifyGroup } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import { getRegisteredGroup } from '../db.js';
 import {
   validateSkillId,

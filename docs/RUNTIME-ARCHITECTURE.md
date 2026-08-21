@@ -29,19 +29,27 @@ SQLite durable state ──► Conversation lane / GroupQueue
   and channel modules receive projection callbacks through `WebDeps`; they must
   not import the Web gateway.
 - `src/channel-registry.ts` owns lazy loading for optional channel providers.
-  `src/im-channel.ts` defines provider-neutral contracts and adapters. Provider
-  SDKs load only when an enabled account connects.
+  `src/channel-contracts.ts` contains provider-neutral Host callbacks and
+  `src/im-channel.ts` owns adapters. Provider SDKs load only when an enabled
+  account connects.
+- `src/group-acl.ts` owns workspace/channel authorization. Domain services do
+  not import the Web gateway to make authorization decisions.
 - `src/im-manager.ts` owns connected account instances and routing to the exact
   account. Provider connectors own only provider protocol behavior.
 - `src/group-queue.ts` owns per-conversation serialization and runner lifecycle.
   Durable messages, cursors, task runs and delivery state remain in SQLite.
 - `src/container-runner.ts` prepares one Host or Docker launch. The production
   Docker image runs the immutable precompiled Agent artifact; source compilation
-  is an explicit development mode.
+  is an explicit development mode. One launch snapshot supplies mounts, Skills,
+  plugins, MCP provenance and the selected capability image.
 - `container/agent-runner/` owns Claude SDK interaction. Chromium starts only
   when `agent-browser` is first invoked.
+- The core Agent image excludes Headroom's optional Python dependency tree.
+  A runtime with an explicit `headroom` MCP command selects the matching signed
+  `-headroom` image for the same source revision.
 - `web/src/components/chat/MarkdownRenderer.tsx` keeps ordinary Markdown on a
-  small synchronous path and lazy-loads code, math, raw HTML and Mermaid support.
+  small synchronous path and lazy-loads code, math, raw HTML and Mermaid as
+  separate feature chunks.
 
 ## Dependency rules
 
@@ -64,7 +72,8 @@ SQLite durable state ──► Conversation lane / GroupQueue
 - A non-browser Agent turn must not start Chromium.
 - Container startup must not run TypeScript compilation in production mode.
 - CI must build and smoke the exact multi-architecture image before it can be
-  promoted to `latest`.
+  promoted to `latest`. The smoke starts the immutable Runner and completes a
+  credential-free SDK/CLI query against an in-container fake provider.
 
 These rules are enforced by type checks, channel lazy-loading tests, Markdown
 bundle tests and the Agent image smoke workflow.

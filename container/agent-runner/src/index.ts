@@ -3915,6 +3915,21 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  if (process.env.HAPPYCLAW_IMAGE_PREFLIGHT === '1') {
+    const cli = resolveBundledClaudeCli();
+    if (!cli || typeof query !== 'function' || SECURITY_RULES.length === 0) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        error: 'Immutable image preflight failed',
+      });
+      forceExitWithSafetyNet(1);
+    }
+    execFileSync(cli, ['--version'], { stdio: 'ignore' });
+    writeOutput({ status: 'closed', result: 'IMAGE_RUNNER_PREFLIGHT_OK' });
+    forceExitWithSafetyNet(0);
+  }
+
   setCurrentChannelTurn(
     containerInput,
     containerInput.currentSourceJid,

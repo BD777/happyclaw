@@ -44,7 +44,7 @@ RUN npm run build \
     && find dist prompts -type d -exec chmod 0555 {} + \
     && find dist prompts -type f -exec chmod 0444 {} +
 
-FROM node:24-slim AS runtime
+FROM node:24-slim AS runtime-base
 
 # The publish workflow sets this to the main-branch commit SHA. Writing it into
 # the first layer intentionally invalidates all downstream "latest" tool
@@ -168,31 +168,13 @@ COPY --from=agent-build /build/agent-runner/package.json /build/agent-runner/pac
 COPY --from=agent-build /build/happyclaw-agent-browser-binary /usr/local/share/happyclaw-agent-browser-binary
 COPY --from=agent-build /build/agent-runner/dist /opt/happyclaw-agent/dist
 COPY --from=agent-build /build/agent-runner/prompts /opt/happyclaw-agent/prompts
+COPY image-sdk-query-smoke.mjs /opt/happyclaw-agent/smoke/image-sdk-query-smoke.mjs
 RUN ln -s /app/node_modules /opt/happyclaw-agent/node_modules \
     && test -f /opt/happyclaw-agent/dist/index.js \
-    && test -f /opt/happyclaw-agent/prompts/security-rules.md
-
-# Headroom (https://github.com/chopratejas/headroom) - 工具输出/RAG/日志压缩.
-# 装上 binary 但默认不启用——用户在 /mcp-servers 自行添加才生效, 配置:
-#   { "command": "headroom", "args": ["mcp", "serve"] }
-# 只选 [code,mcp] 两个 extras: [memory] 通过 sentence-transformers 强依赖
-# torch + CUDA (cudnn-cu12, cublas, cusparse, cusolver, nccl, triton...),
-# 压缩包就 ~2.45GB, 解包 3-6GB 量级. HappyClaw 容器无 GPU, 也不需要语义
-# embedding 类 retrieve. 用户如真需要 headroom 的 memory 能力, 可在容器内
-# 单独 `pip install --index-url https://download.pytorch.org/whl/cpu torch`
-# 再 `pip install "headroom-ai[memory]"` 走 CPU 路径. PIP_BREAK_SYSTEM_PACKAGES
-# 已在上方设置, 这里无需再传 --break-system-packages.
-# 默认安装源码锁定版本；HEADROOM_VERSION 仍可用于显式升级或回退。继续只
-# 安装 [code,mcp]，避免 [memory] 的 GPU/torch 依赖把镜像额外撑大数 GB。
-ARG HEADROOM_VERSION=0.35.0
-RUN set -eu; \
-    if [ "$HEADROOM_VERSION" = latest ]; then \
-      HEADROOM_SPEC='headroom-ai[code,mcp]'; \
-    else \
-      HEADROOM_SPEC="headroom-ai[code,mcp]==${HEADROOM_VERSION}"; \
-    fi; \
-    pip install --no-cache-dir --upgrade "$HEADROOM_SPEC"; \
-    python3 -c "from importlib.metadata import version; print('headroom-ai', version('headroom-ai'))"
+    && test -f /opt/happyclaw-agent/prompts/security-rules.md \
+    && chown -R root:root /opt/happyclaw-agent/smoke \
+    && chmod 0555 /opt/happyclaw-agent/smoke \
+    && chmod 0444 /opt/happyclaw-agent/smoke/image-sdk-query-smoke.mjs
 
 # Resolve the pinned feishu-cli release and verify it against the publisher's
 # checksums. FEISHU_CLI_VERSION remains an explicit upgrade/rollback input.
@@ -241,7 +223,8 @@ RUN mkdir -p /workspace/group /workspace/extra /workspace/ipc/messages /workspac
 
 # Copy entrypoint scripts (run as root, then drop to node via runuser)
 COPY entrypoint.sh session-permissions.sh session-permissions-mount.mjs session-permissions-rescan-queue.mjs session-permissions-watcher.mjs session-generated-paths.mjs session-prompts-copy.mjs /app/
-RUN chmod +x /app/entrypoint.sh
+COPY write-tool-audit.sh /app/write-tool-audit.sh
+RUN chmod +x /app/entrypoint.sh /app/write-tool-audit.sh
 
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace
@@ -264,28 +247,28 @@ RUN set -eu; \
     chown -R node:node /home/node/.oh-my-zsh /home/node/.zshrc; \
     chsh -s /bin/zsh node
 
-# Keep an in-image audit record of every dynamically resolved tool version.
-# This can be inspected without relying on transient GitHub Actions logs:
-#   cat /usr/local/share/happyclaw-tool-versions.txt
-RUN set -eu; \
-    { \
-      printf 'tool_refresh=%s\n' "$TOOL_REFRESH"; \
-      printf 'node=%s\n' "$(node --version)"; \
-      printf 'npm=%s\n' "$(npm --version)"; \
-      printf 'uv=%s\n' "$(uv --version | awk '{print $2}')"; \
-      node -e "const fs=require('node:fs'); for (const p of ['@anthropic-ai/claude-agent-sdk','@anthropic-ai/claude-code','agent-browser']) { const j=JSON.parse(fs.readFileSync('/app/node_modules/'+p+'/package.json','utf8')); console.log(p+'='+j.version); }"; \
-      printf 'feishu-cli=%s\n' "$(cat /usr/local/share/feishu-cli-version)"; \
-      printf 'headroom=%s\n' "$(python3 -c "from importlib.metadata import version; print(version('headroom-ai'))")"; \
-      printf 'chromium=%s\n' "$(chromium --version | awk '{print $2}')"; \
-      printf 'agent-browser-binary=%s\n' "$(cat /usr/local/share/happyclaw-agent-browser-binary)"; \
-      printf 'agent-runner-sha256=%s\n' "$(sha256sum /opt/happyclaw-agent/dist/index.js | awk '{print $1}')"; \
-      printf 'oh-my-zsh=%s\n' "$(cat /usr/local/share/oh-my-zsh-version)"; \
-    } > /usr/local/share/happyclaw-tool-versions.txt; \
-    cat /usr/local/share/happyclaw-tool-versions.txt
-
 # Entrypoint runs as root to fix volume permissions, then drops to node user.
 # Do NOT add USER node here — entrypoint handles the privilege drop.
 WORKDIR /workspace/group
 
 # Entry point reads JSON from stdin, outputs JSON to stdout
 ENTRYPOINT ["/app/entrypoint.sh"]
+
+FROM runtime-base AS runtime-core
+ENV HAPPYCLAW_IMAGE_PROFILE=core
+RUN /app/write-tool-audit.sh core
+
+# Headroom is a separate capability profile because its Python dependency tree
+# adds roughly 0.5GB while no process runs unless an MCP definition requests it.
+FROM runtime-base AS runtime-headroom
+ARG HEADROOM_VERSION=0.35.0
+ENV HAPPYCLAW_IMAGE_PROFILE=headroom
+RUN set -eu; \
+    HEADROOM_SPEC="headroom-ai[code,mcp]==${HEADROOM_VERSION}"; \
+    pip install --no-cache-dir --upgrade "$HEADROOM_SPEC"; \
+    python3 -c "from importlib.metadata import version; print('headroom-ai', version('headroom-ai'))"; \
+    /app/write-tool-audit.sh headroom
+
+# Local/default builds remain the lean production profile. CI explicitly
+# targets and publishes both runtime-core and runtime-headroom.
+FROM runtime-core AS runtime

@@ -35,7 +35,19 @@ import {
 } from './db.js';
 import { logger } from './logger.js';
 import { ensureAgentDirectories } from './utils.js';
-import { getWebDeps } from './web-context.js';
+
+export interface ChannelMountRuntimePort {
+  getRegisteredGroups: () => Record<string, RegisteredGroup>;
+  clearImFailCounts?: (jid: string) => void;
+}
+
+let channelMountRuntimePort: ChannelMountRuntimePort | null = null;
+
+export function injectChannelMountRuntimePort(
+  port: ChannelMountRuntimePort | null,
+): void {
+  channelMountRuntimePort = port;
+}
 
 export interface ChannelMountResolutionDeps {
   getAgent: (
@@ -126,10 +138,6 @@ export type ChannelMountTargetResolution =
       sessionId?: string;
       workspaceJid: string;
     };
-
-export function isImChannelJid(jid: string): boolean {
-  return jid !== '' && !jid.startsWith('web:') && getChannelType(jid) !== null;
-}
 
 /**
  * A native-context container owns many platform conversations (for example a
@@ -530,12 +538,6 @@ export function upgradeNativeContextChannelMount(
   return { status: 'upgraded', updated };
 }
 
-export function toRoutingMode(
-  group: Pick<RegisteredGroup, 'binding_mode'>,
-): ChannelRoutingMode {
-  return group.binding_mode === 'thread_map' ? 'thread_map' : 'single_session';
-}
-
 export function resolveWorkspaceJid(
   workspaceJid: string | undefined,
   deps: Pick<
@@ -694,11 +696,10 @@ export function commitChannelMountUpdate(
   } else {
     setRegisteredGroup(channelJid, updated);
   }
-  const deps = getWebDeps();
-  if (!deps) return;
-  const groups = deps.getRegisteredGroups();
+  if (!channelMountRuntimePort) return;
+  const groups = channelMountRuntimePort.getRegisteredGroups();
   if (groups[channelJid]) groups[channelJid] = updated;
-  deps.clearImFailCounts?.(channelJid);
+  channelMountRuntimePort.clearImFailCounts?.(channelJid);
 }
 
 export function hasSessionMountConflict(

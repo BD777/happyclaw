@@ -82,7 +82,7 @@ export interface DiscordConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;

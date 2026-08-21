@@ -9,7 +9,7 @@ import {
   projectWebAgentStatus,
 } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { canAccessGroup, canModifyGroup } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import {
   clearSessionChannelOwner,
   getRegisteredGroup,

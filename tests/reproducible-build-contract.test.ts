@@ -81,7 +81,10 @@ describe('reproducible build contract', () => {
     const publishWorkflow = read('.github/workflows/docker-publish.yml');
 
     expect(dockerfile).toMatch(/^FROM node:24-slim AS agent-build$/m);
-    expect(dockerfile).toMatch(/^FROM node:24-slim AS runtime$/m);
+    expect(dockerfile).toMatch(/^FROM node:24-slim AS runtime-base$/m);
+    expect(dockerfile).toMatch(/^FROM runtime-base AS runtime-core$/m);
+    expect(dockerfile).toMatch(/^FROM runtime-base AS runtime-headroom$/m);
+    expect(dockerfile).toMatch(/^FROM runtime-core AS runtime$/m);
     expect(dockerfile).toContain('COPY --from=ghcr.io/astral-sh/uv:0.12.5');
     expect(dockerfile).toContain('npm ci');
     expect(dockerfile).not.toContain('ARG CLAUDE_AGENT_SDK_VERSION=latest');
@@ -96,8 +99,10 @@ describe('reproducible build contract', () => {
       'ARG OH_MY_ZSH_REF=97e11051e2f8053b1d694788d1cb4b0dbb1e2365',
     );
     expect(dockerfile).toContain('sha256sum -c checksum.txt');
-    expect(dockerfile).toContain('happyclaw-tool-versions.txt');
-    expect(dockerfile).toContain("version('headroom-ai')");
+    const toolAudit = read('container/write-tool-audit.sh');
+    expect(toolAudit).toContain('happyclaw-tool-versions.txt');
+    expect(toolAudit).toContain("version('headroom-ai')");
+    expect(toolAudit).toContain('image-profile=%s');
     expect(dockerfile).toContain('PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1');
     expect(dockerfile).not.toContain('npm install -g');
     expect(publishWorkflow).toContain('TOOL_REFRESH=${{ github.sha }}');

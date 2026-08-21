@@ -61,6 +61,21 @@ else
   )
 fi
 
+runner_preflight="$({
+  printf '%s' '{"prompt":"image preflight","groupFolder":"smoke","chatJid":"web:smoke","isMain":false}' |
+    docker run --rm --interactive \
+      "${smoke_identity_args[@]}" \
+      --env HAPPYCLAW_IMAGE_PREFLIGHT=1 \
+      --tmpfs /home/node/.claude:rw,nosuid,nodev,noexec \
+      --tmpfs /workspace/ipc:rw,nosuid,nodev,noexec \
+      --tmpfs /workspace/group:rw,nosuid,nodev \
+      --tmpfs /workspace/extra:rw,nosuid,nodev \
+      "$IMAGE_REF"
+} 2>&1)"
+printf '%s\n' "$runner_preflight"
+grep -q 'IMAGE_RUNNER_PREFLIGHT_OK' <<<"$runner_preflight"
+grep -q 'phase=runner_exec' <<<"$runner_preflight"
+
 # -i keeps stdin open while detached. The production entrypoint validates the
 # immutable Agent artifact, installs the lazy browser wrapper, and then waits
 # for task JSON on stdin. The smoke invokes that real wrapper explicitly.
@@ -100,6 +115,9 @@ docker exec "$SMOKE_CONTAINER_NAME" \
   test ! -e /tmp/dist/index.js
 docker exec "$SMOKE_CONTAINER_NAME" \
   /app/node_modules/.bin/claude --version
+docker exec --user node "$SMOKE_CONTAINER_NAME" \
+  env HOME=/home/node node \
+  /opt/happyclaw-agent/smoke/image-sdk-query-smoke.mjs
 
 # Chromium must consume no resources before a browser tool is actually used.
 if docker exec "$SMOKE_CONTAINER_NAME" \

@@ -125,7 +125,7 @@ export interface WeChatConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   normalizeIncomingJid?: (jid: string) => string | null;
   /** No inbound message may register or download media before this passes. */
   isChatAuthorized?: (jid: string) => boolean;

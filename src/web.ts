@@ -21,11 +21,10 @@ import {
   LAST_ACTIVE_DEBOUNCE_MS,
   isHostExecutionGroup,
   hasHostExecutionPermission,
-  canAccessGroup,
-  canModifyGroup,
   getCachedSessionWithUser,
   invalidateSessionCache,
 } from './web-context.js';
+import { canAccessGroup, canModifyGroup } from './group-acl.js';
 
 // Schemas
 import {

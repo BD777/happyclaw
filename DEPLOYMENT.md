@@ -29,6 +29,8 @@ export HAPPYCLAW_EXPECTED_SHA='replace-with-full-commit-sha'
 export HAPPYCLAW_PUBLIC_URL_PRIMARY='https://claw.riba2534.cn'
 export HAPPYCLAW_PUBLIC_URL_SECONDARY='https://claw.home.riba2534.cn:23333'
 export HAPPYCLAW_AGENT_IMAGE='riba2534/happyclaw-agent:latest'
+# 分支不可变镜像会自动派生同 SHA 的 `-headroom` 能力标签；只有实际配置
+# headroom MCP 时 Docker 才按需拉取它。
 ```
 
 ## 2. 只读预检与目标校验

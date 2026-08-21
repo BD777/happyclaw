@@ -5,68 +5,12 @@ import remarkMath from 'remark-math';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
 import rehypeRaw from 'rehype-raw';
-import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+import rehypeSanitize from 'rehype-sanitize';
 import { MarkdownContent, type MarkdownRendererProps } from './MarkdownContent';
 import type { MarkdownFeatures } from './MarkdownRenderer';
+import { markdownSanitizeSchema } from './markdownSanitizeSchema';
 import 'highlight.js/styles/github.css';
 import 'katex/dist/katex.min.css';
-
-/** Preserve highlight classes and KaTeX's MathML accessibility layer. */
-const sanitizeSchema = {
-  ...defaultSchema,
-  attributes: {
-    ...defaultSchema.attributes,
-    code: [...(defaultSchema.attributes?.code || []), 'class', 'className'],
-    span: [
-      ...(defaultSchema.attributes?.span || []),
-      'class',
-      'className',
-      'style',
-      'aria-hidden',
-    ],
-    div: [
-      ...(defaultSchema.attributes?.div || []),
-      'class',
-      'className',
-      'style',
-    ],
-    img: ['src', 'alt', 'width', 'height', 'loading', 'longDesc', 'title'],
-    math: ['xmlns', 'display'],
-    annotation: ['encoding'],
-  },
-  tagNames: [
-    ...(defaultSchema.tagNames || []),
-    'math',
-    'semantics',
-    'mrow',
-    'mi',
-    'mn',
-    'mo',
-    'msup',
-    'msub',
-    'mfrac',
-    'mover',
-    'munder',
-    'msqrt',
-    'mroot',
-    'mtable',
-    'mtr',
-    'mtd',
-    'mtext',
-    'mspace',
-    'mstyle',
-    'menclose',
-    'annotation',
-    'msubsup',
-    'munderover',
-    'mpadded',
-    'mphantom',
-  ],
-  protocols: {
-    ...defaultSchema.protocols,
-    src: [...(defaultSchema.protocols?.src || []), 'data'],
-  },
-};
 
 export interface EnhancedMarkdownRendererProps extends MarkdownRendererProps {
   features: MarkdownFeatures;
@@ -102,7 +46,7 @@ export function EnhancedMarkdownRenderer({
             ...(features.hasMath
               ? [[rehypeKatex, { throwOnError: false, strict: false }] as const]
               : []),
-            [rehypeSanitize, sanitizeSchema] as const,
+            [rehypeSanitize, markdownSanitizeSchema] as const,
           ],
     [features.hasCodeFence, features.hasMath, streaming],
   );

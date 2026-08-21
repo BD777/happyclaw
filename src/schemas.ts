@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { AGENT_EFFORT_LEVELS } from './agent-effort.js';
 import { ALL_PERMISSIONS } from './permissions.js';
 import type { Permission } from './types.js';
-import { MAX_GROUP_NAME_LEN } from './web-context.js';
+import { MAX_GROUP_NAME_LEN } from './group-constants.js';
 
 export const ChannelProviderSchema = z.enum([
   'feishu',

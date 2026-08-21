@@ -46,7 +46,6 @@ import type {
   FollowUpActionResult,
   FollowUpDisposition,
   FollowUpMode,
-  NewMessage,
 } from './types.js';
 import type {
   FeishuCapabilityRequest,
@@ -64,6 +63,10 @@ import type { QQStreamingController } from './qq-streaming-card.js';
 import type { WeComStreamingController } from './wecom-streaming.js';
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
 import { loadChannelImplementation } from './channel-registry.js';
+import type {
+  OnChannelFollowUpsChanged,
+  OnChannelMessagePersisted,
+} from './channel-contracts.js';
 
 /** Union type for any streaming card controller (Feishu, DingTalk, Discord, QQ, or WeCom) */
 export type StreamingSession =
@@ -108,13 +111,9 @@ export interface IMChannelConnectOpts {
   onNewChat: (chatJid: string, chatName: string) => void;
   onMessage?: (chatJid: string, text: string, senderName: string) => void;
   /** Project a channel message after its durable insert has committed. */
-  onMessagePersisted?: (
-    chatJid: string,
-    message: NewMessage & { is_from_me?: boolean },
-    agentId?: string,
-  ) => void;
+  onMessagePersisted?: OnChannelMessagePersisted;
   /** Notify host projections after the durable follow-up queue changes. */
-  onFollowUpsChanged?: (chatJid: string) => void;
+  onFollowUpsChanged?: OnChannelFollowUpsChanged;
   ignoreMessagesBefore?: number;
   isChatAuthorized?: (jid: string) => boolean;
   onPairAttempt?: (
@@ -267,17 +266,6 @@ export interface ChannelMessageDeliveryOptions {
   /** `native` avoids bot/card presentation for Proactive-mode workspace Agents. */
   presentation?: 'default' | 'native';
 }
-
-// ─── Channel Registry ───────────────────────────────────────────
-
-/** Backward-compatible registry derived from the shared CHANNEL_PREFIXES. */
-export const CHANNEL_REGISTRY: Record<string, { prefix: string }> =
-  Object.fromEntries(
-    Object.entries(CHANNEL_PREFIXES).map(([type, prefix]) => [
-      type,
-      { prefix },
-    ]),
-  );
 
 /**
  * Determine the channel type from a JID string.

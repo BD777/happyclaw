@@ -23,14 +23,16 @@ import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
-  canAccessGroup,
-  canModifyGroup,
-  canDeleteGroup,
-  MAX_GROUP_NAME_LEN,
   getWebDeps,
   projectWebMessageDeleted,
   projectWebNewMessage,
 } from '../web-context.js';
+import {
+  canAccessGroup,
+  canModifyGroup,
+  canDeleteGroup,
+} from '../group-acl.js';
+import { MAX_GROUP_NAME_LEN } from '../group-constants.js';
 import {
   clearSessionChannelOwner,
   getRegisteredGroup,

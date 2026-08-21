@@ -105,7 +105,7 @@ export interface WhatsAppConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   /** Bot added to a new group */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot removed from a group / group dissolved */
@@ -1286,16 +1286,6 @@ export function collectWhatsAppSelfJids(self: WhatsAppSelfRef): string[] {
     if (key) identities.add(key);
   }
   return [...identities];
-}
-
-export function isWhatsAppSelfJid(
-  candidate: string | null | undefined,
-  self: WhatsAppSelfRef,
-): boolean {
-  if (!candidate) return false;
-  const key = canonicalizeWhatsAppUserJid(candidate);
-  if (!key) return false;
-  return collectWhatsAppSelfJids(self).includes(key);
 }
 
 /** Membership events expose LID on `id` and PN on `phoneNumber` independently. */

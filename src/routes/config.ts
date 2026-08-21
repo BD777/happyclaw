@@ -13,7 +13,9 @@ import {
   AVATAR_MAX_FILE_BYTES,
 } from '../http-upload-policy.js';
 import type { Variables } from '../web-context.js';
-import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
+import { getWebDeps } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
+import { recordLegacyUserImRoute } from '../legacy-route-telemetry.js';
 import { extractChatId, getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
@@ -172,6 +174,11 @@ import {
   restorePendingAdminHostOnlyRuntimeSafetyBlocks,
 } from '../admin-host-only-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
+
+configRoutes.use('/user-im/*', async (c, next) => {
+  recordLegacyUserImRoute(c.req.method, new URL(c.req.url).pathname);
+  await next();
+});
 
 /**
  * Count how many IM channels are currently enabled for a user, excluding the given channel.

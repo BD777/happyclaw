@@ -248,6 +248,7 @@ import {
   restoreDefaultChannelMount,
   attachDefaultChannelAccountMount,
   upgradeNativeContextChannelMount,
+  injectChannelMountRuntimePort,
 } from './channel-mount-service.js';
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
@@ -362,8 +363,10 @@ import {
 import {
   invalidateSessionCache,
   getWebDeps,
-  canAccessGroup,
+  type WebDeps,
 } from './web-context.js';
+import { canAccessGroup } from './group-acl.js';
+import { StreamingBuffer } from './streaming-buffer.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
   AgentBuilderTurnRegistry,
@@ -3347,16 +3350,13 @@ async function settleAndRecordTaskIpcDeliveries(
   return { accepted: true, receipt: outcome.receipt };
 }
 
-export function isCursorAfter(
-  candidate: MessageCursor,
-  base: MessageCursor,
-): boolean {
+function isCursorAfter(candidate: MessageCursor, base: MessageCursor): boolean {
   if (candidate.timestamp > base.timestamp) return true;
   if (candidate.timestamp < base.timestamp) return false;
   return candidate.id > base.id;
 }
 
-export function normalizeCursor(value: unknown): MessageCursor {
+function normalizeCursor(value: unknown): MessageCursor {
   if (typeof value === 'string') {
     return { timestamp: value, id: '' };
   }
@@ -10130,7 +10130,7 @@ async function sendMessage(
   return (await sendMessageWithOutcome(jid, text, options)).messageId;
 }
 
-export function buildOverflowPartialReply(partialText: string): string {
+function buildOverflowPartialReply(partialText: string): string {
   const trimmed = partialText.trimEnd();
   return trimmed
     ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，稍后自动继续*`
@@ -10183,152 +10183,35 @@ function saveInterruptedStreamingMessages(): void {
   }
 
   // Clean up buffer files since we saved to DB (avoids duplicates on next startup)
-  cleanStreamingBufferDir();
+  streamingBuffer.clean();
 }
 
-// ─── Periodic Streaming Buffer ──────────────────────────────────────
-// Writes in-progress streaming text to disk every 5s so that even SIGKILL
-// crashes preserve most of the partial response.
-
-const STREAMING_BUFFER_DIR = path.join(DATA_DIR, 'streaming-buffer');
-const STREAMING_BUFFER_INTERVAL_MS = 5000;
-let streamingBufferInterval: ReturnType<typeof setInterval> | null = null;
-
-export function encodeJidForFilename(jid: string): string {
-  return Buffer.from(jid).toString('base64url');
-}
-
-export function decodeJidFromFilename(filename: string): string {
-  const name = filename.endsWith('.txt') ? filename.slice(0, -4) : filename;
-  return Buffer.from(name, 'base64url').toString();
-}
-
-/** Write all active streaming texts to disk (atomic write per file). */
-function flushStreamingBuffer(): void {
-  try {
-    const activeTexts = getActiveStreamingTexts();
-    if (activeTexts.size === 0) {
-      // Nothing streaming — clean up any stale files
-      cleanStreamingBufferDir();
-      return;
-    }
-
-    fs.mkdirSync(STREAMING_BUFFER_DIR, { recursive: true });
-
-    const activeFiles = new Set<string>();
-    for (const [jid, text] of activeTexts) {
-      const filename = encodeJidForFilename(jid) + '.txt';
-      activeFiles.add(filename);
-      const filePath = path.join(STREAMING_BUFFER_DIR, filename);
-      const tmpPath = filePath + '.tmp';
-      fs.writeFileSync(tmpPath, text);
-      fs.renameSync(tmpPath, filePath);
-    }
-
-    // Remove files for JIDs that are no longer streaming
-    try {
-      for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
-        if (f.endsWith('.txt') && !activeFiles.has(f)) {
-          fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
-        }
-      }
-    } catch {
-      /* ignore cleanup errors */
-    }
-  } catch (err) {
-    logger.debug({ err }, 'Error flushing streaming buffer');
-  }
-}
-
-/** On startup, recover interrupted responses from buffer files left by a crash. */
-function recoverStreamingBuffer(): void {
-  try {
-    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
-
-    const txtFiles = fs
-      .readdirSync(STREAMING_BUFFER_DIR)
-      .filter((f) => f.endsWith('.txt'));
-    if (txtFiles.length === 0) return;
-
-    logger.info(
-      { count: txtFiles.length },
-      'Recovering interrupted streaming messages from buffer files',
-    );
-
-    for (const filename of txtFiles) {
-      try {
-        const jid = decodeJidFromFilename(filename);
-        const text = fs.readFileSync(
-          path.join(STREAMING_BUFFER_DIR, filename),
-          'utf-8',
-        );
-        if (text.trim()) {
-          const interruptedText = buildInterruptedReply(text);
-          const msgId = crypto.randomUUID();
-          const timestamp = new Date().toISOString();
-          ensureChatExists(jid);
-          storeMessageDirect(
-            msgId,
-            jid,
-            'happyclaw-agent',
-            ASSISTANT_NAME,
-            interruptedText,
-            timestamp,
-            true,
-            {
-              meta: {
-                sourceKind: 'interrupt_partial',
-                finalizationReason: 'crash_recovery',
-              },
-            },
-          );
-          logger.info(
-            { jid, textLen: text.length },
-            'Recovered interrupted streaming message',
-          );
-        }
-        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, filename));
-      } catch (err) {
-        logger.warn(
-          { err, filename },
-          'Error recovering streaming buffer file',
-        );
-      }
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Error recovering streaming buffer');
-  }
-}
-
-/** Remove all buffer files. */
-function cleanStreamingBufferDir(): void {
-  try {
-    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
-    for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
-      try {
-        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
-      } catch {
-        /* ignore */
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-}
-
-function startStreamingBuffer(): void {
-  streamingBufferInterval = setInterval(
-    flushStreamingBuffer,
-    STREAMING_BUFFER_INTERVAL_MS,
-  );
-}
-
-function stopStreamingBuffer(): void {
-  if (streamingBufferInterval) {
-    clearInterval(streamingBufferInterval);
-    streamingBufferInterval = null;
-  }
-}
+const streamingBuffer = new StreamingBuffer(
+  path.join(DATA_DIR, 'streaming-buffer'),
+  {
+    getActiveTexts: getActiveStreamingTexts,
+    persistInterrupted: (jid, text, reason) => {
+      const msgId = crypto.randomUUID();
+      const timestamp = new Date().toISOString();
+      ensureChatExists(jid);
+      storeMessageDirect(
+        msgId,
+        jid,
+        'happyclaw-agent',
+        ASSISTANT_NAME,
+        buildInterruptedReply(text),
+        timestamp,
+        true,
+        {
+          meta: {
+            sourceKind: 'interrupt_partial',
+            finalizationReason: reason,
+          },
+        },
+      );
+    },
+  },
+);
 
 // Thin production wrapper around the pure helper in ./cross-group-acl.ts so
 // the helper can be unit-tested without booting all of index.ts.
@@ -20645,7 +20528,7 @@ async function main(): Promise<void> {
 
     // Agent output is now quiescent. Persist any partial text that did not
     // reach a normal result before touching the external card lifecycle.
-    stopStreamingBuffer();
+    streamingBuffer.stop();
     saveInterruptedStreamingMessages();
 
     // Phase 2: terminalize every remaining card while the Feishu clients are
@@ -21134,7 +21017,7 @@ async function main(): Promise<void> {
   };
 
   // Start Web server early so frontend auth/API isn't blocked by Feishu readiness.
-  startWebServer({
+  const webRuntimeDeps: WebDeps = {
     queue,
     getRegisteredGroups: () => registeredGroups,
     sessions,
@@ -21277,7 +21160,12 @@ async function main(): Promise<void> {
     editFollowUp,
     reorderFollowUp,
     interruptAndRunFollowUp,
+  };
+  injectChannelMountRuntimePort({
+    getRegisteredGroups: webRuntimeDeps.getRegisteredGroups,
+    clearImFailCounts: webRuntimeDeps.clearImFailCounts,
   });
+  startWebServer(webRuntimeDeps);
 
   // Clean expired sessions every hour
   setInterval(
@@ -22232,12 +22120,12 @@ async function main(): Promise<void> {
     void channelReliabilityRecoveryLoop?.trigger();
   });
   imManager.resumeDeferredInbound();
-  recoverStreamingBuffer();
+  streamingBuffer.recover();
   recoverStartupTypedIpcDeliveries();
   recoverPendingMessages();
   recoverConversationAgents();
   startIpcWatcher();
-  startStreamingBuffer();
+  streamingBuffer.start();
   startMessageLoop();
 
   // Start Feishu group sync if any connection is active

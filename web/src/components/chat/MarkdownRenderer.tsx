@@ -8,6 +8,21 @@ const EnhancedMarkdownRenderer = lazy(() =>
     default: module.EnhancedMarkdownRenderer,
   })),
 );
+const CodeMarkdownRenderer = lazy(() =>
+  import('./CodeMarkdownRenderer').then((module) => ({
+    default: module.CodeMarkdownRenderer,
+  })),
+);
+const MathMarkdownRenderer = lazy(() =>
+  import('./MathMarkdownRenderer').then((module) => ({
+    default: module.MathMarkdownRenderer,
+  })),
+);
+const RawMarkdownRenderer = lazy(() =>
+  import('./RawMarkdownRenderer').then((module) => ({
+    default: module.RawMarkdownRenderer,
+  })),
+);
 
 const BASIC_REMARK_PLUGINS = [remarkGfm, remarkBreaks];
 const BASIC_REHYPE_PLUGINS: [] = [];
@@ -58,6 +73,22 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
 
   if (!needsEnhancedMarkdown(features, streaming)) return basic;
 
+  const enhanced = streaming ? (
+    <CodeMarkdownRenderer {...props} streaming />
+  ) : features.hasCodeFence && !features.hasMath && !features.hasRawHtml ? (
+    <CodeMarkdownRenderer {...props} streaming={streaming} />
+  ) : features.hasMath && !features.hasCodeFence && !features.hasRawHtml ? (
+    <MathMarkdownRenderer {...props} streaming={streaming} />
+  ) : features.hasRawHtml && !features.hasCodeFence && !features.hasMath ? (
+    <RawMarkdownRenderer {...props} streaming={streaming} />
+  ) : (
+    <EnhancedMarkdownRenderer
+      {...props}
+      streaming={streaming}
+      features={features}
+    />
+  );
+
   return (
     <Suspense
       fallback={
@@ -66,11 +97,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
         </div>
       }
     >
-      <EnhancedMarkdownRenderer
-        {...props}
-        streaming={streaming}
-        features={features}
-      />
+      {enhanced}
     </Suspense>
   );
 });

@@ -153,21 +153,6 @@ export const requirePermission =
     await next();
   };
 
-export const requireAnyPermission =
-  (permissions: Permission[]) => async (c: any, next: any) => {
-    const user = c.get('user') as AuthUser;
-    const ok = permissions.some((permission) =>
-      hasPermission(user, permission),
-    );
-    if (!ok) {
-      return c.json(
-        { error: `Forbidden: one of [${permissions.join(', ')}] required` },
-        403,
-      );
-    }
-    await next();
-  };
-
 export const systemConfigMiddleware = requirePermission('manage_system_config');
 export const adminRoleMiddleware = async (c: any, next: any) => {
   const user = c.get('user') as AuthUser;
@@ -176,10 +161,6 @@ export const adminRoleMiddleware = async (c: any, next: any) => {
   }
   await next();
 };
-export const groupEnvMiddleware = requireAnyPermission([
-  'manage_group_env',
-  'manage_system_config',
-]);
 export const usersManageMiddleware = requirePermission('manage_users');
 export const inviteManageMiddleware = requirePermission('manage_invites');
 export const auditViewMiddleware = requirePermission('view_audit_log');

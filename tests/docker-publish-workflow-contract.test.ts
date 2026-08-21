@@ -12,6 +12,10 @@ describe('Docker image distribution contract', () => {
     expect(workflow).toContain('branches: [main]');
     expect(workflow).toContain('platform: linux/amd64');
     expect(workflow).toContain('platform: linux/arm64');
+    expect(workflow).toContain('profile: core');
+    expect(workflow).toContain('target: runtime-core');
+    expect(workflow).toContain('profile: headroom');
+    expect(workflow).toContain('target: runtime-headroom');
     expect(workflow).toContain('runner: ubuntu-24.04');
     expect(workflow).toContain('runner: ubuntu-24.04-arm');
     expect(workflow).toContain('uses: docker/build-push-action@');
@@ -47,9 +51,10 @@ describe('Docker image distribution contract', () => {
     );
     expect(workflow).toContain('cosign sign --yes');
     expect(workflow).toContain('cosign verify');
-    expect(workflow).toContain('--tag "${IMAGE_NAME}:latest"');
+    expect(workflow).toContain('promote_and_verify latest');
+    expect(workflow).toContain('promote_and_verify latest-headroom');
     expect(workflow).toContain('for attempt in {1..12}');
-    expect(workflow).toContain('if [ "$latest_digest" = "$MANIFEST_DIGEST" ]');
+    expect(workflow).toContain('if [ "$latest_digest" = "$manifest_digest" ]');
     expect(workflow).toContain('username: ${{ secrets.DOCKERHUB_USERNAME }}');
     expect(workflow).toContain('password: ${{ secrets.DOCKERHUB_TOKEN }}');
     expect(workflow).not.toContain(`${['dckr', 'pat'].join('_')}_`);
@@ -72,7 +77,7 @@ describe('Docker image distribution contract', () => {
     const smokeIndex = workflow.indexOf(
       './scripts/smoke-agent-image.sh "$IMAGE_REF" "${{ matrix.arch }}"',
     );
-    const latestIndex = workflow.indexOf('--tag "${IMAGE_NAME}:latest"');
+    const latestIndex = workflow.indexOf('promote_and_verify latest');
     expect(smokeIndex).toBeGreaterThan(-1);
     expect(latestIndex).toBeGreaterThan(smokeIndex);
   });
@@ -151,6 +156,9 @@ describe('Docker image distribution contract', () => {
     expect(smoke).toContain('http://127.0.0.1:9222/json/version');
     expect(smoke).toContain('test -f /opt/happyclaw-agent/dist/index.js');
     expect(smoke).toContain('test ! -e /tmp/dist/index.js');
+    expect(smoke).toContain('HAPPYCLAW_IMAGE_PREFLIGHT=1');
+    expect(smoke).toContain('IMAGE_RUNNER_PREFLIGHT_OK');
+    expect(smoke).toContain('image-sdk-query-smoke.mjs');
     expect(smoke).toContain(
       '/app/node_modules/.bin/agent-browser open about:blank',
     );

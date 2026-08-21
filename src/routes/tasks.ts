@@ -34,9 +34,9 @@ import { TIMEZONE } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
-  canAccessGroup,
   getWebDeps,
 } from '../web-context.js';
+import { canAccessGroup } from '../group-acl.js';
 import {
   computeNextRunForSchedule,
   computeNextRunForTaskResume,

@@ -74,7 +74,7 @@ export interface WeComConnectOpts {
     sourceJid?: string;
   } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  onMessagePersisted?: import('./im-channel.js').IMChannelConnectOpts['onMessagePersisted'];
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   normalizeIncomingJid?: (jid: string) => string | null;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
