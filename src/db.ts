@@ -3606,20 +3606,6 @@ export function restorePromotingFollowUpBatch(
   }
 }
 
-export function beginPromotingFollowUp(
-  chatJid: string,
-  messageId: string,
-): QueuedFollowUp | null {
-  return transitionFollowUp(chatJid, messageId, ['queued'], 'promoting');
-}
-
-export function restorePromotingFollowUp(
-  chatJid: string,
-  messageId: string,
-): QueuedFollowUp | null {
-  return transitionFollowUp(chatJid, messageId, ['promoting'], 'queued');
-}
-
 export function cancelQueuedFollowUp(
   chatJid: string,
   messageId: string,
@@ -3793,236 +3779,6 @@ export function rebuildMessageTokenUsageFromLedger(
 }
 
 /**
- * Get token usage statistics aggregated by date.
- */
-export function getTokenUsageStats(
-  days: number,
-  chatJids?: string[],
-): Array<{
-  date: string;
-  model: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_creation_tokens: number;
-  reasoning_tokens: number;
-  cost_usd: number;
-  message_count: number;
-}> {
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  const sinceStr = since.toISOString();
-
-  const jidFilter =
-    chatJids && chatJids.length > 0
-      ? `AND m.chat_jid IN (${chatJids.map(() => '?').join(',')})`
-      : '';
-  const params: unknown[] = [sinceStr, ...(chatJids || [])];
-
-  const baseQuery = `
-    SELECT
-      date(m.timestamp) as date,
-      json_extract(m.token_usage, '$.modelUsage') as model_usage_json,
-      json_extract(m.token_usage, '$.inputTokens') as input_tokens,
-      json_extract(m.token_usage, '$.outputTokens') as output_tokens,
-      json_extract(m.token_usage, '$.cacheReadInputTokens') as cache_read_tokens,
-      json_extract(m.token_usage, '$.cacheCreationInputTokens') as cache_creation_tokens,
-      json_extract(m.token_usage, '$.reasoningTokens') as reasoning_tokens,
-      json_extract(m.token_usage, '$.costUSD') as cost_usd
-    FROM messages m
-    WHERE m.token_usage IS NOT NULL
-      AND m.timestamp >= ?
-      ${jidFilter}
-    ORDER BY m.timestamp ASC
-  `;
-
-  const rows = db.prepare(baseQuery).all(...params) as Array<{
-    date: string;
-    model_usage_json: string | null;
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens: number;
-    cache_creation_tokens: number;
-    reasoning_tokens: number;
-    cost_usd: number;
-  }>;
-
-  // Aggregate by date + model
-  type AggregatedEntry = {
-    date: string;
-    model: string;
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens: number;
-    cache_creation_tokens: number;
-    reasoning_tokens: number;
-    cost_usd: number;
-    message_count: number;
-  };
-  const aggregated = new Map<string, AggregatedEntry>();
-
-  function addToAggregated(
-    date: string,
-    model: string,
-    inputTokens: number,
-    outputTokens: number,
-    cacheReadTokens: number,
-    cacheCreationTokens: number,
-    reasoningTokens: number,
-    costUsd: number,
-  ): void {
-    const key = `${date}|${model}`;
-    const existing = aggregated.get(key);
-    if (existing) {
-      existing.input_tokens += inputTokens;
-      existing.output_tokens += outputTokens;
-      existing.cache_read_tokens += cacheReadTokens;
-      existing.cache_creation_tokens += cacheCreationTokens;
-      existing.reasoning_tokens += reasoningTokens;
-      existing.cost_usd += costUsd;
-      existing.message_count += 1;
-    } else {
-      aggregated.set(key, {
-        date,
-        model,
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        cache_read_tokens: cacheReadTokens,
-        cache_creation_tokens: cacheCreationTokens,
-        reasoning_tokens: reasoningTokens,
-        cost_usd: costUsd,
-        message_count: 1,
-      });
-    }
-  }
-
-  for (const row of rows) {
-    if (row.model_usage_json) {
-      try {
-        const modelUsage = JSON.parse(row.model_usage_json) as Record<
-          string,
-          {
-            inputTokens: number;
-            outputTokens: number;
-            cacheReadInputTokens?: number;
-            cacheCreationInputTokens?: number;
-            reasoningTokens?: number;
-            costUSD: number;
-          }
-        >;
-        for (const [model, usage] of Object.entries(modelUsage)) {
-          addToAggregated(
-            row.date,
-            model,
-            usage.inputTokens || 0,
-            usage.outputTokens || 0,
-            usage.cacheReadInputTokens || 0,
-            usage.cacheCreationInputTokens || 0,
-            usage.reasoningTokens || 0,
-            usage.costUSD || 0,
-          );
-        }
-      } catch (e) {
-        logger.warn(
-          { date: row.date, error: e },
-          'Failed to parse model_usage_json',
-        );
-        // fallback: use aggregate fields
-        addToAggregated(
-          row.date,
-          'unknown',
-          row.input_tokens || 0,
-          row.output_tokens || 0,
-          row.cache_read_tokens || 0,
-          row.cache_creation_tokens || 0,
-          row.reasoning_tokens || 0,
-          row.cost_usd || 0,
-        );
-      }
-    } else {
-      addToAggregated(
-        row.date,
-        'unknown',
-        row.input_tokens || 0,
-        row.output_tokens || 0,
-        row.cache_read_tokens || 0,
-        row.cache_creation_tokens || 0,
-        row.reasoning_tokens || 0,
-        row.cost_usd || 0,
-      );
-    }
-  }
-
-  return Array.from(aggregated.values());
-}
-
-/**
- * Get token usage summary totals.
- */
-export function getTokenUsageSummary(
-  days: number,
-  chatJids?: string[],
-): {
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheReadTokens: number;
-  totalCacheCreationTokens: number;
-  totalReasoningTokens: number;
-  totalCostUSD: number;
-  totalMessages: number;
-  totalActiveDays: number;
-} {
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  const sinceStr = since.toISOString();
-
-  const jidFilter =
-    chatJids && chatJids.length > 0
-      ? `AND chat_jid IN (${chatJids.map(() => '?').join(',')})`
-      : '';
-  const params: unknown[] = [sinceStr, ...(chatJids || [])];
-
-  const row = db
-    .prepare(
-      `
-    SELECT
-      COALESCE(SUM(json_extract(token_usage, '$.inputTokens')), 0) as total_input,
-      COALESCE(SUM(json_extract(token_usage, '$.outputTokens')), 0) as total_output,
-      COALESCE(SUM(json_extract(token_usage, '$.cacheReadInputTokens')), 0) as total_cache_read,
-      COALESCE(SUM(json_extract(token_usage, '$.cacheCreationInputTokens')), 0) as total_cache_creation,
-      COALESCE(SUM(json_extract(token_usage, '$.reasoningTokens')), 0) as total_reasoning,
-      COALESCE(SUM(json_extract(token_usage, '$.costUSD')), 0) as total_cost,
-      COUNT(*) as total_messages,
-      COUNT(DISTINCT date(timestamp)) as total_active_days
-    FROM messages
-    WHERE token_usage IS NOT NULL AND timestamp >= ?
-      ${jidFilter}
-  `,
-    )
-    .get(...params) as {
-    total_input: number;
-    total_output: number;
-    total_cache_read: number;
-    total_cache_creation: number;
-    total_reasoning: number;
-    total_cost: number;
-    total_messages: number;
-    total_active_days: number;
-  };
-
-  return {
-    totalInputTokens: row.total_input,
-    totalOutputTokens: row.total_output,
-    totalCacheReadTokens: row.total_cache_read,
-    totalCacheCreationTokens: row.total_cache_creation,
-    totalReasoningTokens: row.total_reasoning,
-    totalCostUSD: row.total_cost,
-    totalMessages: row.total_messages,
-    totalActiveDays: row.total_active_days,
-  };
-}
-
-/**
  * Get a local timezone date string (YYYY-MM-DD) from a Date or ISO string.
  */
 function toLocalDateString(date?: Date | string): string {
@@ -4048,57 +3804,6 @@ export function getUsageDateWindow(
     days: normalizedDays,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   };
-}
-
-/**
- * Insert a usage record and update daily summary.
- */
-export function insertUsageRecord(record: {
-  userId: string;
-  groupFolder: string;
-  agentId?: string | null;
-  messageId?: string;
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadInputTokens: number;
-  cacheCreationInputTokens: number;
-  reasoningTokens?: number;
-  costUSD: number;
-  durationMs?: number;
-  numTurns?: number;
-  source?: string;
-}): void {
-  recordUsageEventBatch({
-    eventId: crypto.randomUUID(),
-    userId: record.userId,
-    groupFolder: record.groupFolder,
-    agentId: record.agentId,
-    messageId: record.messageId,
-    inputTokens: record.inputTokens,
-    outputTokens: record.outputTokens,
-    cacheReadInputTokens: record.cacheReadInputTokens,
-    cacheCreationInputTokens: record.cacheCreationInputTokens,
-    reasoningTokens: record.reasoningTokens || 0,
-    providerEstimatedCostUSD: record.costUSD,
-    billedCostUSD: 0,
-    durationMs: record.durationMs,
-    numTurns: record.numTurns,
-    source: record.source,
-    models: [
-      {
-        model: record.model,
-        inputTokens: record.inputTokens,
-        outputTokens: record.outputTokens,
-        cacheReadInputTokens: record.cacheReadInputTokens,
-        cacheCreationInputTokens: record.cacheCreationInputTokens,
-        reasoningTokens: record.reasoningTokens || 0,
-        providerEstimatedCostUSD: record.costUSD,
-        billedCostUSD: 0,
-      },
-    ],
-    trackBillingUsage: false,
-  });
 }
 
 export interface UsageModelRecordInput {
@@ -4360,149 +4065,6 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
 
     return { inserted: true };
   })();
-}
-
-/**
- * Get usage stats from daily summary table (fixes timezone + token KPI issues).
- */
-export function getUsageDailyStats(
-  days: number,
-  userId?: string,
-  modelFilter?: string,
-): Array<{
-  date: string;
-  model: string;
-  user_id: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_creation_tokens: number;
-  reasoning_tokens: number;
-  cost_usd: number;
-  request_count: number;
-}> {
-  const window = getUsageDateWindow(days);
-  const conditions: string[] = ['date >= ?', 'date <= ?'];
-  const params: unknown[] = [window.from, window.to];
-
-  if (userId) {
-    conditions.push('user_id = ?');
-    params.push(userId);
-  }
-  if (modelFilter) {
-    conditions.push('model = ?');
-    params.push(modelFilter);
-  }
-
-  const whereClause = conditions.join(' AND ');
-  return db
-    .prepare(
-      `
-    SELECT date, model, user_id,
-      total_input_tokens as input_tokens,
-      total_output_tokens as output_tokens,
-      total_cache_read_tokens as cache_read_tokens,
-      total_cache_creation_tokens as cache_creation_tokens,
-      total_reasoning_tokens as reasoning_tokens,
-      total_cost_usd as cost_usd,
-      request_count
-    FROM usage_daily_summary
-    WHERE ${whereClause}
-    ORDER BY date ASC
-  `,
-    )
-    .all(...params) as Array<{
-    date: string;
-    model: string;
-    user_id: string;
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens: number;
-    cache_creation_tokens: number;
-    reasoning_tokens: number;
-    cost_usd: number;
-    request_count: number;
-  }>;
-}
-
-/**
- * Get usage summary from daily summary table.
- */
-export function getUsageDailySummary(
-  days: number,
-  userId?: string,
-  modelFilter?: string,
-): {
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheReadTokens: number;
-  totalCacheCreationTokens: number;
-  totalReasoningTokens: number;
-  totalCostUSD: number;
-  totalMessages: number;
-  totalActiveDays: number;
-} {
-  const window = getUsageDateWindow(days);
-  const conditions: string[] = ['date >= ?', 'date <= ?'];
-  const params: unknown[] = [window.from, window.to];
-
-  if (userId) {
-    conditions.push('user_id = ?');
-    params.push(userId);
-  }
-  if (modelFilter) {
-    conditions.push('model = ?');
-    params.push(modelFilter);
-  }
-
-  const whereClause = conditions.join(' AND ');
-  const row = db
-    .prepare(
-      `
-    SELECT
-      COALESCE(SUM(total_input_tokens), 0) as total_input,
-      COALESCE(SUM(total_output_tokens), 0) as total_output,
-      COALESCE(SUM(total_cache_read_tokens), 0) as total_cache_read,
-      COALESCE(SUM(total_cache_creation_tokens), 0) as total_cache_creation,
-      COALESCE(SUM(total_reasoning_tokens), 0) as total_reasoning,
-      COALESCE(SUM(total_cost_usd), 0) as total_cost,
-      COALESCE(SUM(request_count), 0) as total_messages,
-      COUNT(DISTINCT date) as total_active_days
-    FROM usage_daily_summary
-    WHERE ${whereClause}
-  `,
-    )
-    .get(...params) as {
-    total_input: number;
-    total_output: number;
-    total_cache_read: number;
-    total_cache_creation: number;
-    total_reasoning: number;
-    total_cost: number;
-    total_messages: number;
-    total_active_days: number;
-  };
-
-  return {
-    totalInputTokens: row.total_input,
-    totalOutputTokens: row.total_output,
-    totalCacheReadTokens: row.total_cache_read,
-    totalCacheCreationTokens: row.total_cache_creation,
-    totalReasoningTokens: row.total_reasoning,
-    totalCostUSD: row.total_cost,
-    totalMessages: row.total_messages,
-    totalActiveDays: row.total_active_days,
-  };
-}
-
-/**
- * Get list of all models that have usage data.
- */
-export function getUsageModels(): string[] {
-  const rows = db
-    .prepare('SELECT DISTINCT model FROM usage_daily_summary ORDER BY model')
-    .all() as Array<{ model: string }>;
-  return rows.map((r) => r.model);
 }
 
 export interface UsageQueryFilters {
@@ -4942,15 +4504,6 @@ function mapTaskRow(row: unknown): ScheduledTask {
 export function getTaskById(id: string): ScheduledTask | undefined {
   const row = db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id);
   return row ? mapTaskRow(row) : undefined;
-}
-
-export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
-  return db
-    .prepare(
-      'SELECT * FROM scheduled_tasks WHERE group_folder = ? AND deleted_at IS NULL ORDER BY created_at DESC',
-    )
-    .all(groupFolder)
-    .map(mapTaskRow);
 }
 
 export function getAllTasks(): ScheduledTask[] {
@@ -5421,27 +4974,6 @@ export function deleteTask(id: string): void {
   db.prepare('DELETE FROM task_runs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
-}
-
-export function deleteTasksForGroup(groupFolder: string): void {
-  const tx = db.transaction((folder: string) => {
-    db.prepare(
-      `DELETE FROM task_runs
-       WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)`,
-    ).run(folder);
-    db.prepare(
-      `
-      DELETE FROM task_run_logs
-      WHERE task_id IN (
-        SELECT id FROM scheduled_tasks WHERE group_folder = ?
-      )
-      `,
-    ).run(folder);
-    db.prepare('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(
-      folder,
-    );
-  });
-  tx(groupFolder);
 }
 
 export function getDueTasks(): ScheduledTask[] {
@@ -11877,13 +11409,6 @@ export function getChannelMount(channelJid: string): ChannelMount | undefined {
   return row ? parseChannelMountRow(row) : undefined;
 }
 
-export function listChannelMounts(): ChannelMount[] {
-  const rows = db
-    .prepare('SELECT * FROM channel_mounts ORDER BY updated_at DESC')
-    .all() as ChannelMountRow[];
-  return rows.map(parseChannelMountRow);
-}
-
 export function listChannelMountsByWorkspace(
   workspaceJid: string,
 ): ChannelMount[] {
@@ -12036,12 +11561,6 @@ export function listImContextBindingsByAgent(
   return rows.map(mapImContextBindingRow);
 }
 
-export function deleteImContextBindingsByWorkspace(workspaceJid: string): void {
-  db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
-    workspaceJid,
-  );
-}
-
 export function deleteImContextBindingsByAgent(agentId: string): void {
   db.prepare('DELETE FROM im_context_bindings WHERE agent_id = ?').run(agentId);
 }
@@ -12056,16 +11575,6 @@ export function touchImContextBindingActivity(
   db.prepare(
     'UPDATE im_context_bindings SET last_active_at = ?, updated_at = ? WHERE source_jid = ? AND context_type = ? AND context_id = ?',
   ).run(lastActiveAt, lastActiveAt, sourceJid, contextType, contextId);
-}
-
-/** List native-thread agent IDs for a workspace JID (legacy Feishu included). */
-export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
-  const rows = db
-    .prepare(
-      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind IN ('native_thread', 'feishu_thread')",
-    )
-    .all(workspaceJid) as { id: string }[];
-  return rows.map((r) => r.id);
 }
 
 /**
@@ -12768,35 +12277,6 @@ export function getTaskRunLogs(taskId: string, limit = 20): TaskRunLog[] {
   `,
     )
     .all(taskId, limit) as TaskRunLog[];
-}
-
-// ===================== Daily Summary Queries =====================
-
-/**
- * Get messages for a chat within a time range, ordered by timestamp ASC.
- */
-export function getMessagesByTimeRange(
-  chatJid: string,
-  startTs: number,
-  endTs: number,
-  limit = 500,
-): Array<NewMessage & { is_from_me: boolean }> {
-  const startIso = new Date(startTs).toISOString();
-  const endIso = new Date(endTs).toISOString();
-  const rows = db
-    .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
-       FROM messages
-       WHERE chat_jid = ? AND timestamp >= ? AND timestamp < ?
-       ORDER BY timestamp ASC
-       LIMIT ?`,
-    )
-    .all(chatJid, startIso, endIso, limit) as Array<
-    NewMessage & { is_from_me: number }
-  >;
-
-  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -13742,48 +13222,6 @@ export function queryAuthAuditLogs(
   return { logs, total, limit, offset };
 }
 
-export function getAuthAuditLogs(limit = 100, offset = 0): AuthAuditLog[] {
-  return queryAuthAuditLogs({ limit, offset }).logs;
-}
-
-export function checkLoginRateLimitFromAudit(
-  username: string,
-  ip: string,
-  maxAttempts: number,
-  lockoutMinutes: number,
-): { allowed: boolean; retryAfterSeconds?: number; attempts: number } {
-  if (maxAttempts <= 0) return { allowed: true, attempts: 0 };
-  const windowStart = new Date(
-    Date.now() - lockoutMinutes * 60 * 1000,
-  ).toISOString();
-  const rows = db
-    .prepare(
-      `
-      SELECT created_at
-      FROM auth_audit_log
-      WHERE event_type = 'login_failed'
-        AND username = ?
-        AND ip_address = ?
-        AND created_at >= ?
-        AND (details IS NULL OR details NOT LIKE '%"reason":"rate_limited"%')
-      ORDER BY created_at ASC
-      `,
-    )
-    .all(username, ip, windowStart) as Array<{ created_at: string }>;
-
-  const attempts = rows.length;
-  if (attempts < maxAttempts) return { allowed: true, attempts };
-
-  const oldest = rows[0]?.created_at;
-  const oldestTs = oldest ? Date.parse(oldest) : Date.now();
-  const retryAt = oldestTs + lockoutMinutes * 60 * 1000;
-  const retryAfterSeconds = Math.max(
-    1,
-    Math.ceil((retryAt - Date.now()) / 1000),
-  );
-  return { allowed: false, retryAfterSeconds, attempts };
-}
-
 // ===================== Sub-Agent CRUD =====================
 
 export function createAgent(agent: SubAgent): void {
@@ -13818,15 +13256,6 @@ export function getAgent(id: string): SubAgent | undefined {
     | undefined;
   if (!row) return undefined;
   return mapAgentRow(row);
-}
-
-export function listAgentsByFolder(folder: string): SubAgent[] {
-  const rows = db
-    .prepare(
-      'SELECT * FROM agents WHERE group_folder = ? ORDER BY created_at DESC',
-    )
-    .all(folder) as Array<Record<string, unknown>>;
-  return rows.map(mapAgentRow);
 }
 
 export function listAgentsByJid(chatJid: string): SubAgent[] {
@@ -14618,18 +14047,6 @@ export function expireSubscriptions(): number {
   return result.changes + renewed;
 }
 
-export function updateSubscriptionAutoRenew(
-  userId: string,
-  autoRenew: boolean,
-): boolean {
-  const result = db
-    .prepare(
-      "UPDATE user_subscriptions SET auto_renew = ? WHERE user_id = ? AND status = 'active'",
-    )
-    .run(autoRenew ? 1 : 0, userId);
-  return result.changes > 0;
-}
-
 function mapSubscriptionRow(row: Record<string, unknown>): UserSubscription {
   return {
     id: String(row.id),
@@ -14994,16 +14411,6 @@ export function createRedeemCode(code: RedeemCode): void {
     code.batch_id,
     code.created_at,
   );
-}
-
-export function incrementRedeemCodeUsage(code: string, userId: string): void {
-  const now = new Date().toISOString();
-  db.prepare(
-    'UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = ?',
-  ).run(code);
-  db.prepare(
-    'INSERT INTO redeem_code_usage (code, user_id, redeemed_at) VALUES (?, ?, ?)',
-  ).run(code, userId, now);
 }
 
 export function deleteRedeemCode(code: string): boolean {
@@ -15498,15 +14905,6 @@ export function batchAssignPlan(
   });
   txn();
   return count;
-}
-
-export function getPlanSubscriberCount(planId: string): number {
-  const row = db
-    .prepare(
-      "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ? AND status = 'active'",
-    )
-    .get(planId) as { cnt: number };
-  return row.cnt;
 }
 
 export function getAllPlanSubscriberCounts(): Record<string, number> {

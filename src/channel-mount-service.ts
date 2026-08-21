@@ -35,7 +35,19 @@ import {
 } from './db.js';
 import { logger } from './logger.js';
 import { ensureAgentDirectories } from './utils.js';
-import { getWebDeps } from './web-context.js';
+
+export interface ChannelMountRuntimePort {
+  getRegisteredGroups: () => Record<string, RegisteredGroup>;
+  clearImFailCounts?: (jid: string) => void;
+}
+
+let channelMountRuntimePort: ChannelMountRuntimePort | null = null;
+
+export function injectChannelMountRuntimePort(
+  port: ChannelMountRuntimePort | null,
+): void {
+  channelMountRuntimePort = port;
+}
 
 export interface ChannelMountResolutionDeps {
   getAgent: (
@@ -126,10 +138,6 @@ export type ChannelMountTargetResolution =
       sessionId?: string;
       workspaceJid: string;
     };
-
-export function isImChannelJid(jid: string): boolean {
-  return jid !== '' && !jid.startsWith('web:') && getChannelType(jid) !== null;
-}
 
 /**
  * A native-context container owns many platform conversations (for example a
@@ -530,12 +538,6 @@ export function upgradeNativeContextChannelMount(
   return { status: 'upgraded', updated };
 }
 
-export function toRoutingMode(
-  group: Pick<RegisteredGroup, 'binding_mode'>,
-): ChannelRoutingMode {
-  return group.binding_mode === 'thread_map' ? 'thread_map' : 'single_session';
-}
-
 export function resolveWorkspaceJid(
   workspaceJid: string | undefined,
   deps: Pick<
@@ -554,55 +556,6 @@ export function resolveWorkspaceJid(
   for (const jid of candidates) {
     if (jid.startsWith('web:') && deps.getRegisteredGroup(jid)) return jid;
   }
-  return null;
-}
-
-export function normalizeChannelMountFromGroup(
-  channelJid: string,
-  group: RegisteredGroup,
-  deps: ChannelMountResolutionDeps,
-  now = new Date().toISOString(),
-): Omit<ChannelMount, 'created_at' | 'updated_at'> | null {
-  if (!isImChannelJid(channelJid)) return null;
-
-  const channelType = getChannelType(channelJid);
-  if (!channelType) return null;
-
-  if (group.target_agent_id) {
-    const session = deps.getAgent(group.target_agent_id);
-    if (!session?.chat_jid) return null;
-    return {
-      channel_jid: channelJid,
-      channel_account_id: group.channel_account_id ?? null,
-      channel_type: channelType,
-      workspace_jid: session.chat_jid,
-      session_id: group.target_agent_id,
-      routing_mode: 'single_session',
-      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
-      activation_mode: group.activation_mode ?? 'auto',
-      audience_mode: group.audience_mode ?? 'everyone',
-      owner_im_id: group.owner_im_id ?? null,
-    };
-  }
-
-  if (group.target_main_jid) {
-    const workspaceJid = resolveWorkspaceJid(group.target_main_jid, deps);
-    if (!workspaceJid) return null;
-    return {
-      channel_jid: channelJid,
-      channel_account_id: group.channel_account_id ?? null,
-      channel_type: channelType,
-      workspace_jid: workspaceJid,
-      session_id: null,
-      routing_mode: toRoutingMode(group),
-      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
-      activation_mode: group.activation_mode ?? 'auto',
-      audience_mode: group.audience_mode ?? 'everyone',
-      owner_im_id: group.owner_im_id ?? null,
-    };
-  }
-
-  void now;
   return null;
 }
 
@@ -743,11 +696,10 @@ export function commitChannelMountUpdate(
   } else {
     setRegisteredGroup(channelJid, updated);
   }
-  const deps = getWebDeps();
-  if (!deps) return;
-  const groups = deps.getRegisteredGroups();
+  if (!channelMountRuntimePort) return;
+  const groups = channelMountRuntimePort.getRegisteredGroups();
   if (groups[channelJid]) groups[channelJid] = updated;
-  deps.clearImFailCounts?.(channelJid);
+  channelMountRuntimePort.clearImFailCounts?.(channelJid);
 }
 
 export function hasSessionMountConflict(

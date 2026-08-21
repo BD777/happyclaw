@@ -4,8 +4,8 @@ import { authMiddleware } from '../middleware/auth.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
-  canAccessGroup,
 } from '../web-context.js';
+import { canAccessGroup } from '../group-acl.js';
 import type { AuthUser } from '../types.js';
 import type { RegisteredGroup } from '../types.js';
 import { getRegisteredGroup } from '../db.js';

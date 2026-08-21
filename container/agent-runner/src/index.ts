@@ -235,8 +235,9 @@ function loadPrompt(...segments: string[]): string {
 
 // 解析本地依赖 @anthropic-ai/claude-code 的真实 CLI binary 路径。
 // 该包 postinstall 会把平台对应的 native binary 落地到其 `bin` 字段指向的位置
-// （Windows / macOS / Linux 一致），作为 SDK 的 pathToClaudeCodeExecutable 最可靠来源——
-// 它不依赖 PATH，也不会命中 SDK optionalDependencies 里那些空的 native binary 占位包。
+// （Windows / macOS / Linux 一致），作为 SDK 的 pathToClaudeCodeExecutable 最可靠来源。
+// The image deliberately removes the SDK's duplicate platform packages after
+// verifying this binary, so every runtime must prefer it before PATH fallbacks.
 function resolveBundledClaudeCli(): string | undefined {
   try {
     const require = createRequire(import.meta.url);
@@ -2284,7 +2285,7 @@ async function runQueryAttempt(
 
   const processor = new StreamEventProcessor(emit, log);
 
-  const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const { isHome } = normalizeHomeFlags(containerInput);
   const agentBuilderEnabled = resolveAgentBuilderEnabled(
     containerInput,
     isHome,
@@ -2571,14 +2572,16 @@ async function runQueryAttempt(
     }
   }
   // Resolve the actual claude CLI path for the SDK.
-  // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-{platform} 等）不保证被安装，
-  // pathToClaudeCodeExecutable 留空、且 SDK 自带平台包缺失时会报
-  // "Claude Code native binary not found at .../claude-agent-sdk-win32-x64/claude"（Windows 宿主机模式）。
-  // 仅在 Windows 上优先解析本地依赖 @anthropic-ai/claude-code 里 postinstall 落地的真实 binary
-  // （Windows 没有 which、SDK 平台包又常缺失，故需此兜底）；Linux 容器 / macOS 宿主机
-  // 保持原有 which 解析逻辑不变，避免改变既有 claude 解析来源。
+  // Container builds remove the SDK's duplicate native optionalDependencies,
+  // so the image requires its verified @anthropic-ai/claude-code binary.
+  // Windows keeps the same bundled-first fallback it has always needed. Other
+  // host runtimes retain their existing PATH resolution contract.
+  const requireBundledClaude =
+    process.env.HAPPYCLAW_REQUIRE_BUNDLED_CLAUDE === '1';
   let pathToClaudeCodeExecutable: string | undefined =
-    process.platform === 'win32' ? resolveBundledClaudeCli() : undefined;
+    requireBundledClaude || process.platform === 'win32'
+      ? resolveBundledClaudeCli()
+      : undefined;
   if (!pathToClaudeCodeExecutable) {
     try {
       // `which` 在 Windows 上不存在，改用 `where`；其多行输出取第一行。
@@ -3910,6 +3913,21 @@ async function main(): Promise<void> {
       error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
+  }
+
+  if (process.env.HAPPYCLAW_IMAGE_PREFLIGHT === '1') {
+    const cli = resolveBundledClaudeCli();
+    if (!cli || typeof query !== 'function' || SECURITY_RULES.length === 0) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        error: 'Immutable image preflight failed',
+      });
+      forceExitWithSafetyNet(1);
+    }
+    execFileSync(cli, ['--version'], { stdio: 'ignore' });
+    writeOutput({ status: 'closed', result: 'IMAGE_RUNNER_PREFLIGHT_OK' });
+    forceExitWithSafetyNet(0);
   }
 
   setCurrentChannelTurn(

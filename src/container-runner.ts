@@ -18,6 +18,7 @@ import {
   CONTAINER_HTTP_PROXY,
   CONTAINER_HTTPS_PROXY,
   CONTAINER_IMAGE,
+  CONTAINER_IMAGE_HEADROOM,
   CONTAINER_NO_PROXY,
   DATA_DIR,
   GROUPS_DIR,
@@ -103,7 +104,7 @@ import {
   syncHostClaudeContext,
 } from './claude-context-resolver.js';
 import { pluginSkillLayers } from './effective-skill-resolver.js';
-import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
+import { RegisteredGroup } from './types.js';
 import type {
   AgentProfileRuntimePolicy,
   ChannelTurnContext,
@@ -111,6 +112,8 @@ import type {
 } from './types.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
+import type { ContainerOutput } from './agent-runtime-contracts.js';
+export type { ContainerOutput } from './agent-runtime-contracts.js';
 import {
   resolveHostSkillPolicy,
   type HostSkillPolicy,
@@ -504,82 +507,6 @@ export interface ContainerInput {
   skillManifest?: { hash: string; selectedSkillIds: string[] };
 }
 
-export interface ContainerOutput {
-  status: 'success' | 'error' | 'stream' | 'closed';
-  result: string | null;
-  /** Hidden SDK final text from a Proactive runner. Public interactive turns
-   * must never publish it; scheduled-result extraction may consume it. */
-  proactiveFinalCandidate?: string;
-  newSessionId?: string;
-  error?: string;
-  providerFailure?: boolean;
-  /**
-   * Upstream `rate_limit_event.resetsAt` for an account-scope rejection, used
-   * to quarantine the provider until the limit actually resets instead of the
-   * flat recovery interval.
-   */
-  providerRateLimitResetsAt?: number;
-  /**
-   * Upstream limit text captured when a provider failure was raised by a model
-   * wall. The host shows it instead of the generic pool notice, but only after
-   * every account is exhausted.
-   */
-  providerFailureNotice?: string;
-  /**
-   * Whether the rejection walled the whole account or just one model tier.
-   * Model-scope walls quarantine the (account, model) pair only: the account's
-   * other tiers and every other account's budget for this model stay usable.
-   */
-  providerRateLimitScope?: 'account' | 'model';
-  /** The model that was actually in use when the limit was reported. */
-  providerRateLimitModel?: string;
-  /**
-   * Host-derived terminal boundary. False means the durable input must be
-   * replayed on another healthy provider; true means the pool is exhausted.
-   */
-  providerFailureTerminal?: boolean;
-  /** Internal agent-runner marker: the failed turn is being retried in-process. */
-  providerFailureRetrying?: boolean;
-  /** Provider failed during a post-turn internal maintenance query. */
-  providerFailureMaintenance?: boolean;
-  streamEvent?: StreamEvent;
-  /** Durable input-turn correlation emitted by agent-runner. */
-  readonly inputTurnId?: string;
-  turnId?: string;
-  sessionId?: string;
-  sdkMessageUuid?: string;
-  sourceKind?: Exclude<MessageSourceKind, 'user_command'>;
-  /** 'truncated'：上游断流截断的 partial（usage 双零指纹，runner 会自动续写） */
-  finalizationReason?: 'completed' | 'interrupted' | 'error' | 'truncated';
-  /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
-   * >0 时主进程把流式卡片保持在「后台任务运行中」而非定稿。 */
-  pendingBgTasks?: number;
-  inputTurnCompleted?: boolean;
-  /** The streaming SDK query has no accepted user turn left to process. */
-  queryIdle?: boolean;
-  ipcReceipts?: Array<{
-    deliveryId: string;
-    chatJid: string;
-    coveredCursors?: Array<{
-      timestamp: string;
-      id: string;
-      sourceJid?: string;
-    }>;
-    cursor: { timestamp: string; id: string; sourceJid?: string };
-  }>;
-  /** Exact IPC inputs that now own output after the completed turn. */
-  activeIpcReceipts?: Array<{
-    deliveryId: string;
-    chatJid: string;
-    coveredCursors?: Array<{
-      timestamp: string;
-      id: string;
-      sourceJid?: string;
-    }>;
-    cursor: { timestamp: string; id: string; sourceJid?: string };
-  }>;
-}
-
 /**
  * Record one provider failure at the right granularity.
  *
@@ -664,6 +591,16 @@ export interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+export type AgentRunnerMode = 'image' | 'development';
+
+export function resolveAgentRunnerMode(
+  value = process.env.HAPPYCLAW_AGENT_RUNNER_MODE,
+): AgentRunnerMode {
+  if (!value || value === 'image') return 'image';
+  if (value === 'development') return 'development';
+  throw new Error('HAPPYCLAW_AGENT_RUNNER_MODE must be image or development');
 }
 
 /**
@@ -899,6 +836,17 @@ function buildRuntimeMcpManifest(
   return buildEffectiveMcpManifest({
     ...resolveRuntimeMcpServers(group, agentProfile),
     ...pluginServers,
+  });
+}
+
+export function runtimeMcpServersRequireHeadroom(
+  servers: Record<string, Record<string, unknown>>,
+): boolean {
+  return Object.values(servers).some((definition) => {
+    const command = definition.command;
+    if (typeof command !== 'string') return false;
+    const executable = path.basename(command.trim()).toLowerCase();
+    return executable === 'headroom' || executable === 'headroom.exe';
   });
 }
 
@@ -1447,7 +1395,14 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   }
 }
 
-export function buildVolumeMounts(
+interface PreparedVolumeMounts {
+  mounts: VolumeMount[];
+  claudeContextPlan: ReturnType<typeof buildClaudeContextPlan>;
+  runtimeMcpServers: Record<string, Record<string, unknown>>;
+  hostPlugins: SdkPluginConfig[];
+}
+
+function prepareVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
   mountUserSkills = true,
@@ -1466,7 +1421,7 @@ export function buildVolumeMounts(
     envLines: [],
     addHostGateway: false,
   },
-): VolumeMount[] {
+): PreparedVolumeMounts {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
       `Persisted container configuration is invalid: ${group.containerConfigError}`,
@@ -1497,7 +1452,6 @@ export function buildVolumeMounts(
   const mounts: VolumeMount[] = [];
   let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
   const projectRoot = process.cwd();
-  const groupDir = path.join(GROUPS_DIR, group.folder);
   const ownerId = group.created_by;
 
   if (isAdminHome) {
@@ -1541,6 +1495,7 @@ export function buildVolumeMounts(
     agentProfile,
   );
   const pluginSkills = ownerId ? prepareHostPlugins(ownerId) : [];
+  const runtimeMcpServers = resolveRuntimeMcpServers(group, agentProfile);
   const claudeContextPlan = buildClaudeContextPlan({
     executionMode: 'container',
     group,
@@ -1560,17 +1515,13 @@ export function buildVolumeMounts(
     materializeLinks: false,
   });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  ensureSettingsJson(
-    settingsFile,
-    resolveRuntimeMcpServers(group, agentProfile),
-    {
-      // The session settings file is HappyClaw-owned. Always replace this map
-      // with the resolved layers so removed/unselected managed MCP cannot
-      // survive from a previous Agent run.
-      replaceMcpServers: true,
-      baseSettings: loadHostClaudeSettings(claudeContextPlan),
-    },
-  );
+  ensureSettingsJson(settingsFile, runtimeMcpServers, {
+    // The session settings file is HappyClaw-owned. Always replace this map
+    // with the resolved layers so removed/unselected managed MCP cannot
+    // survive from a previous Agent run.
+    replaceMcpServers: true,
+    baseSettings: loadHostClaudeSettings(claudeContextPlan),
+  });
 
   mounts.push({
     hostPath: groupSessionsDir,
@@ -1825,31 +1776,19 @@ export function buildVolumeMounts(
     }
   }
 
-  // Mount agent-runner source from host — recompiled on container startup.
-  // Bypasses Docker 镜像构建缓存，确保代码变更生效。
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  mounts.push({
-    hostPath: agentRunnerSrc,
-    containerPath: '/app/src',
-    readonly: true,
-  });
-
-  // Prompts must ride along with the source for the same reason: the image
-  // bakes a copy at build time, so a prompt file added after the last image
-  // build (e.g. identity.happyclaw.md) is missing inside the container while
-  // the freshly-mounted runner code already requires it — every container
-  // startup then dies with ENOENT. The entrypoint's /tmp/prompts symlink
-  // resolves through this mount.
-  mounts.push({
-    hostPath: path.join(projectRoot, 'container', 'agent-runner', 'prompts'),
-    containerPath: '/app/prompts',
-    readonly: true,
-  });
+  if (resolveAgentRunnerMode() === 'development') {
+    // Explicit hot-reload mode compiles the checked-out source at startup.
+    mounts.push({
+      hostPath: path.join(projectRoot, 'container', 'agent-runner', 'src'),
+      containerPath: '/app/src',
+      readonly: true,
+    });
+    mounts.push({
+      hostPath: path.join(projectRoot, 'container', 'agent-runner', 'prompts'),
+      containerPath: '/app/prompts',
+      readonly: true,
+    });
+  }
 
   // Native Claude user config overlays the isolated session config. Workspace
   // remains the SDK cwd; these read-only mounts provide the same user-level
@@ -1906,7 +1845,18 @@ export function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
-  return mounts;
+  return {
+    mounts,
+    claudeContextPlan,
+    runtimeMcpServers,
+    hostPlugins: pluginSkills,
+  };
+}
+
+export function buildVolumeMounts(
+  ...args: Parameters<typeof prepareVolumeMounts>
+): VolumeMount[] {
+  return prepareVolumeMounts(...args).mounts;
 }
 
 export type ContainerHostIdentityMode =
@@ -2119,11 +2069,13 @@ export function buildContainerArgs(
   tz: string,
   hostIdentity: ContainerHostIdentity = detectContainerHostIdentity(),
   networkConfig: ContainerNetworkConfig = { addHostGateway: false },
+  containerImage = CONTAINER_IMAGE,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
+  args.push('-e', `HAPPYCLAW_AGENT_RUNNER_MODE=${resolveAgentRunnerMode()}`);
   args.push('-e', `HAPPYCLAW_HOST_IDENTITY_MODE=${hostIdentity.mode}`);
   if (hostIdentity.mode === 'direct') {
     if (isPositiveUnixId(hostIdentity.uid)) {
@@ -2149,7 +2101,7 @@ export function buildContainerArgs(
     }
   }
 
-  args.push(CONTAINER_IMAGE);
+  args.push(containerImage);
 
   return args;
 }
@@ -2207,7 +2159,7 @@ export async function runContainerAgent(
     // Resolve before creating mounts or spawning Docker so Linux loopback
     // configurations fail fast with an actionable error.
     const containerProxy = resolveContainerProxyConfig();
-    const mounts = buildVolumeMounts(
+    const preparedLaunch = prepareVolumeMounts(
       group,
       isAdminHome,
       shouldMountUserSkills,
@@ -2222,6 +2174,37 @@ export async function runContainerAgent(
       modelSelectionPinned,
       containerProxy,
     );
+    const mounts = preparedLaunch.mounts;
+    const dockerPlugins = group.created_by
+      ? loadUserPlugins(group.created_by, { runtime: 'docker' })
+      : [];
+    const pluginMcpServers =
+      getAgentProfileMcpPolicyMode(input.agentProfile) === 'inherit'
+        ? loadPluginMcpDefinitions(preparedLaunch.hostPlugins)
+        : {};
+    const effectiveMcpServers = {
+      ...preparedLaunch.runtimeMcpServers,
+      ...pluginMcpServers,
+    };
+    const mcpManifest = buildEffectiveMcpManifest(effectiveMcpServers);
+    const requiresHeadroom =
+      runtimeMcpServersRequireHeadroom(effectiveMcpServers);
+    if (requiresHeadroom && !CONTAINER_IMAGE_HEADROOM) {
+      throw new Error(
+        'Headroom MCP requires CONTAINER_IMAGE_HEADROOM when the core image is pinned by digest',
+      );
+    }
+    const containerImage = requiresHeadroom
+      ? CONTAINER_IMAGE_HEADROOM
+      : CONTAINER_IMAGE;
+    const contextAudit = {
+      ...preparedLaunch.claudeContextPlan.audit,
+      mcp: {
+        manifestHash: mcpManifest.hash,
+        serverIds: mcpManifest.serverIds,
+      },
+    };
+    const skillManifest = preparedLaunch.claudeContextPlan.effectiveSkills;
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
       ? `-${sessionAgentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
@@ -2233,6 +2216,7 @@ export async function runContainerAgent(
       TIMEZONE,
       detectContainerHostIdentity(),
       { addHostGateway: containerProxy.addHostGateway },
+      containerImage,
     );
 
     logger.debug(
@@ -2254,6 +2238,8 @@ export async function runContainerAgent(
         containerName,
         mountCount: mounts.length,
         isMain: input.isMain,
+        imageProfile:
+          containerImage === CONTAINER_IMAGE_HEADROOM ? 'headroom' : 'core',
       },
       'Spawning container agent',
     );
@@ -2285,103 +2271,12 @@ export async function runContainerAgent(
         ...input,
         workspaceMemoryMutationSigningSecret,
         workspaceMemoryRunnerInstanceId,
-        plugins: group.created_by
-          ? loadUserPlugins(group.created_by, { runtime: 'docker' })
-          : [],
-        contextAudit: (() => {
-          const skillsPolicy = resolveAgentProfileUserSkillsPolicy(
-            group.created_by,
-            input.agentProfile,
-          );
-          const audit = buildClaudeContextPlan({
-            executionMode: 'container',
-            group,
-            ownerHomeFolder,
-            externalClaudeDir: getEffectiveExternalDir(),
-            projectRoot: process.cwd(),
-            dataDir: DATA_DIR,
-            groupSessionsDir: sessionAgentId
-              ? path.join(
-                  DATA_DIR,
-                  'sessions',
-                  group.folder,
-                  'agents',
-                  sessionAgentId,
-                  '.claude',
-                )
-              : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
-            includeHostClaudeContext: shouldIncludeHostClaudeContext(
-              input.agentProfile,
-            ),
-            hostSkillPolicy: resolveAgentProfileHostSkillPolicy(
-              input.agentProfile,
-            ),
-            mountUserSkills:
-              shouldMountUserSkills && skillsPolicy.mountUserSkills,
-            userSkillsDirOverride: skillsPolicy.userSkillsDirOverride,
-            managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
-            pluginSkillLayers: pluginSkillLayers(
-              group.created_by
-                ? loadUserPlugins(group.created_by, { runtime: 'host' })
-                : [],
-            ),
-          }).audit;
-          const mcpManifest = buildRuntimeMcpManifest(
-            group,
-            input.agentProfile,
-            group.created_by
-              ? loadUserPlugins(group.created_by, { runtime: 'host' })
-              : [],
-          );
-          audit.mcp = {
-            manifestHash: mcpManifest.hash,
-            serverIds: mcpManifest.serverIds,
-          };
-          return audit;
-        })(),
-        skillManifest: (() => {
-          const skillsPolicy = resolveAgentProfileUserSkillsPolicy(
-            group.created_by,
-            input.agentProfile,
-          );
-          const manifest = buildClaudeContextPlan({
-            executionMode: 'container',
-            group,
-            ownerHomeFolder,
-            externalClaudeDir: getEffectiveExternalDir(),
-            projectRoot: process.cwd(),
-            dataDir: DATA_DIR,
-            groupSessionsDir: sessionAgentId
-              ? path.join(
-                  DATA_DIR,
-                  'sessions',
-                  group.folder,
-                  'agents',
-                  sessionAgentId,
-                  '.claude',
-                )
-              : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
-            includeHostClaudeContext: shouldIncludeHostClaudeContext(
-              input.agentProfile,
-            ),
-            hostSkillPolicy: resolveAgentProfileHostSkillPolicy(
-              input.agentProfile,
-            ),
-            mountUserSkills:
-              shouldMountUserSkills && skillsPolicy.mountUserSkills,
-            userSkillsDirOverride: skillsPolicy.userSkillsDirOverride,
-            managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
-            pluginSkillLayers: pluginSkillLayers(
-              group.created_by
-                ? loadUserPlugins(group.created_by, { runtime: 'host' })
-                : [],
-            ),
-          }).effectiveSkills;
-          return {
-            hash: manifest.hash,
-            selectedSkillIds: manifest.selected.map((skill) => skill.id),
-          };
-        })(),
+        plugins: dockerPlugins,
+        contextAudit,
+        skillManifest: {
+          hash: skillManifest.hash,
+          selectedSkillIds: skillManifest.selected.map((skill) => skill.id),
+        },
       };
       container.stdin.write(JSON.stringify(dockerInput));
       container.stdin.end();

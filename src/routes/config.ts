@@ -13,12 +13,13 @@ import {
   AVATAR_MAX_FILE_BYTES,
 } from '../http-upload-policy.js';
 import type { Variables } from '../web-context.js';
-import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
+import { getWebDeps } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
+import { recordLegacyUserImRoute } from '../legacy-route-telemetry.js';
 import { extractChatId, getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
-  deleteAgent,
   getRegisteredGroup,
   getAllRegisteredGroups,
   forceActiveAdminRuntimesToHost,
@@ -132,11 +133,9 @@ import type {
   ClaudeOAuthCredentials,
   CachedOAuthUsage,
   OAuthUsageResponse,
-  OAuthUsageBucket,
 } from '../runtime-config.js';
 import { parseOAuthUsageBucket } from '../runtime-config.js';
 import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
-import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
 import brandAssetRoutes from './brand-assets.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
@@ -175,6 +174,11 @@ import {
   restorePendingAdminHostOnlyRuntimeSafetyBlocks,
 } from '../admin-host-only-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
+
+configRoutes.use('/user-im/*', async (c, next) => {
+  recordLegacyUserImRoute(c.req.method, new URL(c.req.url).pathname);
+  await next();
+});
 
 /**
  * Count how many IM channels are currently enabled for a user, excluding the given channel.
@@ -3786,11 +3790,6 @@ configRoutes.post('/user-im/discord/test', authMiddleware, async (c) => {
 
 const WECHAT_API_BASE = 'https://ilinkai.weixin.qq.com';
 const WECHAT_QR_BOT_TYPE = '3';
-
-function randomWechatUin(): string {
-  const uint32 = randomBytes(4).readUInt32BE(0);
-  return Buffer.from(String(uint32), 'utf-8').toString('base64');
-}
 
 function maskBotToken(token: string | undefined): string | null {
   if (!token) return null;

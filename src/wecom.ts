@@ -16,7 +16,6 @@ import {
   storeMessageDirect,
 } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import {
   evaluateChannelAdmission,
@@ -75,6 +74,7 @@ export interface WeComConnectOpts {
     sourceJid?: string;
   } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   normalizeIncomingJid?: (jid: string) => string | null;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
@@ -192,10 +192,6 @@ function sdkChatId(chatId: string): string {
   if (chatId.startsWith('c2c:')) return chatId.slice('c2c:'.length);
   if (chatId.startsWith('group:')) return chatId.slice('group:'.length);
   return chatId;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 export function createWeComConnection(
@@ -534,7 +530,7 @@ export function createWeComConnection(
         progress.frameCached = true;
       }
       if (!progress.broadcast) {
-        broadcastNewMessage(
+        opts?.onMessagePersisted?.(
           targetJid,
           {
             id,

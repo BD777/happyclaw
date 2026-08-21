@@ -103,6 +103,11 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  webContext.setWebDeps({
+    getRegisteredGroups: () => ({}),
+    broadcastAgentStatus: vi.fn(),
+    broadcastAgentRemoved: vi.fn(),
+  } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
   try {
     db.deleteRegisteredGroup(GROUP_JID);
   } catch {

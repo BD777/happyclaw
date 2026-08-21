@@ -125,6 +125,8 @@ beforeAll(() => {
   db.initDatabase();
   webContext.setWebDeps({
     getRegisteredGroups: () => ({}),
+    broadcastNewMessage: vi.fn(),
+    broadcastMessageDeleted: broadcastMessageDeletedMock,
   } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 });
 

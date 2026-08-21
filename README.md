@@ -34,6 +34,7 @@
 <p align="center">
   <a href="https://happyclaw.cc/"><strong>访问官网</strong></a> ·
   <a href="docs/API.md">API 文档</a> ·
+  <a href="docs/RUNTIME-ARCHITECTURE.md">运行时架构</a> ·
   <a href="docs/ACL-MATRIX.md">权限矩阵</a> ·
   <a href="DEPLOYMENT.md">生产部署</a> ·
   <a href="https://github.com/riba2534/happyclaw/issues">问题反馈</a>
@@ -282,10 +283,12 @@ docker pull riba2534/happyclaw-agent:latest
 `main` 分支每次推送都会重新构建
 `riba2534/happyclaw-agent`（amd64/arm64）。两个架构会分别在 GitHub 原生 x64
 与 ARM64 Hosted Runner 上并行构建，不使用 QEMU 模拟。每个 runner 先推送没有
-用户标签的 digest candidate，使用真实容器入口启动 Chromium，并通过 HTTP 请求
-`/json/version`；两边都验证通过后才合并、签名并提升 `git-<sha>` 和 `latest`
-manifest。镜像构建时会解析 Claude Code、Claude Agent SDK、agent-browser、
-feishu-cli、uv 和 Headroom 的最新稳定版；实际安装版本记录在镜像内的
+用户标签的 digest candidate，真实启动不可变 Runner、执行本地 fake provider
+SDK/CLI query，并在首次调用 agent-browser 后验证 `/json/version`；两边都验证通过
+后才合并、签名并提升 `git-<sha>` 和 `latest` manifest。默认 core 镜像不携带未启用
+的 Headroom Python 依赖；配置了 `headroom` MCP 的智能体会选择同版本
+`-headroom` 镜像。Claude Code、Claude Agent SDK、agent-browser、feishu-cli、uv
+和 Headroom 均使用源码锁定版本；实际安装版本记录在镜像内的
 `/usr/local/share/happyclaw-tool-versions.txt`，需要回滚时也可以通过 Docker
 build args 在发布工作流中指定精确版本。
 
@@ -312,6 +315,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `WEB_PORT`                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
 | `WEB_SESSION_SECRET`         | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
 | `CONTAINER_IMAGE`            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
+| `CONTAINER_IMAGE_HEADROOM`   | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
 | `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                   |
 | `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
 | `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
@@ -383,7 +387,7 @@ flowchart LR
 | ---------------- | -------------------------------------------------------------------------------------------------------- |
 | **主服务**       | Node.js、TypeScript、Hono、WebSocket、SQLite                                                             |
 | **智能体运行时** | Claude Agent SDK、Claude Code CLI、MCP、文件 IPC                                                         |
-| **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、Recharts、xterm.js                                      |
+| **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、原生 SVG 图表、xterm.js                                 |
 | **渠道**         | Feishu SDK、grammY、QQ Bot API、DingTalk Stream、企业微信智能机器人 SDK、Discord.js、Baileys、微信 iLink |
 | **隔离执行**     | Docker、非 root Node.js 容器、Chromium、常用开发与浏览器工具                                             |
 | **质量保障**     | TypeScript、Vitest、Prettier、GitHub Actions                                                             |
@@ -479,6 +483,7 @@ happyclaw/
 | 文档                                                                  | 用途                                               |
 | --------------------------------------------------------------------- | -------------------------------------------------- |
 | [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、智能体、用量等接口 |
+| [运行时架构](docs/RUNTIME-ARCHITECTURE.md)                            | 模块边界、依赖规则和性能预算                       |
 | [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求               |
 | [Workspace Memory v2](docs/workspace-memory-v2.md)                    | Workspace 知识边界、数据模型、并发和 UI 语义       |
 | [智能体优先架构记录](docs/agent-first-architecture-plan.md)           | 智能体、工作区、运行会话与渠道挂载的迁移背景       |

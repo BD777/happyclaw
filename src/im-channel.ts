@@ -4,54 +4,39 @@
  * Defines a standard interface for all IM integrations (Feishu, Telegram, etc.)
  * and provides adapter factories that wrap existing connection implementations.
  */
-import {
-  createFeishuConnection,
-  parseFeishuRouteTarget,
-  type FeishuConnection,
-  type FeishuConnectionConfig,
-} from './feishu.js';
+import type { FeishuConnection, FeishuConnectionConfig } from './feishu.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
-import {
-  createTelegramConnection,
-  type TelegramConnection,
-  type TelegramConnectionConfig,
+import type {
+  TelegramConnection,
+  TelegramConnectionConfig,
 } from './telegram.js';
-import {
-  createQQConnection,
-  type QQConnection,
-  type QQConnectionConfig,
-} from './qq.js';
-import {
-  createWeChatConnection,
-  type WeChatConnection,
-  type WeChatConnectionConfig,
-  type WeChatConnectionState,
+import type { QQConnection, QQConnectionConfig } from './qq.js';
+import type {
+  WeChatConnection,
+  WeChatConnectionConfig,
+  WeChatConnectionState,
 } from './wechat.js';
-import {
-  createWeComConnection,
-  type WeComConnection,
-  type WeComConnectionConfig,
-  type WeComConnectionState,
+import type {
+  WeComConnection,
+  WeComConnectionConfig,
+  WeComConnectionState,
 } from './wecom.js';
-import {
-  createDingTalkConnection,
-  type DingTalkConnection,
-  type DingTalkConnectionConfig,
+import type {
+  DingTalkConnection,
+  DingTalkConnectionConfig,
 } from './dingtalk.js';
-import {
-  createDiscordConnection,
-  type DiscordConnection,
-  type DiscordConnectionConfig,
-  type DiscordHistoryMessage,
-  type DiscordHistoryOpts,
-  type DiscordChannelInfo,
-  type DiscordGuildInfo,
+import type {
+  DiscordConnection,
+  DiscordConnectionConfig,
+  DiscordHistoryMessage,
+  DiscordHistoryOpts,
+  DiscordChannelInfo,
+  DiscordGuildInfo,
 } from './discord.js';
-import {
-  createWhatsAppConnection,
-  type WhatsAppConnection,
-  type WhatsAppConnectionConfig,
-  type WhatsAppConnectionState,
+import type {
+  WhatsAppConnection,
+  WhatsAppConnectionConfig,
+  WhatsAppConnectionState,
 } from './whatsapp.js';
 import { logger } from './logger.js';
 import type {
@@ -66,18 +51,22 @@ import type {
   FeishuCapabilityRequest,
   FeishuCapabilityResult,
 } from './feishu-capability.js';
-import {
+import type {
+  InterruptedStreamingCardInput,
+  StreamingCardLifecycle,
+  StreamingCardOptions,
   StreamingCardController,
-  reconcileInterruptedStreamingCard,
-  type InterruptedStreamingCardInput,
-  type StreamingCardLifecycle,
-  type StreamingCardOptions,
 } from './feishu-streaming-card.js';
 import type { DingTalkStreamingCardController } from './dingtalk-streaming-card.js';
 import type { DiscordStreamingEditController } from './discord-streaming-edit.js';
 import type { QQStreamingController } from './qq-streaming-card.js';
 import type { WeComStreamingController } from './wecom-streaming.js';
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
+import { loadChannelImplementation } from './channel-registry.js';
+import type {
+  OnChannelFollowUpsChanged,
+  OnChannelMessagePersisted,
+} from './channel-contracts.js';
 
 /** Union type for any streaming card controller (Feishu, DingTalk, Discord, QQ, or WeCom) */
 export type StreamingSession =
@@ -121,6 +110,10 @@ export interface IMChannelConnectOpts {
   onReady: () => void;
   onNewChat: (chatJid: string, chatName: string) => void;
   onMessage?: (chatJid: string, text: string, senderName: string) => void;
+  /** Project a channel message after its durable insert has committed. */
+  onMessagePersisted?: OnChannelMessagePersisted;
+  /** Notify host projections after the durable follow-up queue changes. */
+  onFollowUpsChanged?: OnChannelFollowUpsChanged;
   ignoreMessagesBefore?: number;
   isChatAuthorized?: (jid: string) => boolean;
   onPairAttempt?: (
@@ -274,17 +267,6 @@ export interface ChannelMessageDeliveryOptions {
   presentation?: 'default' | 'native';
 }
 
-// ─── Channel Registry ───────────────────────────────────────────
-
-/** Backward-compatible registry derived from the shared CHANNEL_PREFIXES. */
-export const CHANNEL_REGISTRY: Record<string, { prefix: string }> =
-  Object.fromEntries(
-    Object.entries(CHANNEL_PREFIXES).map(([type, prefix]) => [
-      type,
-      { prefix },
-    ]),
-  );
-
 /**
  * Determine the channel type from a JID string.
  * Returns the matching channelType key or null if no prefix matches.
@@ -315,6 +297,8 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
     channelType: 'feishu',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createFeishuConnection } =
+        await loadChannelImplementation('feishu');
       inner = createFeishuConnection(config);
       const connected = await inner.connect({
         onReady: opts.onReady,
@@ -324,6 +308,8 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         resolveGroupFolder: opts.resolveGroupFolder,
         resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
         onAgentMessage: opts.onAgentMessage,
+        onMessagePersisted: opts.onMessagePersisted,
+        onFollowUpsChanged: opts.onFollowUpsChanged,
         onFollowUpMessage: opts.onFollowUpMessage,
         onSessionBreak: opts.onSessionBreak,
         onSessionClear: opts.onSessionClear,
@@ -444,6 +430,10 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       if (!inner) return undefined;
       const larkClient = inner.getLarkClient();
       if (!larkClient) return undefined;
+      const { parseFeishuRouteTarget } =
+        await loadChannelImplementation('feishu');
+      const { StreamingCardController } =
+        await import('./feishu-streaming-card.js');
       const target = parseFeishuRouteTarget(chatId);
       const opts: StreamingCardOptions = {
         client: larkClient,
@@ -468,6 +458,8 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       if (!inner) throw new Error('Feishu channel is not connected');
       const larkClient = inner.getLarkClient();
       if (!larkClient) throw new Error('Feishu Bot client is not ready');
+      const { reconcileInterruptedStreamingCard } =
+        await import('./feishu-streaming-card.js');
       return reconcileInterruptedStreamingCard(larkClient, input);
     },
   };
@@ -571,6 +563,8 @@ export function createTelegramChannel(
     channelType: 'telegram',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createTelegramConnection } =
+        await loadChannelImplementation('telegram');
       inner = createTelegramConnection(config);
       try {
         await inner.connect({
@@ -584,6 +578,7 @@ export function createTelegramChannel(
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          onMessagePersisted: opts.onMessagePersisted,
           onBotAddedToGroup: opts.onBotAddedToGroup,
           onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
           normalizeIncomingJid: opts.normalizeIncomingJid,
@@ -708,6 +703,7 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
     channelType: 'qq',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createQQConnection } = await loadChannelImplementation('qq');
       inner = createQQConnection(config);
       try {
         await inner.connect({
@@ -720,6 +716,7 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          onMessagePersisted: opts.onMessagePersisted,
           normalizeIncomingJid: opts.normalizeIncomingJid,
         });
         return inner.isConnected();
@@ -847,6 +844,8 @@ export function createWeChatChannel(
     channelType: 'wechat',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createWeChatConnection } =
+        await loadChannelImplementation('wechat');
       inner ??= createWeChatConnection(config);
       try {
         await inner.connect({
@@ -857,6 +856,7 @@ export function createWeChatChannel(
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          onMessagePersisted: opts.onMessagePersisted,
           normalizeIncomingJid: opts.normalizeIncomingJid,
           isChatAuthorized: opts.isChatAuthorized,
           onPairAttempt: opts.onPairAttempt,
@@ -964,6 +964,8 @@ export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
     channelType: 'wecom',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createWeComConnection } =
+        await loadChannelImplementation('wecom');
       inner ??= createWeComConnection(config);
       try {
         await inner.connect({
@@ -976,6 +978,7 @@ export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
           onCommand: opts.onCommand,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          onMessagePersisted: opts.onMessagePersisted,
           normalizeIncomingJid: opts.normalizeIncomingJid,
           shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
           isGroupOwnerMessage: opts.isGroupOwnerMessage,
@@ -1037,6 +1040,8 @@ export function createDingTalkChannel(
     channelType: 'dingtalk',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createDingTalkConnection } =
+        await loadChannelImplementation('dingtalk');
       inner = createDingTalkConnection(config);
       try {
         await inner.connect({
@@ -1049,6 +1054,7 @@ export function createDingTalkChannel(
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          onMessagePersisted: opts.onMessagePersisted,
           onBotAddedToGroup: opts.onBotAddedToGroup,
           onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
           shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
@@ -1195,6 +1201,8 @@ export function createDiscordChannel(
     channelType: 'discord',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createDiscordConnection } =
+        await loadChannelImplementation('discord');
       inner = createDiscordConnection(config);
       try {
         const ok = await inner.connect({
@@ -1207,6 +1215,7 @@ export function createDiscordChannel(
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          onMessagePersisted: opts.onMessagePersisted,
           onBotAddedToGroup: opts.onBotAddedToGroup,
           onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
           shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
@@ -1347,6 +1356,8 @@ export function createWhatsAppChannel(
     channelType: 'whatsapp',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      const { createWhatsAppConnection } =
+        await loadChannelImplementation('whatsapp');
       inner = createWhatsAppConnection(config);
       try {
         await inner.connect({
@@ -1359,6 +1370,7 @@ export function createWhatsAppChannel(
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          onMessagePersisted: opts.onMessagePersisted,
           onBotAddedToGroup: opts.onBotAddedToGroup,
           onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
           shouldProcessGroupMessage: opts.shouldProcessGroupMessage,

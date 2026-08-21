@@ -854,17 +854,6 @@ function buildStreamingModeCard(initialText: string): object {
   return buildStreamingAgentCard({ initialText, rich: true });
 }
 
-/**
- * Serialize auxiliary element array into a single markdown string.
- * Reuses output from buildAuxiliaryElements().
- */
-function serializeAuxContent(elements: Array<Record<string, unknown>>): string {
-  return elements
-    .map((e) => (e as { content?: string }).content || '')
-    .filter(Boolean)
-    .join('\n\n');
-}
-
 // ─── Flush Controller ─────────────────────────────────────────
 
 class FlushController {
