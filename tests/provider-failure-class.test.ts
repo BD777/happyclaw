@@ -5,6 +5,7 @@ import {
   PROVIDER_FAILURE_USER_NOTICE,
   PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE,
   PROVIDER_MODEL_CONFIG_USER_NOTICE,
+  PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE,
   PROVIDER_TRANSIENT_FAILURE_USER_NOTICE,
   resolveProviderFailureClass,
   resolveTerminalProviderFailureNotice,
@@ -82,6 +83,32 @@ describe('terminal provider failure notices', () => {
     ).toBe(PROVIDER_MODEL_CONFIG_USER_NOTICE);
   });
 
+  test('an escalated transient failure says the account was taken out, not that quota ran out', () => {
+    const notice = resolveTerminalProviderFailureNotice({
+      providerFailureClass: 'account',
+      providerFailureEscalatedFrom: 'transient',
+      providerLivenessTimeout: true,
+    });
+    expect(notice).toBe(PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE);
+    // By this point the account is quarantined, so telling the user to just
+    // resend would be a lie — the next message would fail the same way.
+    expect(notice).toContain('已暂时停用该账号');
+    expect(notice).not.toBe(PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE);
+    expect(notice).not.toBe(PROVIDER_FAILURE_USER_NOTICE);
+  });
+
+  test('escalation is recorded explicitly, never inferred from the stall flag', () => {
+    // `account` + `livenessTimeout` happens to be the escalation signature, but
+    // reading a disposition off an unrelated flag is the original defect. A
+    // stall flag with no escalation marker must not select the escalated notice.
+    expect(
+      resolveTerminalProviderFailureNotice({
+        providerFailureClass: 'account',
+        providerLivenessTimeout: true,
+      }),
+    ).toBeUndefined();
+  });
+
   test('an account failure keeps whatever notice the caller already resolved', () => {
     // Account walls carry the upstream limit text or the generic pool notice;
     // overwriting them here would discard the reset time the user needs.
@@ -116,6 +143,29 @@ describe('host disposition is keyed on the class, not on individual flags', () =
     const poolRefresh = hostRunner.indexOf('providerPool.refreshFromConfig(');
     expect(transientBranch).toBeGreaterThan(-1);
     expect(poolRefresh).toBeGreaterThan(transientBranch);
+  });
+
+  test('a repeated transient failure escalates to an account verdict', () => {
+    // The escalation must rewrite the class BEFORE quarantining, or
+    // quarantineFromOutput's own `!== 'account'` guard would skip the very
+    // quarantine the escalation exists to perform.
+    expect(hostRunner).toMatch(
+      /output\.providerFailureClass = 'account';\s*output\.providerFailureEscalatedFrom = 'transient';\s*if \(selectedProfileId !== null\) \{\s*quarantineFromOutput\(selectedProfileId, output\);/,
+    );
+    // And it must fall through to the pool logic rather than returning early,
+    // so a multi-account install still fails over on the escalated verdict.
+    const escalation = hostRunner.indexOf(
+      "output.providerFailureEscalatedFrom = 'transient';",
+    );
+    const poolRefresh = hostRunner.indexOf('providerPool.refreshFromConfig(');
+    expect(escalation).toBeGreaterThan(-1);
+    expect(poolRefresh).toBeGreaterThan(escalation);
+  });
+
+  test('the first transient failure still replays without touching the account', () => {
+    expect(hostRunner).toMatch(
+      /if \(transientRetries\.consume\(resolveTransientRetryKey\(output\)\)\) \{\s*applyKnownProviderFailureDisposition\(output, false\);\s*return false;\s*\}/,
+    );
   });
 
   test('config failures end immediately without a quarantine or a retry', () => {

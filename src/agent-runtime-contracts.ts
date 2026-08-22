@@ -13,6 +13,7 @@ export interface ContainerOutput {
   providerRateLimitScope?: 'account' | 'model';
   providerRateLimitModel?: string;
   providerFailureClass?: 'account' | 'transient' | 'config';
+  providerFailureEscalatedFrom?: 'transient';
   providerFailureTerminal?: boolean;
   providerFailureRetrying?: boolean;
   providerFailureMaintenance?: boolean;

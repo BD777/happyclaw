@@ -588,11 +588,29 @@ function applyProviderFailureDisposition(
   // identical for single- and multi-account installs by design — a 529 is not a
   // reason to move the conversation to a different account.
   if (failureClass === 'transient') {
-    const terminal = !transientRetries.consume(
-      resolveTransientRetryKey(output),
-    );
-    applyKnownProviderFailureDisposition(output, terminal);
-    return terminal;
+    if (transientRetries.consume(resolveTransientRetryKey(output))) {
+      applyKnownProviderFailureDisposition(output, false);
+      return false;
+    }
+    // The replay is spent and the same input failed transiently again.
+    //
+    // "Transient" is a claim that the upstream will be back shortly, and two
+    // consecutive failures spanning both liveness deadlines are evidence
+    // against it. Measured against the stub upstream, a 401 and a 429 are both
+    // retried silently by the CLI until the watchdog fires, so they are
+    // indistinguishable from a stall on first sight — refusing to ever escalate
+    // would leave a dead key or an exhausted quota permanently un-quarantined
+    // and strand a multi-account pool on its one broken profile.
+    //
+    // Escalating rewrites the class, so everything downstream — the quarantine
+    // here, the pool disposition below, the session-clearing guard, and the
+    // notice — treats it as the account verdict it now looks like.
+    output.providerFailureClass = 'account';
+    output.providerFailureEscalatedFrom = 'transient';
+    if (selectedProfileId !== null) {
+      quarantineFromOutput(selectedProfileId, output);
+    }
+    // fall through to the account disposition
   }
   // A config failure is terminal on arrival. Every account would be asked for
   // the same unservable model, so a retry and a failover both just reproduce
