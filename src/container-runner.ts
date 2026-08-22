@@ -76,9 +76,11 @@ import {
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import {
-  LivenessRetryLedger,
-  PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE,
-  resolveLivenessRetryKey,
+  DEFAULT_MAX_TRANSIENT_RETRIES,
+  TransientRetryLedger,
+  resolveProviderFailureClass,
+  resolveTerminalProviderFailureNotice,
+  resolveTransientRetryKey,
 } from './provider-failure.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
 import {
@@ -525,13 +527,18 @@ function quarantineFromOutput(
     | 'providerRateLimitScope'
     | 'providerRateLimitModel'
     | 'providerRateLimitResetsAt'
+    | 'providerFailureClass'
     | 'providerLivenessTimeout'
   >,
 ): void {
-  // A liveness stall says nothing about the account: the stream simply produced
-  // no model event in time. Quarantining here is what turned an upstream/network
-  // hiccup into a fake "quota exhausted" verdict for single-account pools.
-  if (output.providerLivenessTimeout) return;
+  // Only an account-class verdict may change account health.
+  //
+  // A transient failure says nothing about the account — the stream stalled, or
+  // the upstream returned 529/5xx — and quarantining on it is what turned an
+  // upstream hiccup into a fake "quota exhausted" verdict for single-account
+  // pools. A config failure would fail identically on every account, so
+  // quarantining would drain the whole pool over one unservable model name.
+  if (resolveProviderFailureClass(output) !== 'account') return;
   // Fail safe: a model-scope report with no model name cannot be recorded as a
   // tier quarantine, and silently dropping it would let the same failing pair
   // be selected forever. Degrade to an account-scope quarantine instead.
@@ -567,20 +574,32 @@ function poolCanStillServe(): boolean {
   return !!fallbackModel && providerPool.hasCandidateForTier(fallbackModel);
 }
 
-/** Host-process replay budget; each liveness retry runs a fresh runner. */
-const livenessRetries = new LivenessRetryLedger();
+/** Host-process replay budget; each transient retry runs a fresh runner. */
+const transientRetries = new TransientRetryLedger();
 
 function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
   allowFailover = true,
 ): boolean {
-  // Liveness stalls never consult the pool: no account was judged, so the only
-  // question is whether this input still has a retry left.
-  if (output.providerLivenessTimeout) {
-    const terminal = !livenessRetries.consume(resolveLivenessRetryKey(output));
+  const failureClass = resolveProviderFailureClass(output);
+  // Transient failures never consult the pool: no account was judged, so the
+  // only question is whether this input still has a retry left. This is
+  // identical for single- and multi-account installs by design — a 529 is not a
+  // reason to move the conversation to a different account.
+  if (failureClass === 'transient') {
+    const terminal = !transientRetries.consume(
+      resolveTransientRetryKey(output),
+    );
     applyKnownProviderFailureDisposition(output, terminal);
     return terminal;
+  }
+  // A config failure is terminal on arrival. Every account would be asked for
+  // the same unservable model, so a retry and a failover both just reproduce
+  // it — and neither would tell the user what to actually fix.
+  if (failureClass === 'config') {
+    applyKnownProviderFailureDisposition(output, true);
+    return true;
   }
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
@@ -605,10 +624,11 @@ function applyKnownProviderFailureDisposition(
   output.providerFailureTerminal = terminal;
   output.inputTurnCompleted = terminal;
   // Set here rather than in the disposition helper so every path that forces a
-  // liveness stall terminal — including the scheduled replay loop's
-  // no-progress bail-out — reports the stall instead of a quota verdict.
-  if (terminal && output.providerLivenessTimeout) {
-    output.providerFailureNotice = PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE;
+  // non-account failure terminal — including the scheduled replay loop's
+  // no-progress bail-out — names the real cause instead of a quota verdict.
+  if (terminal) {
+    const notice = resolveTerminalProviderFailureNotice(output);
+    if (notice) output.providerFailureNotice = notice;
   }
 }
 
@@ -3586,8 +3606,21 @@ export async function runAgentWithModelFallback(
     : Math.max(1, enabledProviders.length + fallbackOnlyCombinations);
   let lastOutput: ContainerOutput | undefined;
   let availabilityState = providerPool.getAvailabilityStateKey();
+  // A transient replay is not a distinct combination — it re-runs the same
+  // (account, tier) on purpose — so it must not consume the combination budget.
+  // Without this a single-account install computes maxAttempts = 1 and a
+  // scheduled task could never use the retry the disposition granted it, while
+  // adding the headroom up front would instead hand a pinned Agent a second
+  // attempt it must not get for an account failure. Granted only after an
+  // observed transient failure, and capped independently of the per-input
+  // ledger that is the real bound.
+  let transientReplayBudget = 0;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < maxAttempts + transientReplayBudget;
+    attempt += 1
+  ) {
     let completedInputBeforeProviderFailure = false;
     let attemptedProviderId: string | null = null;
     const gatedOnOutput = onOutput
@@ -3647,8 +3680,23 @@ export async function runAgentWithModelFallback(
     }
 
     const nextAvailabilityState = providerPool.getAvailabilityStateKey();
+    // A transient failure deliberately leaves availability untouched, so the
+    // no-progress guard below would read "nothing changed" and stop — burning
+    // the replay budget the disposition just granted without ever using it.
+    // Reaching here already proves the failure was non-terminal, i.e. the
+    // bounded ledger allowed one more attempt, so the same-provider replay this
+    // guard normally prevents is exactly the intended behaviour here.
+    const replayableTransient =
+      resolveProviderFailureClass(lastOutput) === 'transient';
+    if (
+      replayableTransient &&
+      transientReplayBudget < DEFAULT_MAX_TRANSIENT_RETRIES
+    ) {
+      transientReplayBudget += 1;
+    }
     if (
       attemptedProviderId !== null &&
+      !replayableTransient &&
       nextAvailabilityState === availabilityState
     ) {
       logger.error(
@@ -3670,7 +3718,9 @@ export async function runAgentWithModelFallback(
         attempt: attempt + 1,
         maxAttempts,
       },
-      'Scheduled task provider failed; retrying the same prompt on another provider',
+      replayableTransient
+        ? 'Scheduled task hit a transient provider failure; replaying the same prompt on the same provider'
+        : 'Scheduled task provider failed; retrying the same prompt on another provider',
     );
   }
 

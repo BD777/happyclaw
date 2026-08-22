@@ -1,23 +1,23 @@
 import { describe, expect, test } from 'vitest';
 
 import {
-  DEFAULT_MAX_LIVENESS_RETRIES,
-  LivenessRetryLedger,
+  DEFAULT_MAX_TRANSIENT_RETRIES,
+  TransientRetryLedger,
   PROVIDER_FAILURE_USER_NOTICE,
   PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE,
-  resolveLivenessRetryKey,
+  resolveTransientRetryKey,
 } from '../src/provider-failure.js';
 
 describe('liveness retry ledger', () => {
   test('grants exactly one same-provider replay per input turn', () => {
-    const ledger = new LivenessRetryLedger();
-    expect(DEFAULT_MAX_LIVENESS_RETRIES).toBe(1);
+    const ledger = new TransientRetryLedger();
+    expect(DEFAULT_MAX_TRANSIENT_RETRIES).toBe(1);
     expect(ledger.consume('turn-a')).toBe(true);
     expect(ledger.consume('turn-a')).toBe(false);
   });
 
   test('budgets are independent per input turn', () => {
-    const ledger = new LivenessRetryLedger();
+    const ledger = new TransientRetryLedger();
     expect(ledger.consume('turn-a')).toBe(true);
     expect(ledger.consume('turn-b')).toBe(true);
     expect(ledger.consume('turn-a')).toBe(false);
@@ -25,7 +25,7 @@ describe('liveness retry ledger', () => {
   });
 
   test('a spent turn stops occupying the ledger', () => {
-    const ledger = new LivenessRetryLedger();
+    const ledger = new TransientRetryLedger();
     ledger.consume('turn-a');
     expect(ledger.trackedTurnCount).toBe(1);
     ledger.consume('turn-a');
@@ -33,14 +33,14 @@ describe('liveness retry ledger', () => {
   });
 
   test('fails closed without a durable turn identity', () => {
-    const ledger = new LivenessRetryLedger();
+    const ledger = new TransientRetryLedger();
     expect(ledger.consume(undefined)).toBe(false);
     expect(ledger.consume('')).toBe(false);
     expect(ledger.trackedTurnCount).toBe(0);
   });
 
   test('honours a larger retry budget', () => {
-    const ledger = new LivenessRetryLedger(3);
+    const ledger = new TransientRetryLedger(3);
     expect(ledger.consume('turn-a')).toBe(true);
     expect(ledger.consume('turn-a')).toBe(true);
     expect(ledger.consume('turn-a')).toBe(true);
@@ -48,7 +48,7 @@ describe('liveness retry ledger', () => {
   });
 
   test('evicts in insertion order instead of growing without bound', () => {
-    const ledger = new LivenessRetryLedger(1, 2);
+    const ledger = new TransientRetryLedger(1, 2);
     ledger.consume('turn-a');
     ledger.consume('turn-b');
     expect(ledger.trackedTurnCount).toBe(2);
@@ -68,7 +68,7 @@ describe('liveness retry ledger', () => {
 describe('liveness retry key', () => {
   test('prefers the durable message id over the per-hand-off deliveryId', () => {
     expect(
-      resolveLivenessRetryKey({
+      resolveTransientRetryKey({
         inputTurnId: 'delivery-uuid-1',
         ipcReceipts: [{ cursor: { id: 'msg-1' } }],
       }),
@@ -76,7 +76,7 @@ describe('liveness retry key', () => {
   });
 
   test('a replayed turn keeps its budget even as the deliveryId rotates', () => {
-    const ledger = new LivenessRetryLedger();
+    const ledger = new TransientRetryLedger();
     // Warm turn: deliveryId is a fresh UUID per IPC hand-off.
     const warm = {
       inputTurnId: 'delivery-uuid-1',
@@ -86,14 +86,14 @@ describe('liveness retry key', () => {
     // durable message id. Both must resolve to the same budget.
     const cold = { inputTurnId: 'msg-1' };
 
-    expect(ledger.consume(resolveLivenessRetryKey(warm))).toBe(true);
-    expect(ledger.consume(resolveLivenessRetryKey(cold))).toBe(false);
+    expect(ledger.consume(resolveTransientRetryKey(warm))).toBe(true);
+    expect(ledger.consume(resolveTransientRetryKey(cold))).toBe(false);
   });
 
   test('falls back to inputTurnId for a cold, non-IPC turn', () => {
-    expect(resolveLivenessRetryKey({ inputTurnId: 'msg-2' })).toBe('msg-2');
-    expect(resolveLivenessRetryKey({})).toBeUndefined();
-    expect(resolveLivenessRetryKey({ ipcReceipts: [] })).toBeUndefined();
+    expect(resolveTransientRetryKey({ inputTurnId: 'msg-2' })).toBe('msg-2');
+    expect(resolveTransientRetryKey({})).toBeUndefined();
+    expect(resolveTransientRetryKey({ ipcReceipts: [] })).toBeUndefined();
   });
 });
 

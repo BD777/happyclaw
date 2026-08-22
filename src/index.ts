@@ -94,7 +94,10 @@ import {
 } from './stuck-runner-recovery.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
-import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
+import {
+  PROVIDER_FAILURE_USER_NOTICE,
+  resolveProviderFailureClass,
+} from './provider-failure.js';
 import {
   closeDatabase,
   createTask,
@@ -15630,12 +15633,12 @@ async function processAgentConversation(
     // #549: a provider switch surfaced as a failure clears the agent session so
     // the next turn starts fresh on the newly-selected provider.
     //
-    // Only when a switch can actually happen. A liveness stall judged no account
-    // at all, and a single-provider pool has nothing to switch to — clearing the
-    // session there just destroys the conversation for nothing.
+    // Only when a switch can actually happen. Transient and config failures
+    // judged no account at all, and a single-provider pool has nothing to switch
+    // to — clearing the session there just destroys the conversation for nothing.
     if (
       output.providerFailure &&
-      !output.providerLivenessTimeout &&
+      resolveProviderFailureClass(output) === 'account' &&
       willClearSessionOnProviderSwitch(
         effectiveGroup.folder,
         agentId,

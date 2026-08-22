@@ -8,6 +8,61 @@ export const PROVIDER_FAILURE_USER_NOTICE =
 export const PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE =
   '⚠️ 模型服务本轮长时间没有任何响应，重试后仍未恢复，本次请求未被执行。这通常是上游暂时不可用或网络中断，与账号额度无关。请稍后重新发送。';
 
+/**
+ * A reported upstream error (529/5xx). Same disposition as a stall, but the
+ * upstream did answer, so the wording must not claim it went silent.
+ */
+export const PROVIDER_TRANSIENT_FAILURE_USER_NOTICE =
+  '⚠️ 模型服务上游暂时不可用（过载或服务端错误），重试后仍未恢复，本次请求未被执行。这与账号额度无关。请稍后重新发送。';
+
+/**
+ * A configuration verdict, not a capacity one. Retrying and failing over both
+ * re-send the same unserviceable model name, so the user has to act.
+ */
+export const PROVIDER_MODEL_CONFIG_USER_NOTICE =
+  '⚠️ 当前配置的模型在该服务端不存在或不可用，本次请求未被执行。这不是额度问题，重试或切换账号都无法解决，请在「模型配置」中检查模型名称。';
+
+/** Failure classes as reported by the agent runner. */
+export type ProviderFailureClass = 'account' | 'transient' | 'config';
+
+/** The subset of an output that determines the failure class and its notice. */
+export interface ProviderFailureClassification {
+  readonly providerFailureClass?: ProviderFailureClass;
+  readonly providerLivenessTimeout?: boolean;
+}
+
+/**
+ * Resolve the class a failure must be dispositioned as.
+ *
+ * Defaults to `account` when the field is absent so that an output framed by an
+ * older runner keeps its historical disposition rather than silently gaining
+ * the never-quarantine transient path. `providerLivenessTimeout` is honoured on
+ * its own for the same reason: a batch-1 runner emits the stall flag without a
+ * class, and that stall must still avoid the quarantine.
+ */
+export function resolveProviderFailureClass(
+  output: ProviderFailureClassification,
+): ProviderFailureClass {
+  if (output.providerFailureClass) return output.providerFailureClass;
+  return output.providerLivenessTimeout ? 'transient' : 'account';
+}
+
+/**
+ * The notice for a failure that has become terminal, or undefined when the
+ * caller's own notice (an upstream limit text, or the generic pool notice)
+ * should stand.
+ */
+export function resolveTerminalProviderFailureNotice(
+  output: ProviderFailureClassification,
+): string | undefined {
+  const failureClass = resolveProviderFailureClass(output);
+  if (failureClass === 'config') return PROVIDER_MODEL_CONFIG_USER_NOTICE;
+  if (failureClass !== 'transient') return undefined;
+  return output.providerLivenessTimeout
+    ? PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE
+    : PROVIDER_TRANSIENT_FAILURE_USER_NOTICE;
+}
+
 export interface ProviderFailureHealth {
   profileId: string;
   healthy: boolean;
@@ -42,8 +97,8 @@ export function resolveProviderFailureDisposition(
   };
 }
 
-/** The identity fields a liveness replay budget can be keyed on. */
-export interface LivenessRetryIdentity {
+/** The identity fields a transient replay budget can be keyed on. */
+export interface TransientRetryIdentity {
   readonly inputTurnId?: string;
   readonly ipcReceipts?: ReadonlyArray<{ cursor: { id: string } }>;
 }
@@ -57,31 +112,31 @@ export interface LivenessRetryIdentity {
  * cursor survives replay, so prefer it. Cold turns already use the message id as
  * their ContainerInput.turnId, so they are stable either way.
  */
-export function resolveLivenessRetryKey(
-  output: LivenessRetryIdentity,
+export function resolveTransientRetryKey(
+  output: TransientRetryIdentity,
 ): string | undefined {
   return output.ipcReceipts?.[0]?.cursor?.id || output.inputTurnId;
 }
 
-/** Same-provider replay budget for one liveness stall. */
-export const DEFAULT_MAX_LIVENESS_RETRIES = 1;
-const DEFAULT_MAX_TRACKED_LIVENESS_TURNS = 512;
+/** Same-provider replay budget for one transient provider failure. */
+export const DEFAULT_MAX_TRANSIENT_RETRIES = 1;
+const DEFAULT_MAX_TRACKED_TRANSIENT_TURNS = 512;
 
 /**
- * Bounded same-provider replay budget for liveness stalls, keyed by durable
- * input turn.
+ * Bounded same-provider replay budget for transient provider failures — both
+ * silent stalls and reported upstream errors — keyed by durable input turn.
  *
- * A stall judged no account, so the right answer is to run the same input
- * again rather than retire it. Each retry is a fresh runner, so the ledger must
- * live in the long-lived host process. It is what stops a permanently wedged
- * upstream from replaying one input forever.
+ * A transient failure judged no account, so the right answer is to run the same
+ * input again rather than retire it. Each retry is a fresh runner, so the ledger
+ * must live in the long-lived host process. It is what stops a permanently
+ * wedged upstream from replaying one input forever.
  */
-export class LivenessRetryLedger {
+export class TransientRetryLedger {
   private readonly used = new Map<string, number>();
 
   constructor(
-    private readonly maxRetries: number = DEFAULT_MAX_LIVENESS_RETRIES,
-    private readonly maxTracked: number = DEFAULT_MAX_TRACKED_LIVENESS_TURNS,
+    private readonly maxRetries: number = DEFAULT_MAX_TRANSIENT_RETRIES,
+    private readonly maxTracked: number = DEFAULT_MAX_TRACKED_TRANSIENT_TURNS,
   ) {}
 
   /**
