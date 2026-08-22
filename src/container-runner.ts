@@ -577,7 +577,13 @@ function poolCanStillServe(): boolean {
 /** Host-process replay budget; each transient retry runs a fresh runner. */
 const transientRetries = new TransientRetryLedger();
 
-function applyProviderFailureDisposition(
+/**
+ * Exported for tests: the transient escalation spans this function, the
+ * host-process retry ledger and the provider pool, so asserting it on source
+ * text alone would not prove that a second failure actually quarantines the
+ * account or that the pool then decides failover.
+ */
+export function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
   allowFailover = true,
