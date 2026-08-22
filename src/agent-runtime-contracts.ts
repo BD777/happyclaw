@@ -15,6 +15,7 @@ export interface ContainerOutput {
   providerFailureTerminal?: boolean;
   providerFailureRetrying?: boolean;
   providerFailureMaintenance?: boolean;
+  providerLivenessTimeout?: boolean;
   streamEvent?: StreamEvent;
   readonly inputTurnId?: string;
   turnId?: string;

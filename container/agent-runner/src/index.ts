@@ -1796,6 +1796,7 @@ async function runQueryAttempt(
     rateLimitResetsAt?: number,
     failureNotice?: string,
     rateLimitScope: 'account' | 'model' = 'account',
+    livenessTimeout = false,
   ): void => {
     if (providerFailurePublished) return;
     providerFailurePublished = true;
@@ -1819,6 +1820,7 @@ async function runQueryAttempt(
         PROVIDER_FALLBACK_MODELS.activeModelOverride,
       ),
       ...(!emitOutput ? { providerFailureMaintenance: true } : {}),
+      ...(livenessTimeout ? { providerLivenessTimeout: true } : {}),
       finalizationReason: 'error',
       ...(emitOutput && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
       ...(sourceKindOverride ? { sourceKind: sourceKindOverride } : {}),
@@ -2629,10 +2631,18 @@ async function runQueryAttempt(
     firstResponseWatchdog = new SdkFirstResponseWatchdog(
       SDK_FIRST_RESPONSE_TIMEOUT_MS,
       (phase, timeoutMs) => {
-        log(
-          `No model response event within ${timeoutMs}ms (${phase}); marking provider unhealthy`,
+        // WARN, not info: the host only forwards warn-and-above from the runner,
+        // and this line is the sole diagnostic for a liveness stall.
+        logWarn(
+          `No model response event within ${timeoutMs}ms (${phase}); reporting a transient liveness timeout (account health untouched)`,
         );
-        publishProviderAccountFailure('server_error');
+        publishProviderAccountFailure(
+          'server_error',
+          undefined,
+          undefined,
+          'account',
+          true,
+        );
         processor.discardPendingTextOutput();
         processor.cleanup();
         stream.end();

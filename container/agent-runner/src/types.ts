@@ -363,6 +363,13 @@ export interface ContainerOutput {
    * completed. The host quarantines it without replaying or notifying again.
    */
   providerFailureMaintenance?: boolean;
+  /**
+   * The SDK stream produced no model response event within the liveness
+   * deadline. This is a transport/upstream stall, NOT evidence that the account
+   * is out of quota: the host must not quarantine the profile or clear the
+   * session, and it must keep the durable input replayable while retries remain.
+   */
+  providerLivenessTimeout?: boolean;
   streamEvent?: StreamEvent;
   /**
    * Immutable identity of the user input turn that produced this output.

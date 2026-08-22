@@ -75,6 +75,11 @@ import {
   setSessionProviderId,
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
+import {
+  LivenessRetryLedger,
+  PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE,
+  resolveLivenessRetryKey,
+} from './provider-failure.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
 import {
   loadManagedMcpLayers,
@@ -520,8 +525,13 @@ function quarantineFromOutput(
     | 'providerRateLimitScope'
     | 'providerRateLimitModel'
     | 'providerRateLimitResetsAt'
+    | 'providerLivenessTimeout'
   >,
 ): void {
+  // A liveness stall says nothing about the account: the stream simply produced
+  // no model event in time. Quarantining here is what turned an upstream/network
+  // hiccup into a fake "quota exhausted" verdict for single-account pools.
+  if (output.providerLivenessTimeout) return;
   // Fail safe: a model-scope report with no model name cannot be recorded as a
   // tier quarantine, and silently dropping it would let the same failing pair
   // be selected forever. Degrade to an account-scope quarantine instead.
@@ -557,11 +567,21 @@ function poolCanStillServe(): boolean {
   return !!fallbackModel && providerPool.hasCandidateForTier(fallbackModel);
 }
 
+/** Host-process replay budget; each liveness retry runs a fresh runner. */
+const livenessRetries = new LivenessRetryLedger();
+
 function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
   allowFailover = true,
 ): boolean {
+  // Liveness stalls never consult the pool: no account was judged, so the only
+  // question is whether this input still has a retry left.
+  if (output.providerLivenessTimeout) {
+    const terminal = !livenessRetries.consume(resolveLivenessRetryKey(output));
+    applyKnownProviderFailureDisposition(output, terminal);
+    return terminal;
+  }
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
   // Ask the pool across both dimensions. A model wall leaves the account
@@ -584,6 +604,12 @@ function applyKnownProviderFailureDisposition(
   output.result = null;
   output.providerFailureTerminal = terminal;
   output.inputTurnCompleted = terminal;
+  // Set here rather than in the disposition helper so every path that forces a
+  // liveness stall terminal — including the scheduled replay loop's
+  // no-progress bail-out — reports the stall instead of a quota verdict.
+  if (terminal && output.providerLivenessTimeout) {
+    output.providerFailureNotice = PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE;
+  }
 }
 
 export interface VolumeMount {
