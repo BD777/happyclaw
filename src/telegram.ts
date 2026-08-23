@@ -231,6 +231,33 @@ export interface TelegramConnection {
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
 
+/**
+ * Only real HTML parse failures should fall back to a second plain send.
+ * Timeout / 5xx / 429 / other transport errors are wrapped by grammy as
+ * HttpError (inner error on `.error`, not `.cause`) and must be rethrown so
+ * the already-attempted chunk is not duplicated.
+ */
+function isTelegramHtmlParseError(err: unknown): boolean {
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const rec = current as Record<string, unknown>;
+    const code = Number(rec.error_code);
+    const description = String(rec.description ?? rec.message ?? '');
+    if (
+      code === 400 &&
+      /parse entities|unclosed|unsupported start tag|can't find end tag/i.test(
+        description,
+      )
+    ) {
+      return true;
+    }
+    current = rec.cause ?? rec.error;
+  }
+  return false;
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -1470,6 +1497,9 @@ export function createTelegramConnection(
               ...threadOptions,
             });
           } catch (err) {
+            if (!isTelegramHtmlParseError(err)) {
+              throw err;
+            }
             // HTML parse failed (e.g. unclosed tags), fallback to plain text
             logger.debug(
               { err, chatId },

@@ -342,11 +342,9 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       options?: ChannelMessageDeliveryOptions,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'Feishu channel not connected, skip sending message',
+        throw new Error(
+          `Feishu channel is not connected; message to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendMessage(chatId, text, localImagePaths, options);
     },
@@ -359,11 +357,9 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       fileName?: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'Feishu channel not connected, skip sending image',
+        throw new Error(
+          `Feishu channel is not connected; image to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
@@ -403,11 +399,9 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       fileName: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'Feishu channel not connected, skip sending file',
+        throw new Error(
+          `Feishu channel is not connected; file to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendFile(chatId, filePath, fileName);
     },
@@ -604,11 +598,9 @@ export function createTelegramChannel(
       localImagePaths?: string[],
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'Telegram channel not connected, skip sending message',
+        throw new Error(
+          `Telegram channel is not connected; message to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendMessage(chatId, text, localImagePaths);
     },
@@ -621,11 +613,9 @@ export function createTelegramChannel(
       fileName?: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'Telegram channel not connected, skip sending image',
+        throw new Error(
+          `Telegram channel is not connected; image to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
@@ -636,11 +626,9 @@ export function createTelegramChannel(
       fileName: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'Telegram channel not connected, skip sending file',
+        throw new Error(
+          `Telegram channel is not connected; file to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendFile(chatId, filePath, fileName);
     },
@@ -739,11 +727,9 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       localImagePaths?: string[],
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'QQ channel not connected, skip sending message',
+        throw new Error(
+          `QQ channel is not connected; message to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendMessage(chatId, text, localImagePaths);
     },
@@ -756,8 +742,9 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       fileName?: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'QQ channel not connected, skip sending image');
-        return;
+        throw new Error(
+          `QQ channel is not connected; image to ${chatId} was not sent`,
+        );
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
@@ -768,8 +755,9 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       fileName: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn({ chatId }, 'QQ channel not connected, skip sending file');
-        return;
+        throw new Error(
+          `QQ channel is not connected; file to ${chatId} was not sent`,
+        );
       }
       await inner.sendFile(chatId, filePath, fileName);
     },
@@ -1078,11 +1066,9 @@ export function createDingTalkChannel(
 
     async sendMessage(chatId: string, text: string): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'DingTalk channel not connected, skip sending message',
+        throw new Error(
+          `DingTalk channel is not connected; message to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendMessage(chatId, text);
     },
@@ -1099,11 +1085,9 @@ export function createDingTalkChannel(
       fileName?: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'DingTalk channel not connected, skip sending image',
+        throw new Error(
+          `DingTalk channel is not connected; image to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
@@ -1114,11 +1098,9 @@ export function createDingTalkChannel(
       fileName: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'DingTalk channel not connected, skip sending file',
+        throw new Error(
+          `DingTalk channel is not connected; file to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendFile(chatId, filePath, fileName);
     },
@@ -1242,17 +1224,29 @@ export function createDiscordChannel(
     },
 
     async sendMessage(chatId, text, localImagePaths?) {
-      if (!inner) return;
+      if (!inner) {
+        throw new Error(
+          `Discord channel is not connected; message to ${chatId} was not sent`,
+        );
+      }
       await inner.sendMessage(chatId, text, localImagePaths);
     },
 
     async sendFile(chatId, filePath, fileName) {
-      if (!inner) return;
+      if (!inner) {
+        throw new Error(
+          `Discord channel is not connected; file to ${chatId} was not sent`,
+        );
+      }
       await inner.sendFile(chatId, filePath, fileName);
     },
 
     async sendImage(chatId, imageBuffer, mimeType, caption?, fileName?) {
-      if (!inner) return;
+      if (!inner) {
+        throw new Error(
+          `Discord channel is not connected; image to ${chatId} was not sent`,
+        );
+      }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
 
