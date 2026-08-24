@@ -1069,12 +1069,10 @@ export function createWhatsAppConnection(
       const jid = stripChannelPrefix(chatId);
       try {
         const buf = await readFile(filePath);
-        const mime = guessMimeType(fileName) || 'application/octet-stream';
-        await sock.sendMessage(jid, {
-          document: buf,
-          mimetype: mime,
-          fileName,
-        });
+        await sock.sendMessage(
+          jid,
+          buildWhatsAppSendFileContent(buf, fileName),
+        );
       } catch (err) {
         logger.error(
           { err, feature: 'whatsapp', chatId, filePath },
@@ -1365,6 +1363,27 @@ export function stripLeadingWhatsAppBotMention(
  * Covers WhatsApp-relevant types: image/video/audio/document.
  * Returns null when unknown so caller can fall back to a sensible default.
  */
+
+export type WhatsAppSendFileContent =
+  | { video: Buffer; mimetype: string }
+  | { audio: Buffer; mimetype: string }
+  | { document: Buffer; mimetype: string; fileName: string };
+
+/** Pick Baileys' native video/audio envelope from guessMimeType; PDFs stay document. */
+export function buildWhatsAppSendFileContent(
+  buf: Buffer,
+  fileName: string,
+): WhatsAppSendFileContent {
+  const mime = guessMimeType(fileName) || 'application/octet-stream';
+  if (mime.startsWith('video/')) {
+    return { video: buf, mimetype: mime };
+  }
+  if (mime.startsWith('audio/')) {
+    return { audio: buf, mimetype: mime };
+  }
+  return { document: buf, mimetype: mime, fileName };
+}
+
 export function guessMimeType(fileName: string): string | null {
   const m = fileName.toLowerCase().match(/\.([a-z0-9]+)$/);
   if (!m) return null;
