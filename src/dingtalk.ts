@@ -205,6 +205,40 @@ export function parseDingTalkGroupMessageResponse(
   return data;
 }
 
+/** Map uploaded media type to the DingTalk robot msgKey + body.
+ * sampleFile is documents only; video/voice need sampleVideo / sampleAudio. */
+export function buildDingTalkFileSendPayload(
+  mediaType: string,
+  mediaId: string,
+  fileName: string,
+  ext: string,
+): { msgKey: string; msgParam: Record<string, string> } {
+  if (mediaType === 'image') {
+    return { msgKey: 'sampleImageMsg', msgParam: { photoURL: mediaId } };
+  }
+  if (mediaType === 'voice') {
+    return {
+      msgKey: 'sampleAudio',
+      msgParam: { mediaId, duration: '1' },
+    };
+  }
+  if (mediaType === 'video') {
+    return {
+      msgKey: 'sampleVideo',
+      msgParam: {
+        duration: '1',
+        videoMediaId: mediaId,
+        videoType: ext || 'mp4',
+        picMediaId: mediaId,
+      },
+    };
+  }
+  return {
+    msgKey: 'sampleFile',
+    msgParam: { mediaId, fileName, fileType: ext },
+  };
+}
+
 interface DingTalkAccessToken {
   token: string;
   expiresAt: number;
@@ -1322,11 +1356,24 @@ export function createDingTalkConnection(
     mediaId: string,
     fileName: string,
     fileType: string,
+    mediaType = 'file',
   ): Promise<void> {
     try {
       const token = await getAccessToken();
-      const msgParam = JSON.stringify({ mediaId, fileName, fileType });
-      await batchSendToUser([userId], robotCode, token, 'sampleFile', msgParam);
+      const payload = buildDingTalkFileSendPayload(
+        mediaType,
+        mediaId,
+        fileName,
+        fileType,
+      );
+      const msgParam = JSON.stringify(payload.msgParam);
+      await batchSendToUser(
+        [userId],
+        robotCode,
+        token,
+        payload.msgKey,
+        msgParam,
+      );
       logger.info({ userId, mediaId, fileName }, 'DingTalk file message sent');
     } catch (err) {
       logger.error(
@@ -2383,25 +2430,17 @@ export function createDingTalkConnection(
       if (isGroup && openConversationId) {
         // Send via persistent groupMessages API
         try {
-          if (mediaType === 'image') {
-            const msgParam = JSON.stringify({ photoURL: mediaId });
-            await sendViaGroupMessagesAPI(
-              openConversationId,
-              'sampleImageMsg',
-              msgParam,
-            );
-          } else {
-            const msgParam = JSON.stringify({
-              mediaId,
-              fileName,
-              fileType: ext,
-            });
-            await sendViaGroupMessagesAPI(
-              openConversationId,
-              'sampleFile',
-              msgParam,
-            );
-          }
+          const payload = buildDingTalkFileSendPayload(
+            mediaType,
+            mediaId,
+            fileName,
+            ext,
+          );
+          await sendViaGroupMessagesAPI(
+            openConversationId,
+            payload.msgKey,
+            JSON.stringify(payload.msgParam),
+          );
           logger.info(
             { chatId, fileName, mediaId },
             'DingTalk group file sent via persistent API',
@@ -2435,6 +2474,7 @@ export function createDingTalkConnection(
             mediaId,
             fileName,
             ext,
+            mediaType,
           );
         }
         logger.info(
