@@ -4,6 +4,7 @@ export interface ImSendFailurePolicy {
 }
 
 const REFRESH_REQUIRED_CODE = 'WECHAT_CONTEXT_REFRESH_REQUIRED';
+const DEFINITIVE_DELIVERY_REJECTION_CODE = 'CHANNEL_DELIVERY_REJECTED';
 
 function errorChainHasCode(error: unknown, expectedCode: string): boolean {
   let current = error;
@@ -21,7 +22,10 @@ function errorChainHasCode(error: unknown, expectedCode: string): boolean {
  * failure is evidence that the concrete chat binding is unhealthy.
  */
 export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
-  if (errorChainHasCode(error, REFRESH_REQUIRED_CODE)) {
+  if (
+    errorChainHasCode(error, REFRESH_REQUIRED_CODE) ||
+    errorChainHasCode(error, DEFINITIVE_DELIVERY_REJECTION_CODE)
+  ) {
     return {
       retryable: false,
       countsTowardChannelRemoval: false,

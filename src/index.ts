@@ -260,6 +260,7 @@ import {
 import {
   deliverChannelOutboxItem,
   reconcileChannelOutboxDeliveries,
+  type ChannelOutboxDeliveryOutcome,
 } from './channel-outbox-delivery.js';
 import {
   ActiveChannelOutboxScopeRegistry,
@@ -2653,6 +2654,16 @@ interface ChannelOutboxDeliveryRef {
   ordinalSlot?: string;
 }
 
+class ScopedChannelDeliveryError extends Error {
+  constructor(
+    readonly status: Exclude<ChannelOutboxDeliveryOutcome, 'delivered'>,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ScopedChannelDeliveryError';
+  }
+}
+
 /**
  * `inputTurnId` is the correlation key runner-side MCP output resolves against,
  * so it must be the id the runner actually reports — its IPC deliveryId for a
@@ -2716,6 +2727,7 @@ async function deliverScopedChannelOutput(
     kind: 'text' | 'card' | 'image' | 'file';
     payload: unknown;
     send: () => Promise<void>;
+    failure?: { error?: unknown };
   },
 ): Promise<boolean | null> {
   if (!ref) return null;
@@ -2812,6 +2824,12 @@ async function deliverScopedChannelOutput(
     },
   });
   if (result.status !== 'delivered') {
+    if (input.failure) {
+      input.failure.error = new ScopedChannelDeliveryError(
+        result.status,
+        result.error ?? `Channel delivery ended as ${result.status}`,
+      );
+    }
     logger.warn(
       {
         targetJid,
@@ -2899,6 +2917,7 @@ async function sendImWithRetry(
             outboxMetadata,
           ),
           send: () => imManager.sendMessage(imJid, text, [], deliveryOptions),
+          failure: sendFailure,
         },
       );
       ok = delivered === true;
@@ -2934,6 +2953,7 @@ async function sendImWithRetry(
               undefined,
               path.basename(imagePath),
             ),
+          failure: sendFailure,
         },
       );
       if (delivered !== true) ok = false;
@@ -10542,6 +10562,7 @@ function startIpcWatcher(): void {
               let messageStaged = false;
               let messageDeliveryError: string | undefined;
               let messageDeliveryUncertain = false;
+              const messageDeliveryFailure: { error?: unknown } = {};
               let nativeDeliveryAcknowledged = false;
               let stagedDisposition:
                 | 'staged_progress'
@@ -10751,6 +10772,7 @@ function startIpcWatcher(): void {
                             inputTurnId: data.inputTurnId,
                             logicalChatJid: effectiveChatJid,
                           },
+                          messageDeliveryFailure,
                         );
                         nativeDeliveryAcknowledged = messageDelivered;
                         if (
@@ -10763,6 +10785,15 @@ function startIpcWatcher(): void {
                           messageDeliveryUncertain = true;
                           messageDeliveryError =
                             'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
+                        } else if (
+                          !messageDelivered &&
+                          messageDeliveryFailure.error instanceof
+                            ScopedChannelDeliveryError &&
+                          messageDeliveryFailure.error.status === 'failed'
+                        ) {
+                          messageDeliveryError =
+                            `The native channel definitively rejected this message before delivery: ${messageDeliveryFailure.error.message}. ` +
+                            'Revise the rejected content according to the provider reason and retry once; do not resend the identical payload.';
                         }
                       }
                     }

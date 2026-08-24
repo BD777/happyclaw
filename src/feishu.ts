@@ -44,10 +44,13 @@ import {
   parseFeishuRuntimeControl,
 } from './follow-up-policy.js';
 import {
+  definitiveFeishuHttpRejection,
+  DefinitiveFeishuCapabilityError,
   executeFeishuCapability,
   type FeishuCapabilityRequest,
   type FeishuCapabilityResult,
 } from './feishu-capability.js';
+import { DefinitiveChannelDeliveryError } from './channel-outbox-delivery.js';
 import { enrichFeishuInboundContent } from './feishu-rich-content.js';
 import {
   FeishuForwardBundleResolver,
@@ -297,6 +300,34 @@ class FeishuApiRejectedError extends Error {
     super(message);
     this.name = 'FeishuApiRejectedError';
   }
+}
+
+/**
+ * Convert an authoritative Feishu rejection into the durable Outbox's
+ * definitive-failure signal. The Lark SDK rejects HTTP 4xx responses as
+ * Axios errors before the normal response-envelope assertion can inspect
+ * their code/message, so both shapes must be recognized here.
+ */
+function definitiveFeishuChannelDeliveryError(
+  error: unknown,
+): DefinitiveChannelDeliveryError | null {
+  if (error instanceof DefinitiveChannelDeliveryError) return error;
+  const rejection =
+    error instanceof FeishuApiRejectedError
+      ? error
+      : definitiveFeishuHttpRejection(error);
+  if (!rejection) return null;
+
+  const retryAfterMs =
+    rejection instanceof DefinitiveFeishuCapabilityError
+      ? rejection.retryAfterMs
+      : undefined;
+  return new DefinitiveChannelDeliveryError(rejection.message, {
+    cause: rejection,
+    ...(retryAfterMs === undefined
+      ? {}
+      : { retryAt: new Date(Date.now() + retryAfterMs).toISOString() }),
+  });
 }
 
 type FeishuSlashCommandCheckpoint =
@@ -1885,12 +1916,13 @@ export function createFeishuConnection(
       );
     } catch (err) {
       logger.error({ chatId, err }, 'Failed to send Feishu text reply');
+      const rejected = definitiveFeishuChannelDeliveryError(err);
       throw new FeishuTextDeliveryError(
         `Feishu text reply was not acknowledged: ${
           err instanceof Error ? err.message : String(err)
         }`,
-        err instanceof FeishuApiRejectedError ? 'rejected' : 'uncertain',
-        err,
+        rejected ? 'rejected' : 'uncertain',
+        rejected ?? err,
       );
     }
   }
@@ -3822,7 +3854,7 @@ export function createFeishuConnection(
         }
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Feishu message');
-        throw err;
+        throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },
 
@@ -3874,7 +3906,7 @@ export function createFeishuConnection(
         );
       } catch (err) {
         logger.error({ err, chatId, mimeType }, 'Failed to send Feishu image');
-        throw err;
+        throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },
 
@@ -3941,7 +3973,7 @@ export function createFeishuConnection(
           { err, chatId, filePath },
           'Failed to send file to Feishu',
         );
-        throw err;
+        throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },
 

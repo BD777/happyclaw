@@ -65,4 +65,28 @@ describe('Explicit Proactive final projection', () => {
     });
     expect(registry.get(SCOPE, TURN)?.hasDeliveredUtterance).toBe(false);
   });
+
+  test('preserves a definitively rejected native final without claiming uncertainty', async () => {
+    const registry = new ActiveTurnOutputRegistry();
+    registry.bind(SCOPE, TURN, {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+    });
+    const project = vi.fn(async () => true);
+
+    await expect(
+      preserveUnacknowledgedProactiveFinal({
+        registry,
+        scopeKey: SCOPE,
+        inputTurnId: TURN,
+        text: '包含公开邮件地址的完整答案',
+        uncertain: false,
+        project,
+      }),
+    ).resolves.toEqual({
+      projected: true,
+      finalizationReason: 'error',
+    });
+    expect(project).toHaveBeenCalledWith('包含公开邮件地址的完整答案', 'error');
+  });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 
 import { imSendFailurePolicy } from '../src/im-send-retry-policy.js';
+import { DefinitiveChannelDeliveryError } from '../src/channel-outbox-delivery.js';
 import { WeChatContextTokenError } from '../src/wechat-context-token.js';
 
 describe('imSendFailurePolicy', () => {
@@ -30,6 +31,19 @@ describe('imSendFailurePolicy', () => {
     expect(imSendFailurePolicy(new Error('connection reset'))).toEqual({
       retryable: true,
       countsTowardChannelRemoval: true,
+    });
+  });
+
+  test('does not retry or remove a healthy channel after an explicit provider rejection', () => {
+    expect(
+      imSendFailurePolicy(
+        new DefinitiveChannelDeliveryError(
+          'Feishu rejected the request (http=400, code=230028)',
+        ),
+      ),
+    ).toEqual({
+      retryable: false,
+      countsTowardChannelRemoval: false,
     });
   });
 });

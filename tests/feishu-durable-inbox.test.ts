@@ -95,8 +95,14 @@ const db = await import('../src/db.js');
 const { createFeishuConnection } = await import('../src/feishu.js');
 const { ChannelRouteRejectedError } =
   await import('../src/channel-admission.js');
-const { getChannelCursor, recordChannelInbox } =
-  await import('../src/channel-reliability-store.js');
+const {
+  createChannelTurnRun,
+  getChannelCursor,
+  getUncertainChannelOutboxForTurn,
+  recordChannelInbox,
+} = await import('../src/channel-reliability-store.js');
+const { deliverChannelOutboxItem } =
+  await import('../src/channel-outbox-delivery.js');
 
 const openConnections: Array<{ stop(): Promise<void> }> = [];
 
@@ -228,6 +234,61 @@ async function connect(
 }
 
 describe('Feishu durable Inbox and cursor integration', () => {
+  test('classifies an Axios-style content-audit HTTP 400 as a definitive Outbox failure', async () => {
+    const accountId = `account-content-audit-${Date.now()}`;
+    const connected = await connect(accountId, vi.fn());
+    controls.messageCreate.mockRejectedValueOnce(
+      Object.assign(new Error('Request failed with status code 400'), {
+        response: {
+          status: 400,
+          data: {
+            code: 230028,
+            msg: 'The messages do NOT pass the audit, ext=contain sensitive data: EMAIL_ADDRESS',
+          },
+        },
+      }),
+    );
+    const route = {
+      provider: 'feishu',
+      accountId,
+      sourceJid: 'feishu:ou_durable_user',
+      chatId: 'ou_durable_user',
+    };
+    const run = createChannelTurnRun({
+      ...route,
+      idempotencyKey: `content-audit-turn-${Date.now()}`,
+    }).run;
+
+    const result = await deliverChannelOutboxItem({
+      ...route,
+      turnRunId: run.id,
+      ordinal: 0,
+      kind: 'text',
+      payload: { text: 'general@incubator.apache.org' },
+      owner: 'content-audit-worker',
+      delivery: {
+        mode: 'single',
+        send: async () => {
+          await connected.connection.sendMessage(
+            'ou_durable_user',
+            'general@incubator.apache.org',
+            [],
+            { presentation: 'native' },
+          );
+          return { providerMessageId: 'must-not-succeed' };
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('code=230028'),
+    });
+    expect(result.error).toContain('EMAIL_ADDRESS');
+    expect(getUncertainChannelOutboxForTurn(run.id)).toBeUndefined();
+    expect(controls.messageCreate).toHaveBeenCalledTimes(1);
+  });
+
   test('adds OnIt only when the active batch explicitly acquires it', async () => {
     const connected = await connect(`account-batch-ack-${Date.now()}`, vi.fn());
     const messageId = 'om_batch_ack';
