@@ -1886,6 +1886,63 @@ export function createDingTalkConnection(
             logger.warn({ msgId }, 'DingTalk file download failed, skipping');
             return;
           }
+        } else if (data.msgtype === 'audio' && 'content' in data) {
+          // Official C2C: { duration, downloadCode, recognition }
+          interface AudioContent {
+            duration?: number;
+            downloadCode?: string;
+            recognition?: string;
+          }
+          const audioContent = (data as { content: AudioContent }).content;
+          const recognition = audioContent?.recognition?.trim();
+          content = recognition || '[语音消息]';
+        } else if (data.msgtype === 'video' && 'content' in data) {
+          // Official C2C: { duration, downloadCode, videoType }
+          interface VideoContent {
+            duration?: number;
+            downloadCode?: string;
+            videoType?: string;
+          }
+          const videoContent = (data as { content: VideoContent }).content;
+          const downloadCode = videoContent?.downloadCode;
+          const videoType =
+            (videoContent?.videoType || 'mp4').replace(/[^a-z0-9]/gi, '') ||
+            'mp4';
+          const fileName = `video.${videoType}`;
+          if (downloadCode) {
+            const fileBuffer = await downloadDingTalkFileByDownloadCode(
+              downloadCode,
+              data.robotCode ?? '',
+            );
+            if (fileBuffer) {
+              const groupFolder = opts.resolveGroupFolder?.(jid);
+              if (groupFolder) {
+                try {
+                  const savedPath = await saveDownloadedFile(
+                    groupFolder,
+                    'dingtalk',
+                    `video_${Date.now()}.${videoType}`,
+                    fileBuffer,
+                  );
+                  content = await buildFileContentBlock({
+                    fileName,
+                    savedRelPath: savedPath,
+                    groupFolder,
+                    prefixLabel: '视频',
+                  });
+                } catch (err) {
+                  logger.warn({ err }, 'Failed to save DingTalk video to disk');
+                  content = `[视频: ${sanitizeFileName(fileName)}（保存失败）]`;
+                }
+              } else {
+                content = `[视频: ${sanitizeFileName(fileName)}（未注册群组）]`;
+              }
+            } else {
+              content = '[视频消息]';
+            }
+          } else {
+            content = '[视频消息]';
+          }
         } else if (data.msgtype === 'image' && 'image' in data) {
           // Image message via contentUrl (legacy/native format)
           const contentUrl = (data as DingTalkRobotMessage).image?.contentUrl;
