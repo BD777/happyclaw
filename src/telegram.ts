@@ -105,6 +105,26 @@ export function buildTelegramRouteJid(
     : base;
 }
 
+/** Caption or text `/pair CODE` — Telegram puts media captions on `caption`, not `text`. */
+export function matchTelegramPairCode(text: string | undefined): string | null {
+  if (!text) return null;
+  const match = text.trim().match(/^\/pair\s+(\S+)/i);
+  return match?.[1] ?? null;
+}
+
+export async function attemptTelegramCaptionPair(
+  caption: string | undefined,
+  onPairAttempt:
+    | ((jid: string, chatName: string, code: string) => Promise<boolean>)
+    | undefined,
+  jid: string,
+  chatName: string,
+): Promise<boolean | null> {
+  const code = matchTelegramPairCode(caption);
+  if (!code || !onPairAttempt) return null;
+  return onPairAttempt(jid, chatName, code);
+}
+
 export interface TelegramProviderTarget {
   chatId: number;
   messageThreadId?: number;
@@ -671,9 +691,9 @@ export function createTelegramConnection(
             const text = ctx.message.text;
 
             // ── /pair <code> command ──
-            const pairMatch = text.match(/^\/pair\s+(\S+)/i);
-            if (pairMatch && opts.onPairAttempt) {
-              const code = pairMatch[1];
+            const pairCode = matchTelegramPairCode(text);
+            if (pairCode && opts.onPairAttempt) {
+              const code = pairCode;
               try {
                 const success = await opts.onPairAttempt(jid, chatName, code);
                 if (success) {
@@ -932,6 +952,52 @@ export function createTelegramConnection(
                 .join(' ') || 'Unknown';
 
             if (!opts.isChatAuthorized(jid)) {
+              const paired = await attemptTelegramCaptionPair(
+                ctx.message.caption,
+                opts.onPairAttempt,
+                jid,
+                chatName,
+              );
+              if (paired !== null) {
+                try {
+                  const success = paired;
+                  if (success) {
+                    const forumState = await prepareTelegramForumPairing(
+                      jid,
+                      ctx.chat as TelegramChatDescriptor,
+                      (id) => bot!.api.getChat(id),
+                      opts.onNativeContextDetected,
+                    );
+                    if (forumState === 'thread_ready') {
+                      nativeContextReported.add(jid);
+                    }
+                    await ctx.reply(
+                      forumState === 'thread_unavailable'
+                        ? 'Pairing succeeded, but Telegram Forum routing could not be initialized. In Web settings, bind this channel to a default workspace before sending topic messages; do not bind it to a fixed session.'
+                        : 'Pairing successful! This chat is now connected.',
+                    );
+                  } else {
+                    await ctx.reply(
+                      'Invalid or expired pairing code. Please generate a new code from the web settings page.',
+                    );
+                  }
+                } catch (err) {
+                  logger.error({ err, jid }, 'Error during pair attempt');
+                  await ctx.reply(
+                    'Pairing failed due to an internal error. Please try again.',
+                  );
+                }
+                return;
+              }
+              const now = Date.now();
+              const lastReject = rejectTimestamps.get(jid) ?? 0;
+              if (now - lastReject >= REJECT_COOLDOWN_MS) {
+                rejectTimestamps.set(jid, now);
+                await ctx.reply(
+                  'This chat is not yet paired. Please send /pair <code> to connect.\n' +
+                    'You can generate a pairing code from the web settings page.',
+                );
+              }
               logger.debug(
                 { jid },
                 'Unauthorized Telegram chat (photo), ignoring',
@@ -1122,6 +1188,52 @@ export function createTelegramConnection(
                 .join(' ') || 'Unknown';
 
             if (!opts.isChatAuthorized(jid)) {
+              const paired = await attemptTelegramCaptionPair(
+                ctx.message.caption,
+                opts.onPairAttempt,
+                jid,
+                chatName,
+              );
+              if (paired !== null) {
+                try {
+                  const success = paired;
+                  if (success) {
+                    const forumState = await prepareTelegramForumPairing(
+                      jid,
+                      ctx.chat as TelegramChatDescriptor,
+                      (id) => bot!.api.getChat(id),
+                      opts.onNativeContextDetected,
+                    );
+                    if (forumState === 'thread_ready') {
+                      nativeContextReported.add(jid);
+                    }
+                    await ctx.reply(
+                      forumState === 'thread_unavailable'
+                        ? 'Pairing succeeded, but Telegram Forum routing could not be initialized. In Web settings, bind this channel to a default workspace before sending topic messages; do not bind it to a fixed session.'
+                        : 'Pairing successful! This chat is now connected.',
+                    );
+                  } else {
+                    await ctx.reply(
+                      'Invalid or expired pairing code. Please generate a new code from the web settings page.',
+                    );
+                  }
+                } catch (err) {
+                  logger.error({ err, jid }, 'Error during pair attempt');
+                  await ctx.reply(
+                    'Pairing failed due to an internal error. Please try again.',
+                  );
+                }
+                return;
+              }
+              const now = Date.now();
+              const lastReject = rejectTimestamps.get(jid) ?? 0;
+              if (now - lastReject >= REJECT_COOLDOWN_MS) {
+                rejectTimestamps.set(jid, now);
+                await ctx.reply(
+                  'This chat is not yet paired. Please send /pair <code> to connect.\n' +
+                    'You can generate a pairing code from the web settings page.',
+                );
+              }
               logger.debug(
                 { jid },
                 'Unauthorized Telegram chat (document), ignoring',
