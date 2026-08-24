@@ -613,6 +613,17 @@ export function applyProviderFailureDisposition(
     // notice — treats it as the account verdict it now looks like.
     output.providerFailureClass = 'account';
     output.providerFailureEscalatedFrom = 'transient';
+    // WARN, not info: this is the one line that says an account was taken out
+    // of rotation for repeated silence rather than for anything the upstream
+    // actually reported, and it is the only in-log evidence that the
+    // escalation fired at all.
+    logger.warn(
+      {
+        providerId: selectedProfileId,
+        livenessTimeout: output.providerLivenessTimeout === true,
+      },
+      'Transient provider failure repeated after its replay; escalating to an account verdict and quarantining',
+    );
     if (selectedProfileId !== null) {
       quarantineFromOutput(selectedProfileId, output);
     }

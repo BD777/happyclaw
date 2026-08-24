@@ -146,20 +146,30 @@ describe('host disposition is keyed on the class, not on individual flags', () =
   });
 
   test('a repeated transient failure escalates to an account verdict', () => {
-    // The escalation must rewrite the class BEFORE quarantining, or
-    // quarantineFromOutput's own `!== 'account'` guard would skip the very
-    // quarantine the escalation exists to perform.
-    expect(hostRunner).toMatch(
-      /output\.providerFailureClass = 'account';\s*output\.providerFailureEscalatedFrom = 'transient';\s*if \(selectedProfileId !== null\) \{\s*quarantineFromOutput\(selectedProfileId, output\);/,
+    // Ordering, asserted by position rather than adjacency so that inserting a
+    // log line between the steps does not read as a regression:
+    //
+    //   class rewrite  ->  quarantine  ->  pool disposition
+    //
+    // The rewrite must come first or quarantineFromOutput's own `!== 'account'`
+    // guard skips the very quarantine the escalation exists to perform, and the
+    // pool step must come last or a multi-account install never fails over.
+    // The behavioural proof lives in provider-transient-escalation.test.ts;
+    // this only pins the order the two functions have to be called in.
+    const rewrite = hostRunner.indexOf(
+      "output.providerFailureClass = 'account';",
     );
-    // And it must fall through to the pool logic rather than returning early,
-    // so a multi-account install still fails over on the escalated verdict.
     const escalation = hostRunner.indexOf(
       "output.providerFailureEscalatedFrom = 'transient';",
     );
+    const quarantine = hostRunner.indexOf(
+      'quarantineFromOutput(selectedProfileId, output);',
+    );
     const poolRefresh = hostRunner.indexOf('providerPool.refreshFromConfig(');
-    expect(escalation).toBeGreaterThan(-1);
-    expect(poolRefresh).toBeGreaterThan(escalation);
+    expect(rewrite).toBeGreaterThan(-1);
+    expect(escalation).toBeGreaterThan(rewrite);
+    expect(quarantine).toBeGreaterThan(escalation);
+    expect(poolRefresh).toBeGreaterThan(quarantine);
   });
 
   test('the first transient failure still replays without touching the account', () => {
