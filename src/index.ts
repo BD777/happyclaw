@@ -2997,6 +2997,8 @@ async function sendImWithRetry(
 
 const CHANNEL_MANUAL_RECONCILIATION_NOTICE =
   '⚠️ 上一次回复在部分内容已送达后异常中断。为避免重复发送，系统已停止自动重放；可能仍有附件或结论未送达，请重新发起请求或联系管理员核对。';
+const CHANNEL_DEFINITIVE_REJECTION_NOTICE =
+  '⚠️ 完整回复已保存在 HappyClaw Web，但飞书拒绝了本次消息，无法在当前话题投递。请前往 Web 查看。';
 
 /**
  * Surface a crash-after-delivery fence to the exact native route. The notice
@@ -3062,6 +3064,8 @@ async function deliverIndependentChannelSystemNotice(input: {
     sourceKind?: MessageSourceKind;
     finalizationReason?: MessageFinalizationReason;
   };
+  /** Native-only notices must never pollute the canonical Web transcript. */
+  projectToWeb?: boolean;
   route: {
     provider: string;
     accountId: string;
@@ -3133,6 +3137,8 @@ async function deliverIndependentChannelSystemNotice(input: {
         });
       }
     }
+
+    if (input.projectToWeb === false) return true;
 
     const msgId = `sys_notice_${noticeRuntime.runId}`;
     const timestamp = new Date().toISOString();
@@ -10562,7 +10568,17 @@ function startIpcWatcher(): void {
               let messageStaged = false;
               let messageDeliveryError: string | undefined;
               let messageDeliveryUncertain = false;
+              let messageDeliveryRejected = false;
+              let webFallbackProjected = false;
               const messageDeliveryFailure: { error?: unknown } = {};
+              let nativeFailureNotice:
+                | {
+                    scopeKey: string;
+                    targetJid: string;
+                    inputTurnId: string;
+                    scope: ActiveChannelOutboxScope;
+                  }
+                | undefined;
               let nativeDeliveryAcknowledged = false;
               let stagedDisposition:
                 | 'staged_progress'
@@ -10791,9 +10807,18 @@ function startIpcWatcher(): void {
                             ScopedChannelDeliveryError &&
                           messageDeliveryFailure.error.status === 'failed'
                         ) {
+                          messageDeliveryRejected = true;
+                          nativeFailureNotice = messageScope
+                            ? {
+                                scopeKey: messageScopeKey,
+                                targetJid: ipcImRoute,
+                                inputTurnId: data.inputTurnId,
+                                scope: messageScope,
+                              }
+                            : undefined;
                           messageDeliveryError =
                             `The native channel definitively rejected this message before delivery: ${messageDeliveryFailure.error.message}. ` +
-                            'Revise the rejected content according to the provider reason and retry once; do not resend the identical payload.';
+                            'The complete answer will remain available in HappyClaw Web; do not retry or rewrite it solely for this channel failure.';
                         }
                       }
                     }
@@ -10961,14 +10986,19 @@ function startIpcWatcher(): void {
 
                 // An unacknowledged native final must keep the exact answer in
                 // the canonical Web session without replaying the provider
-                // mutation. Its provenance remains visibly non-completed.
+                // mutation. A definitive rejection is a channel-only failure:
+                // the canonical Web answer remains completed.
                 if (!messageDelivered && isExplicitProactiveFinal) {
                   const preserved = await preserveUnacknowledgedProactiveFinal({
                     registry: activeTurnOutputs,
                     scopeKey: channelTurnScope(sourceGroup, ipcAgentId),
                     inputTurnId: data.inputTurnId,
                     text: webText,
-                    uncertain: messageDeliveryUncertain,
+                    nativeFailure: messageDeliveryRejected
+                      ? 'rejected'
+                      : messageDeliveryUncertain
+                        ? 'uncertain'
+                        : 'unavailable',
                     project: async (text, finalizationReason) => {
                       const outcome = await sendMessageWithOutcome(
                         effectiveChatJid,
@@ -10998,6 +11028,49 @@ function startIpcWatcher(): void {
                       ? 'Preserved unacknowledged Proactive final in canonical Web session'
                       : 'Failed to preserve unacknowledged Proactive final in canonical Web session',
                   );
+                  webFallbackProjected = preserved.webCompleted;
+                  if (
+                    webFallbackProjected &&
+                    nativeFailureNotice?.scope.chatId
+                  ) {
+                    const noticeScope = nativeFailureNotice.scope;
+                    const notified =
+                      await deliverIndependentChannelSystemNotice({
+                        logicalChatJid: effectiveChatJid,
+                        scopeKey: nativeFailureNotice.scopeKey,
+                        targetJid: nativeFailureNotice.targetJid,
+                        originalInputTurnId: nativeFailureNotice.inputTurnId,
+                        originalRunId: noticeScope.turnRunId,
+                        noticeKey: 'native-delivery-rejected',
+                        text: CHANNEL_DEFINITIVE_REJECTION_NOTICE,
+                        agentId: ipcAgentId,
+                        presentation: usesNativeMessagePresentation(
+                          ipcInteractionMode,
+                        )
+                          ? 'native'
+                          : undefined,
+                        projectToWeb: false,
+                        route: {
+                          provider: noticeScope.provider,
+                          accountId: noticeScope.accountId,
+                          sourceJid: noticeScope.sourceJid,
+                          chatId: noticeScope.chatId!,
+                          rootId: noticeScope.rootId,
+                          threadId: noticeScope.threadId,
+                        },
+                      });
+                    logger[notified ? 'info' : 'warn'](
+                      {
+                        chatJid: effectiveChatJid,
+                        sourceGroup,
+                        agentId: ipcAgentId,
+                        inputTurnId: data.inputTurnId,
+                      },
+                      notified
+                        ? 'Native rejection notice delivered without Web projection'
+                        : 'Native rejection notice could not be delivered',
+                    );
+                  }
                 }
                 if (messageDelivered) {
                   const sendOutcome = await sendMessageWithOutcome(
@@ -11048,11 +11121,14 @@ function startIpcWatcher(): void {
                     chatJid: effectiveChatJid,
                     sourceGroup,
                     agentId: ipcAgentId,
-                    delivered: messageDelivered,
+                    nativeDelivered: messageDelivered,
+                    webFallbackProjected,
                   },
                   messageDelivered
                     ? 'IPC message delivered and projected'
-                    : 'IPC message was not delivered',
+                    : webFallbackProjected
+                      ? 'IPC final completed in Web after native rejection'
+                      : 'IPC message was not delivered',
                 );
               } else {
                 logger.warn(
@@ -11096,7 +11172,7 @@ function startIpcWatcher(): void {
               messageResultWritten = writeIpcMessageResult(
                 messageResultsDir,
                 messageRequestId,
-                messageDelivered
+                messageDelivered || webFallbackProjected
                   ? {
                       success: true,
                       disposition: stagedDisposition ?? 'delivered_separately',
