@@ -14,6 +14,7 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
+import { parseBuffer as parseMediaMetadata } from 'music-metadata';
 import {
   DWClient,
   TOPIC_ROBOT,
@@ -372,6 +373,172 @@ export async function sendViaGroupMessagesAPI(
     'DingTalk sendViaGroupMessagesAPI response',
   );
   return data;
+}
+
+const DINGTALK_IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp']);
+const DINGTALK_VOICE_EXTENSIONS = new Set(['amr', 'mp3', 'wav']);
+const DINGTALK_VIDEO_EXTENSIONS = new Set(['mp4']);
+const DINGTALK_VOICE_MAX_BYTES = 2 * 1024 * 1024;
+
+export interface DingTalkNativeMediaMetadata {
+  /** Parsed media duration in seconds. */
+  durationSeconds?: number;
+  /** Separately uploaded image media ID required by sampleVideo. */
+  picMediaId?: string;
+}
+
+function parseAmrDurationSeconds(buffer: Buffer): number | undefined {
+  const narrowBandMagic = Buffer.from('#!AMR\n');
+  const wideBandMagic = Buffer.from('#!AMR-WB\n');
+  let offset: number;
+  let frameSizes: Array<number | undefined>;
+
+  if (buffer.subarray(0, narrowBandMagic.length).equals(narrowBandMagic)) {
+    offset = narrowBandMagic.length;
+    frameSizes = [
+      13,
+      14,
+      16,
+      18,
+      20,
+      21,
+      27,
+      32,
+      6,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      1,
+      1,
+    ];
+  } else if (buffer.subarray(0, wideBandMagic.length).equals(wideBandMagic)) {
+    offset = wideBandMagic.length;
+    frameSizes = [
+      18,
+      24,
+      33,
+      37,
+      41,
+      47,
+      51,
+      59,
+      61,
+      6,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      1,
+      1,
+    ];
+  } else {
+    return undefined;
+  }
+
+  let frameCount = 0;
+  while (offset < buffer.length) {
+    const frameType = (buffer[offset] >> 3) & 0x0f;
+    const frameSize = frameSizes[frameType];
+    if (!frameSize || offset + frameSize > buffer.length) return undefined;
+    offset += frameSize;
+    frameCount += 1;
+  }
+  return frameCount > 0 ? frameCount * 0.02 : undefined;
+}
+
+export async function getDingTalkMediaDurationSeconds(
+  buffer: Buffer,
+  ext: string,
+): Promise<number | undefined> {
+  const normalizedExt = ext.toLowerCase();
+  if (normalizedExt === 'amr') return parseAmrDurationSeconds(buffer);
+
+  const mimeTypeByExtension: Record<string, string> = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    mp4: 'video/mp4',
+  };
+  const mimeType = mimeTypeByExtension[normalizedExt];
+  if (!mimeType) return undefined;
+
+  try {
+    const metadata = await parseMediaMetadata(
+      buffer,
+      { mimeType, size: buffer.length },
+      { duration: true, skipCovers: true },
+    );
+    const duration = metadata.format.duration;
+    return duration !== undefined && Number.isFinite(duration) && duration > 0
+      ? duration
+      : undefined;
+  } catch (err) {
+    logger.debug(
+      { err, ext: normalizedExt },
+      'Unable to parse DingTalk outbound media duration',
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Map validated uploaded media to the DingTalk robot msgKey + body.
+ * Unsupported formats or incomplete native metadata deliberately degrade to
+ * sampleFile instead of producing a provider-invalid audio/video payload.
+ */
+export function buildDingTalkFileSendPayload(
+  mediaType: string,
+  mediaId: string,
+  fileName: string,
+  ext: string,
+  metadata: DingTalkNativeMediaMetadata = {},
+): { msgKey: string; msgParam: Record<string, string> } {
+  const normalizedExt = ext.toLowerCase();
+  if (mediaType === 'image' && DINGTALK_IMAGE_EXTENSIONS.has(normalizedExt)) {
+    return { msgKey: 'sampleImageMsg', msgParam: { photoURL: mediaId } };
+  }
+  const durationSeconds = metadata.durationSeconds;
+  const hasDuration =
+    durationSeconds !== undefined &&
+    Number.isFinite(durationSeconds) &&
+    durationSeconds > 0;
+  if (
+    mediaType === 'voice' &&
+    DINGTALK_VOICE_EXTENSIONS.has(normalizedExt) &&
+    hasDuration
+  ) {
+    return {
+      msgKey: 'sampleAudio',
+      // sampleAudio expects milliseconds.
+      msgParam: {
+        mediaId,
+        duration: String(Math.max(1, Math.round(durationSeconds * 1000))),
+      },
+    };
+  }
+  if (
+    mediaType === 'video' &&
+    DINGTALK_VIDEO_EXTENSIONS.has(normalizedExt) &&
+    hasDuration &&
+    metadata.picMediaId &&
+    metadata.picMediaId !== mediaId
+  ) {
+    return {
+      msgKey: 'sampleVideo',
+      msgParam: {
+        // sampleVideo expects whole seconds.
+        duration: String(Math.max(1, Math.ceil(durationSeconds))),
+        videoMediaId: mediaId,
+        videoType: normalizedExt,
+        picMediaId: metadata.picMediaId,
+      },
+    };
+  }
+  return {
+    msgKey: 'sampleFile',
+    msgParam: { mediaId, fileName, fileType: normalizedExt },
+  };
 }
 
 interface DingTalkAccessToken {
@@ -1323,11 +1490,26 @@ export function createDingTalkConnection(
     mediaId: string,
     fileName: string,
     fileType: string,
+    mediaType = 'file',
+    metadata: DingTalkNativeMediaMetadata = {},
   ): Promise<void> {
     try {
       const token = await getAccessToken();
-      const msgParam = JSON.stringify({ mediaId, fileName, fileType });
-      await batchSendToUser([userId], robotCode, token, 'sampleFile', msgParam);
+      const payload = buildDingTalkFileSendPayload(
+        mediaType,
+        mediaId,
+        fileName,
+        fileType,
+        metadata,
+      );
+      const msgParam = JSON.stringify(payload.msgParam);
+      await batchSendToUser(
+        [userId],
+        robotCode,
+        token,
+        payload.msgKey,
+        msgParam,
+      );
       logger.info({ userId, mediaId, fileName }, 'DingTalk file message sent');
     } catch (err) {
       logger.error(
@@ -2419,13 +2601,67 @@ export function createDingTalkConnection(
       const ext = fileName.includes('.')
         ? fileName.split('.').pop()!.toLowerCase()
         : '';
-      const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
-      const voiceExts = ['amr', 'mp3', 'wav'];
-      const videoExts = ['mp4'];
       let mediaType = 'file';
-      if (imageExts.includes(ext)) mediaType = 'image';
-      else if (voiceExts.includes(ext)) mediaType = 'voice';
-      else if (videoExts.includes(ext)) mediaType = 'video';
+      if (DINGTALK_IMAGE_EXTENSIONS.has(ext)) mediaType = 'image';
+      else if (DINGTALK_VOICE_EXTENSIONS.has(ext)) mediaType = 'voice';
+      else if (DINGTALK_VIDEO_EXTENSIONS.has(ext)) mediaType = 'video';
+
+      const nativeMetadata: DingTalkNativeMediaMetadata = {};
+      if (mediaType === 'voice') {
+        if (fileBuffer.length > DINGTALK_VOICE_MAX_BYTES) {
+          logger.info(
+            { chatId, fileName, size: fileBuffer.length },
+            'DingTalk voice exceeds native media limit; sending as file',
+          );
+          mediaType = 'file';
+        } else {
+          nativeMetadata.durationSeconds =
+            await getDingTalkMediaDurationSeconds(fileBuffer, ext);
+          if (!nativeMetadata.durationSeconds) {
+            logger.info(
+              { chatId, fileName },
+              'DingTalk voice duration unavailable; sending as file',
+            );
+            mediaType = 'file';
+          }
+        }
+      } else if (mediaType === 'video') {
+        nativeMetadata.durationSeconds = await getDingTalkMediaDurationSeconds(
+          fileBuffer,
+          ext,
+        );
+        if (!nativeMetadata.durationSeconds) {
+          logger.info(
+            { chatId, fileName },
+            'DingTalk video duration unavailable; sending as file',
+          );
+          mediaType = 'file';
+        } else {
+          try {
+            const coverBuffer = await fs.readFile(
+              new URL('../web/public/icons/icon-512.png', import.meta.url),
+            );
+            nativeMetadata.picMediaId =
+              (await uploadDingTalkMedia(
+                coverBuffer,
+                'happyclaw-video-cover.png',
+                'image',
+              )) ?? undefined;
+          } catch (err) {
+            logger.warn(
+              { err, chatId, fileName },
+              'Failed to prepare DingTalk video cover',
+            );
+          }
+          if (!nativeMetadata.picMediaId) {
+            logger.info(
+              { chatId, fileName },
+              'DingTalk video cover unavailable; sending as file',
+            );
+            mediaType = 'file';
+          }
+        }
+      }
 
       // Upload to DingTalk media API
       const mediaId = await uploadDingTalkMedia(
@@ -2446,25 +2682,18 @@ export function createDingTalkConnection(
       if (isGroup && openConversationId) {
         // Send via persistent groupMessages API
         try {
-          if (mediaType === 'image') {
-            const msgParam = JSON.stringify({ photoURL: mediaId });
-            await sendPersistentGroupMessage(
-              openConversationId,
-              'sampleImageMsg',
-              msgParam,
-            );
-          } else {
-            const msgParam = JSON.stringify({
-              mediaId,
-              fileName,
-              fileType: ext,
-            });
-            await sendPersistentGroupMessage(
-              openConversationId,
-              'sampleFile',
-              msgParam,
-            );
-          }
+          const payload = buildDingTalkFileSendPayload(
+            mediaType,
+            mediaId,
+            fileName,
+            ext,
+            nativeMetadata,
+          );
+          await sendPersistentGroupMessage(
+            openConversationId,
+            payload.msgKey,
+            JSON.stringify(payload.msgParam),
+          );
           logger.info(
             { chatId, fileName, mediaId },
             'DingTalk group file sent via persistent API',
@@ -2498,6 +2727,8 @@ export function createDingTalkConnection(
             mediaId,
             fileName,
             ext,
+            mediaType,
+            nativeMetadata,
           );
         }
         logger.info(
