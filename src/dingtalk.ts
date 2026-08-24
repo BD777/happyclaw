@@ -247,6 +247,53 @@ export function parseDingTalkGroupMessageResponse(
   return data;
 }
 
+export interface DingTalkC2cSendSuccess {
+  processQueryKey?: string;
+  errcode?: number;
+  errmsg?: string;
+}
+
+/** Validate C2C batchSend / sessionWebhook transport and JSON envelope. */
+export function parseDingTalkC2cSendResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkC2cSendSuccess {
+  if (!statusCode || statusCode < 200 || statusCode >= 300) {
+    throw new Error(
+      `DingTalk C2C send HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
+    );
+  }
+  if (!body.trim()) {
+    throw new Error('DingTalk C2C send returned an empty response');
+  }
+
+  let data: DingTalkC2cSendSuccess;
+  try {
+    data = JSON.parse(body) as DingTalkC2cSendSuccess;
+  } catch {
+    throw new Error('DingTalk C2C send returned invalid JSON');
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('DingTalk C2C send returned an invalid envelope');
+  }
+  if (data.errcode !== undefined && Number(data.errcode) !== 0) {
+    throw new Error(
+      `DingTalk C2C send API error: ${data.errcode} ${data.errmsg ?? ''}`,
+    );
+  }
+
+  const hasSuccessMarker =
+    (typeof data.processQueryKey === 'string' &&
+      data.processQueryKey.trim().length > 0) ||
+    data.errcode === 0;
+  if (!hasSuccessMarker) {
+    throw new Error(
+      'DingTalk C2C send returned an unrecognized success envelope',
+    );
+  }
+  return data;
+}
+
 /**
  * POST /v1.0/robot/oToMessages/batchSend
  * Used by C2C text, file, and image message senders.
@@ -276,25 +323,7 @@ export async function batchSendToUser(
     body,
   );
   const respBody = respBuf.toString('utf8');
-  if (statusCode && statusCode >= 400) {
-    throw new Error(
-      `DingTalk batchSend HTTP failed (${statusCode}): ${respBody}`,
-    );
-  }
-  try {
-    const data = JSON.parse(respBody);
-    if (data.errcode && data.errcode !== 0) {
-      throw new Error(
-        `DingTalk batchSend API error: ${data.errcode} ${data.errmsg}`,
-      );
-    }
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      // Not JSON, ignore
-    } else {
-      throw err;
-    }
-  }
+  parseDingTalkC2cSendResponse(statusCode, respBody);
 }
 
 /**
@@ -848,30 +877,16 @@ export function createDingTalkConnection(
       JSON.stringify(body),
     );
     const respBody = respBuf.toString('utf-8');
-    if (statusCode && statusCode >= 400) {
-      throw new Error(`DingTalk HTTP failed (${statusCode}): ${respBody}`);
-    }
-    // Also check DingTalk API-level errcode
-    try {
-      const data = JSON.parse(respBody);
-      logger.info(
-        {
-          statusCode,
-          errcode: data.errcode,
-          errmsg: data.errmsg,
-        },
-        'DingTalk sendViaSessionWebhook response',
-      );
-      if (data.errcode && data.errcode !== 0) {
-        throw new Error(`DingTalk API error: ${data.errcode} ${data.errmsg}`);
-      }
-    } catch (err) {
-      if (err instanceof SyntaxError) {
-        // Not JSON, ignore
-      } else {
-        throw err;
-      }
-    }
+    const data = parseDingTalkC2cSendResponse(statusCode, respBody);
+    logger.info(
+      {
+        statusCode,
+        errcode: data.errcode,
+        errmsg: data.errmsg,
+        processQueryKey: data.processQueryKey,
+      },
+      'DingTalk sendViaSessionWebhook response',
+    );
   }
 
   /**
