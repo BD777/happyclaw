@@ -1136,7 +1136,7 @@ export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
 
 /**
  * Extract human-readable text from a baileys IMessage payload.
- * Returns null for unsupported message types (image/audio/video/document — M3 scope).
+ * Returns null only when there is no conversation, caption, location, or contact.
  */
 export function extractMessageText(content: proto.IMessage): string | null {
   if (content.conversation) return content.conversation;
@@ -1157,7 +1157,45 @@ export function extractMessageText(content: proto.IMessage): string | null {
   if (content.imageMessage?.caption) return content.imageMessage.caption;
   if (content.videoMessage?.caption) return content.videoMessage.caption;
   if (content.documentMessage?.caption) return content.documentMessage.caption;
+  if (content.locationMessage) {
+    return formatWhatsAppLocation(content.locationMessage);
+  }
+  if (content.liveLocationMessage) {
+    return formatWhatsAppLocation(content.liveLocationMessage);
+  }
+  if (content.contactMessage) {
+    return formatWhatsAppContact(content.contactMessage);
+  }
+  if (content.contactsArrayMessage) {
+    const contacts = content.contactsArrayMessage.contacts ?? [];
+    if (contacts.length === 0) return '[联系人]';
+    return contacts.map((entry) => formatWhatsAppContact(entry)).join('\n');
+  }
   return null;
+}
+
+function formatWhatsAppLocation(loc: {
+  degreesLatitude?: number | null;
+  degreesLongitude?: number | null;
+  name?: string | null;
+  address?: string | null;
+}): string {
+  const name = loc.name?.trim() || loc.address?.trim();
+  const lat = loc.degreesLatitude;
+  const lon = loc.degreesLongitude;
+  const coords = lat != null && lon != null ? `${lat}, ${lon}` : '';
+  if (name && coords) return `[位置: ${name} (${coords})]`;
+  if (name) return `[位置: ${name}]`;
+  if (coords) return `[位置: ${coords}]`;
+  return '[位置]';
+}
+
+function formatWhatsAppContact(contact: {
+  displayName?: string | null;
+  vcard?: string | null;
+}): string {
+  const name = contact.displayName?.trim();
+  return name ? `[联系人: ${name}]` : '[联系人]';
 }
 
 /**
@@ -1177,7 +1215,7 @@ export function normalizeTimestamp(
 }
 
 interface DetectedMedia {
-  kind: 'image' | 'video' | 'audio' | 'document';
+  kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
   label: string;
   defaultExt: string;
   node: {
@@ -1187,7 +1225,7 @@ interface DetectedMedia {
   };
 }
 
-function detectMedia(content: proto.IMessage): DetectedMedia | null {
+export function detectMedia(content: proto.IMessage): DetectedMedia | null {
   if (content.imageMessage) {
     return {
       kind: 'image',
@@ -1219,6 +1257,14 @@ function detectMedia(content: proto.IMessage): DetectedMedia | null {
       label: '文档',
       defaultExt: '',
       node: content.documentMessage as DetectedMedia['node'],
+    };
+  }
+  if (content.stickerMessage) {
+    return {
+      kind: 'sticker',
+      label: '贴纸',
+      defaultExt: '.webp',
+      node: content.stickerMessage as DetectedMedia['node'],
     };
   }
   return null;
