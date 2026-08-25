@@ -963,6 +963,101 @@ describe('Feishu durable Inbox and cursor integration', () => {
     ).toBe('ignored');
   });
 
+  test('coalesces an immediate image-root caption into one vision turn', async () => {
+    const accountId = `account-image-caption-${Date.now()}`;
+    const executed = vi.fn();
+    const rootId = `om_image_caption_root_${Date.now()}`;
+    const noteId = `${rootId}_note`;
+    const threadId = `omt_image_caption_${Date.now()}`;
+    const createTime = Date.now();
+    const connected = await connect(accountId, executed);
+    const groupEvent = (messageId: string, time: number) => ({
+      ...event(messageId, time, ''),
+      message: {
+        ...event(messageId, time, '').message,
+        chat_id: 'oc_image_caption_group',
+        chat_type: 'group',
+        thread_id: threadId,
+      },
+    });
+
+    await connected.handler({
+      ...groupEvent(rootId, createTime),
+      message: {
+        ...groupEvent(rootId, createTime).message,
+        message_type: 'image',
+        content: JSON.stringify({ image_key: 'img_caption_root' }),
+      },
+    });
+    expect(executed).not.toHaveBeenCalled();
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === rootId),
+    ).toMatchObject({
+      delivery_status: 'awaiting_companion',
+      attachments: expect.any(String),
+      channel_context: {
+        message: {
+          contentLink: {
+            kind: 'forward_bundle',
+            role: 'forwarded_content',
+            materialResolved: true,
+          },
+        },
+      },
+    });
+
+    await connected.handler({
+      ...groupEvent(noteId, createTime + 1_500),
+      message: {
+        ...groupEvent(noteId, createTime + 1_500).message,
+        message_type: 'text',
+        content: JSON.stringify({ text: '理解一下这张图的含义。' }),
+        root_id: rootId,
+        parent_id: rootId,
+      },
+    });
+
+    expect(executed).toHaveBeenCalledTimes(1);
+    expect(executed).toHaveBeenCalledWith(noteId);
+    const note = db
+      .getMessagesPage('web:durable-feishu-test')
+      .find((message) => message.id === noteId);
+    expect(note).toMatchObject({
+      content: '理解一下这张图的含义。',
+      attachments: expect.any(String),
+      channel_context: {
+        message: {
+          contentLink: {
+            kind: 'forward_bundle',
+            bundleId: rootId,
+            role: 'forwarder_comment',
+          },
+          referencedMessages: [
+            expect.objectContaining({
+              id: rootId,
+              text: '[图片]',
+              materialResolved: true,
+            }),
+          ],
+        },
+      },
+    });
+    expect(controls.messageResourceGet).toHaveBeenCalledTimes(1);
+    expect(controls.messageGet).not.toHaveBeenCalled();
+    expect(
+      recordChannelInbox({
+        provider: 'feishu',
+        accountId,
+        externalMessageId: rootId,
+        sourceJid: 'feishu:oc_image_caption_group',
+        chatId: 'oc_image_caption_group',
+        status: 'queued',
+      }).item.status,
+    ).toBe('ignored');
+  });
+
   test('keeps a held root and its note in one queued follow-up batch', async () => {
     const accountId = `account-forward-queued-${Date.now()}`;
     const rootId = `om_forward_queued_${Date.now()}`;
@@ -1294,7 +1389,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
     });
   });
 
-  test('keeps an incomplete note from steering and sequences its late root after the cursor', async () => {
+  test('defers an incomplete note until its late root supplies complete material', async () => {
     const accountId = `account-forward-note-first-incomplete-${Date.now()}`;
     const followUps = vi.fn(() => ({ disposition: 'started' as const }));
     const rootId = `om_note_first_incomplete_root_${Date.now()}`;
@@ -1316,6 +1411,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
     const connected = await connect(accountId, vi.fn(), {
       onFollowUpMessage: followUps as TestConnectOptions['onFollowUpMessage'],
     });
+    vi.useFakeTimers();
 
     await connected.handler({
       ...event(noteId, rootTime + 9_000, '请分析这个问题'),
@@ -1325,12 +1421,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
         parent_id: rootId,
       },
     });
-    expect(followUps).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        messageId: noteId,
-        coalesceBundleId: undefined,
-      }),
-    );
+    expect(followUps).not.toHaveBeenCalled();
 
     controls.messageGet.mockResolvedValue({
       data: {
@@ -1360,12 +1451,24 @@ describe('Feishu durable Inbox and cursor integration', () => {
         content: 'Merged and Forwarded Message',
       },
     });
-
-    const afterNote = db.getMessagesSince('web:durable-feishu-test', {
-      timestamp: new Date(rootTime + 9_000).toISOString(),
-      id: noteId,
+    expect(followUps).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2_100);
+    await connected.handler({
+      ...event(noteId, rootTime + 9_000, '请分析这个问题'),
+      message: {
+        ...event(noteId, rootTime + 9_000, '请分析这个问题').message,
+        root_id: rootId,
+        parent_id: rootId,
+      },
     });
-    expect(afterNote.map((message) => message.id)).toContain(rootId);
+
+    expect(followUps).toHaveBeenCalledTimes(1);
+    expect(followUps).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: noteId,
+        coalesceBundleId: rootId,
+      }),
+    );
     expect(
       db
         .getMessagesPage('web:durable-feishu-test')
@@ -1373,6 +1476,23 @@ describe('Feishu durable Inbox and cursor integration', () => {
     ).toMatchObject({
       delivery_status: null,
       content: expect.stringContaining('迟到的完整材料'),
+    });
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === noteId),
+    ).toMatchObject({
+      content: '请分析这个问题',
+      channel_context: {
+        message: {
+          referencedMessages: [
+            expect.objectContaining({
+              id: rootId,
+              materialResolved: true,
+            }),
+          ],
+        },
+      },
     });
   });
 

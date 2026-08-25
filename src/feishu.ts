@@ -4,6 +4,7 @@ import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import {
+  cancelAwaitingForwardBundleRoot,
   findForwardBundleCommentTail,
   findForwardBundleCoveringComment,
   getForwardBundleRootMaterial,
@@ -263,6 +264,10 @@ const FEISHU_INBOX_LEASE_MS = 5 * 60 * 1000;
 const FEISHU_INBOX_HEARTBEAT_MS = 60 * 1000;
 const FEISHU_INBOX_RETRY_DELAY_MS = 5_000;
 const FEISHU_FORWARD_COMPANION_GRACE_MS = 3_000;
+const FEISHU_FORWARD_CONTENT_REQUEST_TIMEOUT_MS = 3_000;
+const FEISHU_FORWARD_CONTENT_TOTAL_TIMEOUT_MS = 5_000;
+const FEISHU_FORWARD_MATERIAL_RETRY_DELAY_MS = 2_000;
+const FEISHU_FORWARD_MATERIAL_MAX_ATTEMPTS = 4;
 const FEISHU_INBOX_GATE_RETRY_DELAY_MS = 250;
 const FEISHU_INBOX_RECOVERY_LIMIT = 500;
 const FEISHU_RESOURCE_REQUEST_TIMEOUT_MS = 15_000;
@@ -2712,13 +2717,23 @@ export function createFeishuConnection(
           threadId,
           // A cached root is already a complete durable reference. Avoid a
           // second provider read whose timeout used to split one forward.
-          limits:
-            contentLink?.role === 'forwarder_comment' &&
+          limits: {
+            ...(contentLink?.role === 'forwarder_comment' &&
             cachedForwardRootMaterial
               ? { maxReferenceDepth: 0 }
               : threadId
                 ? { maxReferenceDepth: 1 }
-                : undefined,
+                : {}),
+            ...(messageType === 'merge_forward' ||
+            (contentLink?.kind === 'forward_bundle' &&
+              contentLink.role === 'forwarder_comment' &&
+              !cachedForwardRootMaterial)
+              ? {
+                  requestTimeoutMs: FEISHU_FORWARD_CONTENT_REQUEST_TIMEOUT_MS,
+                  totalTimeoutMs: FEISHU_FORWARD_CONTENT_TOTAL_TIMEOUT_MS,
+                }
+              : {}),
+          },
           parseContent: (type, content) => extractMessageContent(type, content),
         });
       }
@@ -2775,9 +2790,11 @@ export function createFeishuConnection(
       const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
       let timestamp = new Date(resolvedCreateTimeMs).toISOString();
 
-      let attachmentsJson: string | undefined = reuseCurrentForwardRoot
-        ? (cachedForwardRootMaterial.attachments ?? undefined)
-        : undefined;
+      let attachmentsJson: string | undefined =
+        cachedForwardRootMaterial &&
+        (reuseCurrentForwardRoot || contentLink?.role === 'forwarder_comment')
+          ? (cachedForwardRootMaterial.attachments ?? undefined)
+          : undefined;
       let currentForwardMaterialResolved =
         contentLink?.role === 'forwarded_content' &&
         enriched.currentMaterialResolved === true;
@@ -2948,6 +2965,14 @@ export function createFeishuConnection(
         // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
         // 否则长图/超大图片下载失败时会落入 agent 的空消息分支，回复"消息是空的"。
         const failedCount = currentImageRefs.length - downloadedCurrentImages;
+        if (
+          messageType === 'image' &&
+          contentLink?.role === 'forwarded_content' &&
+          currentImageRefs.length > 0 &&
+          failedCount === 0
+        ) {
+          currentForwardMaterialResolved = true;
+        }
         if (failedCount > 0) currentForwardMaterialResolved = false;
         const markers: string[] = [];
         if (attachments.length > 0) {
@@ -3106,6 +3131,62 @@ export function createFeishuConnection(
           channelContext,
         },
       });
+      const incompleteForwardLink =
+        contentLink?.kind === 'forward_bundle' ? contentLink : null;
+      const incompleteForwardMaterial =
+        incompleteForwardLink !== null &&
+        ((incompleteForwardLink.role === 'forwarded_content' &&
+          !currentForwardMaterialResolved &&
+          claim.attempt > 1) ||
+          (incompleteForwardLink.role === 'forwarder_comment' &&
+            !bundleCommentCarriesCompleteMaterial));
+      if (incompleteForwardMaterial) {
+        if (claim.attempt < FEISHU_FORWARD_MATERIAL_MAX_ATTEMPTS) {
+          failClaimedInbound(
+            claim,
+            payload,
+            new Error('Waiting for complete forwarded material'),
+            true,
+            FEISHU_FORWARD_MATERIAL_RETRY_DELAY_MS,
+          );
+          logger.warn(
+            {
+              messageId,
+              bundleId: incompleteForwardLink.bundleId,
+              role: incompleteForwardLink.role,
+              claimAttempt: claim.attempt,
+            },
+            'Deferred Agent execution until forwarded material is complete',
+          );
+          return;
+        }
+        cancelAwaitingForwardBundleRoot({
+          chatJid: targetJid,
+          bundleId: incompleteForwardLink.bundleId,
+          sender: senderOpenId,
+        });
+        ignoreClaimedInbound(claim, payload, 'forward_material_unavailable');
+        try {
+          await replyToFeishuMessage(
+            messageId,
+            'text',
+            JSON.stringify({
+              text: '⚠️ 暂时无法读取这条转发的完整内容，请稍后重新转发一次。',
+            }),
+            true,
+          );
+        } catch (feedbackError) {
+          logger.warn(
+            {
+              feedbackError,
+              messageId,
+              bundleId: incompleteForwardLink.bundleId,
+            },
+            'Failed to send terminal forwarded-material feedback',
+          );
+        }
+        return;
+      }
 
       const earlierBundleComment =
         contentLink?.role === 'forwarded_content'

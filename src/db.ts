@@ -3170,6 +3170,35 @@ export function releaseAwaitingForwardBundleRoot(input: {
   return changed.changes === 1;
 }
 
+/** Stop exposing a held root as runnable after bounded material lookup fails. */
+export function cancelAwaitingForwardBundleRoot(input: {
+  chatJid: string;
+  bundleId: string;
+  sender: string;
+  updatedAt?: string;
+}): boolean {
+  const changed = db
+    .prepare(
+      `UPDATE messages
+       SET delivery_mode = NULL, delivery_status = 'cancelled',
+           delivery_run_id = NULL, delivery_updated_at = ?
+       WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND delivery_status = 'awaiting_companion'
+         AND channel_context IS NOT NULL AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarded_content'`,
+    )
+    .run(
+      input.updatedAt ?? new Date().toISOString(),
+      input.bundleId,
+      input.chatJid,
+      input.sender,
+      input.bundleId,
+    );
+  return changed.changes === 1;
+}
+
 /**
  * Find a previously admitted note that already carries the complete material
  * for this physical merged-forward root. This durable lookup lets a root event
