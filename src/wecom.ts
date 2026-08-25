@@ -9,7 +9,7 @@
 // - outbound promises resolve only after the SDK receives a successful ACK.
 import crypto from 'node:crypto';
 import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
-import type { WsFrame, TextMessage } from '@wecom/aibot-node-sdk';
+import type { BaseMessage, WsFrame } from '@wecom/aibot-node-sdk';
 import {
   getMessage,
   sequenceInboundTimestampAfterChatTail,
@@ -104,7 +104,7 @@ export interface WeComConnection {
 }
 
 interface CachedInboundFrame {
-  frame: WsFrame<TextMessage>;
+  frame: WsFrame<BaseMessage>;
   chatId: string;
   expiresAt: number;
 }
@@ -128,7 +128,7 @@ interface WeComInboundProgress {
  * the provider callback itself as structured mention evidence; never guess by
  * parsing a user-controlled "@name" prefix.
  */
-function weComGroupMentionState(body: TextMessage): WeComGroupMentionState {
+function weComGroupMentionState(body: BaseMessage): WeComGroupMentionState {
   return body.chattype === 'group' ? 'provider_mentioned' : 'not_group';
 }
 
@@ -244,7 +244,7 @@ export function createWeComConnection(
   function cacheFrame(
     inputMessageId: string,
     chatId: string,
-    frame: WsFrame<TextMessage>,
+    frame: WsFrame<BaseMessage>,
   ): void {
     pruneFrames();
     inboundFrames.delete(inputMessageId);
@@ -258,7 +258,7 @@ export function createWeComConnection(
 
   async function sendReply(
     client: WSClient,
-    frame: WsFrame<TextMessage>,
+    frame: WsFrame<BaseMessage>,
     text: string,
   ): Promise<void> {
     await client.replyStream(frame, generateReqId('reply'), text, true);
@@ -287,7 +287,7 @@ export function createWeComConnection(
     }
   }
 
-  function rawConversationJid(body: TextMessage): {
+  function rawConversationJid(body: BaseMessage): {
     jid: string;
     providerChatId: string;
     isGroup: boolean;
@@ -309,10 +309,90 @@ export function createWeComConnection(
     };
   }
 
-  async function handleInbound(frame: WsFrame<TextMessage>): Promise<void> {
+  async function extractInboundPersistText(body: BaseMessage): Promise<string> {
+    const msgtype = body.msgtype;
+    const isGroup = body.chattype === 'group';
+    // Official image/voice/file/video callbacks are C2C-only.
+    if (
+      isGroup &&
+      (msgtype === 'image' ||
+        msgtype === 'voice' ||
+        msgtype === 'file' ||
+        msgtype === 'video')
+    ) {
+      return '';
+    }
+
+    if (msgtype === 'text') {
+      return typeof body.text?.content === 'string'
+        ? body.text.content.trim()
+        : '';
+    }
+    if (msgtype === 'voice') {
+      const transcript =
+        typeof body.voice?.content === 'string'
+          ? body.voice.content.trim()
+          : '';
+      return transcript || '[语音消息]';
+    }
+    if (msgtype === 'mixed') {
+      const items = Array.isArray(body.mixed?.msg_item)
+        ? body.mixed.msg_item
+        : [];
+      const texts = items
+        .filter((item: { msgtype?: string }) => item?.msgtype === 'text')
+        .map((item: { text?: { content?: string } }) =>
+          typeof item.text?.content === 'string'
+            ? item.text.content.trim()
+            : '',
+        )
+        .filter(Boolean);
+      return texts.length > 0 ? texts.join('\n') : '[图文消息]';
+    }
+    if (msgtype === 'image') {
+      const image = body.image as { url?: string; aeskey?: string } | undefined;
+      if (ws && image?.url) {
+        try {
+          const downloaded = await ws.downloadFile(image.url, image.aeskey);
+          return downloaded.filename
+            ? `[图片: ${downloaded.filename}]`
+            : '[图片]';
+        } catch {
+          return '[图片]';
+        }
+      }
+      return '[图片]';
+    }
+    if (msgtype === 'file') {
+      const file = body.file as { url?: string; aeskey?: string } | undefined;
+      if (ws && file?.url) {
+        try {
+          const downloaded = await ws.downloadFile(file.url, file.aeskey);
+          return `[文件: ${downloaded.filename || 'file'}]`;
+        } catch {
+          return '[文件]';
+        }
+      }
+      return '[文件]';
+    }
+    if (msgtype === 'video') {
+      const video = body.video as { url?: string; aeskey?: string } | undefined;
+      if (ws && video?.url) {
+        try {
+          await ws.downloadFile(video.url, video.aeskey);
+        } catch {
+          // Persist the marker even when the official download fails.
+        }
+      }
+      return '[视频消息]';
+    }
+    return '';
+  }
+
+  async function handleInbound(frame: WsFrame<BaseMessage>): Promise<void> {
     const body = frame.body;
     if (!body) return;
-    const content = body.text?.content?.trim();
+    const content = await extractInboundPersistText(body);
     if (!content) return;
     const conversation = rawConversationJid(body);
     if (!conversation) return;
@@ -618,6 +698,21 @@ export function createWeComConnection(
       timeout.unref?.();
 
       client.on('message.text', (data) => {
+        void handleInbound(data);
+      });
+      client.on('message.image', (data) => {
+        void handleInbound(data);
+      });
+      client.on('message.voice', (data) => {
+        void handleInbound(data);
+      });
+      client.on('message.file', (data) => {
+        void handleInbound(data);
+      });
+      client.on('message.video', (data) => {
+        void handleInbound(data);
+      });
+      client.on('message.mixed', (data) => {
         void handleInbound(data);
       });
       client.on('authenticated', () => {
