@@ -203,7 +203,7 @@ function stmts() {
                 delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
-           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
+           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
          ORDER BY timestamp ASC, id ASC`,
       ),
       getExpiredSessionIds: db.prepare(
@@ -226,7 +226,7 @@ function getNewMessagesStmt(jidCount: number): any {
          AND chat_jid IN (${placeholders})
          AND is_from_me = 0
          AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
-         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
+         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
        ORDER BY timestamp ASC, id ASC`,
     );
     // Cap cache size to avoid unbounded growth in deployments where the
@@ -3080,6 +3080,94 @@ export function getMessageChannelTurnContext(
     )
     .get(messageId, chatJid) as { channel_context?: unknown } | undefined;
   return parseChannelTurnContext(row?.channel_context) ?? null;
+}
+
+export interface ForwardBundleRootMaterial {
+  id: string;
+  content: string;
+  senderName: string;
+  attachments: string | null;
+  channelContext: ChannelTurnContext;
+}
+
+/** Reuse an already-normalized forward root instead of calling Feishu again. */
+export function getForwardBundleRootMaterial(
+  chatJid: string,
+  bundleId: string,
+  sender: string,
+): ForwardBundleRootMaterial | null {
+  const row = db
+    .prepare(
+      `SELECT id, content, sender_name, attachments, channel_context
+       FROM messages
+       WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND channel_context IS NOT NULL AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarded_content'
+         AND json_extract(channel_context, '$.message.contentLink.materialResolved') = 1
+         AND COALESCE(delivery_status, '') <> 'cancelled'
+       LIMIT 1`,
+    )
+    .get(bundleId, chatJid, sender, bundleId) as
+    | {
+        id: string;
+        content: string;
+        sender_name: string;
+        attachments: string | null;
+        channel_context: unknown;
+      }
+    | undefined;
+  if (!row) return null;
+  const channelContext = parseChannelTurnContext(row.channel_context);
+  if (!channelContext) return null;
+  return {
+    id: row.id,
+    content: toUtf8String(row.content),
+    senderName: toUtf8String(row.sender_name),
+    attachments: row.attachments,
+    channelContext,
+  };
+}
+
+/**
+ * Release a held forward root into the companion's exact execution family.
+ * No active query means the root becomes an ordinary pending input; an
+ * unrelated active query keeps root and note together in the durable queue.
+ */
+export function releaseAwaitingForwardBundleRoot(input: {
+  chatJid: string;
+  bundleId: string;
+  sender: string;
+  queuedRunId?: string | null;
+  subsumedByMessageId?: string | null;
+  updatedAt?: string;
+}): boolean {
+  const subsumed = Boolean(input.subsumedByMessageId);
+  const queued = Boolean(input.queuedRunId);
+  const changed = db
+    .prepare(
+      `UPDATE messages
+       SET delivery_mode = ?, delivery_status = ?, delivery_run_id = ?,
+           delivery_updated_at = ?
+       WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND delivery_status = 'awaiting_companion'
+         AND channel_context IS NOT NULL AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarded_content'`,
+    )
+    .run(
+      queued ? 'queue' : null,
+      subsumed ? 'subsumed' : queued ? 'queued' : null,
+      subsumed ? input.subsumedByMessageId : queued ? input.queuedRunId : null,
+      input.updatedAt ?? new Date().toISOString(),
+      input.bundleId,
+      input.chatJid,
+      input.sender,
+      input.bundleId,
+    );
+  return changed.changes === 1;
 }
 
 /**

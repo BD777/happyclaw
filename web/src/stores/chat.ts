@@ -76,6 +76,7 @@ export interface Message {
     | 'promoting'
     | 'released'
     | 'cancelled'
+    | 'awaiting_companion'
     | 'subsumed'
     | null;
   delivery_run_id?: string | null;

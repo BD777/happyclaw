@@ -50,6 +50,10 @@ export interface ChannelContentLink {
   bundleId: string;
   role: 'forwarded_content' | 'forwarder_comment';
   relatedMessageId?: string;
+  /** The host resolved the complete provider material and may reuse it. */
+  materialResolved?: boolean;
+  /** Product fallback when an admitted forward receives no authored note. */
+  defaultAction?: 'summarize';
 }
 
 /**
@@ -451,6 +455,8 @@ export type FollowUpStatus =
   | 'promoting'
   | 'released'
   | 'cancelled'
+  /** Forward material is visible but intentionally held for a companion note. */
+  | 'awaiting_companion'
   /** Preserved in history, but already delivered through a linked physical input. */
   | 'subsumed';
 

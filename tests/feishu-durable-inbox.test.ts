@@ -664,6 +664,43 @@ describe('Feishu durable Inbox and cursor integration', () => {
     expect(executed).toHaveBeenCalledWith('om_first_dm');
   });
 
+  test('treats an unbound group route as terminal without retry feedback', async () => {
+    const accountId = `account-unbound-group-${Date.now()}`;
+    const executed = vi.fn();
+    const connected = await connect(accountId, executed, {
+      resolveEffectiveChatJid: (jid) => {
+        throw new ChannelRouteRejectedError(jid);
+      },
+    });
+    const messageId = `om_unbound_group_${Date.now()}`;
+
+    await connected.handler({
+      ...event(messageId, Date.now(), '不应重试'),
+      message: {
+        ...event(messageId, Date.now(), '不应重试').message,
+        chat_id: 'oc_unbound_group',
+        chat_type: 'group',
+      },
+    });
+
+    expect(executed).not.toHaveBeenCalled();
+    expect(controls.messageCreate).not.toHaveBeenCalled();
+    expect(
+      recordChannelInbox({
+        provider: 'feishu',
+        accountId,
+        externalMessageId: messageId,
+        sourceJid: 'feishu:oc_unbound_group',
+        chatId: 'oc_unbound_group',
+        status: 'queued',
+      }).item,
+    ).toMatchObject({
+      status: 'ignored',
+      attempt: 1,
+      error: 'binding_rejected',
+    });
+  });
+
   test('rejects a known-owner mismatch before P2P registration or routing', async () => {
     const accountId = `account-owner-gate-${Date.now()}`;
     const executed = vi.fn();
@@ -807,16 +844,17 @@ describe('Feishu durable Inbox and cursor integration', () => {
         params: { type: 'image' },
       }),
     );
-    expect(executed).toHaveBeenCalledWith('om_forward_owner_test');
+    expect(executed).not.toHaveBeenCalled();
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === 'om_forward_owner_test'),
+    ).toMatchObject({ delivery_status: 'awaiting_companion' });
   });
 
   test('requests safe merged-forward coalescing while preserving both structural roles', async () => {
     const accountId = `account-forward-companion-${Date.now()}`;
-    const followUps = vi.fn((input: { messageId: string }) =>
-      input.messageId === 'om_forward_bundle_root'
-        ? { disposition: 'started' as const }
-        : { disposition: 'steered' as const, runId: 'run_forward' },
-    );
+    const followUps = vi.fn(() => ({ disposition: 'started' as const }));
     controls.messageGet.mockResolvedValue({
       data: {
         items: [
@@ -864,16 +902,8 @@ describe('Feishu durable Inbox and cursor integration', () => {
       }),
     ]);
 
-    expect(followUps).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        messageId: 'om_forward_bundle_root',
-        requestedMode: undefined,
-        coalesceBundleId: undefined,
-      }),
-    );
-    expect(followUps).toHaveBeenNthCalledWith(
-      2,
+    expect(followUps).toHaveBeenCalledTimes(1);
+    expect(followUps).toHaveBeenCalledWith(
       expect.objectContaining({
         messageId: 'om_forward_bundle_note',
         requestedMode: undefined,
@@ -885,10 +915,11 @@ describe('Feishu durable Inbox and cursor integration', () => {
         'web:durable-feishu-test',
         'om_forward_bundle_root',
       )?.message.contentLink,
-    ).toEqual({
+    ).toMatchObject({
       kind: 'forward_bundle',
       bundleId: 'om_forward_bundle_root',
       role: 'forwarded_content',
+      materialResolved: true,
     });
     const noteContext = db.getMessageChannelTurnContext(
       'web:durable-feishu-test',
@@ -906,6 +937,183 @@ describe('Feishu durable Inbox and cursor integration', () => {
         role: 'forwarded_content',
       },
     });
+    expect(controls.messageGet).toHaveBeenCalledTimes(1);
+    expect(
+      db
+        .getMessagesSince('web:durable-feishu-test', {
+          timestamp: new Date(createTime - 1).toISOString(),
+          id: '',
+        })
+        .filter(
+          (message) =>
+            message.id === 'om_forward_bundle_root' ||
+            message.id === 'om_forward_bundle_note',
+        )
+        .map((message) => message.id),
+    ).toEqual(['om_forward_bundle_root', 'om_forward_bundle_note']);
+    expect(
+      recordChannelInbox({
+        provider: 'feishu',
+        accountId,
+        externalMessageId: 'om_forward_bundle_root',
+        sourceJid: 'feishu:ou_durable_user',
+        chatId: 'ou_durable_user',
+        status: 'queued',
+      }).item.status,
+    ).toBe('ignored');
+  });
+
+  test('keeps a held root and its note in one queued follow-up batch', async () => {
+    const accountId = `account-forward-queued-${Date.now()}`;
+    const rootId = `om_forward_queued_${Date.now()}`;
+    const noteId = `${rootId}_note`;
+    const createTime = Date.now();
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            create_time: String(createTime),
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: `${rootId}_child`,
+            upper_message_id: rootId,
+            msg_type: 'text',
+            sender: { id: 'ou_customer', name: 'Customer' },
+            body: { content: JSON.stringify({ text: '排队时也不能拆开' }) },
+          },
+        ],
+      },
+    });
+    const connected = await connect(accountId, vi.fn(), {
+      onFollowUpMessage: vi.fn((input) => {
+        expect(
+          db.setMessageFollowUp(input.targetJid, input.messageId, {
+            mode: 'queue',
+            status: 'queued',
+            runId: 'run-unrelated-active',
+          }),
+        ).toBe(true);
+        return {
+          disposition: 'queued' as const,
+          runId: 'run-unrelated-active',
+          position: 1,
+        };
+      }) as TestConnectOptions['onFollowUpMessage'],
+    });
+
+    await connected.handler({
+      ...event(rootId, createTime, ''),
+      message: {
+        ...event(rootId, createTime, '').message,
+        message_type: 'merge_forward',
+        content: 'Merged and Forwarded Message',
+      },
+    });
+    await connected.handler({
+      ...event(noteId, createTime + 300, '请处理'),
+      message: {
+        ...event(noteId, createTime + 300, '请处理').message,
+        root_id: rootId,
+        parent_id: rootId,
+      },
+    });
+
+    expect(
+      db.listQueuedFollowUps('web:durable-feishu-test').map((item) => item.id),
+    ).toEqual([rootId, noteId]);
+    expect(
+      db
+        .claimNextQueuedFollowUpBatch(
+          'web:durable-feishu-test',
+          'run-forward-batch',
+        )
+        .map((item) => item.id),
+    ).toEqual([rootId, noteId]);
+  });
+
+  test('promotes an admitted forward without a note to one default-summary turn', async () => {
+    const accountId = `account-forward-default-${Date.now()}`;
+    const executed = vi.fn();
+    const rootId = `om_forward_default_${Date.now()}`;
+    const createTime = Date.now();
+    controls.messageGet.mockResolvedValue({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            create_time: String(createTime),
+            sender: { id: 'ou_durable_user', name: 'Durable User' },
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: `${rootId}_child`,
+            upper_message_id: rootId,
+            msg_type: 'text',
+            sender: { id: 'ou_customer', name: 'Customer' },
+            body: { content: JSON.stringify({ text: '默认需要理解的材料' }) },
+          },
+        ],
+      },
+    });
+    const connected = await connect(accountId, executed);
+
+    vi.useFakeTimers();
+    await connected.handler({
+      ...event(rootId, createTime, ''),
+      message: {
+        ...event(rootId, createTime, '').message,
+        message_type: 'merge_forward',
+        content: 'Merged and Forwarded Message',
+      },
+    });
+
+    expect(executed).not.toHaveBeenCalled();
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === rootId),
+    ).toMatchObject({ delivery_status: 'awaiting_companion' });
+    expect(
+      db
+        .getMessagesSince('web:durable-feishu-test', {
+          timestamp: new Date(createTime - 1).toISOString(),
+          id: '',
+        })
+        .some((message) => message.id === rootId),
+    ).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(3_100);
+
+    expect(executed).toHaveBeenCalledTimes(1);
+    expect(executed).toHaveBeenCalledWith(rootId);
+    expect(controls.messageGet).toHaveBeenCalledTimes(1);
+    expect(
+      db.getMessageChannelTurnContext('web:durable-feishu-test', rootId)
+        ?.message.contentLink,
+    ).toMatchObject({
+      bundleId: rootId,
+      role: 'forwarded_content',
+      materialResolved: true,
+      defaultAction: 'summarize',
+    });
+    expect(
+      db
+        .getMessagesPage('web:durable-feishu-test')
+        .find((message) => message.id === rootId),
+    ).toMatchObject({ delivery_status: null });
+    expect(
+      db
+        .getMessagesSince('web:durable-feishu-test', {
+          timestamp: new Date(createTime - 1).toISOString(),
+          id: '',
+        })
+        .some((message) => message.id === rootId),
+    ).toBe(true);
   });
 
   test('coalesces the real rapid topic root+reply event shape as one complete request', async () => {
