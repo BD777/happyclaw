@@ -62,7 +62,7 @@ const MESSAGE_ITEM_TYPE_TEXT = 1;
 const MESSAGE_ITEM_TYPE_IMAGE = 2;
 // const MESSAGE_ITEM_TYPE_VOICE = 3;
 const MESSAGE_ITEM_TYPE_FILE = 4;
-// const MESSAGE_ITEM_TYPE_VIDEO = 5;
+const MESSAGE_ITEM_TYPE_VIDEO = 5;
 
 // iLink message state
 // const MESSAGE_STATE_NEW = 0;
@@ -1584,6 +1584,7 @@ export function createWeChatConnection(
         // Reserve the context token only once the pre-send CDN upload has
         // succeeded. Ambiguous sendmessage failures remain conservatively
         // charged by sendWithReservedContext below.
+        const isVideo = fileName.toLowerCase().endsWith('.mp4');
         const upload = await uploadMedia({
           buf,
           fileName,
@@ -1591,12 +1592,35 @@ export function createWeChatConnection(
           baseUrl,
           token: config.botToken,
           cdnBaseUrl,
-          mediaType: 3, // MEDIA_FILE
+          mediaType: isVideo ? 2 : 3, // MEDIA_VIDEO : MEDIA_FILE
           dispatcher: ensureDispatcher(),
         });
         const record = contextTokens.claim(userId);
         await sendWithReservedContext(record, async () => {
           const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
+          const media = {
+            encrypt_query_param: upload.downloadEncryptedQueryParam,
+            aes_key: upload.aeskey,
+            encrypt_type: 1,
+          };
+          const item = isVideo
+            ? {
+                type: MESSAGE_ITEM_TYPE_VIDEO,
+                video_item: {
+                  media,
+                  video_size: upload.fileSizeCiphertext,
+                },
+              }
+            : {
+                type: MESSAGE_ITEM_TYPE_FILE,
+                file_item: {
+                  media,
+                  file_name: fileName,
+                  // 'len' is the raw (plaintext) file size as a string — per
+                  // nightsailer/wechat-clawbot reference.
+                  len: String(upload.fileSize),
+                },
+              };
           const resp = await apiPost<{
             ret?: number;
             errcode?: number;
@@ -1605,22 +1629,7 @@ export function createWeChatConnection(
             msg: {
               to_user_id: userId,
               context_token: record.token,
-              item_list: [
-                {
-                  type: MESSAGE_ITEM_TYPE_FILE,
-                  file_item: {
-                    media: {
-                      encrypt_query_param: upload.downloadEncryptedQueryParam,
-                      aes_key: upload.aeskey,
-                      encrypt_type: 1,
-                    },
-                    file_name: fileName,
-                    // 'len' is the raw (plaintext) file size as a string — per
-                    // nightsailer/wechat-clawbot reference.
-                    len: String(upload.fileSize),
-                  },
-                },
-              ],
+              item_list: [item],
               message_type: MESSAGE_TYPE_BOT,
               message_state: MESSAGE_STATE_FINISH,
               client_id: clientId,
