@@ -2996,9 +2996,9 @@ async function sendImWithRetry(
 }
 
 const CHANNEL_MANUAL_RECONCILIATION_NOTICE =
-  '⚠️ 上一次回复在部分内容已送达后异常中断。为避免重复发送，系统已停止自动重放；可能仍有附件或结论未送达，请重新发起请求或联系管理员核对。';
+  '刚才的回复可能没有完整送达。为避免重复消息，系统未自动重发；如内容不完整，重新发送问题即可。';
 const CHANNEL_DEFINITIVE_REJECTION_NOTICE =
-  '⚠️ 完整回复已保存在 HappyClaw Web，但飞书拒绝了本次消息，无法在当前话题投递。请前往 Web 查看。';
+  '刚才的回复未能送达飞书，完整内容已保存在 HappyClaw Web。你可以前往 Web 查看，或稍后重新发送问题。';
 
 /**
  * Surface a crash-after-delivery fence to the exact native route. The notice
@@ -10817,7 +10817,7 @@ function startIpcWatcher(): void {
                               }
                             : undefined;
                           messageDeliveryError =
-                            `The native channel definitively rejected this message before delivery: ${messageDeliveryFailure.error.message}. ` +
+                            `The native channel definitively did not accept this message: ${messageDeliveryFailure.error.message}. ` +
                             'The complete answer will remain available in HappyClaw Web; do not retry or rewrite it solely for this channel failure.';
                         }
                       }

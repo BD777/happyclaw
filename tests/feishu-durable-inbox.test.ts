@@ -234,6 +234,115 @@ async function connect(
 }
 
 describe('Feishu durable Inbox and cursor integration', () => {
+  test('safely retries a pre-TLS send failure without fencing the turn', async () => {
+    const accountId = `account-pre-tls-retry-${Date.now()}`;
+    const connected = await connect(accountId, vi.fn());
+    const preTlsFailure = () =>
+      Object.assign(
+        new Error(
+          'Client network socket disconnected before secure TLS connection was established',
+        ),
+        { code: 'ECONNRESET' },
+      );
+    controls.messageCreate
+      .mockRejectedValueOnce(preTlsFailure())
+      .mockRejectedValueOnce(preTlsFailure())
+      .mockResolvedValueOnce({
+        code: 0,
+        data: { message_id: 'om_recovered' },
+      });
+    const route = {
+      provider: 'feishu',
+      accountId,
+      sourceJid: 'feishu:ou_durable_user',
+      chatId: 'ou_durable_user',
+    };
+    const run = createChannelTurnRun({
+      ...route,
+      idempotencyKey: `pre-tls-retry-turn-${Date.now()}`,
+    }).run;
+
+    vi.useFakeTimers();
+    const pending = deliverChannelOutboxItem({
+      ...route,
+      turnRunId: run.id,
+      ordinal: 0,
+      kind: 'text',
+      payload: { text: '网络恢复后自动送达' },
+      owner: 'pre-tls-retry-worker',
+      delivery: {
+        mode: 'single',
+        send: async () => {
+          await connected.connection.sendMessage(
+            'ou_durable_user',
+            '网络恢复后自动送达',
+            [],
+            { presentation: 'native' },
+          );
+          return { providerMessageId: 'om_recovered' };
+        },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(6_000);
+    await expect(pending).resolves.toMatchObject({ status: 'delivered' });
+    expect(controls.messageCreate).toHaveBeenCalledTimes(3);
+    expect(getUncertainChannelOutboxForTurn(run.id)).toBeUndefined();
+  });
+
+  test('records exhausted pre-TLS retries as not delivered instead of uncertain', async () => {
+    const accountId = `account-pre-tls-exhausted-${Date.now()}`;
+    const connected = await connect(accountId, vi.fn());
+    const preTlsFailure = () =>
+      Object.assign(
+        new Error(
+          'Client network socket disconnected before secure TLS connection was established',
+        ),
+        { code: 'ECONNRESET' },
+      );
+    controls.messageCreate.mockImplementation(async () => {
+      throw preTlsFailure();
+    });
+    const route = {
+      provider: 'feishu',
+      accountId,
+      sourceJid: 'feishu:ou_durable_user',
+      chatId: 'ou_durable_user',
+    };
+    const run = createChannelTurnRun({
+      ...route,
+      idempotencyKey: `pre-tls-exhausted-turn-${Date.now()}`,
+    }).run;
+
+    vi.useFakeTimers();
+    const pending = deliverChannelOutboxItem({
+      ...route,
+      turnRunId: run.id,
+      ordinal: 0,
+      kind: 'text',
+      payload: { text: '网络持续不可达' },
+      owner: 'pre-tls-exhausted-worker',
+      delivery: {
+        mode: 'single',
+        send: async () => {
+          await connected.connection.sendMessage(
+            'ou_durable_user',
+            '网络持续不可达',
+            [],
+            { presentation: 'native' },
+          );
+          return { providerMessageId: 'must-not-succeed' };
+        },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(6_000);
+    await expect(pending).resolves.toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('before the request was sent'),
+    });
+    expect(controls.messageCreate).toHaveBeenCalledTimes(3);
+    expect(getUncertainChannelOutboxForTurn(run.id)).toBeUndefined();
+  });
+
   test('classifies an Axios-style content-audit HTTP 400 as a definitive Outbox failure', async () => {
     const accountId = `account-content-audit-${Date.now()}`;
     const connected = await connect(accountId, vi.fn());

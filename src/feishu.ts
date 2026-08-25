@@ -47,6 +47,7 @@ import {
   definitiveFeishuHttpRejection,
   DefinitiveFeishuCapabilityError,
   executeFeishuCapability,
+  withFeishuPreAcceptanceRetry,
   type FeishuCapabilityRequest,
   type FeishuCapabilityResult,
 } from './feishu-capability.js';
@@ -1875,30 +1876,42 @@ export function createFeishuConnection(
     msgType: string,
     content: string,
   ): Promise<void> {
-    if (!client) throw new Error('Feishu client is not initialized');
-    const target = requireFeishuRouteTarget(chatId);
-    const receiveIdType = target.chatId.startsWith('oc_')
-      ? 'chat_id'
-      : 'open_id';
-    const replyMsgId = target.rootMessageId || p2pLastMessageId(target);
-    if (replyMsgId) {
-      await replyToFeishuMessage(
-        replyMsgId,
-        msgType,
-        content,
-        target.replyInThread,
-      );
-    } else {
-      const response = await client.im.v1.message.create({
-        params: { receive_id_type: receiveIdType },
-        data: {
-          receive_id: target.chatId,
-          msg_type: msgType,
-          content,
+    await withFeishuPreAcceptanceRetry(
+      async () => {
+        if (!client) throw new Error('Feishu client is not initialized');
+        const target = requireFeishuRouteTarget(chatId);
+        const receiveIdType = target.chatId.startsWith('oc_')
+          ? 'chat_id'
+          : 'open_id';
+        const replyMsgId = target.rootMessageId || p2pLastMessageId(target);
+        if (replyMsgId) {
+          await replyToFeishuMessage(
+            replyMsgId,
+            msgType,
+            content,
+            target.replyInThread,
+          );
+        } else {
+          const response = await client.im.v1.message.create({
+            params: { receive_id_type: receiveIdType },
+            data: {
+              receive_id: target.chatId,
+              msg_type: msgType,
+              content,
+            },
+          });
+          assertFeishuApiSuccess('Feishu message.create', response);
+        }
+      },
+      {
+        onRetry: ({ attempt, nextAttempt, delayMs, error }) => {
+          logger.warn(
+            { chatId, msgType, attempt, nextAttempt, delayMs, err: error },
+            'Feishu request failed before send; retrying safely',
+          );
         },
-      });
-      assertFeishuApiSuccess('Feishu message.create', response);
-    }
+      },
+    );
   }
 
   async function sendTextToChat(chatId: string, text: string): Promise<void> {
