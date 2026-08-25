@@ -27,8 +27,13 @@ vi.mock('../src/logger.js', () => ({
 
 const { createWeChatConnection } = await import('../src/wechat.js');
 
-function jsonResponse(body: unknown) {
-  return Response.json(body);
+function waitUntilAborted(signal?: AbortSignal | null): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    const abort = () =>
+      reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (signal?.aborted) return abort();
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 }
 
 function inboundMsg(item: Record<string, unknown>, id: string) {
@@ -41,6 +46,17 @@ function inboundMsg(item: Record<string, unknown>, id: string) {
   };
 }
 
+function fetchOnceThenHang(firstBody: unknown): ReturnType<typeof vi.fn> {
+  let first = true;
+  return vi.fn(async (_url: string, init?: { signal?: AbortSignal | null }) => {
+    if (first) {
+      first = false;
+      return Response.json(firstBody);
+    }
+    return waitUntilAborted(init?.signal);
+  });
+}
+
 async function connectAndDrain(fetchMock: ReturnType<typeof vi.fn>) {
   const close = vi.fn(async () => undefined);
   const connection = createWeChatConnection(
@@ -51,21 +67,25 @@ async function connectAndDrain(fetchMock: ReturnType<typeof vi.fn>) {
     {
       fetch: fetchMock as typeof fetch,
       createDispatcher: () => ({ close }) as unknown as Dispatcher,
+      contextTokenStore: null,
       random: () => 0.5,
       now: () => Date.now(),
     },
   );
-  await connection.connect({
-    onNewChat: vi.fn(),
-    isChatAuthorized: () => true,
-    resolveGroupFolder: () => '/tmp/wechat-ws',
-    resolveEffectiveChatJid: (jid: string) => ({
-      effectiveJid: jid,
-      agentId: null,
-    }),
-  });
-  await vi.waitFor(() => expect(db.storeMessageDirect).toHaveBeenCalled());
-  await connection.disconnect();
+  try {
+    await connection.connect({
+      onNewChat: vi.fn(),
+      isChatAuthorized: () => true,
+      resolveGroupFolder: () => '/tmp/wechat-ws',
+      resolveEffectiveChatJid: (jid: string) => ({
+        effectiveJid: jid,
+        agentId: null,
+      }),
+    });
+    await vi.waitFor(() => expect(db.storeMessageDirect).toHaveBeenCalled());
+  } finally {
+    await connection.disconnect();
+  }
   return connection;
 }
 
@@ -85,30 +105,23 @@ describe('WeChat inbound video CDN persist', () => {
   });
 
   test('type-5 video-only persists a workspace file', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        jsonResponse({
-          get_updates_buf: 'c1',
-          msgs: [
-            inboundMsg(
-              {
-                type: 5,
-                video_item: {
-                  media: {
-                    encrypt_query_param: 'q-video',
-                    aes_key: 'k-video',
-                  },
-                },
+    const fetchMock = fetchOnceThenHang({
+      get_updates_buf: 'c1',
+      msgs: [
+        inboundMsg(
+          {
+            type: 5,
+            video_item: {
+              media: {
+                encrypt_query_param: 'q-video',
+                aes_key: 'k-video',
               },
-              'vid-1',
-            ),
-          ],
-        }),
-      )
-      .mockImplementation(() =>
-        jsonResponse({ get_updates_buf: 'c2', msgs: [] }),
-      );
+            },
+          },
+          'vid-1',
+        ),
+      ],
+    });
     await connectAndDrain(fetchMock);
     expect(crypto.downloadAndDecryptMedia).toHaveBeenCalled();
     expect(downloader.saveDownloadedFile).toHaveBeenCalled();
@@ -118,61 +131,47 @@ describe('WeChat inbound video CDN persist', () => {
   });
 
   test('type 2 image still downloads', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        jsonResponse({
-          get_updates_buf: 'c1',
-          msgs: [
-            inboundMsg(
-              {
-                type: 2,
-                image_item: {
-                  media: {
-                    encrypt_query_param: 'q-img',
-                    aes_key: 'k-img',
-                  },
-                },
+    const fetchMock = fetchOnceThenHang({
+      get_updates_buf: 'c1',
+      msgs: [
+        inboundMsg(
+          {
+            type: 2,
+            image_item: {
+              media: {
+                encrypt_query_param: 'q-img',
+                aes_key: 'k-img',
               },
-              'img-1',
-            ),
-          ],
-        }),
-      )
-      .mockImplementation(() =>
-        jsonResponse({ get_updates_buf: 'c2', msgs: [] }),
-      );
+            },
+          },
+          'img-1',
+        ),
+      ],
+    });
     await connectAndDrain(fetchMock);
     expect(crypto.downloadAndDecryptMedia).toHaveBeenCalled();
     expect(downloader.saveDownloadedFile).toHaveBeenCalled();
   });
 
   test('type 4 PDF still downloads', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        jsonResponse({
-          get_updates_buf: 'c1',
-          msgs: [
-            inboundMsg(
-              {
-                type: 4,
-                file_item: {
-                  file_name: 'notes.pdf',
-                  media: {
-                    encrypt_query_param: 'q-pdf',
-                    aes_key: 'k-pdf',
-                  },
-                },
+    const fetchMock = fetchOnceThenHang({
+      get_updates_buf: 'c1',
+      msgs: [
+        inboundMsg(
+          {
+            type: 4,
+            file_item: {
+              file_name: 'notes.pdf',
+              media: {
+                encrypt_query_param: 'q-pdf',
+                aes_key: 'k-pdf',
               },
-              'pdf-1',
-            ),
-          ],
-        }),
-      )
-      .mockImplementation(() =>
-        jsonResponse({ get_updates_buf: 'c2', msgs: [] }),
-      );
+            },
+          },
+          'pdf-1',
+        ),
+      ],
+    });
     await connectAndDrain(fetchMock);
     expect(crypto.downloadAndDecryptMedia).toHaveBeenCalled();
     expect(downloader.saveDownloadedFile).toHaveBeenCalled();
