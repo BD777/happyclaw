@@ -13,6 +13,7 @@ const db = vi.hoisted(() => ({
   storeChatMetadata: vi.fn(),
   storeMessageDirect: vi.fn(),
   updateChatName: vi.fn(),
+  isDatabaseInitialized: () => false,
 }));
 const notify = vi.hoisted(() => ({ notifyNewImMessage: vi.fn() }));
 
