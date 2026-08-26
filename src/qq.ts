@@ -1402,6 +1402,20 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             lastSequence = null;
             scheduleReconnect(opts);
             break;
+          case 'intents-rejected':
+            // A RESUME would replay the same rejected IDENTIFY, so drop the
+            // session, and back off rather than retrying immediately: nothing
+            // about the request changes between attempts, so a fast retry is
+            // pure load on a gateway that already said no.
+            sessionId = null;
+            lastSequence = null;
+            logger.error(
+              { code, intents: INTENTS },
+              'QQ gateway refused the requested intents; check the bot permissions ' +
+                'on the QQ Open Platform',
+            );
+            scheduleReconnect(opts, RATE_LIMIT_DELAY_MS);
+            break;
           default:
             scheduleReconnect(opts);
         }
