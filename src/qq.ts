@@ -77,7 +77,7 @@ class QQApiError extends Error {
   }
 }
 
-enum QQMediaFileType {
+export enum QQMediaFileType {
   IMAGE = 1,
   VIDEO = 2,
   VOICE = 3,
@@ -109,7 +109,40 @@ interface QQMediaUploadResponse {
   ttl: number;
 }
 
-const QQ_FILE_MAX_SIZE = 30 * 1024 * 1024; // 30MB (consistent with other channels)
+/**
+ * Per-media-type upload ceilings for the QQ Open Platform.
+ *
+ * Mirrors `MEDIA_FILE_TYPE_INFO` in `@tencent-connect/qqbot-nodejs` 1.0.4
+ * (`protocol/utils/file-utils.ts`), i.e. what a maintained first-party client
+ * enforces. That package's own README quotes lower numbers for image (20MB)
+ * and video (30MB); if the platform rejects an upload that passed this check,
+ * trust the rejection and lower the entry here.
+ *
+ * These bound outbound uploads only. Inbound attachments and Web uploads stay
+ * under the global `MAX_FILE_SIZE`.
+ */
+export const QQ_MEDIA_MAX_SIZE: Record<QQMediaFileType, number> = {
+  [QQMediaFileType.IMAGE]: 30 * 1024 * 1024,
+  [QQMediaFileType.VIDEO]: 100 * 1024 * 1024,
+  [QQMediaFileType.VOICE]: 20 * 1024 * 1024,
+  [QQMediaFileType.FILE]: 100 * 1024 * 1024,
+};
+
+const QQ_MEDIA_TYPE_NAME: Record<QQMediaFileType, string> = {
+  [QQMediaFileType.IMAGE]: 'image',
+  [QQMediaFileType.VIDEO]: 'video',
+  [QQMediaFileType.VOICE]: 'voice',
+  [QQMediaFileType.FILE]: 'file',
+};
+
+/**
+ * Ceiling for the one-shot base64 upload API backing `uploadMedia`.
+ *
+ * Lower than the image entry above on purpose: that path posts the whole
+ * payload in a single request rather than going through chunked upload, and
+ * 20MB is the documented limit of the one-shot endpoint itself.
+ */
+export const QQ_ONESHOT_UPLOAD_MAX_SIZE = 20 * 1024 * 1024;
 const MD5_10M_SIZE = 10_002_432;
 const PART_UPLOAD_TIMEOUT = 300_000; // 5 min
 const PART_UPLOAD_MAX_RETRIES = 2;
@@ -124,7 +157,7 @@ const COMPLETE_UPLOAD_BASE_DELAY_MS = 1000;
 const DEFAULT_CONCURRENT_PARTS = 1;
 const MAX_CONCURRENT_PARTS = 10;
 
-function getQQMediaFileType(fileName: string): QQMediaFileType {
+export function getQQMediaFileType(fileName: string): QQMediaFileType {
   const ext = path.extname(fileName).toLowerCase();
   if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext))
     return QQMediaFileType.IMAGE;
@@ -725,16 +758,15 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
   // ─── Image Sending ───────────────────────────────────────
 
-  const QQ_UPLOAD_MAX_SIZE = 10 * 1024 * 1024; // 10MB
-
   async function uploadMedia(
     chatType: 'c2c' | 'group',
     openid: string,
     imageBuffer: Buffer,
   ): Promise<string> {
-    if (imageBuffer.length > QQ_UPLOAD_MAX_SIZE) {
+    if (imageBuffer.length > QQ_ONESHOT_UPLOAD_MAX_SIZE) {
       throw new Error(
-        `Image too large for QQ upload: ${(imageBuffer.length / 1024 / 1024).toFixed(1)}MB (max 10MB)`,
+        `Image too large for QQ upload: ${(imageBuffer.length / 1024 / 1024).toFixed(1)}MB ` +
+          `(max ${QQ_ONESHOT_UPLOAD_MAX_SIZE / 1024 / 1024}MB)`,
       );
     }
 
@@ -1065,14 +1097,16 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     filePath: string,
     fileName: string,
   ): Promise<void> {
+    const fileType = getQQMediaFileType(fileName);
+    const maxSize = QQ_MEDIA_MAX_SIZE[fileType];
     const stat = await fs.promises.stat(filePath);
-    if (stat.size > QQ_FILE_MAX_SIZE) {
+    if (stat.size > maxSize) {
       throw new Error(
-        `File too large for QQ upload: ${(stat.size / 1024 / 1024).toFixed(1)}MB (max ${QQ_FILE_MAX_SIZE / 1024 / 1024}MB)`,
+        `File too large for QQ upload: ${(stat.size / 1024 / 1024).toFixed(1)}MB ` +
+          `(max ${maxSize / 1024 / 1024}MB for ${QQ_MEDIA_TYPE_NAME[fileType]})`,
       );
     }
 
-    const fileType = getQQMediaFileType(fileName);
     const fileInfo = await chunkedUpload(chatType, openid, filePath, fileType);
 
     const chatKey = `${chatType}:${openid}`;
