@@ -54,8 +54,15 @@ export interface PassiveReplyStore {
    *
    * Returns `undefined` when every known reference is expired or exhausted —
    * the caller should then send an active push (no msg_id).
+   *
+   * `reserve` keeps that many uses of a reference untouched, so a low-value
+   * send can take slack without spending the budget a real reply needs.
    */
-  claim(chatKey: string, now?: number): PassiveReplyClaim | undefined;
+  claim(
+    chatKey: string,
+    now?: number,
+    options?: { reserve?: number },
+  ): PassiveReplyClaim | undefined;
   /** Drop all state (used when the socket goes away). */
   clear(): void;
   /** Number of tracked chats. Exposed for tests and diagnostics. */
@@ -110,9 +117,15 @@ export function createPassiveReplyStore(
       touch(chatKey, refs);
     },
 
-    claim(chatKey: string, now = Date.now()): PassiveReplyClaim | undefined {
+    claim(
+      chatKey: string,
+      now = Date.now(),
+      options?: { reserve?: number },
+    ): PassiveReplyClaim | undefined {
       const refs = chats.get(chatKey);
       if (!refs?.length) return undefined;
+
+      const usable = Math.max(0, maxUses - Math.max(0, options?.reserve ?? 0));
 
       // Newest first: the freshest reference has the most window left.
       for (let i = refs.length - 1; i >= 0; i--) {
@@ -121,7 +134,7 @@ export function createPassiveReplyStore(
         // list is only approximately ordered by age. The list is capped at
         // `maxPerChat`, so scanning all of it is cheap.
         if (now - ref.receivedAt >= ttlMs) continue;
-        if (ref.uses >= maxUses) continue;
+        if (ref.uses >= usable) continue;
         ref.uses += 1;
         touch(chatKey, refs);
         return { msgId: ref.msgId, msgSeq: ref.uses };

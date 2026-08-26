@@ -684,8 +684,36 @@ export function createTelegramChannel(
 
 // ─── QQ Adapter ─────────────────────────────────────────────────
 
+/**
+ * Refresh cadence for the QQ typing indicator.
+ *
+ * Kept just under `TYPING_NOTIFY_SECONDS` in `qq.ts` (60s), which is how long
+ * one notification stays visible, so the state does not flicker between
+ * pulses. `qq.ts` is loaded lazily, so the value is mirrored rather than
+ * imported; change both together.
+ */
+const QQ_TYPING_REFRESH_MS = 50_000;
+
 export function createQQChannel(config: QQConnectionConfig): IMChannel {
   let inner: QQConnection | null = null;
+  // A chat may have overlapping warm inputs. Each input owns a lease; the
+  // provider pulse stops only after the final lease is released.
+  const typingLeases = new Map<string, Set<string>>();
+  const typingTimers = new Map<string, NodeJS.Timeout>();
+  const typingExpiry = new TypingLeaseExpiry((chatId, leaseId) => {
+    const leases = typingLeases.get(chatId);
+    if (!leases?.delete(leaseId)) return;
+    if (leases.size === 0) stopTyping(chatId);
+  });
+
+  function stopTyping(chatId: string): void {
+    typingLeases.delete(chatId);
+    typingExpiry.disarmChat(chatId);
+    const timer = typingTimers.get(chatId);
+    if (!timer) return;
+    clearInterval(timer);
+    typingTimers.delete(chatId);
+  }
 
   const channel: IMChannel = {
     channelType: 'qq',
@@ -718,6 +746,9 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
     },
 
     async disconnect(): Promise<void> {
+      for (const chatId of [...typingTimers.keys()]) stopTyping(chatId);
+      typingLeases.clear();
+      typingExpiry.disarmAll();
       if (inner) {
         await inner.disconnect();
         inner = null;
@@ -765,8 +796,52 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       await inner.sendFile(chatId, filePath, fileName);
     },
 
-    async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
-      // QQ Bot API v2 does not support typing indicators
+    async setTyping(
+      chatId: string,
+      isTyping: boolean,
+      leaseId = '__legacy__',
+    ): Promise<void> {
+      if (!inner) return;
+      // The platform exposes the indicator for direct chats only.
+      if (!chatId.startsWith('c2c:')) return;
+      const openid = chatId.slice(4);
+
+      if (!isTyping) {
+        const leases = typingLeases.get(chatId);
+        leases?.delete(leaseId);
+        typingExpiry.disarm(chatId, leaseId);
+        if (leases && leases.size > 0) return;
+        stopTyping(chatId);
+        return;
+      }
+
+      let leases = typingLeases.get(chatId);
+      if (!leases) {
+        leases = new Set<string>();
+        typingLeases.set(chatId, leases);
+      }
+      if (leases.has(leaseId)) return;
+      leases.add(leaseId);
+      typingExpiry.arm(chatId, leaseId);
+      if (typingTimers.has(chatId)) return;
+
+      const pulse = async (): Promise<void> => {
+        if (!inner) return;
+        try {
+          // A skipped pulse (budget guard) is not an error: the indicator
+          // simply lapses while the turn keeps running.
+          await inner.sendTypingIndicator(openid);
+        } catch (err) {
+          logger.debug({ err, chatId }, 'QQ typing indicator failed');
+        }
+      };
+
+      void pulse();
+      // Refresh slightly before the platform drops the state, so the
+      // indicator does not flicker between pulses.
+      const timer = setInterval(() => void pulse(), QQ_TYPING_REFRESH_MS);
+      timer.unref?.();
+      typingTimers.set(chatId, timer);
     },
 
     isConnected(): boolean {

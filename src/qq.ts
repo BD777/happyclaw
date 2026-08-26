@@ -63,6 +63,22 @@ const QQ_TOKEN_REQUEST_TIMEOUT_MS = 15_000;
 const QQ_API_REQUEST_TIMEOUT_MS = 30_000;
 const QQ_MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024;
 
+/**
+ * How long the platform shows the typing state for one notification.
+ *
+ * The refresh cadence in the channel adapter is derived from this, so the two
+ * cannot drift apart.
+ */
+export const TYPING_NOTIFY_SECONDS = 60;
+
+/**
+ * Passive-reply uses the typing indicator refuses to touch.
+ *
+ * A long turn refreshes the indicator repeatedly, so without a floor it would
+ * drain the per-msg_id budget and force the actual answer into an active push.
+ */
+const TYPING_PASSIVE_RESERVE = 2;
+
 const IMAGE_EXT_MAP: Record<string, string> = {
   'image/jpeg': '.jpg',
   'image/png': '.png',
@@ -389,6 +405,14 @@ export interface QQConnection {
   getNextMsgSeq(chatId: string): number;
   /** Latest msg_id received from a C2C openid, for passive reply. */
   getLastIncomingMsgId(openid: string): string | undefined;
+  /**
+   * Show the "bot is typing" state to a C2C user for `TYPING_NOTIFY_SECONDS`.
+   *
+   * Resolves to whether the platform was actually told. A `false` is normal
+   * rather than an error: the indicator is a courtesy and is skipped when it
+   * would eat into the passive-reply budget a real message needs.
+   */
+  sendTypingIndicator(openid: string): Promise<boolean>;
 }
 
 interface TokenInfo {
@@ -2390,7 +2414,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     },
 
     async sendChatAction(_chatId: string, _action: 'typing'): Promise<void> {
-      // QQ Bot API v2 does not support typing indicators
+      // Deliberately inert. QQ does support a typing state, but it is not a
+      // fire-and-forget action: it is addressed to one C2C user and spends
+      // passive-reply budget, so it goes through sendTypingIndicator() and the
+      // lease tracking in createQQChannel instead.
     },
 
     isConnected(): boolean {
@@ -2438,6 +2465,28 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
     getLastIncomingMsgId(openid: string): string | undefined {
       return lastIncomingMsgId.get(openid);
+    },
+
+    async sendTypingIndicator(openid: string): Promise<boolean> {
+      // Reserve the rest of the budget for real messages. The indicator is a
+      // courtesy: dropping it costs nothing, while spending the last passive
+      // reply on it would push an actual reply onto the active-push quota.
+      // For the same reason it never falls back to an active push.
+      const claim = passiveReplies.claim(`c2c:${openid}`, Date.now(), {
+        reserve: TYPING_PASSIVE_RESERVE,
+      });
+      if (!claim) return false;
+
+      await apiRequest('POST', `/v2/users/${openid}/messages`, {
+        msg_type: 6, // input notification
+        input_notify: {
+          input_type: 1, // "typing"
+          input_second: TYPING_NOTIFY_SECONDS,
+        },
+        msg_id: claim.msgId,
+        msg_seq: claim.msgSeq,
+      });
+      return true;
     },
   };
 

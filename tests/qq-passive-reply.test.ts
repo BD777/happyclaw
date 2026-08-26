@@ -97,6 +97,43 @@ describe('createPassiveReplyStore', () => {
     });
   });
 
+  test('reserve leaves budget for higher-value sends', () => {
+    const store = createPassiveReplyStore();
+    store.record('c2c:u1', 'm1', T0);
+
+    // A typing indicator reserves 2, so it may only take the first 2 of 4.
+    expect(store.claim('c2c:u1', T0, { reserve: 2 })?.msgSeq).toBe(1);
+    expect(store.claim('c2c:u1', T0, { reserve: 2 })?.msgSeq).toBe(2);
+    expect(store.claim('c2c:u1', T0, { reserve: 2 })).toBeUndefined();
+
+    // The reserved uses are still there for an unreserved caller.
+    expect(store.claim('c2c:u1', T0)?.msgSeq).toBe(3);
+    expect(store.claim('c2c:u1', T0)?.msgSeq).toBe(4);
+    expect(store.claim('c2c:u1', T0)).toBeUndefined();
+  });
+
+  test('a reserve at or above the cap yields nothing', () => {
+    const store = createPassiveReplyStore();
+    store.record('c2c:u1', 'm1', T0);
+
+    expect(
+      store.claim('c2c:u1', T0, { reserve: PASSIVE_REPLY_MAX_USES }),
+    ).toBeUndefined();
+    expect(store.claim('c2c:u1', T0, { reserve: 99 })).toBeUndefined();
+    // ...and nothing was consumed by the refusals.
+    expect(store.claim('c2c:u1', T0)?.msgSeq).toBe(1);
+  });
+
+  test('a negative reserve cannot widen the budget', () => {
+    const store = createPassiveReplyStore();
+    store.record('c2c:u1', 'm1', T0);
+
+    for (let i = 1; i <= PASSIVE_REPLY_MAX_USES; i++) {
+      expect(store.claim('c2c:u1', T0, { reserve: -5 })?.msgSeq).toBe(i);
+    }
+    expect(store.claim('c2c:u1', T0, { reserve: -5 })).toBeUndefined();
+  });
+
   test('keeps chats isolated from each other', () => {
     const store = createPassiveReplyStore();
     store.record('c2c:u1', 'm1', T0);
