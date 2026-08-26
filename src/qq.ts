@@ -36,6 +36,7 @@ import {
   getReconnectDelay,
   classifyCloseCode,
 } from './qq-reconnect.js';
+import { createPassiveReplyStore } from './qq-passive-reply.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -416,6 +417,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   // for stream_messages (QQ API rejects the endpoint without msg_id).
   const lastIncomingMsgId = new Map<string, string>();
 
+  // Passive-reply budget per chat. Replying with an inbound msg_id is free;
+  // once the budget is spent we fall back to a (quota-billed) active push.
+  const passiveReplies = createPassiveReplyStore();
+
   // Rate-limit rejection messages
   const rejectTimestamps = new Map<string, number>();
   const REJECT_COOLDOWN_MS = 5 * 60 * 1000;
@@ -495,6 +500,26 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     const next = current + 1;
     msgSeqCounters.set(chatId, next);
     return next;
+  }
+
+  /**
+   * Pick the addressing fields for one outbound message.
+   *
+   * Prefers a passive reply (echo an inbound `msg_id`) because QQ does not
+   * bill those against the active-push quota. When no inbound reference is
+   * still within its window or budget, falls back to an active push, which is
+   * what this channel did unconditionally before.
+   *
+   * `msg_seq` comes from the claim for passive replies because QQ dedupes on
+   * `(msg_id, msg_seq)`; active pushes keep the per-chat counter.
+   */
+  function resolveSendRef(chatKey: string): {
+    msg_id?: string;
+    msg_seq: number;
+  } {
+    const claim = passiveReplies.claim(chatKey);
+    if (claim) return { msg_id: claim.msgId, msg_seq: claim.msgSeq };
+    return { msg_seq: getNextMsgSeq(chatKey) };
   }
 
   // ─── Token Management ──────────────────────────────────────
@@ -685,7 +710,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     content: string,
   ): Promise<void> {
     const chatKey = `${chatType}:${openid}`;
-    const msgSeq = getNextMsgSeq(chatKey);
 
     const endpoint =
       chatType === 'c2c'
@@ -695,7 +719,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     await apiRequest('POST', endpoint, {
       markdown: { content },
       msg_type: 2, // markdown
-      msg_seq: msgSeq,
+      ...resolveSendRef(chatKey),
     });
   }
 
@@ -765,7 +789,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   ): Promise<void> {
     const fileInfo = await uploadMedia(chatType, openid, imageBuffer);
     const chatKey = `${chatType}:${openid}`;
-    const msgSeq = getNextMsgSeq(chatKey);
 
     const endpoint =
       chatType === 'c2c'
@@ -776,7 +799,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       msg_type: 7, // rich media
       media: { file_info: fileInfo },
       content: caption || '',
-      msg_seq: msgSeq,
+      ...resolveSendRef(chatKey),
     });
   }
 
@@ -1053,7 +1076,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     const fileInfo = await chunkedUpload(chatType, openid, filePath, fileType);
 
     const chatKey = `${chatType}:${openid}`;
-    const msgSeq = getNextMsgSeq(chatKey);
 
     const endpoint =
       chatType === 'c2c'
@@ -1064,7 +1086,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       msg_type: 7,
       media: { file_info: fileInfo },
       content: '',
-      msg_seq: msgSeq,
+      ...resolveSendRef(chatKey),
     });
   }
 
@@ -1604,6 +1626,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
         // Only a routable message may update reply context caches.
         lastIncomingMsgId.set(userOpenId, msgId);
+        passiveReplies.record(`c2c:${userOpenId}`, msgId);
 
         // ── Authorized: process message ──
         storeChatMetadata(jid, new Date().toISOString());
@@ -1817,6 +1840,11 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         }
         const { targetJid, routing: agentRouting } = resolvedRoute;
 
+        // Only a routable message may update reply context caches. Groups have
+        // no streaming endpoint, so unlike C2C this is the passive-reply
+        // reference only.
+        passiveReplies.record(`group:${groupOpenId}`, msgId);
+
         // ── Authorized: process message ──
         storeChatMetadata(jid, new Date().toISOString());
 
@@ -1999,6 +2027,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       lastErrorIsTransient = false;
       dedup.clear();
       msgSeqCounters.clear();
+      passiveReplies.clear();
       rejectTimestamps.clear();
       processingLock.dispose();
       logger.info('QQ bot disconnected');
