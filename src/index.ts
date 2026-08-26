@@ -65,7 +65,7 @@ import {
   type ProcessingIndicatorInput,
   type ProcessingIndicatorOwner,
 } from './processing-indicator-batch.js';
-import { resolveFeishuFollowUpMode } from './follow-up-policy.js';
+import { resolveFollowUpMode } from './follow-up-policy.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
 import {
   DeferredOutOfBandCursorLedger,
@@ -19549,7 +19549,7 @@ function handleIncomingFollowUp(input: {
       input.targetJid,
       input.coalesceBundleId!,
     );
-  const mode = resolveFeishuFollowUpMode(
+  const mode = resolveFollowUpMode(
     input.requestedMode ?? (coalesceActiveRoot ? 'steer' : undefined),
   );
   setMessageFollowUp(input.targetJid, input.messageId, {
@@ -19646,7 +19646,7 @@ function handleCardInterrupt(
  * everything that was already durably queued, then interrupt the exact active
  * query. Messages admitted after this synchronous cutoff remain runnable.
  */
-async function handleFeishuSessionBreak(input: {
+async function handleSessionBreak(input: {
   sourceJid: string;
   targetJid?: string;
   senderImId: string;
@@ -19900,7 +19900,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
               () => secret.ownerOpenId || undefined,
             ),
           onFollowUpMessage: handleIncomingFollowUp,
-          onSessionBreak: handleFeishuSessionBreak,
+          onSessionBreak: handleSessionBreak,
           onSessionClear: handleFeishuSessionClear,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
@@ -19968,7 +19968,11 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
         // Not added to `common`: the remaining channels do not forward the
         // callback to their connector, so enabling it there would only look
         // like queue support without providing it.
-        { ...common, onFollowUpMessage: handleIncomingFollowUp },
+        {
+          ...common,
+          onFollowUpMessage: handleIncomingFollowUp,
+          onSessionBreak: handleSessionBreak,
+        },
       );
     } else if (account.provider === 'wechat') {
       const bypassProxy = secret.bypassProxy !== 'false';
@@ -20828,7 +20832,7 @@ async function main(): Promise<void> {
             isSenderAllowedInGroup: (jid: string, sender?: string) =>
               isSenderAllowedInGroup(jid, sender, getReloadOwnerOpenId),
             onFollowUpMessage: handleIncomingFollowUp,
-            onSessionBreak: handleFeishuSessionBreak,
+            onSessionBreak: handleSessionBreak,
             onSessionClear: handleFeishuSessionClear,
             onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
@@ -20897,6 +20901,7 @@ async function main(): Promise<void> {
             onMessagePersisted: broadcastNewMessage,
             onFollowUpsChanged: broadcastFollowUpUpdate,
             onFollowUpMessage: handleIncomingFollowUp,
+            onSessionBreak: handleSessionBreak,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),

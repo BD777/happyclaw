@@ -1399,6 +1399,7 @@ export class IMConnectionManager {
       onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
       onFollowUpMessage?: IMChannelConnectOpts['onFollowUpMessage'];
       onFollowUpsChanged?: IMChannelConnectOpts['onFollowUpsChanged'];
+      onSessionBreak?: IMChannelConnectOpts['onSessionBreak'];
     },
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
@@ -1429,6 +1430,7 @@ export class IMConnectionManager {
         onMessagePersisted: options?.onMessagePersisted,
         onFollowUpMessage: options?.onFollowUpMessage,
         onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
       },
       options?.accountId,
       options?.scopeIncomingJids,

@@ -222,8 +222,11 @@ Host 模式没有 `maxConcurrentHostProcesses`。旧客户端提交该字段时�
 破坏性命令受 `OWNER_REQUIRED_IM_COMMANDS` 和渠道原生 sender ID 约束。
 响应对象策略不能因服务重启、同步聊天或恢复绑定而回退成默认值。
 
-飞书另有三个精确的 Session 运行时控制命令。群聊必须由渠道结构证明真实 `@Bot`，
-命令大小写敏感；私聊可直接使用：
+另有三个精确的 Session 运行时控制命令，由渠道连接器在通用斜杠命令之前解析。
+群聊必须由渠道结构证明真实 `@Bot`，命令大小写敏感；私聊可直接使用。
+飞书支持全部三个；QQ 支持 `/steer` 和 `/break`，其 `/clear` 仍走通用命令处理器。
+QQ 群聊的结构证明来自平台本身 —— 网关只在真实 `@Bot` 时投递
+`GROUP_AT_MESSAGE_CREATE`：
 
 - `/steer <非空消息>`：先可靠进入当前 Session 的 durable pending，再 clean interrupt
   当前 generation；当前已 pending 的普通消息与 steer 按可见顺序在下一轮合批，命令前缀

@@ -38,6 +38,10 @@ import {
 } from './qq-reconnect.js';
 import { createPassiveReplyStore } from './qq-passive-reply.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import {
+  isRuntimeControlLike,
+  parseRuntimeControl,
+} from './follow-up-policy.js';
 import type { FollowUpDisposition, FollowUpMode } from './types.js';
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -339,6 +343,12 @@ export interface QQConnectOpts {
   }) => FollowUpDisposition;
   /** Notify host projections after the durable follow-up queue changes. */
   onFollowUpsChanged?: import('./channel-contracts.js').OnChannelFollowUpsChanged;
+  /** `/break` — cancel the pending queue and interrupt the active query. */
+  onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
   normalizeIncomingJid?: (jid: string) => string | null;
 }
 
@@ -1781,9 +1791,43 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           opts.onNewChat(jid, existing?.name ?? chatName);
         }
 
+        // Runtime controls are parsed before the generic slash handler so
+        // `/steer` and `/break` cannot be swallowed as unknown commands.
+        // A C2C message is always eligible: it is addressed to the bot by
+        // construction.
+        const runtimeControl = parseRuntimeControl({
+          commandText: content,
+          eligible: true,
+          hasAttachments: Boolean(data.attachments?.length),
+        });
+        let requestedFollowUpMode: FollowUpMode | undefined;
+        if (runtimeControl?.kind === 'steer') {
+          requestedFollowUpMode = 'steer';
+          content = runtimeControl.text;
+        } else if (runtimeControl?.kind === 'break') {
+          const reply = opts.onSessionBreak
+            ? await opts.onSessionBreak({
+                sourceJid: jid,
+                targetJid,
+                senderImId: `c2c:${userOpenId}`,
+              })
+            : '当前运行环境不支持 /break。';
+          await sendQQMessage('c2c', userOpenId, markdownToPlainText(reply));
+          return;
+        }
+
         // Handle slash commands
         const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-        if (slashMatch && opts.onCommand) {
+        if (
+          slashMatch &&
+          !requestedFollowUpMode &&
+          opts.onCommand &&
+          // Control lookalikes (`/queue ...`, a bare `/steer`, `/break` with
+          // arguments) are deliberately not commands: they fall through to the
+          // Agent as ordinary input rather than becoming "unknown command".
+          // `/clear` is the exception -- it is a real command here.
+          (runtimeControl?.kind === 'clear' || !isRuntimeControlLike(content))
+        ) {
           const cmdBody = (
             slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
           ).trim();
@@ -1857,6 +1901,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           sourceJid: jid,
           messageId: id,
           senderImId: senderId,
+          requestedMode: requestedFollowUpMode,
         });
 
         opts.onMessagePersisted?.(
@@ -2018,9 +2063,49 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           opts.onNewChat(jid, existing.name ?? chatName);
         }
 
+        // Runtime controls are parsed before the generic slash handler so
+        // `/steer` and `/break` cannot be swallowed as unknown commands.
+        // Eligibility is structural here: the gateway only delivers
+        // GROUP_AT_MESSAGE_CREATE for messages that actually @-mention the
+        // bot, so reaching this point is the proof Feishu has to compute.
+        const runtimeControl = parseRuntimeControl({
+          commandText: content,
+          eligible: true,
+          hasAttachments: Boolean(data.attachments?.length),
+        });
+        let requestedFollowUpMode: FollowUpMode | undefined;
+        if (runtimeControl?.kind === 'steer') {
+          requestedFollowUpMode = 'steer';
+          content = runtimeControl.text;
+        } else if (runtimeControl?.kind === 'break') {
+          // An unidentifiable sender is refused rather than passed through
+          // under a placeholder id: the host ignores senderImId today, but a
+          // synthetic one would silently defeat any check added later.
+          const reply = !memberOpenId
+            ? '无法确认发送者身份，未执行 /break。'
+            : opts.onSessionBreak
+              ? await opts.onSessionBreak({
+                  sourceJid: jid,
+                  targetJid,
+                  senderImId: `group:${memberOpenId}`,
+                })
+              : '当前运行环境不支持 /break。';
+          await sendQQMessage('group', groupOpenId, markdownToPlainText(reply));
+          return;
+        }
+
         // Handle slash commands
         const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-        if (slashMatch && opts.onCommand) {
+        if (
+          slashMatch &&
+          !requestedFollowUpMode &&
+          opts.onCommand &&
+          // Control lookalikes (`/queue ...`, a bare `/steer`, `/break` with
+          // arguments) are deliberately not commands: they fall through to the
+          // Agent as ordinary input rather than becoming "unknown command".
+          // `/clear` is the exception -- it is a real command here.
+          (runtimeControl?.kind === 'clear' || !isRuntimeControlLike(content))
+        ) {
           const cmdBody = (
             slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
           ).trim();
@@ -2094,6 +2179,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           sourceJid: jid,
           messageId: id,
           senderImId: senderId,
+          requestedMode: requestedFollowUpMode,
         });
 
         opts.onMessagePersisted?.(
