@@ -705,6 +705,8 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
           onMessagePersisted: opts.onMessagePersisted,
+          onFollowUpMessage: opts.onFollowUpMessage,
+          onFollowUpsChanged: opts.onFollowUpsChanged,
           normalizeIncomingJid: opts.normalizeIncomingJid,
         });
         return inner.isConnected();

@@ -19965,7 +19965,10 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           workspace.jid,
           account.is_legacy_default,
         ),
-        common,
+        // Not added to `common`: the remaining channels do not forward the
+        // callback to their connector, so enabling it there would only look
+        // like queue support without providing it.
+        { ...common, onFollowUpMessage: handleIncomingFollowUp },
       );
     } else if (account.provider === 'wechat') {
       const bypassProxy = secret.bypassProxy !== 'false';
@@ -20892,6 +20895,8 @@ async function main(): Promise<void> {
           buildOnPairAttempt(userId),
           {
             onMessagePersisted: broadcastNewMessage,
+            onFollowUpsChanged: broadcastFollowUpUpdate,
+            onFollowUpMessage: handleIncomingFollowUp,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
