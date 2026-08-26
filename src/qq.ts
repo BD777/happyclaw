@@ -666,13 +666,32 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
    *
    * `msg_seq` comes from the claim for passive replies because QQ dedupes on
    * `(msg_id, msg_seq)`; active pushes keep the per-chat counter.
+   *
+   * The outcome is logged because it is the only signal that this channel is
+   * spending the bot's limited active-push quota: the request body is
+   * otherwise identical and QQ does not report which class a send was billed
+   * as. The inbound `msg_id` itself is deliberately left out of the log.
    */
-  function resolveSendRef(chatKey: string): {
+  function resolveSendRef(
+    chatKey: string,
+    kind: 'text' | 'image' | 'file',
+  ): {
     msg_id?: string;
     msg_seq: number;
   } {
+    const chatType = chatKey.split(':')[0];
     const claim = passiveReplies.claim(chatKey);
-    if (claim) return { msg_id: claim.msgId, msg_seq: claim.msgSeq };
+    if (claim) {
+      logger.info(
+        { chatType, kind, mode: 'passive', msgSeq: claim.msgSeq },
+        'QQ outbound addressing',
+      );
+      return { msg_id: claim.msgId, msg_seq: claim.msgSeq };
+    }
+    logger.info(
+      { chatType, kind, mode: 'active-push' },
+      'QQ outbound addressing',
+    );
     return { msg_seq: getNextMsgSeq(chatKey) };
   }
 
@@ -873,7 +892,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     await apiRequest('POST', endpoint, {
       markdown: { content },
       msg_type: 2, // markdown
-      ...resolveSendRef(chatKey),
+      ...resolveSendRef(chatKey, 'text'),
     });
   }
 
@@ -952,7 +971,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       msg_type: 7, // rich media
       media: { file_info: fileInfo },
       content: caption || '',
-      ...resolveSendRef(chatKey),
+      ...resolveSendRef(chatKey, 'image'),
     });
   }
 
@@ -1241,7 +1260,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       msg_type: 7,
       media: { file_info: fileInfo },
       content: '',
-      ...resolveSendRef(chatKey),
+      ...resolveSendRef(chatKey, 'file'),
     });
   }
 
