@@ -19714,7 +19714,7 @@ async function handleSessionBreak(input: {
       interrupted,
       cancelledMessageIds: cancelled.map((item) => item.id),
     },
-    'Feishu session break processed',
+    'Session break processed',
   );
   return interrupted || cancelled.length > 0
     ? 'Current task stopped.'
