@@ -238,8 +238,12 @@ describe('resolveTurnOutcome', () => {
     );
     for (const branch of [mainCompletion, agentCompletion]) {
       expect(branch).toContain('getFailedChannelOutboxForTurn(runtime.runId)');
+      expect(branch.indexOf('getUncertainChannelOutboxForTurn')).toBeLessThan(
+        branch.indexOf('getFailedChannelOutboxForTurn'),
+      );
       expect(branch).toContain('runtime.fail(');
       expect(branch).toContain('deliverChannelDefinitiveFailureNotice({');
+      expect(branch).toContain('getDeliveredChannelOutboxForTurn');
       expect(branch).not.toContain('runtime.retry(');
     }
   });
