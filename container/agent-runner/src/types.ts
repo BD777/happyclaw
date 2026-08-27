@@ -371,7 +371,6 @@ export interface ContainerOutput {
    * replay budget was spent and the same input failed transiently again. The
    * runner never sets this; it only ever reports what it observed.
    */
-  providerFailureEscalatedFrom?: 'transient';
   /**
    * Set by the host after it quarantines the failed provider and checks the
    * remaining pool. The agent runner itself only emits providerFailure.

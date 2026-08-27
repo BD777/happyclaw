@@ -1,17 +1,15 @@
 import { describe, expect, test, vi } from 'vitest';
 
-// Two enabled accounts so the escalated verdict has somewhere to fail over to;
-// individual tests narrow this to one account where that is the case under test.
 const mocks = vi.hoisted(() => ({
   enabledProviders: [
     {
-      id: 'escalation-a',
+      id: 'provider-a',
       enabled: true,
       weight: 1,
       anthropicModel: 'primary-model',
     },
     {
-      id: 'escalation-b',
+      id: 'provider-b',
       enabled: true,
       weight: 1,
       anthropicModel: 'primary-model',
@@ -42,113 +40,133 @@ const { applyProviderFailureDisposition } =
   await import('../src/container-runner.js');
 const { providerPool } = await import('../src/provider-pool.js');
 const {
-  PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE,
   PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE,
+  PROVIDER_MODEL_CONFIG_USER_NOTICE,
+  PROVIDER_TRANSIENT_FAILURE_USER_NOTICE,
 } = await import('../src/provider-failure.js');
 type ContainerOutput = import('../src/container-runner.js').ContainerOutput;
 
-/** One liveness stall for a given durable input, as the runner would frame it. */
-function stall(messageId: string): ContainerOutput {
+function transient(messageId: string, livenessTimeout = false): ContainerOutput {
   return {
     status: 'success',
     result: null,
     providerFailure: true,
     providerFailureClass: 'transient',
-    providerLivenessTimeout: true,
+    ...(livenessTimeout ? { providerLivenessTimeout: true } : {}),
     providerRateLimitScope: 'account',
-    // The ledger keys on the durable message id carried by the receipt cursor,
-    // which is what survives a replay.
     ipcReceipts: [
       {
         deliveryId: `delivery-${Math.random()}`,
         chatJid: 'web:x',
-        cursor: { id: messageId },
+        cursor: { timestamp: '2026-08-24T00:00:00.000Z', id: messageId },
       },
     ],
   } as ContainerOutput;
 }
 
-function resetPool(): void {
-  for (const p of mocks.enabledProviders) providerPool.resetHealth(p.id);
+function missingModel(messageId: string): ContainerOutput {
+  return {
+    status: 'success',
+    result: null,
+    providerFailure: true,
+    providerFailureClass: 'config',
+    providerRateLimitScope: 'model',
+    providerRateLimitModel: 'primary-model',
+    inputTurnId: messageId,
+  } as ContainerOutput;
 }
 
-describe('transient failure escalation', () => {
-  test('the first stall replays without judging the account', () => {
-    resetPool();
-    const first = stall('msg-first-only');
-    const terminal = applyProviderFailureDisposition(first, 'escalation-a');
+function resetPool(): void {
+  providerPool.refreshFromConfig(mocks.enabledProviders, {
+    strategy: 'failover',
+    unhealthyThreshold: 2,
+    recoveryIntervalMs: 300_000,
+  });
+  for (const provider of mocks.enabledProviders) {
+    providerPool.resetHealth(provider.id);
+  }
+}
 
-    expect(terminal).toBe(false);
+describe('transient provider failure isolation', () => {
+  test('one replay is allowed without judging the account', () => {
+    resetPool();
+    const first = transient('msg-first-only');
+    expect(applyProviderFailureDisposition(first, 'provider-a')).toBe(false);
     expect(first.providerFailureTerminal).toBe(false);
-    // Not retired: the durable input must stay replayable.
     expect(first.inputTurnCompleted).toBe(false);
-    expect(first.providerFailureClass).toBe('transient');
-    expect(first.providerFailureEscalatedFrom).toBeUndefined();
-    expect(providerPool.getHealthStatus('escalation-a').healthy).toBe(true);
+    expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
   });
 
-  test('a second stall on the same input quarantines the account and fails over', () => {
-    resetPool();
-    const id = 'msg-escalates';
-    applyProviderFailureDisposition(stall(id), 'escalation-a');
-
-    const second = stall(id);
-    const terminal = applyProviderFailureDisposition(second, 'escalation-a');
-
-    expect(second.providerFailureClass).toBe('account');
-    expect(second.providerFailureEscalatedFrom).toBe('transient');
-    // The rewrite has to happen before quarantineFromOutput, whose own guard
-    // skips anything that is not account-class.
-    expect(providerPool.getHealthStatus('escalation-a').healthy).toBe(false);
-    // The other account is untouched, so the input replays there instead of
-    // ending — this is the multi-account failover the escalation restores.
-    expect(providerPool.getHealthStatus('escalation-b').healthy).toBe(true);
-    expect(terminal).toBe(false);
-    expect(second.inputTurnCompleted).toBe(false);
-  });
-
-  test('the budget is per input, so an unrelated message still gets its replay', () => {
-    resetPool();
-    const id = 'msg-a';
-    applyProviderFailureDisposition(stall(id), 'escalation-a');
-    applyProviderFailureDisposition(stall(id), 'escalation-a');
-
-    resetPool();
-    const other = stall('msg-b');
-    expect(applyProviderFailureDisposition(other, 'escalation-a')).toBe(false);
-    expect(other.providerFailureClass).toBe('transient');
-    expect(providerPool.getHealthStatus('escalation-a').healthy).toBe(true);
-  });
-
-  test('a single-account pool ends with the escalated notice, not the stall one', () => {
-    const saved = mocks.enabledProviders;
-    mocks.enabledProviders = [saved[0]];
-    try {
+  test.each([
+    [false, PROVIDER_TRANSIENT_FAILURE_USER_NOTICE],
+    [true, PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE],
+  ])(
+    'repeated 529/5xx or stall ends the input but never quarantines (liveness=%s)',
+    (livenessTimeout, expectedNotice) => {
       resetPool();
-      const id = 'msg-single-account';
-      const first = stall(id);
-      expect(applyProviderFailureDisposition(first, 'escalation-a')).toBe(
-        false,
+      const id = `msg-terminal-${livenessTimeout}`;
+      applyProviderFailureDisposition(
+        transient(id, livenessTimeout),
+        'provider-a',
       );
-      // While it is still transient the user is told it is a stall.
-      expect(first.providerFailureNotice).toBeUndefined();
 
-      const second = stall(id);
-      const terminal = applyProviderFailureDisposition(second, 'escalation-a');
-
-      expect(terminal).toBe(true);
+      const second = transient(id, livenessTimeout);
+      expect(applyProviderFailureDisposition(second, 'provider-a')).toBe(true);
+      expect(second.providerFailureClass).toBe('transient');
       expect(second.inputTurnCompleted).toBe(true);
-      expect(second.providerFailureNotice).toBe(
-        PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE,
-      );
-      // Inviting a resend would be wrong: the account is quarantined now.
-      expect(second.providerFailureNotice).not.toBe(
-        PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE,
-      );
-      expect(providerPool.getHealthStatus('escalation-a').healthy).toBe(false);
-    } finally {
-      mocks.enabledProviders = saved;
-      resetPool();
-    }
+      expect(second.providerFailureNotice).toBe(expectedNotice);
+      expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
+      expect(providerPool.getHealthStatus('provider-b').healthy).toBe(true);
+    },
+  );
+
+  test('the transient budget remains isolated per durable input', () => {
+    resetPool();
+    applyProviderFailureDisposition(transient('msg-a'), 'provider-a');
+    applyProviderFailureDisposition(transient('msg-a'), 'provider-a');
+
+    const other = transient('msg-b');
+    expect(applyProviderFailureDisposition(other, 'provider-a')).toBe(false);
+    expect(other.providerFailureTerminal).toBe(false);
+  });
+});
+
+describe('model_not_found disposition', () => {
+  test('an explicitly pinned configuration fails terminally without quarantine', () => {
+    resetPool();
+    const output = missingModel('pinned');
+    expect(
+      applyProviderFailureDisposition(output, 'provider-a', false),
+    ).toBe(true);
+    expect(output.providerFailureNotice).toBe(PROVIDER_MODEL_CONFIG_USER_NOTICE);
+    expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
+    expect(
+      providerPool.isModelQuarantined('provider-a', 'primary-model'),
+    ).toBe(false);
+  });
+
+  test('an automatic pool fences only the failed provider/model pair and fails over', () => {
+    resetPool();
+    const first = missingModel('automatic-a');
+    expect(applyProviderFailureDisposition(first, 'provider-a', true)).toBe(
+      false,
+    );
+    expect(first.inputTurnCompleted).toBe(false);
+    expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
+    expect(
+      providerPool.isModelQuarantined('provider-a', 'primary-model'),
+    ).toBe(true);
+    expect(
+      providerPool.isModelQuarantined('provider-b', 'primary-model'),
+    ).toBe(false);
+
+    const second = missingModel('automatic-b');
+    expect(applyProviderFailureDisposition(second, 'provider-b', true)).toBe(
+      true,
+    );
+    expect(second.providerFailureNotice).toBe(
+      PROVIDER_MODEL_CONFIG_USER_NOTICE,
+    );
+    expect(providerPool.getHealthStatus('provider-b').healthy).toBe(true);
   });
 });

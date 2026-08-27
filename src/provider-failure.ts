@@ -22,14 +22,6 @@ export const PROVIDER_TRANSIENT_FAILURE_USER_NOTICE =
 export const PROVIDER_MODEL_CONFIG_USER_NOTICE =
   '⚠️ 当前配置的模型在该服务端不存在或不可用，本次请求未被执行。这不是额度问题，重试或切换账号都无法解决，请在「模型配置」中检查模型名称。';
 
-/**
- * A transient failure that repeated after its replay was spent. The account has
- * been quarantined by then, so the wording must not promise that retrying now
- * will work — it has to point at the account.
- */
-export const PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE =
-  '⚠️ 模型服务连续两轮完全没有响应，已暂时停用该账号并尝试切换其他可用账号。若只配置了一个账号，请检查该账号的密钥是否失效、额度是否耗尽，或稍后再试。';
-
 /** Failure classes as reported by the agent runner. */
 export type ProviderFailureClass = 'account' | 'transient' | 'config';
 
@@ -37,15 +29,6 @@ export type ProviderFailureClass = 'account' | 'transient' | 'config';
 export interface ProviderFailureClassification {
   readonly providerFailureClass?: ProviderFailureClass;
   readonly providerLivenessTimeout?: boolean;
-  /**
-   * Host-set: this output arrived as `transient` and was rewritten to `account`
-   * after its replay budget was spent.
-   *
-   * Recorded explicitly rather than inferred from `account + livenessTimeout`.
-   * Inferring a disposition from an unrelated flag is exactly how a stall came
-   * to masquerade as a quota verdict in the first place.
-   */
-  readonly providerFailureEscalatedFrom?: 'transient';
 }
 
 /**
@@ -74,9 +57,6 @@ export function resolveTerminalProviderFailureNotice(
 ): string | undefined {
   const failureClass = resolveProviderFailureClass(output);
   if (failureClass === 'config') return PROVIDER_MODEL_CONFIG_USER_NOTICE;
-  if (output.providerFailureEscalatedFrom === 'transient') {
-    return PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE;
-  }
   if (failureClass !== 'transient') return undefined;
   return output.providerLivenessTimeout
     ? PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE

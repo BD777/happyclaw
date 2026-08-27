@@ -598,43 +598,37 @@ export function applyProviderFailureDisposition(
       applyKnownProviderFailureDisposition(output, false);
       return false;
     }
-    // The replay is spent and the same input failed transiently again.
-    //
-    // "Transient" is a claim that the upstream will be back shortly, and two
-    // consecutive failures spanning both liveness deadlines are evidence
-    // against it. Measured against the stub upstream, a 401 and a 429 are both
-    // retried silently by the CLI until the watchdog fires, so they are
-    // indistinguishable from a stall on first sight — refusing to ever escalate
-    // would leave a dead key or an exhausted quota permanently un-quarantined
-    // and strand a multi-account pool on its one broken profile.
-    //
-    // Escalating rewrites the class, so everything downstream — the quarantine
-    // here, the pool disposition below, the session-clearing guard, and the
-    // notice — treats it as the account verdict it now looks like.
-    output.providerFailureClass = 'account';
-    output.providerFailureEscalatedFrom = 'transient';
-    // WARN, not info: this is the one line that says an account was taken out
-    // of rotation for repeated silence rather than for anything the upstream
-    // actually reported, and it is the only in-log evidence that the
-    // escalation fired at all.
+    // The bounded same-provider replay is spent. Repetition does not turn a
+    // 529/5xx or a silent transport stall into evidence about account health:
+    // end this input visibly, but leave every configured account selectable.
     logger.warn(
       {
         providerId: selectedProfileId,
         livenessTimeout: output.providerLivenessTimeout === true,
       },
-      'Transient provider failure repeated after its replay; escalating to an account verdict and quarantining',
+      'Transient provider failure repeated after its replay; ending input without quarantining the account',
     );
-    if (selectedProfileId !== null) {
-      quarantineFromOutput(selectedProfileId, output);
-    }
-    // fall through to the account disposition
-  }
-  // A config failure is terminal on arrival. Every account would be asked for
-  // the same unservable model, so a retry and a failover both just reproduce
-  // it — and neither would tell the user what to actually fix.
-  if (failureClass === 'config') {
     applyKnownProviderFailureDisposition(output, true);
     return true;
+  }
+  // A pinned model configuration is authoritative, so model_not_found ends
+  // there. In an automatic multi-provider pool, however, each member may use a
+  // different endpoint and configured model. Quarantine only the rejected
+  // (provider, model) pair and let the pool try another member.
+  if (failureClass === 'config') {
+    const model = output.providerRateLimitModel?.trim();
+    if (!allowFailover || selectedProfileId === null || !model) {
+      applyKnownProviderFailureDisposition(output, true);
+      return true;
+    }
+    providerPool.refreshFromConfig(
+      getEnabledProviders(),
+      getBalancingConfig(),
+    );
+    providerPool.reportModelFailure(selectedProfileId, model);
+    const terminal = !poolCanStillServe();
+    applyKnownProviderFailureDisposition(output, terminal);
+    return terminal;
   }
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
@@ -664,6 +658,21 @@ function applyKnownProviderFailureDisposition(
   if (terminal) {
     const notice = resolveTerminalProviderFailureNotice(output);
     if (notice) output.providerFailureNotice = notice;
+  }
+}
+
+function providerFailureDispositionLogMessage(
+  output: ContainerOutput,
+  terminal: boolean,
+): string {
+  if (terminal) return 'Provider options exhausted; surfacing terminal failure';
+  switch (resolveProviderFailureClass(output)) {
+    case 'transient':
+      return 'Transient provider failure; preserving input for bounded same-provider replay';
+    case 'config':
+      return 'Provider model tier rejected; preserving input for automatic-pool failover';
+    default:
+      return 'Provider account quarantined; preserving input for failover replay';
   }
 }
 
@@ -2483,9 +2492,7 @@ export async function runContainerAgent(
                   providerId: selectedProfileId,
                   terminal,
                 },
-                terminal
-                  ? 'Provider pool exhausted; surfacing terminal failure'
-                  : 'Provider quarantined; preserving input for failover replay',
+                providerFailureDispositionLogMessage(output, terminal),
               );
             }
             // Quarantine and classify before awaiting any IM/card projection so
@@ -2740,6 +2747,123 @@ export function killProcessTree(
     }
   }
   return false;
+}
+
+interface HostProcessSnapshot {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  command: string;
+}
+
+function hostProcessGroupSnapshot(processGroupId: number): HostProcessSnapshot[] {
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return [];
+  try {
+    const output = execFileSync(
+      'ps',
+      ['-ax', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'command='],
+      { encoding: 'utf8' },
+    );
+    return output
+      .split('\n')
+      .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/))
+      .filter((match): match is RegExpMatchArray => !!match)
+      .map((match) => ({
+        pid: Number(match[1]),
+        ppid: Number(match[2]),
+        pgid: Number(match[3]),
+        command: match[4],
+      }))
+      .filter((item) => item.pgid === processGroupId);
+  } catch (err) {
+    logger.warn(
+      { processGroupId, err },
+      'Failed to inspect host process group for browser cleanup',
+    );
+    return [];
+  }
+}
+
+function isManagedHostBrowserCommand(command: string): boolean {
+  return (
+    /(?:^|[\s/])agent-browser(?:\s|$)/i.test(command) ||
+    /(?:^|[\s/])(?:Google Chrome|Chromium(?:-browser)?|chrome|chrome_crashpad_handler)(?:\s|$)/i.test(
+      command,
+    )
+  );
+}
+
+function managedHostBrowserProcesses(
+  processGroupId: number,
+): HostProcessSnapshot[] {
+  const members = hostProcessGroupSnapshot(processGroupId);
+  const selected = new Set(
+    members
+      .filter((member) => isManagedHostBrowserCommand(member.command))
+      .map((member) => member.pid),
+  );
+  // Browser helpers do not all carry a recognizable executable name. Once a
+  // managed root is identified, include only its descendants; unrelated
+  // background jobs remain siblings and survive the runner's clean exit.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const member of members) {
+      if (!selected.has(member.pid) && selected.has(member.ppid)) {
+        selected.add(member.pid);
+        changed = true;
+      }
+    }
+  }
+  return members.filter((member) => selected.has(member.pid));
+}
+
+/**
+ * Reap only browser resources left by a successful host-mode turn.
+ *
+ * The runner owns a detached process group, but Agent-authored background
+ * shell jobs are allowed to outlive a turn. Killing the whole PGID here would
+ * destroy those jobs. Browser roots and their descendants receive a graceful
+ * TERM first; processes that are still the same PGID/command one second later
+ * receive KILL.
+ */
+export function cleanupHostBrowserResources(
+  processGroupId: number,
+  killDelayMs = 1_000,
+): number {
+  const targets = managedHostBrowserProcesses(processGroupId);
+  if (targets.length === 0) return 0;
+  const identities = new Map(
+    targets.map((target) => [target.pid, target.command] as const),
+  );
+  for (const target of targets) {
+    try {
+      process.kill(target.pid, 'SIGTERM');
+    } catch {
+      // The process may have exited between ps and kill.
+    }
+  }
+  const killTimer = setTimeout(() => {
+    const remaining = hostProcessGroupSnapshot(processGroupId);
+    const stillManaged = new Set(
+      managedHostBrowserProcesses(processGroupId).map((item) => item.pid),
+    );
+    for (const target of remaining) {
+      if (
+        !stillManaged.has(target.pid) &&
+        identities.get(target.pid) !== target.command
+      ) {
+        continue;
+      }
+      try {
+        process.kill(target.pid, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+  }, Math.max(0, killDelayMs));
+  killTimer.unref?.();
+  return targets.length;
 }
 
 /**
@@ -3442,9 +3566,7 @@ export async function runHostAgent(
                   providerId: hostSelectedProfileId,
                   terminal,
                 },
-                terminal
-                  ? 'Provider pool exhausted; surfacing terminal failure'
-                  : 'Provider quarantined; preserving input for failover replay',
+                providerFailureDispositionLogMessage(output, terminal),
               );
             }
             // Keep provider selection safe while the user-facing projection is
@@ -3474,14 +3596,9 @@ export async function runHostAgent(
       proc.on('close', (code, signal) => {
         clearTimeout(timeout);
         if (killTimer) clearTimeout(killTimer);
-        // detached:true puts the runner in its own process group. agent-browser
-        // / Chrome started during a host browse stay in that group after a
-        // clean exit. Timeout/error already call killProcessTree; success must
-        // reap the leftovers too, then SIGKILL anything that ignores SIGTERM.
-        killProcessTree(proc, 'SIGTERM');
-        setTimeout(() => {
-          killProcessTree(proc, 'SIGKILL');
-        }, 1000);
+        // Reap browser daemons without killing unrelated Agent-authored
+        // background jobs that intentionally outlive this turn.
+        if (proc.pid) cleanupHostBrowserResources(proc.pid);
         const duration = Date.now() - startTime;
 
         const closeCtx: CloseHandlerContext = {

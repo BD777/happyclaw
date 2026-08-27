@@ -5,7 +5,6 @@ import {
   PROVIDER_FAILURE_USER_NOTICE,
   PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE,
   PROVIDER_MODEL_CONFIG_USER_NOTICE,
-  PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE,
   PROVIDER_TRANSIENT_FAILURE_USER_NOTICE,
   resolveProviderFailureClass,
   resolveTerminalProviderFailureNotice,
@@ -83,32 +82,6 @@ describe('terminal provider failure notices', () => {
     ).toBe(PROVIDER_MODEL_CONFIG_USER_NOTICE);
   });
 
-  test('an escalated transient failure says the account was taken out, not that quota ran out', () => {
-    const notice = resolveTerminalProviderFailureNotice({
-      providerFailureClass: 'account',
-      providerFailureEscalatedFrom: 'transient',
-      providerLivenessTimeout: true,
-    });
-    expect(notice).toBe(PROVIDER_TRANSIENT_ESCALATED_USER_NOTICE);
-    // By this point the account is quarantined, so telling the user to just
-    // resend would be a lie — the next message would fail the same way.
-    expect(notice).toContain('已暂时停用该账号');
-    expect(notice).not.toBe(PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE);
-    expect(notice).not.toBe(PROVIDER_FAILURE_USER_NOTICE);
-  });
-
-  test('escalation is recorded explicitly, never inferred from the stall flag', () => {
-    // `account` + `livenessTimeout` happens to be the escalation signature, but
-    // reading a disposition off an unrelated flag is the original defect. A
-    // stall flag with no escalation marker must not select the escalated notice.
-    expect(
-      resolveTerminalProviderFailureNotice({
-        providerFailureClass: 'account',
-        providerLivenessTimeout: true,
-      }),
-    ).toBeUndefined();
-  });
-
   test('an account failure keeps whatever notice the caller already resolved', () => {
     // Account walls carry the upstream limit text or the generic pool notice;
     // overwriting them here would discard the reset time the user needs.
@@ -145,31 +118,14 @@ describe('host disposition is keyed on the class, not on individual flags', () =
     expect(poolRefresh).toBeGreaterThan(transientBranch);
   });
 
-  test('a repeated transient failure escalates to an account verdict', () => {
-    // Ordering, asserted by position rather than adjacency so that inserting a
-    // log line between the steps does not read as a regression:
-    //
-    //   class rewrite  ->  quarantine  ->  pool disposition
-    //
-    // The rewrite must come first or quarantineFromOutput's own `!== 'account'`
-    // guard skips the very quarantine the escalation exists to perform, and the
-    // pool step must come last or a multi-account install never fails over.
-    // The behavioural proof lives in provider-transient-escalation.test.ts;
-    // this only pins the order the two functions have to be called in.
-    const rewrite = hostRunner.indexOf(
+  test('a repeated transient terminates without rewriting or quarantining', () => {
+    expect(hostRunner).toContain(
+      'ending input without quarantining the account',
+    );
+    expect(hostRunner).not.toContain(
       "output.providerFailureClass = 'account';",
     );
-    const escalation = hostRunner.indexOf(
-      "output.providerFailureEscalatedFrom = 'transient';",
-    );
-    const quarantine = hostRunner.indexOf(
-      'quarantineFromOutput(selectedProfileId, output);',
-    );
-    const poolRefresh = hostRunner.indexOf('providerPool.refreshFromConfig(');
-    expect(rewrite).toBeGreaterThan(-1);
-    expect(escalation).toBeGreaterThan(rewrite);
-    expect(quarantine).toBeGreaterThan(escalation);
-    expect(poolRefresh).toBeGreaterThan(quarantine);
+    expect(hostRunner).not.toContain('providerFailureEscalatedFrom');
   });
 
   test('the first transient failure still replays without touching the account', () => {
@@ -178,9 +134,9 @@ describe('host disposition is keyed on the class, not on individual flags', () =
     );
   });
 
-  test('config failures end immediately without a quarantine or a retry', () => {
+  test('config failures are terminal when pinned and model-scoped in an automatic pool', () => {
     expect(hostRunner).toMatch(
-      /if \(failureClass === 'config'\) \{[\s\S]*?applyKnownProviderFailureDisposition\(output, true\);[\s\S]*?return true;/,
+      /if \(failureClass === 'config'\) \{[\s\S]*?!allowFailover[\s\S]*?providerPool\.reportModelFailure\(selectedProfileId, model\)/,
     );
   });
 

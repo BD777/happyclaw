@@ -10,10 +10,10 @@
 // checks the inputs themselves, by standing up a fake Anthropic-compatible
 // endpoint and running the real runner against it.
 //
-// It is what showed that a 401 and a 429 are retried silently by the Claude
-// CLI until the liveness watchdog fires, so both reach the host looking exactly
-// like a stall — which is why a repeated transient failure has to escalate to
-// an account verdict instead of being trusted indefinitely.
+// It also showed that a 401 and a 429 may be retried silently by the Claude CLI
+// until the liveness watchdog fires. The host therefore cannot infer an
+// account verdict from repetition: a healthy account behind a stalled gateway
+// is observationally identical and must not be quarantined without evidence.
 //
 // Not part of `npm test`: it needs the built runner and the stall scenarios
 // each burn the full 60s liveness deadline.
@@ -68,8 +68,7 @@ const SCENARIOS = [
   { mode: 'http:529', expect: 'transient', slow: true, note: 'overloaded' },
   { mode: 'http:500', expect: 'transient', slow: true, note: 'server error' },
   // 401/429 are NOT account-classified here: the CLI retries them silently, so
-  // the runner only ever sees the watchdog. The host is what escalates a
-  // repeated transient failure into the account verdict these deserve.
+  // the runner only ever sees the watchdog and the host keeps them transient.
   {
     mode: 'http:401',
     expect: 'transient',
