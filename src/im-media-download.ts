@@ -7,18 +7,73 @@ import { MAX_FILE_SIZE } from './im-downloader.js';
 export const IM_MEDIA_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 export interface DownloadHttpsBufferOptions {
+  /** Legacy single-protocol Agent. Redirects to another protocol are rejected. */
   agent?: http.Agent | https.Agent;
+  /** Per-hop selector for protocol-aware agents such as ProxyAgent. */
+  agentForUrl?: (url: URL) => http.Agent | https.Agent | undefined;
+  /** Explicit protocol-specific agents; a configured-but-missing side rejects. */
+  httpAgent?: http.Agent;
+  httpsAgent?: https.Agent;
+  /** HTTPS→HTTP redirects are rejected unless the caller explicitly opts in. */
+  allowInsecureRedirects?: boolean;
   timeoutMs?: number;
   maxBytes?: number;
   followRedirects?: boolean;
   oversizedMessage?: string;
 }
 
-export function imMediaAgentForHop(
-  agent: http.Agent | https.Agent | undefined,
-  configuredAgentAllowed: boolean,
+export function imMediaAgentForUrl(
+  requestUrl: URL,
+  initialProtocol: 'http:' | 'https:',
+  options: Pick<
+    DownloadHttpsBufferOptions,
+    'agent' | 'agentForUrl' | 'httpAgent' | 'httpsAgent'
+  >,
 ): http.Agent | https.Agent | undefined {
-  return configuredAgentAllowed ? agent : undefined;
+  if (options.agentForUrl) {
+    const selected = options.agentForUrl(requestUrl);
+    if (!selected) {
+      throw new Error(
+        `IM media agentForUrl returned no Agent for ${requestUrl.protocol} URL`,
+      );
+    }
+    return selected;
+  }
+
+  if (options.httpAgent || options.httpsAgent) {
+    const selected =
+      requestUrl.protocol === 'https:' ? options.httpsAgent : options.httpAgent;
+    if (!selected) {
+      throw new Error(
+        `No IM media Agent configured for ${requestUrl.protocol} URL`,
+      );
+    }
+    return selected;
+  }
+
+  if (options.agent) {
+    if (requestUrl.protocol !== initialProtocol) {
+      throw new Error(
+        `Legacy IM media Agent cannot follow ${initialProtocol}→${requestUrl.protocol} redirect; configure agentForUrl/httpAgent/httpsAgent`,
+      );
+    }
+    return options.agent;
+  }
+  return undefined;
+}
+
+export function assertImMediaRedirectPolicy(
+  currentUrl: URL,
+  nextUrl: URL,
+  allowInsecureRedirects = false,
+): void {
+  if (
+    currentUrl.protocol === 'https:' &&
+    nextUrl.protocol === 'http:' &&
+    !allowInsecureRedirects
+  ) {
+    throw new Error('Refusing insecure IM media redirect from HTTPS to HTTP');
+  }
 }
 
 export function downloadHttpsBuffer(
@@ -76,12 +131,9 @@ export function downloadHttpsBuffer(
       }
       return parsed;
     };
+    let initialProtocol: 'http:' | 'https:';
 
-    const doRequest = (
-      requestUrl: URL,
-      redirectCount: number,
-      configuredAgentAllowed: boolean,
-    ): void => {
+    const doRequest = (requestUrl: URL, redirectCount: number): void => {
       if (settled) return;
       if (redirectCount > 5) {
         finish(new Error('Too many redirects'));
@@ -113,16 +165,26 @@ export function downloadHttpsBuffer(
             );
             return;
           }
-          // A protocol switch cannot safely inherit an http.Agent/https.Agent
-          // selected for the previous transport. Once crossed, keep using the
-          // transport default even if a later redirect switches back.
-          const nextAgentAllowed =
-            configuredAgentAllowed && nextUrl.protocol === requestUrl.protocol;
+          try {
+            assertImMediaRedirectPolicy(
+              requestUrl,
+              nextUrl,
+              options.allowInsecureRedirects,
+            );
+          } catch (error) {
+            res.destroy();
+            finish(
+              error instanceof Error
+                ? error
+                : new Error('Unsafe IM media redirect'),
+            );
+            return;
+          }
           const continueRedirect = (): void => {
             if (settled) return;
             if (activeResponse === res) activeResponse = null;
             if (activeRequest === req) activeRequest = null;
-            doRequest(nextUrl, redirectCount + 1, nextAgentAllowed);
+            doRequest(nextUrl, redirectCount + 1);
           };
           res.once('error', (error) => finish(error));
           res.once('aborted', () =>
@@ -131,7 +193,9 @@ export function downloadHttpsBuffer(
           res.once('close', () => {
             if (!settled && !res.complete) {
               finish(
-                new Error('IM media redirect response closed before completion'),
+                new Error(
+                  'IM media redirect response closed before completion',
+                ),
               );
             }
           });
@@ -178,7 +242,7 @@ export function downloadHttpsBuffer(
         req = transport.get(
           requestUrl,
           {
-            agent: imMediaAgentForHop(options.agent, configuredAgentAllowed),
+            agent: imMediaAgentForUrl(requestUrl, initialProtocol, options),
           },
           onResponse,
         );
@@ -195,7 +259,9 @@ export function downloadHttpsBuffer(
     };
 
     try {
-      doRequest(parseHttpUrl(url), 0, true);
+      const initialUrl = parseHttpUrl(url);
+      initialProtocol = initialUrl.protocol as 'http:' | 'https:';
+      doRequest(initialUrl, 0);
     } catch (error) {
       finish(
         error instanceof Error ? error : new Error('Invalid IM media URL'),

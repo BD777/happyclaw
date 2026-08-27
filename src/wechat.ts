@@ -255,12 +255,36 @@ export class WeChatHttpError extends Error {
     readonly endpoint: string,
     readonly status: number,
     readonly responseBody: string,
+    readonly retryAt?: string,
   ) {
     super(
       `WeChat API ${endpoint} HTTP ${status}: ${responseBody.slice(0, 200)}`,
     );
     this.name = 'WeChatHttpError';
   }
+}
+
+const WECHAT_DEFINITIVE_HTTP_STATUSES = new Set([
+  400, 401, 403, 404, 405, 413, 415, 422,
+]);
+const WECHAT_RETRYABLE_REJECTION_STATUSES = new Set([425, 429]);
+
+export function weChatRetryAtFromHeader(
+  retryAfter: string | null,
+  fallbackMs: number,
+  nowMs = Date.now(),
+): string {
+  let delayMs = fallbackMs;
+  const value = retryAfter?.trim();
+  if (value && /^\d+$/.test(value)) {
+    delayMs = Number(value) * 1000;
+  } else if (value) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) delayMs = parsed - nowMs;
+  }
+  // Avoid hot loops and unbounded hostile Retry-After values.
+  delayMs = Math.min(24 * 60 * 60 * 1000, Math.max(1000, delayMs));
+  return new Date(nowMs + delayMs).toISOString();
 }
 
 export class WeChatInvalidAckError extends Error {
@@ -311,6 +335,7 @@ export class WeChatPartialDeliveryError extends Error {
 function definitiveWeChatDeliveryError(
   operation: string,
   cause: unknown,
+  options: { retryAt?: string } = {},
 ): DefinitiveChannelDeliveryError {
   if (cause instanceof DefinitiveChannelDeliveryError) return cause;
   const message = cause instanceof Error ? cause.message : String(cause);
@@ -320,7 +345,7 @@ function definitiveWeChatDeliveryError(
       : operation;
   return new DefinitiveChannelDeliveryError(
     `WeChat ${reason} definitively produced no provider message: ${message}`,
-    { cause },
+    { cause, retryAt: options.retryAt },
   );
 }
 
@@ -337,13 +362,20 @@ function classifyWeChatSendAttemptError(
   ) {
     return cause;
   }
-  if (
-    cause instanceof WeChatApiError ||
-    (cause instanceof WeChatHttpError &&
-      cause.status >= 400 &&
-      cause.status < 500)
-  ) {
+  if (cause instanceof WeChatApiError) {
     return definitiveWeChatDeliveryError(operation, cause);
+  }
+  if (cause instanceof WeChatHttpError) {
+    if (WECHAT_RETRYABLE_REJECTION_STATUSES.has(cause.status)) {
+      return definitiveWeChatDeliveryError(operation, cause, {
+        retryAt:
+          cause.retryAt ??
+          weChatRetryAtFromHeader(null, cause.status === 425 ? 1000 : 30_000),
+      });
+    }
+    if (WECHAT_DEFINITIVE_HTTP_STATUSES.has(cause.status)) {
+      return definitiveWeChatDeliveryError(operation, cause);
+    }
   }
   // Timeouts, socket failures, 5xx responses and malformed 2xx bodies all
   // happen after request transmission and therefore remain ambiguous.
@@ -406,7 +438,13 @@ export async function parseWeChatApiResponse<T>(
 ): Promise<T> {
   const text = await response.text();
   if (!response.ok) {
-    throw new WeChatHttpError(endpoint, response.status, text);
+    const retryAt = WECHAT_RETRYABLE_REJECTION_STATUSES.has(response.status)
+      ? weChatRetryAtFromHeader(
+          response.headers.get('retry-after'),
+          response.status === 425 ? 1000 : 30_000,
+        )
+      : undefined;
+    throw new WeChatHttpError(endpoint, response.status, text, retryAt);
   }
   try {
     return JSON.parse(text) as T;
@@ -895,7 +933,7 @@ export function createWeChatConnection(
 
     let acknowledgedChunks = 0;
     for (let localIndex = 0; localIndex < chunks.length; localIndex++) {
-      const chunkIndex = options.chunkIndex ?? localIndex;
+      const chunkIndex = (options.chunkIndex ?? 0) + localIndex;
       try {
         let clientId: string;
         try {

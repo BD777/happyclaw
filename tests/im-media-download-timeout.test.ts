@@ -1,11 +1,12 @@
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import {
+  assertImMediaRedirectPolicy,
   downloadHttpsBuffer,
-  imMediaAgentForHop,
+  imMediaAgentForUrl,
 } from '../src/im-media-download.js';
 
 function trackClose(server: net.Server): () => Promise<void> {
@@ -110,11 +111,21 @@ describe('Inbound IM media download timeout against a blackhole peer', () => {
     const addr = server.address();
     if (!addr || typeof addr === 'string') throw new Error('missing HTTP port');
 
-    await expect(
-      downloadHttpsBuffer(`http://127.0.0.1:${addr.port}/start`, {
-        followRedirects: true,
-      }),
-    ).resolves.toEqual(Buffer.from('payload'));
+    const proxyLikeAgent = new http.Agent();
+    const agentForUrl = vi.fn(() => proxyLikeAgent);
+    try {
+      await expect(
+        downloadHttpsBuffer(`http://127.0.0.1:${addr.port}/start`, {
+          followRedirects: true,
+          agentForUrl,
+        }),
+      ).resolves.toEqual(Buffer.from('payload'));
+      expect(
+        agentForUrl.mock.calls.map(([requestUrl]) => requestUrl.pathname),
+      ).toEqual(['/start', '/media/file.bin']);
+    } finally {
+      proxyLikeAgent.destroy();
+    }
   });
 
   test('rejects unsupported schemes and terminal non-2xx responses', async () => {
@@ -170,42 +181,73 @@ describe('Inbound IM media download timeout against a blackhole peer', () => {
     expect(Date.now() - started).toBeLessThan(300);
   });
 
-  test('does not reuse a configured Agent after a protocol-changing redirect', () => {
-    const agent = new http.Agent();
-    expect(imMediaAgentForHop(agent, true)).toBe(agent);
-    expect(imMediaAgentForHop(agent, false)).toBeUndefined();
-    agent.destroy();
+  test('selects protocol agents strictly and preserves agentForUrl proxies per hop', () => {
+    const httpAgent = new http.Agent();
+    const httpsAgent = new https.Agent();
+    const proxyAgent = new http.Agent();
+    const selector = vi.fn(() => proxyAgent);
+    try {
+      expect(
+        imMediaAgentForUrl(new URL('http://example.test/a'), 'http:', {
+          httpAgent,
+          httpsAgent,
+        }),
+      ).toBe(httpAgent);
+      expect(
+        imMediaAgentForUrl(new URL('https://example.test/b'), 'http:', {
+          httpAgent,
+          httpsAgent,
+        }),
+      ).toBe(httpsAgent);
+      expect(() =>
+        imMediaAgentForUrl(new URL('http://example.test/a'), 'https:', {
+          httpsAgent,
+        }),
+      ).toThrow(/No IM media Agent configured for http:/);
+      expect(
+        imMediaAgentForUrl(new URL('http://example.test/a'), 'http:', {
+          agentForUrl: selector,
+        }),
+      ).toBe(proxyAgent);
+      expect(
+        imMediaAgentForUrl(new URL('https://example.test/b'), 'http:', {
+          agentForUrl: selector,
+        }),
+      ).toBe(proxyAgent);
+      expect(selector).toHaveBeenCalledTimes(2);
+      expect(() =>
+        imMediaAgentForUrl(new URL('https://example.test/c'), 'https:', {
+          agentForUrl: () => undefined,
+        }),
+      ).toThrow(/agentForUrl returned no Agent/);
+    } finally {
+      httpAgent.destroy();
+      httpsAgent.destroy();
+      proxyAgent.destroy();
+    }
   });
 
-  test('cross-protocol redirect reaches the new transport without the old Agent', async () => {
-    const server = http.createServer((_req, res) => {
-      const addr = server.address();
-      if (!addr || typeof addr === 'string') throw new Error('missing port');
-      res.writeHead(302, {
-        location: `https://127.0.0.1:${addr.port}/tls-target`,
-      });
-      res.end();
-    });
-    server.on('clientError', (_error, socket) => socket.destroy());
-    closers.push(trackClose(server));
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', resolve);
-    });
-    const addr = server.address();
-    if (!addr || typeof addr === 'string') throw new Error('missing HTTP port');
-    const oldAgent = new http.Agent();
+  test('rejects HTTPS downgrade unless explicitly allowed', () => {
+    const secure = new URL('https://cdn.example.test/file');
+    const insecure = new URL('http://cdn.example.test/file');
+    expect(() => assertImMediaRedirectPolicy(secure, insecure)).toThrow(
+      /insecure.*HTTPS to HTTP/i,
+    );
+    expect(() =>
+      assertImMediaRedirectPolicy(secure, insecure, true),
+    ).not.toThrow();
+  });
+
+  test('legacy single-protocol Agent refuses a protocol switch', () => {
+    const agent = new http.Agent();
     try {
-      const error = await downloadHttpsBuffer(
-        `http://127.0.0.1:${addr.port}/redirect`,
-        { agent: oldAgent, followRedirects: true, timeoutMs: 1000 },
-      ).catch((cause: unknown) => cause);
-      expect(error).toBeInstanceOf(Error);
-      expect((error as NodeJS.ErrnoException).code).not.toBe(
-        'ERR_INVALID_PROTOCOL',
-      );
+      expect(() =>
+        imMediaAgentForUrl(new URL('https://example.test/file'), 'http:', {
+          agent,
+        }),
+      ).toThrow(/Legacy IM media Agent cannot follow http:→https:/);
     } finally {
-      oldAgent.destroy();
+      agent.destroy();
     }
   });
 

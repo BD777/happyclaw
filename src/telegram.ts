@@ -581,7 +581,7 @@ export function createTelegramConnection(
 
       const url = `https://api.telegram.org/file/bot${config.botToken}/${filePath}`;
       const buffer = await downloadHttpsBuffer(url, {
-        agent: telegramApiAgent,
+        agentForUrl: () => telegramApiAgent,
         followRedirects: true,
         oversizedMessage: 'File exceeds MAX_FILE_SIZE during download',
       });
@@ -642,7 +642,7 @@ export function createTelegramConnection(
       }
       const url = `https://api.telegram.org/file/bot${config.botToken}/${filePath}`;
       const buffer = await downloadHttpsBuffer(url, {
-        agent: telegramApiAgent,
+        agentForUrl: () => telegramApiAgent,
         followRedirects: true,
         oversizedMessage: 'Photo exceeds MAX_FILE_SIZE during download',
       });

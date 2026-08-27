@@ -458,6 +458,61 @@ describe('WeChat connection durable context_token integration', () => {
     await connection.disconnect();
   });
 
+  test('non-outbox 2500-character text uses a unique client_id for every local chunk', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-local-chunks',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const clientIds: string[] = [];
+    const fetchMock = vi.fn(
+      async (
+        url: string,
+        init?: { body?: unknown; signal?: AbortSignal | null },
+      ) => {
+        if (url.includes('sendmessage')) {
+          clientIds.push(String(JSON.parse(String(init?.body)).msg.client_id));
+          return Response.json({ ret: 0 });
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+
+    await connection.sendMessage('peer', 'A'.repeat(2500), [], {
+      deliveryId: 'host-non-outbox-delivery',
+      chunkIndex: 0,
+    });
+    expect(clientIds).toEqual([
+      weChatClientIdForChunk('host-non-outbox-delivery', 0),
+      weChatClientIdForChunk('host-non-outbox-delivery', 1),
+    ]);
+    expect(new Set(clientIds).size).toBe(2);
+    expect(store.record?.sendCount).toBe(2);
+    await connection.disconnect();
+  });
+
   test('physical-row preflight failures are definitive and make no provider request', async () => {
     const store = new SharedStore();
     const dispatcher = {
@@ -514,12 +569,54 @@ describe('WeChat connection durable context_token integration', () => {
     await connection.disconnect();
   });
 
-  test('explicit nonzero ACK is definitive while 5xx and invalid 2xx ACK are uncertain', async () => {
+  test('strictly classifies HTTP/ACK outcomes and preserves 429 retry-wait', async () => {
     const cases = [
       {
         name: 'nonzero-ack',
         response: () => Response.json({ ret: 4001, errmsg: 'rejected' }),
         code: 'CHANNEL_DELIVERY_REJECTED',
+      },
+      {
+        name: 'http-400',
+        response: () => new Response('bad request', { status: 400 }),
+        code: 'CHANNEL_DELIVERY_REJECTED',
+      },
+      {
+        name: 'http-408',
+        response: () => new Response('request timeout', { status: 408 }),
+        code: 'CHANNEL_DELIVERY_UNCERTAIN',
+      },
+      {
+        name: 'http-409',
+        response: () => new Response('conflict', { status: 409 }),
+        code: 'CHANNEL_DELIVERY_UNCERTAIN',
+      },
+      {
+        name: 'http-425',
+        response: () =>
+          new Response('too early', {
+            status: 425,
+            headers: { 'retry-after': '2' },
+          }),
+        code: 'CHANNEL_DELIVERY_REJECTED',
+        retryWait: true,
+        expectedRetryMs: 2000,
+      },
+      {
+        name: 'http-429',
+        response: () =>
+          new Response('rate limited', {
+            status: 429,
+            headers: { 'retry-after': '7' },
+          }),
+        code: 'CHANNEL_DELIVERY_REJECTED',
+        retryWait: true,
+        expectedRetryMs: 7000,
+      },
+      {
+        name: 'http-499',
+        response: () => new Response('client closed', { status: 499 }),
+        code: 'CHANNEL_DELIVERY_UNCERTAIN',
       },
       {
         name: 'http-503',
@@ -571,12 +668,25 @@ describe('WeChat connection durable context_token integration', () => {
         },
       );
       await connection.connect({ onNewChat: vi.fn() });
-      await expect(
-        connection.sendMessage('peer', testCase.name, [], {
+      const startedAt = Date.now();
+      const error = await connection
+        .sendMessage('peer', testCase.name, [], {
           deliveryId: `outbox-${testCase.name}`,
           physicalOutput: true,
-        }),
-      ).rejects.toMatchObject({ code: testCase.code });
+        })
+        .catch((cause: unknown) => cause);
+      expect(error).toMatchObject({ code: testCase.code });
+      if ('retryWait' in testCase && testCase.retryWait) {
+        const retryAt = Date.parse(
+          String((error as { retryAt?: string }).retryAt),
+        );
+        expect(retryAt - startedAt).toBeGreaterThanOrEqual(
+          testCase.expectedRetryMs - 1000,
+        );
+        expect(retryAt - startedAt).toBeLessThanOrEqual(
+          testCase.expectedRetryMs + 1000,
+        );
+      }
       expect(sends).toBe(1);
       expect(store.record?.sendCount).toBe(1);
       await connection.disconnect();
