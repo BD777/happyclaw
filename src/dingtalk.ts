@@ -416,6 +416,9 @@ export function createDingTalkConnection(
   // Session webhook expiry per chat
   const sessionWebhookExpiry = new Map<string, number>();
 
+  // Unpaired /pair hint cooldown (same 60s window as WhatsApp / WeCom / Discord)
+  const rejectTimestamps = new Map<string, number>();
+
   // Sender ID per chat (for sending files back to user)
   const lastSenderIds = new Map<string, string>();
 
@@ -1523,6 +1526,18 @@ export function createDingTalkConnection(
           return;
         }
         if (admission.kind === 'deny') {
+          if (data.sessionWebhook) {
+            const now = Date.now();
+            const lastReject = rejectTimestamps.get(jid) ?? 0;
+            if (now - lastReject >= 60_000) {
+              rejectTimestamps.set(jid, now);
+              await sendViaSessionWebhook(
+                data.sessionWebhook,
+                '此聊天尚未配对。请在 Web 设置页生成配对码，然后发送 /pair <code>。',
+                isGroup,
+              );
+            }
+          }
           logger.debug({ jid }, 'DingTalk chat not authorized');
           return;
         }
