@@ -671,7 +671,7 @@ export function createTelegramConnection(
             const text = ctx.message.text;
 
             // ── /pair <code> command ──
-            const pairMatch = text.match(/^\/pair\s+(\S+)/i);
+            const pairMatch = text.match(/^\/pair(?:@\S+)?\s+(\S+)/i);
             if (pairMatch && opts.onPairAttempt) {
               const code = pairMatch[1];
               try {
