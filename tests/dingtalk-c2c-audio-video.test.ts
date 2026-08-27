@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 const inbound = vi.hoisted(() => ({
   listener: null as null | ((downstream: { data: string }) => Promise<void>),
   storeMessageDirect: vi.fn(),
+  saveDownloadedFile: vi.fn(),
   notifyNewImMessage: vi.fn(),
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
@@ -33,6 +34,11 @@ vi.mock('../src/message-notifier.js', () => ({
   notifyNewImMessage: inbound.notifyNewImMessage,
 }));
 
+vi.mock('../src/im-downloader.js', () => ({
+  MAX_FILE_SIZE: 20 * 1024 * 1024,
+  saveDownloadedFile: inbound.saveDownloadedFile,
+}));
+
 vi.mock('../src/logger.js', () => ({
   logger: inbound.logger,
 }));
@@ -46,7 +52,7 @@ function jpegBuffer(): Buffer {
   ]);
 }
 
-function mockDingTalkHttpsDownloads() {
+function mockDingTalkHttpsDownloads(downloadBody = jpegBuffer()) {
   return vi
     .spyOn(https, 'request')
     .mockImplementation((options: any, cb?: any) => {
@@ -57,8 +63,12 @@ function mockDingTalkHttpsDownloads() {
       const req = new EventEmitter() as EventEmitter & {
         write: () => void;
         end: () => void;
+        setTimeout: () => void;
+        destroy: () => void;
       };
       req.write = () => {};
+      req.setTimeout = () => {};
+      req.destroy = () => {};
       req.end = () => {
         let body: Buffer;
         if (path.includes('/gettoken')) {
@@ -74,7 +84,7 @@ function mockDingTalkHttpsDownloads() {
             JSON.stringify({ downloadUrl: 'https://cdn.example/blob' }),
           );
         } else {
-          body = jpegBuffer();
+          body = downloadBody;
         }
         const res = new EventEmitter() as EventEmitter & {
           statusCode: number;
@@ -95,8 +105,12 @@ function mockDingTalkHttpsCdnFail() {
     const req = new EventEmitter() as EventEmitter & {
       write: () => void;
       end: () => void;
+      setTimeout: () => void;
+      destroy: () => void;
     };
     req.write = () => {};
+    req.setTimeout = () => {};
+    req.destroy = () => {};
     req.end = () => {
       req.emit('error', new Error('cdn unavailable'));
     };
@@ -111,6 +125,10 @@ describe('DingTalk C2C inbound audio/video', () => {
   beforeEach(() => {
     inbound.listener = null;
     inbound.storeMessageDirect.mockReset();
+    inbound.saveDownloadedFile.mockReset();
+    inbound.saveDownloadedFile.mockImplementation(
+      async (_folder, channel, fileName) => `files/${channel}/${fileName}`,
+    );
     inbound.notifyNewImMessage.mockReset();
     inbound.logger.debug.mockReset();
     inbound.logger.info.mockReset();
@@ -127,7 +145,7 @@ describe('DingTalk C2C inbound audio/video', () => {
     }
   });
 
-  async function connect(authorized: boolean) {
+  async function connect(authorized: boolean, groupFolder?: string) {
     connection = createDingTalkConnection({
       clientId: 'app-key',
       clientSecret: 'app-secret',
@@ -135,6 +153,7 @@ describe('DingTalk C2C inbound audio/video', () => {
     const ok = await connection.connect({
       onNewChat: vi.fn(),
       isChatAuthorized: () => authorized,
+      resolveGroupFolder: groupFolder ? () => groupFolder : undefined,
     });
     expect(ok).toBe(true);
     expect(typeof inbound.listener).toBe('function');
@@ -169,7 +188,9 @@ describe('DingTalk C2C inbound audio/video', () => {
   }
 
   test('paired C2C audio persists recognition and notifies', async () => {
-    const listener = await connect(true);
+    const rawAudio = Buffer.concat([Buffer.from('#!AMR\n'), Buffer.alloc(13)]);
+    httpsSpy = mockDingTalkHttpsDownloads(rawAudio);
+    const listener = await connect(true, 'workspace-1');
     await fireAndWait(
       listener,
       {
@@ -182,12 +203,22 @@ describe('DingTalk C2C inbound audio/video', () => {
       },
       'audio-1',
     );
-    expect(inbound.storeMessageDirect.mock.calls[0][4]).toBe('你好');
+    expect(inbound.saveDownloadedFile).toHaveBeenCalledWith(
+      'workspace-1',
+      'dingtalk',
+      expect.stringMatching(/^audio_\d+\.amr$/),
+      rawAudio,
+    );
+    expect(inbound.storeMessageDirect.mock.calls[0][4]).toMatch(
+      /^你好\n\n\[语音: audio\.amr → files\/dingtalk\/audio_\d+\.amr\]$/,
+    );
     expect(inbound.notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('paired C2C audio without recognition persists [语音消息]', async () => {
-    const listener = await connect(true);
+    const rawAudio = Buffer.concat([Buffer.from('#!AMR\n'), Buffer.alloc(13)]);
+    httpsSpy = mockDingTalkHttpsDownloads(rawAudio);
+    const listener = await connect(true, 'workspace-1');
     await fireAndWait(
       listener,
       {
@@ -200,7 +231,9 @@ describe('DingTalk C2C inbound audio/video', () => {
       },
       'audio-empty',
     );
-    expect(inbound.storeMessageDirect.mock.calls[0][4]).toBe('[语音消息]');
+    expect(inbound.storeMessageDirect.mock.calls[0][4]).toMatch(
+      /^\[语音: audio\.amr → files\/dingtalk\/audio_\d+\.amr\]$/,
+    );
     expect(inbound.notifyNewImMessage).toHaveBeenCalled();
   });
 
@@ -254,6 +287,7 @@ describe('DingTalk C2C inbound audio/video', () => {
   });
 
   test('unauthorized C2C audio does not persist', async () => {
+    httpsSpy = vi.spyOn(https, 'request');
     const listener = await connect(false);
     await listener(
       downstream(
@@ -271,6 +305,8 @@ describe('DingTalk C2C inbound audio/video', () => {
       );
     });
     expect(inbound.storeMessageDirect).not.toHaveBeenCalled();
+    expect(httpsSpy).not.toHaveBeenCalled();
+    expect(inbound.saveDownloadedFile).not.toHaveBeenCalled();
     expect(inbound.notifyNewImMessage).not.toHaveBeenCalled();
   });
 });

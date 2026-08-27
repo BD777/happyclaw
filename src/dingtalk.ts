@@ -682,6 +682,31 @@ function sanitizeFileName(raw: string): string {
   return cleaned.length > 200 ? cleaned.slice(0, 200) + '…' : cleaned;
 }
 
+function detectDingTalkAudioExtension(buffer: Buffer): string {
+  if (
+    buffer.subarray(0, 6).equals(Buffer.from('#!AMR\n')) ||
+    buffer.subarray(0, 9).equals(Buffer.from('#!AMR-WB\n'))
+  ) {
+    return 'amr';
+  }
+  if (
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WAVE'
+  ) {
+    return 'wav';
+  }
+  if (buffer.subarray(0, 4).toString('ascii') === 'OggS') return 'ogg';
+  if (buffer.subarray(0, 4).toString('ascii') === 'fLaC') return 'flac';
+  if (
+    buffer.subarray(0, 3).toString('ascii') === 'ID3' ||
+    (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0)
+  ) {
+    return 'mp3';
+  }
+  if (buffer.subarray(4, 8).toString('ascii') === 'ftyp') return 'm4a';
+  return 'bin';
+}
+
 /**
  * Build a prompt content block for an attached/quoted file. When possible we
  * inline the extracted text so weaker models (e.g. MiniMax through Anthropic
@@ -2100,7 +2125,42 @@ export function createDingTalkConnection(
           }
           const audioContent = (data as { content: AudioContent }).content;
           const recognition = audioContent?.recognition?.trim();
-          content = recognition || '[语音消息]';
+          const downloadCode = audioContent?.downloadCode;
+          let audioBlock = '[语音消息]';
+          if (downloadCode) {
+            const fileBuffer = await downloadDingTalkFileByDownloadCode(
+              downloadCode,
+              data.robotCode ?? '',
+            );
+            if (fileBuffer) {
+              const extension = detectDingTalkAudioExtension(fileBuffer);
+              const groupFolder = opts.resolveGroupFolder?.(jid);
+              if (groupFolder) {
+                try {
+                  const savedPath = await saveDownloadedFile(
+                    groupFolder,
+                    'dingtalk',
+                    `audio_${Date.now()}.${extension}`,
+                    fileBuffer,
+                  );
+                  audioBlock = `[语音: audio.${extension} → ${savedPath}]`;
+                } catch (err) {
+                  logger.warn(
+                    { err, msgId },
+                    'Failed to save DingTalk audio to disk',
+                  );
+                  audioBlock = '[语音消息（保存失败）]';
+                }
+              } else {
+                audioBlock = '[语音消息（未注册群组）]';
+              }
+            } else {
+              audioBlock = '[语音消息（下载失败）]';
+            }
+          }
+          content = recognition
+            ? `${recognition}\n\n${audioBlock}`
+            : audioBlock;
         } else if (data.msgtype === 'video' && 'content' in data) {
           // Official C2C: { duration, downloadCode, videoType }
           interface VideoContent {
