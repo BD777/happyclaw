@@ -56,6 +56,33 @@ export function resolveScheduledGroupDeliveryContract(
       };
 }
 
+export interface StreamingCardReplyAcknowledgementInput {
+  /** An ACK-lost/partial provider mutation can never advance the turn. */
+  streamingDeliveryUncertain: boolean;
+  /** True when the provider card owns the native IM presentation. */
+  streamingCardHandled: boolean;
+  /** Every separately delivered local attachment has an exact physical ACK. */
+  attachmentsDelivered: boolean;
+  /** A safe card rejection made a post-finalizer static send mandatory. */
+  postFinalizationStaticRequired: boolean;
+  /** The mandatory static fallback itself received a physical ACK. */
+  postFinalizationStaticDelivered: boolean;
+  /** Delivery result from the original DB/Web projection call. */
+  projectedTargetDelivered: boolean;
+}
+
+/** Resolve the physical IM ACK without mistaking a Web-only projection for it. */
+export function resolveStreamingCardReplyAcknowledgement(
+  input: StreamingCardReplyAcknowledgementInput,
+): boolean {
+  if (input.streamingDeliveryUncertain) return false;
+  if (input.streamingCardHandled) return input.attachmentsDelivered;
+  if (input.postFinalizationStaticRequired) {
+    return input.postFinalizationStaticDelivered && input.attachmentsDelivered;
+  }
+  return input.projectedTargetDelivered;
+}
+
 export interface ReplyResultInfo {
   /**
    * Non-null means this result is an interim checkpoint, not the final

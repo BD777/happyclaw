@@ -80,7 +80,7 @@ describe('streaming finalize must not send a second full copy', () => {
     expect(channel.send).toHaveBeenCalledTimes(1);
   });
 
-  test('Discord: pre-accept final failure delegates static fallback to the host', async () => {
+  test('Discord: visible placeholder plus pre-accept final edit is partial', async () => {
     const fallbackSend = vi.fn(async () => {});
     const message = {
       id: 'msg-placeholder',
@@ -103,7 +103,12 @@ describe('streaming finalize must not send a second full copy', () => {
     );
 
     expect(finalized.acknowledged).toBe(false);
-    expect(finalized.error).toMatchObject({ deliveryPhase: 'pre_accept' });
+    expect(finalized.error).toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      cause: { deliveryPhase: 'pre_accept' },
+    });
+    expect(channel.send).toHaveBeenCalledOnce();
+    expect(message.edit).toHaveBeenCalledOnce();
     expect(fallbackSend).not.toHaveBeenCalled();
   });
 
@@ -134,8 +139,11 @@ describe('streaming finalize must not send a second full copy', () => {
       'finalize failed',
     );
 
-    expect(first).toEqual({ acknowledged: false, error: uncertain });
-    expect(repeated).toEqual({ acknowledged: false, error: uncertain });
+    expect(first).toMatchObject({
+      acknowledged: false,
+      error: { code: 'CHANNEL_DELIVERY_PARTIAL', cause: uncertain },
+    });
+    expect(repeated).toEqual(first);
     expect(fallbackSend).not.toHaveBeenCalled();
   });
 
@@ -187,6 +195,55 @@ describe('streaming finalize must not send a second full copy', () => {
     expect(channel.send).toHaveBeenCalledTimes(2);
     expect(message.edit).toHaveBeenCalledOnce();
     expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('Discord: ACK-lost first final edit stops every continuation send', async () => {
+    vi.useFakeTimers();
+    const editAckLoss = Object.assign(
+      new Error('Discord final edit accepted but ACK was lost'),
+      { code: 'ETIMEDOUT' },
+    );
+    let editCalls = 0;
+    const message = {
+      id: 'msg-split-ack-loss',
+      edit: vi.fn(async () => {
+        editCalls += 1;
+        if (editCalls === 2) throw editAckLoss;
+        return message;
+      }),
+    };
+    const channel = { send: vi.fn(async () => message) };
+    const ctrl = new DiscordStreamingEditController(channel as any);
+    ctrl.append('PREVIEW');
+    await vi.advanceTimersByTimeAsync(600);
+
+    const result = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'x'.repeat(2500),
+      true,
+      'finalize failed',
+    );
+
+    expect(result).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+        cause: editAckLoss,
+      },
+    });
+    expect(channel.send).toHaveBeenCalledOnce();
+    expect(message.edit).toHaveBeenCalledTimes(2);
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'x'.repeat(2500),
+      true,
+      'finalize failed',
+    );
+    expect(repeated).toEqual(result);
+    expect(channel.send).toHaveBeenCalledOnce();
+    expect(message.edit).toHaveBeenCalledTimes(2);
   });
 
   test('QQ: preview flush + failed DONE chunk does not fallback-send', async () => {

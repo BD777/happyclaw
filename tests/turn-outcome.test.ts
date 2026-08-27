@@ -3,6 +3,58 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { resolveTurnOutcome } from '../src/turn-outcome.js';
+import { resolveStreamingCardReplyAcknowledgement } from '../src/reply-delivery.js';
+
+describe('resolveStreamingCardReplyAcknowledgement', () => {
+  const base = {
+    streamingDeliveryUncertain: false,
+    streamingCardHandled: false,
+    attachmentsDelivered: true,
+    postFinalizationStaticRequired: false,
+    postFinalizationStaticDelivered: false,
+    projectedTargetDelivered: true,
+  };
+
+  test('never treats a Web projection as the required failed static fallback', () => {
+    expect(
+      resolveStreamingCardReplyAcknowledgement({
+        ...base,
+        postFinalizationStaticRequired: true,
+        postFinalizationStaticDelivered: false,
+      }),
+    ).toBe(false);
+  });
+
+  test('requires both the post-finalizer text and every attachment ACK', () => {
+    expect(
+      resolveStreamingCardReplyAcknowledgement({
+        ...base,
+        postFinalizationStaticRequired: true,
+        postFinalizationStaticDelivered: true,
+      }),
+    ).toBe(true);
+    expect(
+      resolveStreamingCardReplyAcknowledgement({
+        ...base,
+        attachmentsDelivered: false,
+        postFinalizationStaticRequired: true,
+        postFinalizationStaticDelivered: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('uncertain card evidence dominates every apparent delivery ACK', () => {
+    expect(
+      resolveStreamingCardReplyAcknowledgement({
+        ...base,
+        streamingDeliveryUncertain: true,
+        streamingCardHandled: true,
+        postFinalizationStaticRequired: true,
+        postFinalizationStaticDelivered: true,
+      }),
+    ).toBe(false);
+  });
+});
 
 describe('resolveTurnOutcome', () => {
   test('retries an in-flight close with no reply or healthy completion', () => {
@@ -158,7 +210,13 @@ describe('resolveTurnOutcome', () => {
 
     expect(deliveryBranch).toContain('let replyDeliveryAcknowledged');
     expect(deliveryBranch).toContain(
-      'replyDeliveryAcknowledged = await sendImWithRetry',
+      'const routedFallbackDelivered = await sendImWithRetry',
+    );
+    expect(deliveryBranch).toContain(
+      'replyDeliveryAcknowledged =\n                    routedFallbackDelivered',
+    );
+    expect(deliveryBranch).toContain(
+      'postFinalizationStaticDelivered = await sendImWithRetry',
     );
     expect(deliveryBranch).toContain(
       'replyDeliveryAcknowledged &&\n                isGenuineReplyResult',
@@ -200,9 +258,54 @@ describe('resolveTurnOutcome', () => {
     );
     expect(cardAttachmentBranch).not.toContain('imManager.sendImage');
     expect(deliveryAckBranch).toContain(
-      'streamingCardDeliveryUncertain\n                ? false\n                : streamingCardHandledIM',
+      'resolveStreamingCardReplyAcknowledgement({',
     );
-    expect(deliveryAckBranch).toContain('? streamingCardAttachmentsDelivered');
+    expect(deliveryAckBranch).toContain(
+      'streamingDeliveryUncertain: streamingCardDeliveryUncertain',
+    );
+    expect(deliveryAckBranch).toContain(
+      'attachmentsDelivered: streamingCardAttachmentsDelivered',
+    );
+    expect(deliveryAckBranch).toContain('postFinalizationStaticRequired');
+  });
+
+  test('conversation card safe fallback never replays ACKed images and requires their ACK', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const agentStart = main.indexOf('async function processAgentConversation(');
+    const branchStart = main.indexOf(
+      '// Provider cards cannot embed local filesystem images.',
+      agentStart,
+    );
+    const branch = main.slice(
+      branchStart,
+      main.indexOf(
+        '// Optional mirror mode for linked IM channels',
+        branchStart,
+      ),
+    );
+    const acknowledgementBranch = main.slice(
+      main.indexOf('const agentReplyDeliveryAcknowledged =', branchStart),
+      main.indexOf('if (agentReplyDeliveryAcknowledged &&', branchStart),
+    );
+
+    expect(
+      branch.indexOf('const delivered = await sendTaskImageWithRetry'),
+    ).toBeLessThan(branch.indexOf('await finalizeChannelCardAfterDelivery('));
+    expect(
+      branch.indexOf('await finalizeChannelCardAfterDelivery('),
+    ).toBeLessThan(
+      branch.indexOf('const agentStaticTextDelivered = await sendImWithRetry'),
+    );
+    expect(branch).toContain(
+      'pendingAgentCardCompletion ? [] : localImagePaths',
+    );
+    expect(branch).toContain(
+      'agentStaticTextDelivered && agentCardAttachmentsDelivered',
+    );
+    expect(acknowledgementBranch).toContain('agentStaticImDelivered');
   });
 
   test('does not emit a second channel error after an uncertain durable file send', () => {
