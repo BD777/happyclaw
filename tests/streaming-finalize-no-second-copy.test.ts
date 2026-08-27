@@ -105,7 +105,9 @@ describe('streaming finalize must not send a second full copy', () => {
     expect(streamCalls[0].input_state).toBe(1);
     expect(fallbackSend).not.toHaveBeenCalled();
 
-    await ctrl.complete('Hello from the preview — final');
+    await expect(
+      ctrl.complete('Hello from the preview — final'),
+    ).rejects.toThrow('qq finalize DONE failed');
 
     expect(streamCalls.some((c) => c.input_state === 10)).toBe(true);
     expect(fallbackSend).not.toHaveBeenCalled();
