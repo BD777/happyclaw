@@ -341,7 +341,7 @@ describe('WeCom host wiring', () => {
       'await finalizeChannelCardAfterDelivery(',
     );
     const staticDelivery = branch.indexOf(
-      'agentStaticImDelivered = await sendImWithRetry(',
+      'const agentStaticTextDelivered = await sendImWithRetry(',
     );
 
     expect(agentStart).toBeGreaterThanOrEqual(0);

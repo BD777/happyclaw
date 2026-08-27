@@ -40,6 +40,7 @@ import {
   occupiesPrimaryReplyDeliverySlot,
   resolveScheduledGroupDeliveryContract,
   resolveScheduledProactiveArchiveCandidate,
+  resolveStreamingCardReplyAcknowledgement,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
   shouldFinalizeScheduledGroupPrimaryResult,
@@ -8930,6 +8931,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // its files is still missing.
               let pendingStreamingCardCompleted = false;
               let streamingCardDeliveryUncertain = false;
+              let cardFinalizationAllowsStaticFallback = false;
+              let postFinalizationStaticRequired = false;
+              let postFinalizationStaticDelivered = false;
               if (pendingStreamingCardCompletion) {
                 if (localImagePaths.length > 0 && outputReplySourceJid) {
                   for (
@@ -8983,10 +8987,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     : '附件投递未确认，系统将重试',
                 );
                 pendingStreamingCardCompleted = cardFinalization.acknowledged;
+                const acknowledgedProviderOutputs = Math.max(
+                  0,
+                  pendingStreamingCardCompletion.getAcknowledgedProviderOutputCount?.() ??
+                    0,
+                );
+                cardFinalizationAllowsStaticFallback =
+                  !pendingStreamingCardCompleted &&
+                  acknowledgedProviderOutputs === 0 &&
+                  (!cardFinalization.error ||
+                    classifyImSendFailure(cardFinalization.error) !==
+                      'uncertain');
                 if (pendingStreamingCardCompleted) {
                   heldUsagePatchTarget = pendingStreamingCardCompletion;
                   heldCardParts = [];
                 } else if (cardFinalization.error) {
+                  streamingCardDeliveryUncertain =
+                    classifyImSendFailure(cardFinalization.error) ===
+                    'uncertain';
                   const fenced = outputChannelScope.scope
                     ? await persistUncertainStreamingDelivery({
                         scope: outputChannelScope.scope,
@@ -9001,17 +9019,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                         error: cardFinalization.error,
                       })
                     : null;
-                  streamingCardDeliveryUncertain =
-                    fenced?.status === 'uncertain';
                   logger.warn(
                     {
                       cardError: cardFinalization.error,
                       chatJid,
                       streamingCardDeliveryUncertain,
+                      uncertaintyPersisted: fenced?.status === 'uncertain',
                     },
                     streamingCardDeliveryUncertain
                       ? 'Streaming card final ACK is uncertain; fenced for manual reconciliation'
-                      : 'Streaming card final ACK was rejected before acceptance; keeping the channel turn retryable',
+                      : 'Streaming card final ACK was rejected before acceptance; using exact static fallback',
                   );
                 } else {
                   logger.error(
@@ -9028,6 +9045,35 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 streamingCardHandledIM =
                   pendingStreamingCardCompleted ||
                   streamingCardDeliveryUncertain;
+                if (
+                  !streamingCardHandledIM &&
+                  cardFinalizationAllowsStaticFallback &&
+                  (scheduledGroupRuns.length === 0 ||
+                    scheduledGroupDeliveryContract.frameworkDeliversFinalText) &&
+                  directImReply &&
+                  !routeSwitchedAway &&
+                  !routeCleared
+                ) {
+                  postFinalizationStaticRequired = true;
+                  // Main persists its DB/Web projection before terminalizing
+                  // the provider card. If that first provider mutation is
+                  // authoritatively rejected, the original static-send window
+                  // has already passed; deliver the exact same Outbox text row
+                  // now. Card attachments were handled above and must not be
+                  // replayed with the text fallback.
+                  postFinalizationStaticDelivered = await sendImWithRetry(
+                    chatJid,
+                    text,
+                    [],
+                    outputChannelScope.scope
+                      ? {
+                          scopeKey: channelTurnScope(effectiveGroup.folder),
+                          scopeToken: outputChannelScope.scope.token,
+                          operationKey: `main:${lastProcessed.id}:${effectiveTurnId}:${durableOutputIdentity}`,
+                        }
+                      : undefined,
+                  );
+                }
                 if (pendingStreamingCardCompleted) {
                   channelStreamingSessionsByInput.delete(
                     outputChannelScope.inputId,
@@ -9047,11 +9093,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // card. Any separately emitted local image is part of the same
               // logical reply and must also be durably ACKed before the turn can
               // advance its cursor.
-              let replyDeliveryAcknowledged = streamingCardDeliveryUncertain
-                ? false
-                : streamingCardHandledIM
-                  ? streamingCardAttachmentsDelivered
-                  : replySendOutcome.targetDelivered;
+              let replyDeliveryAcknowledged =
+                resolveStreamingCardReplyAcknowledgement({
+                  streamingDeliveryUncertain: streamingCardDeliveryUncertain,
+                  streamingCardHandled: streamingCardHandledIM,
+                  attachmentsDelivered: streamingCardAttachmentsDelivered,
+                  postFinalizationStaticRequired,
+                  postFinalizationStaticDelivered,
+                  projectedTargetDelivered: replySendOutcome.targetDelivered,
+                });
               // A Web-only group-mode task must not replay Agent work after
               // its canonical projection failure has been persisted for
               // idempotent notification-worker repair.
@@ -9073,10 +9123,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // Streaming card already handles IM delivery for the first reply.
               if (outputReplySourceJid && outputReplySourceJid !== chatJid) {
                 if (!streamingCardHandledIM && !outputAlreadySent) {
-                  replyDeliveryAcknowledged = await sendImWithRetry(
+                  const routedFallbackDelivered = await sendImWithRetry(
                     outputReplySourceJid,
                     text,
-                    localImagePaths,
+                    pendingStreamingCardCompletion ? [] : localImagePaths,
                     outputChannelScope.scope
                       ? {
                           scopeKey: channelTurnScope(effectiveGroup.folder),
@@ -9085,6 +9135,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                         }
                       : undefined,
                   );
+                  replyDeliveryAcknowledged =
+                    routedFallbackDelivered &&
+                    streamingCardAttachmentsDelivered;
                 }
               }
 
@@ -17065,6 +17118,8 @@ async function processAgentConversation(
             heldAgentUsagePatchPending = true;
             heldAgentParts = [];
           } else if (cardFinalization.error) {
+            agentStreamingCardDeliveryUncertain =
+              classifyImSendFailure(cardFinalization.error) === 'uncertain';
             const fenced = outputAgentScope.scope
               ? await persistUncertainStreamingDelivery({
                   scope: outputAgentScope.scope,
@@ -17079,14 +17134,13 @@ async function processAgentConversation(
                   error: cardFinalization.error,
                 })
               : null;
-            agentStreamingCardDeliveryUncertain =
-              fenced?.status === 'uncertain';
             logger.warn(
               {
                 err: cardFinalization.error,
                 chatJid,
                 agentId,
                 agentStreamingCardDeliveryUncertain,
+                uncertaintyPersisted: fenced?.status === 'uncertain',
               },
               agentStreamingCardDeliveryUncertain
                 ? 'Agent streaming card final ACK is uncertain; fenced for manual reconciliation'
@@ -17121,10 +17175,12 @@ async function processAgentConversation(
         ) {
           // Only send the FIRST substantive reply to IM. Subsequent results
           // (SDK Task completions) are stored in DB but not spammed to IM.
-          agentStaticImDelivered = await sendImWithRetry(
+          // A pending provider card already delivered every local attachment
+          // above. Its safe text fallback must not replay that ACKed prefix.
+          const agentStaticTextDelivered = await sendImWithRetry(
             outputAgentReplySourceJid,
             text,
-            localImagePaths,
+            pendingAgentCardCompletion ? [] : localImagePaths,
             outputAgentScope.scope
               ? {
                   scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
@@ -17133,6 +17189,8 @@ async function processAgentConversation(
                 }
               : undefined,
           );
+          agentStaticImDelivered =
+            agentStaticTextDelivered && agentCardAttachmentsDelivered;
           if (agentStaticImDelivered) {
             logger.info(
               {
@@ -17151,6 +17209,8 @@ async function processAgentConversation(
                 agentId,
                 replySourceImJid,
                 sourceKind: output.sourceKind,
+                agentStaticTextDelivered,
+                agentCardAttachmentsDelivered,
               },
               'Agent conversation: IM send failed after all retries, message lost',
             );
