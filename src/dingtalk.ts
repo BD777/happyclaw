@@ -96,6 +96,102 @@ export function dingtalkHttpsRequest(
   });
 }
 
+export async function downloadDingTalkHttpBuffer(
+  url: string,
+  maxBytes = MAX_FILE_SIZE,
+  timeoutMs = DINGTALK_HTTPS_REQUEST_TIMEOUT_MS,
+): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const requestUrl = (current: URL, redirectCount: number): void => {
+      if (!['http:', 'https:'].includes(current.protocol)) {
+        reject(
+          new Error(`Unsupported DingTalk media protocol: ${current.protocol}`),
+        );
+        return;
+      }
+      if (redirectCount > 5) {
+        reject(new Error('Too many DingTalk media redirects'));
+        return;
+      }
+
+      const transport = current.protocol === 'https:' ? https : http;
+      const req = transport.request(current, (res) => {
+        const status = res.statusCode ?? 0;
+        if (status >= 300 && status < 400) {
+          const location = res.headers.location;
+          res.resume();
+          if (!location) {
+            reject(
+              new Error(`DingTalk media redirect ${status} has no Location`),
+            );
+            return;
+          }
+          let next: URL;
+          try {
+            next = new URL(location, current);
+          } catch (error) {
+            reject(
+              new Error('Invalid DingTalk media redirect URL', {
+                cause: error,
+              }),
+            );
+            return;
+          }
+          requestUrl(next, redirectCount + 1);
+          return;
+        }
+        if (status < 200 || status >= 300) {
+          res.resume();
+          reject(new Error(`DingTalk media GET HTTP failed (${status})`));
+          return;
+        }
+
+        const contentLength = Number(res.headers['content-length']);
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+          res.resume();
+          reject(new Error('DingTalk media exceeds the download byte limit'));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let total = 0;
+        let exceeded = false;
+        res.on('data', (chunk: Buffer) => {
+          if (exceeded) return;
+          total += chunk.length;
+          if (total > maxBytes) {
+            exceeded = true;
+            res.destroy(
+              new Error('DingTalk media exceeds the download byte limit'),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          if (!exceeded) resolve(Buffer.concat(chunks, total));
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(
+          new Error(`DingTalk media request timed out after ${timeoutMs}ms`),
+        );
+      });
+      req.end();
+    };
+
+    let initial: URL;
+    try {
+      initial = new URL(url);
+    } catch (error) {
+      reject(new Error('Invalid DingTalk media URL', { cause: error }));
+      return;
+    }
+    requestUrl(initial, 0);
+  });
+}
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface DingTalkConnectionConfig {
@@ -248,48 +344,138 @@ export function parseDingTalkGroupMessageResponse(
   return data;
 }
 
-export interface DingTalkC2cSendSuccess {
-  processQueryKey?: string;
+interface DingTalkSendEnvelope {
   errcode?: number;
   errmsg?: string;
+  code?: string | number;
+  message?: string;
 }
 
-/** Validate C2C batchSend / sessionWebhook transport and JSON envelope. */
-export function parseDingTalkC2cSendResponse(
+export interface DingTalkBatchSendSuccess extends DingTalkSendEnvelope {
+  processQueryKey: string;
+  invalidStaffIdList?: string[];
+  flowControlledStaffIdList?: string[];
+}
+
+export type DingTalkBatchFailureClassification =
+  | 'permanent'
+  | 'rate_limited'
+  | 'mixed';
+
+export class DingTalkBatchRecipientError extends Error {
+  readonly code = 'DINGTALK_BATCH_RECIPIENT_FAILURE';
+
+  constructor(
+    readonly classification: DingTalkBatchFailureClassification,
+    readonly invalidStaffIds: string[],
+    readonly flowControlledStaffIds: string[],
+  ) {
+    super(
+      `DingTalk batchSend recipient failure (${classification}): ` +
+        `${invalidStaffIds.length} invalid, ${flowControlledStaffIds.length} flow-controlled`,
+    );
+    this.name = 'DingTalkBatchRecipientError';
+  }
+}
+
+function parseDingTalkJsonEnvelope(
   statusCode: number | undefined,
   body: string,
-): DingTalkC2cSendSuccess {
+  endpoint: string,
+): DingTalkSendEnvelope {
   if (!statusCode || statusCode < 200 || statusCode >= 300) {
     throw new Error(
-      `DingTalk C2C send HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
+      `DingTalk ${endpoint} HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
     );
   }
   if (!body.trim()) {
-    throw new Error('DingTalk C2C send returned an empty response');
+    throw new Error(`DingTalk ${endpoint} returned an empty response`);
   }
 
-  let data: DingTalkC2cSendSuccess;
+  let data: DingTalkSendEnvelope;
   try {
-    data = JSON.parse(body) as DingTalkC2cSendSuccess;
+    data = JSON.parse(body) as DingTalkSendEnvelope;
   } catch {
-    throw new Error('DingTalk C2C send returned invalid JSON');
+    throw new Error(`DingTalk ${endpoint} returned invalid JSON`);
   }
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new Error('DingTalk C2C send returned an invalid envelope');
+    throw new Error(`DingTalk ${endpoint} returned an invalid envelope`);
   }
   if (data.errcode !== undefined && Number(data.errcode) !== 0) {
     throw new Error(
-      `DingTalk C2C send API error: ${data.errcode} ${data.errmsg ?? ''}`,
+      `DingTalk ${endpoint} API error: ${data.errcode} ${data.errmsg ?? ''}`,
     );
   }
-
-  const hasSuccessMarker =
-    (typeof data.processQueryKey === 'string' &&
-      data.processQueryKey.trim().length > 0) ||
-    data.errcode === 0;
-  if (!hasSuccessMarker) {
+  if (
+    data.code !== undefined &&
+    !['0', 'ok', 'success'].includes(String(data.code).toLowerCase())
+  ) {
     throw new Error(
-      'DingTalk C2C send returned an unrecognized success envelope',
+      `DingTalk ${endpoint} API error: ${String(data.code)} ${data.message ?? data.errmsg ?? ''}`,
+    );
+  }
+  return data;
+}
+
+/** Session webhooks acknowledge success only with the documented errcode=0. */
+export function parseDingTalkSessionWebhookResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkSendEnvelope {
+  const data = parseDingTalkJsonEnvelope(statusCode, body, 'sessionWebhook');
+  if (data.errcode !== 0) {
+    throw new Error(
+      'DingTalk sessionWebhook returned an unrecognized success envelope',
+    );
+  }
+  return data;
+}
+
+/** Persistent C2C sends may partially reject individual recipients. */
+export function parseDingTalkBatchSendResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkBatchSendSuccess {
+  const data = parseDingTalkJsonEnvelope(
+    statusCode,
+    body,
+    'batchSend',
+  ) as DingTalkBatchSendSuccess;
+  const invalid = data.invalidStaffIdList ?? [];
+  const flowControlled = data.flowControlledStaffIdList ?? [];
+  if (
+    !Array.isArray(invalid) ||
+    !invalid.every((id) => typeof id === 'string')
+  ) {
+    throw new Error('DingTalk batchSend returned invalidStaffIdList metadata');
+  }
+  if (
+    !Array.isArray(flowControlled) ||
+    !flowControlled.every((id) => typeof id === 'string')
+  ) {
+    throw new Error(
+      'DingTalk batchSend returned flowControlledStaffIdList metadata',
+    );
+  }
+  if (invalid.length > 0 || flowControlled.length > 0) {
+    const classification =
+      invalid.length > 0 && flowControlled.length > 0
+        ? 'mixed'
+        : invalid.length > 0
+          ? 'permanent'
+          : 'rate_limited';
+    throw new DingTalkBatchRecipientError(
+      classification,
+      invalid,
+      flowControlled,
+    );
+  }
+  if (
+    typeof data.processQueryKey !== 'string' ||
+    data.processQueryKey.trim().length === 0
+  ) {
+    throw new Error(
+      'DingTalk batchSend returned an unrecognized success envelope',
     );
   }
   return data;
@@ -324,7 +510,7 @@ export async function batchSendToUser(
     body,
   );
   const respBody = respBuf.toString('utf8');
-  parseDingTalkC2cSendResponse(statusCode, respBody);
+  parseDingTalkBatchSendResponse(statusCode, respBody);
 }
 
 /**
@@ -376,7 +562,7 @@ export async function sendViaGroupMessagesAPI(
 }
 
 const DINGTALK_IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp']);
-const DINGTALK_VOICE_EXTENSIONS = new Set(['amr', 'mp3', 'wav']);
+const DINGTALK_VOICE_EXTENSIONS = new Set(['amr', 'ogg']);
 const DINGTALK_VIDEO_EXTENSIONS = new Set(['mp4']);
 const DINGTALK_VOICE_MAX_BYTES = 2 * 1024 * 1024;
 
@@ -456,8 +642,7 @@ export async function getDingTalkMediaDurationSeconds(
   if (normalizedExt === 'amr') return parseAmrDurationSeconds(buffer);
 
   const mimeTypeByExtension: Record<string, string> = {
-    mp3: 'audio/mpeg',
-    wav: 'audio/wav',
+    ogg: 'audio/ogg',
     mp4: 'video/mp4',
   };
   const mimeType = mimeTypeByExtension[normalizedExt];
@@ -1072,13 +1257,12 @@ export function createDingTalkConnection(
       JSON.stringify(body),
     );
     const respBody = respBuf.toString('utf-8');
-    const data = parseDingTalkC2cSendResponse(statusCode, respBody);
+    const data = parseDingTalkSessionWebhookResponse(statusCode, respBody);
     logger.info(
       {
         statusCode,
         errcode: data.errcode,
         errmsg: data.errmsg,
-        processQueryKey: data.processQueryKey,
       },
       'DingTalk sendViaSessionWebhook response',
     );
@@ -1131,48 +1315,7 @@ export function createDingTalkConnection(
     url: string,
   ): Promise<{ base64: string; mimeType: string } | null> {
     try {
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        const doRequest = (reqUrl: string, redirectCount: number = 0) => {
-          if (redirectCount > 5) {
-            reject(new Error('Too many redirects'));
-            return;
-          }
-          const parsedUrl = new URL(reqUrl);
-          const protocol = parsedUrl.protocol === 'https:' ? https : http;
-          const req = protocol.get(reqUrl, (res) => {
-            if (
-              res.statusCode &&
-              res.statusCode >= 300 &&
-              res.statusCode < 400 &&
-              res.headers.location
-            ) {
-              doRequest(res.headers.location, redirectCount + 1);
-              return;
-            }
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(new Error('Image exceeds MAX_FILE_SIZE'));
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          });
-          req.setTimeout(DINGTALK_HTTPS_REQUEST_TIMEOUT_MS, () => {
-            req.destroy(
-              new Error(
-                `DingTalk HTTPS request timed out after ${DINGTALK_HTTPS_REQUEST_TIMEOUT_MS}ms`,
-              ),
-            );
-          });
-          req.on('error', reject);
-        };
-        doRequest(url);
-      });
+      const buffer = await downloadDingTalkHttpBuffer(url);
 
       if (buffer.length === 0) return null;
       const mimeType = detectImageMimeType(buffer);
@@ -1256,54 +1399,8 @@ export function createDingTalkConnection(
         token,
       );
 
-      // Step 2: Download the actual image from the temporary URL
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        const isHttps = downloadUrl.startsWith('https://');
-        const urlObj = new URL(downloadUrl);
-        const protocol = isHttps ? https : http;
-        const req = protocol.request(
-          {
-            hostname: urlObj.hostname,
-            path: urlObj.pathname + urlObj.search,
-            method: 'GET',
-          },
-          (res) => {
-            if (
-              !res.statusCode ||
-              res.statusCode < 200 ||
-              res.statusCode >= 300
-            ) {
-              reject(
-                new Error(`DingTalk image GET HTTP failed (${res.statusCode})`),
-              );
-              return;
-            }
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(
-                  new Error('Downloaded image exceeds MAX_FILE_SIZE'),
-                );
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.setTimeout(DINGTALK_HTTPS_REQUEST_TIMEOUT_MS, () => {
-          req.destroy(
-            new Error(
-              `DingTalk HTTPS request timed out after ${DINGTALK_HTTPS_REQUEST_TIMEOUT_MS}ms`,
-            ),
-          );
-        });
-        req.end();
-      });
+      // Step 2: Download the actual image from the temporary URL.
+      const buffer = await downloadDingTalkHttpBuffer(downloadUrl);
 
       if (buffer.length === 0) return null;
 
@@ -1354,52 +1451,8 @@ export function createDingTalkConnection(
         token,
       );
 
-      // Step 2: Download raw file bytes (no MIME check — any file type allowed)
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        const isHttps = downloadUrl.startsWith('https://');
-        const urlObj = new URL(downloadUrl);
-        const protocol = isHttps ? https : http;
-        const req = protocol.request(
-          {
-            hostname: urlObj.hostname,
-            path: urlObj.pathname + urlObj.search,
-            method: 'GET',
-          },
-          (res) => {
-            if (
-              !res.statusCode ||
-              res.statusCode < 200 ||
-              res.statusCode >= 300
-            ) {
-              reject(
-                new Error(`DingTalk file GET HTTP failed (${res.statusCode})`),
-              );
-              return;
-            }
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(new Error('Downloaded file exceeds MAX_FILE_SIZE'));
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.setTimeout(DINGTALK_HTTPS_REQUEST_TIMEOUT_MS, () => {
-          req.destroy(
-            new Error(
-              `DingTalk HTTPS request timed out after ${DINGTALK_HTTPS_REQUEST_TIMEOUT_MS}ms`,
-            ),
-          );
-        });
-        req.end();
-      });
+      // Step 2: Download raw file bytes (no MIME check — any file type allowed).
+      const buffer = await downloadDingTalkHttpBuffer(downloadUrl);
 
       if (buffer.length === 0) return null;
       return buffer;

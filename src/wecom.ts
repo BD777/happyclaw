@@ -8,10 +8,17 @@
 //   later message in the same chat cannot steal its req_id;
 // - outbound promises resolve only after the SDK receives a successful ACK.
 import crypto from 'node:crypto';
-import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
+import http from 'node:http';
+import https from 'node:https';
+import {
+  WSClient,
+  decryptFile as decryptWeComFile,
+  generateReqId,
+} from '@wecom/aibot-node-sdk';
 import type { BaseMessage, WsFrame } from '@wecom/aibot-node-sdk';
 import {
   getMessage,
+  getMessagePayload,
   sequenceInboundTimestampAfterChatTail,
   storeMessageDirect,
 } from './db.js';
@@ -42,6 +49,148 @@ const FRAME_CACHE_MAX = 1000;
 const REJECT_COOLDOWN_MS = 60_000;
 const PAGE_HEADER_RESERVE_BYTES = 64;
 const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
+const WECOM_MEDIA_MAX_PLAINTEXT_BYTES = Math.min(
+  MAX_FILE_SIZE,
+  20 * 1024 * 1024,
+);
+const WECOM_MEDIA_DOWNLOAD_TIMEOUT_MS = 15_000;
+const WECOM_MIXED_MAX_IMAGES = 8;
+const WECOM_MIXED_MAX_PLAINTEXT_BYTES = WECOM_MEDIA_MAX_PLAINTEXT_BYTES;
+const WECOM_MIXED_MAX_BASE64_BYTES = 8 * 1024 * 1024;
+const WECOM_PROGRESS_TTL_MS = 10 * 60_000;
+const WECOM_PROGRESS_MAX_STAGED_BYTES = 32 * 1024 * 1024;
+
+export interface WeComDownloadedMedia {
+  buffer: Buffer;
+  filename?: string;
+}
+
+function contentDispositionFilename(
+  value: string | undefined,
+): string | undefined {
+  if (!value) return undefined;
+  const utf8 = value.match(/filename\*=UTF-8''([^;\s]+)/i)?.[1];
+  const plain = value.match(/filename="?([^";\s]+)"?/i)?.[1];
+  const encoded = utf8 ?? plain;
+  if (!encoded) return undefined;
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return encoded;
+  }
+}
+
+export async function downloadAndDecryptWeComMedia(
+  url: string,
+  aesKey: string | undefined,
+  maxPlaintextBytes = WECOM_MEDIA_MAX_PLAINTEXT_BYTES,
+  timeoutMs = WECOM_MEDIA_DOWNLOAD_TIMEOUT_MS,
+): Promise<WeComDownloadedMedia> {
+  const encryptedLimit = maxPlaintextBytes + (aesKey ? 32 : 0);
+  const downloaded = await new Promise<WeComDownloadedMedia>(
+    (resolve, reject) => {
+      const requestUrl = (current: URL, redirects: number): void => {
+        if (!['http:', 'https:'].includes(current.protocol)) {
+          reject(
+            new Error(`Unsupported WeCom media protocol: ${current.protocol}`),
+          );
+          return;
+        }
+        if (redirects > 5) {
+          reject(new Error('Too many WeCom media redirects'));
+          return;
+        }
+        const transport = current.protocol === 'https:' ? https : http;
+        const req = transport.request(current, (res) => {
+          const status = res.statusCode ?? 0;
+          if (status >= 300 && status < 400) {
+            const location = res.headers.location;
+            res.resume();
+            if (!location) {
+              reject(
+                new Error(`WeCom media redirect ${status} has no Location`),
+              );
+              return;
+            }
+            let next: URL;
+            try {
+              next = new URL(location, current);
+            } catch (error) {
+              reject(
+                new Error('Invalid WeCom media redirect URL', { cause: error }),
+              );
+              return;
+            }
+            requestUrl(next, redirects + 1);
+            return;
+          }
+          if (status < 200 || status >= 300) {
+            res.resume();
+            reject(new Error(`WeCom media GET HTTP failed (${status})`));
+            return;
+          }
+          const declared = Number(res.headers['content-length']);
+          if (Number.isFinite(declared) && declared > encryptedLimit) {
+            res.resume();
+            reject(new Error('WeCom encrypted media exceeds the byte limit'));
+            return;
+          }
+          const chunks: Buffer[] = [];
+          let total = 0;
+          let exceeded = false;
+          res.on('data', (chunk: Buffer) => {
+            if (exceeded) return;
+            total += chunk.length;
+            if (total > encryptedLimit) {
+              exceeded = true;
+              res.destroy(
+                new Error('WeCom encrypted media exceeds the byte limit'),
+              );
+              return;
+            }
+            chunks.push(chunk);
+          });
+          res.on('end', () => {
+            if (exceeded) return;
+            resolve({
+              buffer: Buffer.concat(chunks, total),
+              filename: contentDispositionFilename(
+                typeof res.headers['content-disposition'] === 'string'
+                  ? res.headers['content-disposition']
+                  : undefined,
+              ),
+            });
+          });
+          res.on('error', reject);
+        });
+        req.on('error', reject);
+        req.setTimeout(timeoutMs, () => {
+          req.destroy(
+            new Error(`WeCom media request timed out after ${timeoutMs}ms`),
+          );
+        });
+        req.end();
+      };
+
+      let initial: URL;
+      try {
+        initial = new URL(url);
+      } catch (error) {
+        reject(new Error('Invalid WeCom media URL', { cause: error }));
+        return;
+      }
+      requestUrl(initial, 0);
+    },
+  );
+
+  const buffer = aesKey
+    ? decryptWeComFile(downloaded.buffer, aesKey)
+    : downloaded.buffer;
+  if (buffer.length > maxPlaintextBytes) {
+    throw new Error('WeCom decrypted media exceeds the plaintext byte limit');
+  }
+  return { buffer, filename: downloaded.filename };
+}
 
 export type WeComConnectionState =
   | { status: 'connecting' }
@@ -57,6 +206,12 @@ export interface WeComConnectionConfig {
   channelAccountId?: string;
   /** Test-only override; production uses a bounded 15-second authentication wait. */
   authTimeoutMs?: number;
+  /** Test-only bounded media downloader override. */
+  mediaDownloader?: (
+    url: string,
+    aesKey: string | undefined,
+    maxPlaintextBytes?: number,
+  ) => Promise<WeComDownloadedMedia>;
 }
 
 export interface WeComConnectOpts {
@@ -120,6 +275,11 @@ interface CachedInboundFrame {
 type WeComGroupMentionState = 'provider_mentioned' | 'not_group';
 
 interface WeComInboundProgress {
+  expiresAt: number;
+  stagedBytes: number;
+  sourceJid: string;
+  targetJid: string;
+  agentId: string | null;
   timestamp?: string;
   content?: string;
   attachmentsJson?: string;
@@ -213,6 +373,7 @@ export function createWeComConnection(
   let opts: WeComConnectOpts | null = null;
   let intentionalDisconnect = false;
   const logCtx = { accountId: config.channelAccountId, botId: config.botId };
+  const downloadMedia = config.mediaDownloader ?? downloadAndDecryptWeComMedia;
   const dedup = createDedupCache({
     ttlMs: MESSAGE_DEDUP_TTL_MS,
     max: MESSAGE_DEDUP_MAX,
@@ -224,6 +385,7 @@ export function createWeComConnection(
   // Agent notification. The durable stable message id covers reconnect/restart
   // replays after persistence has already committed.
   const inboundProgress = new Map<string, WeComInboundProgress>();
+  let inboundProgressBytes = 0;
   // Once a command handler resolves, retain only its reply across a provider
   // retry. This lets a failed transport ACK retry sendReply without executing
   // a potentially mutating command twice.
@@ -231,6 +393,64 @@ export function createWeComConnection(
   // Exact durable input id -> original callback frame. Map insertion order is
   // the LRU order; a session removes its entry and retains the frozen frame.
   const inboundFrames = new Map<string, CachedInboundFrame>();
+
+  function clearProgressPayload(progress: WeComInboundProgress): void {
+    inboundProgressBytes = Math.max(
+      0,
+      inboundProgressBytes - progress.stagedBytes,
+    );
+    progress.stagedBytes = 0;
+    progress.content = undefined;
+    progress.attachmentsJson = undefined;
+  }
+
+  function deleteProgress(key: string): void {
+    const progress = inboundProgress.get(key);
+    if (progress) clearProgressPayload(progress);
+    inboundProgress.delete(key);
+  }
+
+  function pruneProgress(now = Date.now(), preserveKey?: string): void {
+    for (const [key, progress] of inboundProgress) {
+      if (key !== preserveKey && progress.expiresAt <= now) deleteProgress(key);
+    }
+    while (inboundProgress.size >= MESSAGE_DEDUP_MAX) {
+      const oldest = [...inboundProgress.keys()].find(
+        (key) => key !== preserveKey,
+      );
+      if (!oldest) break;
+      deleteProgress(oldest);
+    }
+  }
+
+  function stageProgressPayload(
+    key: string,
+    progress: WeComInboundProgress,
+    content: string,
+    attachmentsJson: string | undefined,
+  ): void {
+    clearProgressPayload(progress);
+    const stagedBytes =
+      Buffer.byteLength(content, 'utf8') +
+      Buffer.byteLength(attachmentsJson ?? '', 'utf8');
+    for (const candidate of [...inboundProgress.keys()]) {
+      if (
+        inboundProgressBytes + stagedBytes <=
+        WECOM_PROGRESS_MAX_STAGED_BYTES
+      ) {
+        break;
+      }
+      if (candidate !== key) deleteProgress(candidate);
+    }
+    if (stagedBytes > WECOM_PROGRESS_MAX_STAGED_BYTES) {
+      throw new Error('WeCom staged inbound payload exceeds memory budget');
+    }
+    progress.content = content;
+    progress.attachmentsJson = attachmentsJson;
+    progress.stagedBytes = stagedBytes;
+    progress.expiresAt = Date.now() + WECOM_PROGRESS_TTL_MS;
+    inboundProgressBytes += stagedBytes;
+  }
 
   function emitState(state: WeComConnectionState): void {
     try {
@@ -363,6 +583,8 @@ export function createWeComConnection(
   interface NormalizedWeComInbound {
     content: string;
     attachments: WeComImageAttachment[];
+    plaintextBytes?: number;
+    base64Bytes?: number;
   }
 
   function workspaceFolder(sourceJid: string, targetJid: string) {
@@ -377,20 +599,28 @@ export function createWeComConnection(
     sourceJid: string,
     targetJid: string,
     fallbackName: string,
+    limits: { plaintextBytes?: number; base64Bytes?: number } = {},
   ): Promise<NormalizedWeComInbound> {
-    const client = ws;
-    if (!client || !image?.url) {
+    if (!image?.url) {
       logger.warn({ ...logCtx, sourceJid }, 'WeCom image missing download URL');
       return { content: '[图片]', attachments: [] };
     }
     try {
-      const downloaded = await client.downloadFile(image.url, image.aeskey);
+      const plaintextLimit = Math.min(
+        WECOM_MEDIA_MAX_PLAINTEXT_BYTES,
+        limits.plaintextBytes ?? WECOM_MEDIA_MAX_PLAINTEXT_BYTES,
+      );
+      const downloaded = await downloadMedia(
+        image.url,
+        image.aeskey,
+        plaintextLimit,
+      );
       const buffer = downloaded.buffer;
       if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
         logger.warn({ ...logCtx, sourceJid }, 'WeCom image download was empty');
         return { content: '[图片]', attachments: [] };
       }
-      if (buffer.length > MAX_FILE_SIZE) {
+      if (buffer.length > plaintextLimit) {
         logger.warn(
           { ...logCtx, sourceJid, size: buffer.length },
           'WeCom image exceeds inbound file limit',
@@ -399,10 +629,26 @@ export function createWeComConnection(
       }
 
       const mimeType = detectImageMimeTypeStrict(buffer);
-      const attachments: WeComImageAttachment[] =
-        mimeType && buffer.length <= IMAGE_MAX_BASE64_SIZE
-          ? [{ type: 'image', data: buffer.toString('base64'), mimeType }]
-          : [];
+      const base64Limit = limits.base64Bytes ?? Number.POSITIVE_INFINITY;
+      const encodedBytes = Math.ceil(buffer.length / 3) * 4;
+      const base64 =
+        mimeType &&
+        buffer.length <= IMAGE_MAX_BASE64_SIZE &&
+        encodedBytes <= base64Limit
+          ? buffer.toString('base64')
+          : undefined;
+      const attachments: WeComImageAttachment[] = [];
+      if (
+        base64 &&
+        mimeType &&
+        Buffer.byteLength(base64, 'ascii') <= base64Limit
+      ) {
+        attachments.push({ type: 'image', data: base64, mimeType });
+      }
+      const usage = {
+        plaintextBytes: buffer.length,
+        base64Bytes: attachments.length > 0 ? base64!.length : 0,
+      };
       const fileName = sanitizeImFilename(downloaded.filename || fallbackName);
       const folder = workspaceFolder(sourceJid, targetJid);
       if (!folder) {
@@ -410,7 +656,7 @@ export function createWeComConnection(
           { ...logCtx, sourceJid, targetJid },
           'WeCom image has no workspace folder; retaining inline attachment only',
         );
-        return { content: '[图片]', attachments };
+        return { content: '[图片]', attachments, ...usage };
       }
       try {
         const savedPath = await saveDownloadedFile(
@@ -419,13 +665,13 @@ export function createWeComConnection(
           fileName,
           buffer,
         );
-        return { content: `[图片: ${savedPath}]`, attachments };
+        return { content: `[图片: ${savedPath}]`, attachments, ...usage };
       } catch (error) {
         logger.warn(
           { ...logCtx, sourceJid, targetJid, error },
           'Failed to save WeCom image to workspace',
         );
-        return { content: '[图片（保存失败）]', attachments };
+        return { content: '[图片（保存失败）]', attachments, ...usage };
       }
     } catch (error) {
       logger.warn(
@@ -443,8 +689,7 @@ export function createWeComConnection(
     kind: 'file' | 'video',
   ): Promise<NormalizedWeComInbound> {
     const label = kind === 'video' ? '视频' : '文件';
-    const client = ws;
-    if (!client || !media?.url) {
+    if (!media?.url) {
       logger.warn(
         { ...logCtx, sourceJid, kind },
         `WeCom ${kind} missing download URL`,
@@ -452,7 +697,11 @@ export function createWeComConnection(
       return { content: `[${label}]`, attachments: [] };
     }
     try {
-      const downloaded = await client.downloadFile(media.url, media.aeskey);
+      const downloaded = await downloadMedia(
+        media.url,
+        media.aeskey,
+        WECOM_MEDIA_MAX_PLAINTEXT_BYTES,
+      );
       const buffer = downloaded.buffer;
       if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
         logger.warn(
@@ -550,18 +799,41 @@ export function createWeComConnection(
       const parts: string[] = [];
       const attachments: WeComImageAttachment[] = [];
       let imageIndex = 0;
+      let plaintextBytes = 0;
+      let base64Bytes = 0;
+      let limitMarkerAdded = false;
       for (const item of items) {
         if (item?.msgtype === 'text') {
           const text = item.text?.content?.trim();
           if (text) parts.push(text);
         } else if (item?.msgtype === 'image') {
+          if (
+            imageIndex >= WECOM_MIXED_MAX_IMAGES ||
+            plaintextBytes >= WECOM_MIXED_MAX_PLAINTEXT_BYTES
+          ) {
+            if (!limitMarkerAdded) {
+              parts.push('[其余图片因数量或总大小限制已跳过]');
+              limitMarkerAdded = true;
+            }
+            logger.warn(
+              { ...logCtx, sourceJid, imageIndex, plaintextBytes },
+              'WeCom mixed image limits reached',
+            );
+            continue;
+          }
           imageIndex += 1;
           const normalized = await downloadInboundImage(
             item.image,
             sourceJid,
             targetJid,
             `mixed_image_${Date.now()}_${imageIndex}.jpg`,
+            {
+              plaintextBytes: WECOM_MIXED_MAX_PLAINTEXT_BYTES - plaintextBytes,
+              base64Bytes: WECOM_MIXED_MAX_BASE64_BYTES - base64Bytes,
+            },
           );
+          plaintextBytes += normalized.plaintextBytes ?? 0;
+          base64Bytes += normalized.base64Bytes ?? 0;
           if (normalized.content) parts.push(normalized.content);
           attachments.push(...normalized.attachments);
         }
@@ -569,6 +841,8 @@ export function createWeComConnection(
       return {
         content: parts.join('\n') || '[图文消息]',
         attachments,
+        plaintextBytes,
+        base64Bytes,
       };
     }
     return { content: '', attachments: [] };
@@ -655,7 +929,8 @@ export function createWeComConnection(
         );
         return;
       }
-      const { targetJid, routing } = resolvedRoute;
+      let targetJid = resolvedRoute.targetJid;
+      let routeAgentId = resolvedRoute.routing?.agentId ?? null;
 
       const slashMatch = admissionText.match(/^\/(\S+)(?:\s+(.*))?$/u);
       const commandName = slashMatch?.[1]?.toLowerCase();
@@ -736,14 +1011,42 @@ export function createWeComConnection(
 
       // All registration and business side effects are after admission,
       // routing, command handling, and group policy filters.
+      pruneProgress();
       let progress = inboundProgress.get(dedupKey);
-      if (!progress) {
-        while (inboundProgress.size >= MESSAGE_DEDUP_MAX) {
-          const oldest = inboundProgress.keys().next().value;
-          if (oldest === undefined) break;
-          inboundProgress.delete(oldest);
+      if (progress) {
+        if (
+          progress.sourceJid !== jid ||
+          progress.targetJid !== targetJid ||
+          progress.agentId !== routeAgentId
+        ) {
+          logger.warn(
+            {
+              ...logCtx,
+              dedupKey,
+              stagedSourceJid: progress.sourceJid,
+              stagedTargetJid: progress.targetJid,
+              stagedAgentId: progress.agentId,
+              currentSourceJid: jid,
+              currentTargetJid: targetJid,
+              currentAgentId: routeAgentId,
+            },
+            'WeCom retry route changed; reusing staged route snapshot',
+          );
         }
-        progress = {};
+        jid = progress.sourceJid;
+        targetJid = progress.targetJid;
+        routeAgentId = progress.agentId;
+        progress.expiresAt = Date.now() + WECOM_PROGRESS_TTL_MS;
+      }
+      if (!progress) {
+        pruneProgress();
+        progress = {
+          expiresAt: Date.now() + WECOM_PROGRESS_TTL_MS,
+          stagedBytes: 0,
+          sourceJid: jid,
+          targetJid,
+          agentId: routeAgentId,
+        };
         inboundProgress.set(dedupKey, progress);
       }
       const id = stableWeComInboundId({
@@ -760,22 +1063,35 @@ export function createWeComConnection(
         // Refresh only the callback frame needed for a still-pending reply; the
         // DB poller owns recovery, so repeating projections would duplicate it.
         cacheFrame(id, conversation.providerChatId, frame);
-        inboundProgress.delete(dedupKey);
+        deleteProgress(dedupKey);
         return;
       }
       if (!progress.normalized) {
         const normalized = await normalizeInbound(body, jid, targetJid);
-        progress.content = normalized.content;
-        progress.attachmentsJson =
+        const attachmentsJson =
           normalized.attachments.length > 0
             ? JSON.stringify(normalized.attachments)
             : undefined;
+        stageProgressPayload(
+          dedupKey,
+          progress,
+          normalized.content,
+          attachmentsJson,
+        );
         progress.normalized = true;
       }
-      const content = progress.content ?? '';
-      const attachmentsJson = progress.attachmentsJson;
+      let content = progress.content ?? '';
+      let attachmentsJson = progress.attachmentsJson;
+      if (progress.stored) {
+        const durable = getMessagePayload(targetJid, id);
+        if (!durable) {
+          throw new Error('WeCom staged progress lost its durable message');
+        }
+        content = durable.content;
+        attachmentsJson = durable.attachments ?? undefined;
+      }
       if (!content && !attachmentsJson) {
-        inboundProgress.delete(dedupKey);
+        deleteProgress(dedupKey);
         return;
       }
       // WeCom create_time has only second precision. Cursor polling is ordered
@@ -804,6 +1120,9 @@ export function createWeComConnection(
           { attachments: attachmentsJson, sourceJid: jid },
         );
         progress.stored = true;
+        // The database now owns the potentially large content/base64 payload.
+        // Retries rehydrate it by stable id instead of retaining duplicate RAM.
+        clearProgressPayload(progress);
       }
       if (!progress.frameCached) {
         cacheFrame(id, conversation.providerChatId, frame);
@@ -823,7 +1142,7 @@ export function createWeComConnection(
             attachments: attachmentsJson,
             is_from_me: false,
           },
-          routing?.agentId ?? undefined,
+          routeAgentId ?? undefined,
         );
         progress.broadcast = true;
       }
@@ -832,17 +1151,17 @@ export function createWeComConnection(
         progress.notified = true;
       }
 
-      if (routing?.agentId && !progress.agentNotified) {
-        opts?.onAgentMessage?.(jid, routing.agentId);
+      if (routeAgentId && !progress.agentNotified) {
+        opts?.onAgentMessage?.(jid, routeAgentId);
         progress.agentNotified = true;
       }
-      inboundProgress.delete(dedupKey);
+      deleteProgress(dedupKey);
       logger.info(
         {
           ...logCtx,
           jid,
           effectiveJid: targetJid,
-          agentId: routing?.agentId,
+          agentId: routeAgentId,
           msgid: body.msgid,
         },
         'WeCom message admitted and stored',
@@ -971,7 +1290,8 @@ export function createWeComConnection(
       ws = null;
       opts = null;
       inboundFrames.clear();
-      inboundProgress.clear();
+      for (const key of [...inboundProgress.keys()]) deleteProgress(key);
+      inboundProgressBytes = 0;
       commandReplies.clear();
       rejectTimestamps.clear();
       dedup.clear();

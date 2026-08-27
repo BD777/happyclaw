@@ -41,8 +41,8 @@ describe('DingTalk sendFile uses media-native robot msgKeys', () => {
     }
   });
 
-  test('amr/mp3/wav use sampleAudio with duration converted to milliseconds', () => {
-    for (const ext of ['amr', 'mp3', 'wav']) {
+  test('official amr/ogg formats use sampleAudio with milliseconds', () => {
+    for (const ext of ['amr', 'ogg']) {
       const payload = buildDingTalkFileSendPayload(
         'voice',
         'media-voice-1',
@@ -59,19 +59,17 @@ describe('DingTalk sendFile uses media-native robot msgKeys', () => {
   });
 
   test('unsupported native formats and missing duration degrade to sampleFile', () => {
-    expect(
-      buildDingTalkFileSendPayload(
-        'voice',
-        'media-voice-1',
-        'voice.ogg',
-        'ogg',
-        { durationSeconds: 3 },
-      ).msgKey,
-    ).toBe('sampleFile');
-    expect(
-      buildDingTalkFileSendPayload('voice', 'media-voice-1', 'voice.mp3', 'mp3')
-        .msgKey,
-    ).toBe('sampleFile');
+    for (const ext of ['mp3', 'wav']) {
+      expect(
+        buildDingTalkFileSendPayload(
+          'voice',
+          'media-voice-1',
+          `voice.${ext}`,
+          ext,
+          { durationSeconds: 3 },
+        ).msgKey,
+      ).toBe('sampleFile');
+    }
     expect(
       buildDingTalkFileSendPayload(
         'image',
@@ -108,25 +106,14 @@ describe('DingTalk sendFile uses media-native robot msgKeys', () => {
     );
   });
 
-  test('parses real WAV duration from its media header', async () => {
-    const sampleRate = 8_000;
-    const samples = sampleRate;
-    const buffer = Buffer.alloc(44 + samples * 2);
-    buffer.write('RIFF', 0);
-    buffer.writeUInt32LE(buffer.length - 8, 4);
-    buffer.write('WAVEfmt ', 8);
-    buffer.writeUInt32LE(16, 16);
-    buffer.writeUInt16LE(1, 20);
-    buffer.writeUInt16LE(1, 22);
-    buffer.writeUInt32LE(sampleRate, 24);
-    buffer.writeUInt32LE(sampleRate * 2, 28);
-    buffer.writeUInt16LE(2, 32);
-    buffer.writeUInt16LE(16, 34);
-    buffer.write('data', 36);
-    buffer.writeUInt32LE(samples * 2, 40);
-
-    await expect(getDingTalkMediaDurationSeconds(buffer, 'wav')).resolves.toBe(
-      1,
+  test('parses real OGG/Opus duration from granule metadata', async () => {
+    const oneSecondOgg = Buffer.from(
+      'T2dnUwACAAAAAAAAAAABAAAAAAAAAAAAAAABE09wdXNIZWFkAQE4AYC7AAAAAABPZ2dTAAAAAAAAAAAAAAEAAAABAAAAAAAAAAEQT3B1c1RhZ3MAAAAAAAAAAE9nZ1MABLi8AAAAAAAAAQAAAAIAAAAAAAAAAQP4//4=',
+      'base64',
     );
+
+    await expect(
+      getDingTalkMediaDurationSeconds(oneSecondOgg, 'ogg'),
+    ).resolves.toBe(1);
   });
 });
