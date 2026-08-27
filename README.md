@@ -318,6 +318,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `CONTAINER_IMAGE_HEADROOM`   | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
 | `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                   |
 | `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                    | IPC 债务强制恢复上限（整数分钟，范围 4–120；非法值回退默认）                       |
 | `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
 | `MAX_CONCURRENT_CONTAINERS`  | `20`                              | 最大并发容器数                                                                     |
 | `MAX_FILE_SIZE_MB`           | `50`                              | Web 和 IM 入站文件大小上限                                                         |

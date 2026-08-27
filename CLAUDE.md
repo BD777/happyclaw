@@ -314,6 +314,7 @@ Web 持久设置 > 环境变量 > 代码默认值
 | `CONTAINER_IMAGE`           | `riba2534/happyclaw-agent:latest` | GitHub Actions 发布的 Runner 镜像 |
 | `CONTAINER_TIMEOUT`         | `1800000`                         | 默认运行超时                      |
 | `IDLE_TIMEOUT`              | `1800000`                         | 暖 Runner 空闲时间                |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                    | IPC 债务强制恢复上限（4–120 分钟） |
 | `MAX_CONCURRENT_CONTAINERS` | `20`                              | Docker 并发                       |
 | `MAX_FILE_SIZE_MB`          | `50`                              | Web/IM 入站文件上限               |
 | `CORS_ALLOWED_ORIGINS`      | 仅 localhost                      | WebSocket Origin 白名单           |
