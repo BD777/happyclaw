@@ -27,9 +27,9 @@ import {
   parseToolParam,
 } from '../src/feishu-cards/sections.js';
 import {
-  isFeishuRuntimeControlLike,
-  parseFeishuRuntimeControl,
-  resolveFeishuFollowUpMode,
+  isRuntimeControlLike,
+  parseRuntimeControl,
+  resolveFollowUpMode,
 } from '../src/follow-up-policy.js';
 
 // ─── Recursive schema validation helpers ───────────────────────────
@@ -1073,69 +1073,69 @@ describe('buildStreamingAgentCard rich skeleton (Phase F)', () => {
 
 describe('Feishu follow-up controls', () => {
   test('ordinary messages and card replies queue; only an explicit override steers', () => {
-    expect(resolveFeishuFollowUpMode(undefined)).toBe('queue');
-    expect(resolveFeishuFollowUpMode('queue')).toBe('queue');
-    expect(resolveFeishuFollowUpMode('steer')).toBe('steer');
+    expect(resolveFollowUpMode(undefined)).toBe('queue');
+    expect(resolveFollowUpMode('queue')).toBe('queue');
+    expect(resolveFollowUpMode('steer')).toBe('steer');
   });
 
   test('accepts only exact lowercase, structurally eligible runtime controls', () => {
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: '/steer inspect this',
         eligible: true,
         hasAttachments: false,
       }),
     ).toEqual({ kind: 'steer', text: 'inspect this' });
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: ' /clear ',
         eligible: true,
         hasAttachments: false,
       }),
     ).toEqual({ kind: 'clear' });
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: ' /break ',
         eligible: true,
         hasAttachments: false,
       }),
     ).toEqual({ kind: 'break' });
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: '/queue later',
         eligible: true,
         hasAttachments: false,
       }),
     ).toBeUndefined();
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: '/break',
         eligible: false,
         hasAttachments: false,
       }),
     ).toBeUndefined();
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: '/BREAK',
         eligible: true,
         hasAttachments: false,
       }),
     ).toBeUndefined();
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: '/break now',
         eligible: true,
         hasAttachments: false,
       }),
     ).toBeUndefined();
     expect(
-      parseFeishuRuntimeControl({
+      parseRuntimeControl({
         commandText: '/break',
         eligible: true,
         hasAttachments: true,
       }),
     ).toBeUndefined();
-    expect(isFeishuRuntimeControlLike('/StEeR later')).toBe(true);
+    expect(isRuntimeControlLike('/StEeR later')).toBe(true);
   });
 
   test('uses neutral stop language on the active streaming card', () => {

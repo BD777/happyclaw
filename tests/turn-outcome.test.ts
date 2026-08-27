@@ -198,8 +198,9 @@ describe('resolveTurnOutcome', () => {
     );
     expect(cardAttachmentBranch).not.toContain('imManager.sendImage');
     expect(deliveryAckBranch).toContain(
-      'streamingCardHandledIM\n                ? streamingCardAttachmentsDelivered',
+      'streamingCardDeliveryUncertain\n                ? false\n                : streamingCardHandledIM',
     );
+    expect(deliveryAckBranch).toContain('? streamingCardAttachmentsDelivered');
   });
 
   test('does not emit a second channel error after an uncertain durable file send', () => {

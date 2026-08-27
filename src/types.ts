@@ -503,6 +503,12 @@ export type MessageSourceKind =
   | 'sdk_send_message'
   | 'proactive_sdk_fallback'
   | 'input_rejection_warning'
+  /**
+   * Standalone notice that the primary model hit a model-scope wall and the
+   * turn is being answered by the configured fallback model instead. Like
+   * 'input_rejection_warning' it is an out-of-band notice, never the answer.
+   */
+  | 'provider_fallback_notice'
   | 'interrupt_partial'
   | 'overflow_partial'
   | 'compact_partial'
@@ -589,6 +595,7 @@ export type TaskRunNotificationStatus =
   | 'success'
   | 'partial_failed'
   | 'failed'
+  | 'uncertain'
   | 'skipped';
 
 export interface TaskRunNotificationSummary {
@@ -596,6 +603,9 @@ export interface TaskRunNotificationSummary {
   succeeded: number;
   failed: number;
   failed_channels: string[];
+  /** Subset of failed attempts whose provider acceptance is unknown. */
+  uncertain?: number;
+  uncertain_channels?: string[];
 }
 
 export interface TaskRunNotificationReceipt {

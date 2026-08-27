@@ -96,6 +96,9 @@ export class QQStreamingController {
   private fallbackSend: FallbackSendFn;
   private fallbackUsed = false;
   private passiveMsgId: string | undefined;
+  private definitiveStartRejection = false;
+  private uncertainStartError: unknown;
+  private onDefinitiveRejection?: (error: unknown) => boolean;
 
   // Tool state remains available to the shared streaming-session interface.
   private tools = new Map<
@@ -116,12 +119,15 @@ export class QQStreamingController {
     fallbackSend: FallbackSendFn;
     /** Latest incoming msg_id from this openid. Required by QQ stream API. */
     passiveMsgId?: string;
+    /** Proves a failed start was rejected before any stream became visible. */
+    onDefinitiveRejection?: (error: unknown) => boolean;
   }) {
     this.openid = opts.openid;
     this.msgSeq = opts.msgSeq;
     this.sendStreamChunk = opts.sendStreamChunk;
     this.fallbackSend = opts.fallbackSend;
     this.passiveMsgId = opts.passiveMsgId;
+    this.onDefinitiveRejection = opts.onDefinitiveRejection;
   }
 
   // ─── StreamingSession interface ─────────────────────────────
@@ -200,17 +206,35 @@ export class QQStreamingController {
       return;
     }
 
+    if (this.definitiveStartRejection) {
+      logger.warn(
+        { openid: this.openid },
+        'QQ stream start was rejected; using one observable plain-message fallback',
+      );
+      await this.finishWithFallback(finalText);
+      return;
+    }
+    if (this.uncertainStartError) {
+      this.state = 'aborted';
+      throw this.uncertainStartError;
+    }
+
     // If we never managed to start a stream, use fallback for the full text
     if (this.sentChunkCount === 0) {
       await this.tryStartStream(safeFinal);
-      if (!this.streamMsgId) {
-        logger.warn(
-          { openid: this.openid },
-          'QQ streaming never started, falling back to plain message',
-        );
-        await this.tryFallback(finalText);
-        this.state = 'completed';
+      if (this.definitiveStartRejection) {
+        await this.finishWithFallback(finalText);
         return;
+      }
+      if (this.uncertainStartError) {
+        this.state = 'aborted';
+        throw this.uncertainStartError;
+      }
+      if (!this.streamMsgId) {
+        this.state = 'aborted';
+        throw new Error(
+          'QQ streaming start returned no provider receipt; delivery outcome is uncertain',
+        );
       }
     }
 
@@ -228,14 +252,10 @@ export class QQStreamingController {
     } catch (err: any) {
       logger.warn(
         { err: err.message, openid: this.openid },
-        'QQ streaming finalize failed, using fallback',
+        'QQ streaming finalize failed; refusing duplicate plain fallback',
       );
-      // Stream already started (preview is visible). A plain send would
-      // deliver a second full copy of the same reply.
-      if (this.sentChunkCount === 0) {
-        await this.tryFallback(finalText);
-      }
-      this.state = 'completed';
+      this.state = 'aborted';
+      throw err;
     }
   }
 
@@ -389,6 +409,7 @@ export class QQStreamingController {
   private async doFlush(): Promise<void> {
     const rawText = this.accumulatedText;
     if (!rawText.trim()) return;
+    if (this.definitiveStartRejection || this.uncertainStartError) return;
 
     // Length guard: QQ stream_messages caps content_raw (~5000 chars). Once we
     // cross the conservative threshold, every subsequent chunk would hit the
@@ -465,15 +486,31 @@ export class QQStreamingController {
       } else {
         logger.warn(
           { openid: this.openid, resp },
-          'QQ stream API returned no id',
+          'QQ stream API returned no id; delivery outcome is uncertain',
+        );
+        this.uncertainStartError = new Error(
+          'QQ stream API returned no provider receipt',
         );
       }
     } catch (err: any) {
+      const definitivelyRejected = this.onDefinitiveRejection?.(err) === true;
       logger.warn(
-        { err: err.message, openid: this.openid },
-        'QQ streaming start failed',
+        {
+          err: err.message,
+          openid: this.openid,
+          outcome: definitivelyRejected ? 'rejected' : 'uncertain',
+        },
+        definitivelyRejected
+          ? 'QQ streaming start was definitively rejected'
+          : 'QQ streaming start failed with an uncertain outcome',
       );
-      // Stay in idle, will retry or fallback
+      if (definitivelyRejected) {
+        this.definitiveStartRejection = true;
+      } else {
+        // Reusing the same (msg_id,msg_seq) or sending a plain fallback could
+        // duplicate a stream the provider accepted before its ACK was lost.
+        this.uncertainStartError = err;
+      }
     }
   }
 
@@ -505,6 +542,17 @@ export class QQStreamingController {
         { err: err.message },
         'QQ streaming fallback send also failed',
       );
+      throw err;
+    }
+  }
+
+  private async finishWithFallback(text: string): Promise<void> {
+    try {
+      await this.tryFallback(text);
+      this.state = 'completed';
+    } catch (error) {
+      this.state = 'aborted';
+      throw error;
     }
   }
 

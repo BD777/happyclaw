@@ -354,4 +354,60 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
 
     expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
   });
+  test('internal-continue idle does not wipe unpaid IPC debt', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    const owedAt = Date.now() - IDLE_THRESHOLD_MS - 1000;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: owedAt,
+      lastActivityAt: owedAt,
+    });
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+
+    expect(getState(q, jid).queryInFlight).toBe(true);
+    expect(getState(q, jid).ipcOwedSinceAt).toBe(owedAt);
+    const stuck = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
+    expect(stuck).toHaveLength(1);
+    expect(stuck[0].reason).toBe('ipc_injected');
+  });
+
+  test('internal-continue preserve hint still closes a query with no real IPC debt', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: null,
+      lastActivityAt: Date.now() - 1000,
+    });
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+
+    expect(getState(q, jid).queryInFlight).toBe(false);
+    expect(getState(q, jid).queryId).toBeNull();
+    expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
+  });
+
+  test('ordinary query idle still clears IPC debt', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - 1000,
+      lastActivityAt: Date.now() - 1000,
+    });
+
+    q.markRunnerQueryIdle(jid);
+
+    expect(getState(q, jid).queryInFlight).toBe(false);
+    expect(getState(q, jid).ipcOwedSinceAt).toBeNull();
+    expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
+  });
 });

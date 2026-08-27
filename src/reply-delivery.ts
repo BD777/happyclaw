@@ -78,6 +78,10 @@ export function isGenuineReplyResult(info: ReplyResultInfo): boolean {
   if (info.holdReason) return false;
   if (
     info.sourceKind === 'input_rejection_warning' ||
+    // A model-fallback notice is emitted *before* the retry produces the real
+    // answer. Counting it as a delivered reply would let a later error skip the
+    // retry, leaving the user with the notice and no answer at all.
+    info.sourceKind === 'provider_fallback_notice' ||
     info.sourceKind === 'overflow_partial' ||
     info.sourceKind === 'compact_partial'
   ) {
@@ -119,7 +123,10 @@ export function shouldFinalizeScheduledGroupPrimaryResult(
 export function occupiesPrimaryReplyDeliverySlot(
   sourceKind?: string | null,
 ): boolean {
-  return sourceKind !== 'input_rejection_warning';
+  return (
+    sourceKind !== 'input_rejection_warning' &&
+    sourceKind !== 'provider_fallback_notice'
+  );
 }
 
 export function resolveHeldReplyDbText(input: {

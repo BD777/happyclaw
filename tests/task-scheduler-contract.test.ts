@@ -10,6 +10,8 @@ import {
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { settleTaskNotificationDeliveries } from '../src/task-notification.js';
+import { preAcceptImDeliveryError } from '../src/im-send-retry-policy.js';
 
 const tmpDir = fs.mkdtempSync(
   path.join(os.tmpdir(), 'task-scheduler-contract-'),
@@ -2594,6 +2596,100 @@ describe('scheduled task workspace/session contract', () => {
       summary: { failed_channels: ['web:notification-retry-source'] },
     });
     expect(result.retryPayload).toEqual(payload);
+  });
+
+  test('persisted retry worker never requeues an uncertain provider outcome', async () => {
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_message',
+      targetJid: 'feishu:uncertain',
+      text: 'scheduled output',
+      localImagePaths: [],
+    };
+    const result = await deliverPersistedNotificationPayload(payload, {
+      retryTaskNotification: vi.fn(async () => ({
+        status: 'uncertain' as const,
+        summary: {
+          attempted: 1,
+          succeeded: 0,
+          failed: 1,
+          failed_channels: ['feishu'],
+          uncertain: 1,
+          uncertain_channels: ['feishu'],
+        },
+        error: 'provider acceptance is unknown',
+      })),
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(result.receipt.status).toBe('uncertain');
+    expect(result.retryPayload).toBeUndefined();
+  });
+
+  test('typed pre-send failure survives the DB scheduler retry chain', async () => {
+    const taskId = createTask({ id: 'typed-pre-send-retry-chain' });
+    const task = db.getTaskById(taskId)!;
+    const created = db.createTaskRun({ task, triggerType: 'manual' });
+    const execution = db.claimNextTaskRun('typed-pre-send-executor', 60_000)!;
+    expect(
+      db.completeTaskRun(
+        execution.id,
+        execution.lease_owner,
+        execution.lease_token,
+        { status: 'success', notificationStatus: 'pending' },
+      ),
+    ).toBe(true);
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_message',
+      targetJid: 'feishu:missing-binding',
+      text: 'scheduled output',
+      localImagePaths: [],
+    };
+    const error = preAcceptImDeliveryError('No connected binding');
+    const initial = await settleTaskNotificationDeliveries([
+      {
+        channel: 'feishu',
+        payload,
+        failure: { error, outcome: error.deliveryPhase },
+        deliver: async () => false,
+      },
+    ]);
+    expect(initial.receipt.status).toBe('failed');
+    expect(initial.retryPayload).toEqual(payload);
+    expect(
+      db.recordTaskRunNotificationReceipt(
+        created.run.id,
+        initial.receipt,
+        initial.retryPayload,
+      ),
+    ).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    const claim = db.claimTaskRunNotificationById(
+      created.run.id,
+      'typed-pre-send-notifier',
+      60_000,
+    )!;
+    const retryTaskNotification = vi.fn(async () => ({
+      status: 'success' as const,
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    }));
+    expect(
+      await processClaimedTaskRunNotification(
+        claim,
+        { retryTaskNotification, sendMessage: vi.fn() } as never,
+        60_000,
+      ),
+    ).toBe(true);
+    expect(retryTaskNotification).toHaveBeenCalledWith(payload);
+    expect(db.getTaskRunById(created.run.id)).toMatchObject({
+      notification_status: 'success',
+      notification_payload: null,
+    });
   });
 
   test('persists unresolved explicit channel work until a binding can be resolved', async () => {
