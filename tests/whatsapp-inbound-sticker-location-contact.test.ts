@@ -102,8 +102,13 @@ vi.mock('proxy-agent', () => ({
   },
 }));
 
-const { createWhatsAppConnection, detectMedia, extractMessageText } =
-  await import('../src/whatsapp.js');
+const {
+  createWhatsAppConnection,
+  detectMedia,
+  extractMessageText,
+  isMentioningBot,
+  unwrapMessageContent,
+} = await import('../src/whatsapp.js');
 
 const root = fs.mkdtempSync(
   path.join(os.tmpdir(), 'whatsapp-inbound-sticker-'),
@@ -123,6 +128,21 @@ function upsertMessage(
     message,
     pushName: 'Ada',
     messageTimestamp: Math.floor(Date.now() / 1000),
+  };
+}
+
+function lottieStickerPayload() {
+  return {
+    lottieStickerMessage: {
+      message: {
+        stickerMessage: {
+          mimetype: 'image/webp',
+          url: 'https://mmg.whatsapp.net/lottie.enc',
+          isLottie: true,
+          isAnimated: true,
+        },
+      },
+    },
   };
 }
 
@@ -160,6 +180,67 @@ describe('WhatsApp inbound sticker / location / contact (live upsert)', () => {
     expect(db.storeMessageDirect).toHaveBeenCalled();
     expect(String(db.storeMessageDirect.mock.calls[0][4])).toMatch(/贴纸/);
     expect(notify.notifyNewImMessage).toHaveBeenCalled();
+  });
+
+  test('authorized ptvMessage video note downloads and persists', async () => {
+    const { socket } = await connect(true);
+    await socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        upsertMessage('15559876543@s.whatsapp.net', 'ptv-1', {
+          ptvMessage: { mimetype: 'video/mp4', caption: 'video note' },
+        }),
+      ],
+    });
+
+    expect(downloadMediaMessage).toHaveBeenCalledOnce();
+    expect(db.storeMessageDirect).toHaveBeenCalledOnce();
+    expect(String(db.storeMessageDirect.mock.calls[0][4])).toMatch(
+      /视频.*video note/s,
+    );
+    expect(notify.notifyNewImMessage).toHaveBeenCalledOnce();
+  });
+
+  test('authorized Event and group invite persist as bounded text', async () => {
+    const { socket } = await connect(true);
+    await socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        upsertMessage('15559876543@s.whatsapp.net', 'event-1', {
+          eventMessage: { name: '周五\u0000例会' },
+        }),
+        upsertMessage('15559876543@s.whatsapp.net', 'invite-1', {
+          groupInviteMessage: { groupName: '产品群' },
+        }),
+      ],
+    });
+
+    expect(db.storeMessageDirect).toHaveBeenCalledTimes(2);
+    expect(db.storeMessageDirect.mock.calls[0][4]).toBe('[活动: 周五 例会]');
+    expect(db.storeMessageDirect.mock.calls[1][4]).toBe('[群邀请: 产品群]');
+    expect(downloadMediaMessage).not.toHaveBeenCalled();
+    expect(notify.notifyNewImMessage).toHaveBeenCalledTimes(2);
+  });
+
+  test('authorized lottieStickerMessage downloads the unwrapped sticker', async () => {
+    const { socket } = await connect(true);
+    await socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        upsertMessage('15559876543@s.whatsapp.net', 'lottie-1', {
+          ...lottieStickerPayload(),
+        }),
+      ],
+    });
+
+    expect(downloadMediaMessage).toHaveBeenCalledOnce();
+    const passed = downloadMediaMessage.mock.calls[0][0] as {
+      message?: { stickerMessage?: unknown; lottieStickerMessage?: unknown };
+    };
+    expect(passed.message?.stickerMessage).toBeTruthy();
+    expect(passed.message?.lottieStickerMessage).toBeUndefined();
+    expect(String(db.storeMessageDirect.mock.calls[0][4])).toMatch(/贴纸/);
+    expect(notify.notifyNewImMessage).toHaveBeenCalledOnce();
   });
 
   test('authorized locationMessage persists as text via messages.upsert', async () => {
@@ -217,6 +298,31 @@ describe('WhatsApp inbound sticker / location / contact (live upsert)', () => {
     expect(notify.notifyNewImMessage).not.toHaveBeenCalled();
   });
 
+  test.each([
+    ['ptv', { ptvMessage: { mimetype: 'video/mp4' } }],
+    ['event', { eventMessage: { name: '秘密会议' } }],
+    ['lottie', lottieStickerPayload()],
+  ])(
+    'unauthorized %s payload has no durable or media side effect',
+    async (_label, message) => {
+      const { socket } = await connect(false);
+      await socket.emit('messages.upsert', {
+        type: 'notify',
+        messages: [
+          upsertMessage(
+            '15559876543@s.whatsapp.net',
+            `deny-${_label}`,
+            message,
+          ),
+        ],
+      });
+
+      expect(downloadMediaMessage).not.toHaveBeenCalled();
+      expect(db.storeMessageDirect).not.toHaveBeenCalled();
+      expect(notify.notifyNewImMessage).not.toHaveBeenCalled();
+    },
+  );
+
   test('disconnect fences held media and a new connection stores redelivery once', async () => {
     let releaseDownload!: (value: Buffer) => void;
     let admittedSignal: AbortSignal | undefined;
@@ -262,6 +368,51 @@ describe('WhatsApp inbound sticker / location / contact (live upsert)', () => {
     await second.connection.disconnect();
   });
 
+  test('disconnect fences an unwrapped Lottie download before persistence', async () => {
+    let releaseDownload!: (value: Buffer) => void;
+    let admittedSignal: AbortSignal | undefined;
+    downloadMediaMessage.mockImplementation(
+      async (_message, _type, options) =>
+        new Promise<Buffer>((resolve) => {
+          admittedSignal = options?.options?.signal ?? undefined;
+          releaseDownload = resolve;
+        }),
+    );
+
+    const first = await connect(true);
+    const inbound = upsertMessage(
+      '15559876543@s.whatsapp.net',
+      'disconnect-lottie-1',
+      lottieStickerPayload(),
+    );
+    const oldAttempt = first.socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [inbound],
+    });
+    await vi.waitFor(() => expect(downloadMediaMessage).toHaveBeenCalledOnce());
+    expect(
+      (downloadMediaMessage.mock.calls[0][0] as { message?: proto.IMessage })
+        .message?.stickerMessage,
+    ).toBeTruthy();
+
+    const disconnect = first.connection.disconnect();
+    await vi.waitFor(() => expect(admittedSignal?.aborted).toBe(true));
+    releaseDownload(Buffer.from('late-lottie'));
+    await Promise.all([oldAttempt, disconnect]);
+    expect(db.storeMessageDirect).not.toHaveBeenCalled();
+    expect(notify.notifyNewImMessage).not.toHaveBeenCalled();
+
+    downloadMediaMessage.mockResolvedValue(Buffer.from('fresh-lottie'));
+    const second = await connect(true);
+    await second.socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [inbound],
+    });
+    expect(db.storeMessageDirect).toHaveBeenCalledOnce();
+    expect(notify.notifyNewImMessage).toHaveBeenCalledOnce();
+    await second.connection.disconnect();
+  });
+
   test('public send waits for a Meta server ACK instead of socket-write success', async () => {
     const { connection, socket } = await connect(true);
     socket.sendMessage.mockResolvedValue({
@@ -301,6 +452,83 @@ describe('detectMedia / extractMessageText helpers', () => {
         stickerMessage: { mimetype: 'image/webp' },
       } as proto.IMessage),
     ).toMatchObject({ kind: 'sticker', label: '贴纸' });
+  });
+
+  test('ptvMessage is detected as video and preserves its caption', () => {
+    const content = {
+      ptvMessage: { mimetype: 'video/mp4', caption: 'video note' },
+    } as proto.IMessage;
+    expect(detectMedia(content)).toMatchObject({
+      kind: 'video',
+      label: '视频',
+      node: { caption: 'video note' },
+    });
+    expect(extractMessageText(content)).toBe('video note');
+  });
+
+  test('Event and invite labels are sanitized and bounded', () => {
+    const longName = ` event\u0000name ${'x'.repeat(800)}`;
+    const eventText = extractMessageText({
+      eventMessage: { name: longName },
+    } as proto.IMessage)!;
+    expect(eventText.startsWith('[活动: event name ')).toBe(true);
+    expect(eventText).not.toContain('\u0000');
+    expect(eventText.length).toBeLessThanOrEqual(518);
+    expect(
+      extractMessageText({
+        groupInviteMessage: { groupName: '  ', caption: '研发群' },
+      } as proto.IMessage),
+    ).toBe('[群邀请: 研发群]');
+    expect(extractMessageText({ eventMessage: {} } as proto.IMessage)).toBe(
+      '[活动]',
+    );
+    expect(
+      extractMessageText({ groupInviteMessage: {} } as proto.IMessage),
+    ).toBe('[群邀请]');
+  });
+
+  test.each([
+    {
+      ptvMessage: {
+        contextInfo: { mentionedJid: ['19990001111@s.whatsapp.net'] },
+      },
+    },
+    {
+      eventMessage: {
+        name: '例会',
+        contextInfo: { mentionedJid: ['19990001111@s.whatsapp.net'] },
+      },
+    },
+    {
+      groupInviteMessage: {
+        groupName: '产品群',
+        contextInfo: { mentionedJid: ['19990001111@s.whatsapp.net'] },
+      },
+    },
+    {
+      lottieStickerMessage: {
+        message: {
+          stickerMessage: {
+            contextInfo: { mentionedJid: ['19990001111@s.whatsapp.net'] },
+          },
+        },
+      },
+    },
+  ])('new supported payloads retain group mention policy', (wrapped) => {
+    expect(
+      isMentioningBot(
+        unwrapMessageContent(wrapped as proto.IMessage),
+        '19990001111:7@s.whatsapp.net',
+      ),
+    ).toBe(true);
+  });
+
+  test('lottieStickerMessage unwraps to its inner sticker', () => {
+    const unwrapped = unwrapMessageContent({
+      ...lottieStickerPayload(),
+    } as proto.IMessage);
+    expect(unwrapped.stickerMessage).toBeTruthy();
+    expect(unwrapped.lottieStickerMessage).toBeUndefined();
   });
 
   test('location and contact extract as text', () => {

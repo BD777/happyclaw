@@ -642,7 +642,7 @@ export function createWhatsAppConnection(
   }
 
   /**
-   * Detect and download a media message (image/video/audio/document).
+   * Detect and download a media message (image/video/audio/document/sticker).
    * Returns null if `content` has no supported media node.
    * Returns { content, attachmentsJson } shaped like dingtalk's normalize result.
    */
@@ -658,10 +658,19 @@ export function createWhatsAppConnection(
     if (!detected) return null;
     const { kind, label, node, defaultExt } = detected;
 
+    // Baileys unwraps its known FutureProofMessage variants internally, but
+    // rc13 does not yet recognize proto-74 lottieStickerMessage. Keep the
+    // provider key/envelope metadata while giving the downloader the same
+    // normalized content used by detection. This also remains valid for the
+    // wrappers Baileys already understands and lets media re-upload use the
+    // exact inner media key.
+    const downloadEnvelope: WAMessage =
+      msg.message === content ? msg : { ...msg, message: content };
+
     let buffer: Buffer;
     try {
       buffer = await downloadMediaMessage(
-        msg,
+        downloadEnvelope,
         'buffer',
         { options: { signal: lease.signal } },
         {
@@ -1222,7 +1231,8 @@ export function createWhatsAppConnection(
 }
 
 /**
- * Strip ephemeral / view-once envelopes so the real inner message is exposed.
+ * Strip ephemeral / view-once / future-proof envelopes so the real inner
+ * message is exposed.
  * extractMessageText recurses through these on its own, but detectMedia and
  * isMentioningBot only inspect top-level nodes — so a disappearing-message photo
  * (`ephemeralMessage.message.imageMessage`, increasingly the Meta default) would
@@ -1244,7 +1254,8 @@ export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
       inner.viewOnceMessageV2?.message ||
       inner.viewOnceMessageV2Extension?.message ||
       inner.documentWithCaptionMessage?.message ||
-      inner.editedMessage?.message;
+      inner.editedMessage?.message ||
+      inner.lottieStickerMessage?.message;
     if (!next) break;
     inner = next;
   }
@@ -1253,7 +1264,7 @@ export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
 
 /**
  * Extract human-readable text from a baileys IMessage payload.
- * Returns null only when there is no conversation, caption, location, or contact.
+ * Returns null only when there is no supported human-readable payload.
  */
 export function extractMessageText(content: proto.IMessage): string | null {
   if (content.conversation) return content.conversation;
@@ -1273,7 +1284,18 @@ export function extractMessageText(content: proto.IMessage): string | null {
   // so the user at least sees what was sent. Media binary download is M3.
   if (content.imageMessage?.caption) return content.imageMessage.caption;
   if (content.videoMessage?.caption) return content.videoMessage.caption;
+  if (content.ptvMessage?.caption) return content.ptvMessage.caption;
   if (content.documentMessage?.caption) return content.documentMessage.caption;
+  if (content.eventMessage) {
+    const name = boundedWhatsAppText(content.eventMessage.name);
+    return name ? `[活动: ${name}]` : '[活动]';
+  }
+  if (content.groupInviteMessage) {
+    const name =
+      boundedWhatsAppText(content.groupInviteMessage.groupName) ||
+      boundedWhatsAppText(content.groupInviteMessage.caption);
+    return name ? `[群邀请: ${name}]` : '[群邀请]';
+  }
   if (content.locationMessage) {
     return formatWhatsAppLocation(content.locationMessage);
   }
@@ -1469,12 +1491,13 @@ export function detectMedia(content: proto.IMessage): DetectedMedia | null {
       node: content.imageMessage as DetectedMedia['node'],
     };
   }
-  if (content.videoMessage) {
+  const video = content.videoMessage ?? content.ptvMessage;
+  if (video) {
     return {
       kind: 'video',
       label: '视频',
       defaultExt: '.mp4',
-      node: content.videoMessage as DetectedMedia['node'],
+      node: video as DetectedMedia['node'],
     };
   }
   if (content.audioMessage) {
@@ -1606,8 +1629,12 @@ export function isMentioningBot(
     content.extendedTextMessage?.contextInfo ||
     content.imageMessage?.contextInfo ||
     content.videoMessage?.contextInfo ||
+    content.ptvMessage?.contextInfo ||
     content.documentMessage?.contextInfo ||
-    content.audioMessage?.contextInfo;
+    content.audioMessage?.contextInfo ||
+    content.stickerMessage?.contextInfo ||
+    content.eventMessage?.contextInfo ||
+    content.groupInviteMessage?.contextInfo;
   const mentioned = ctx?.mentionedJid;
   if (!mentioned || mentioned.length === 0) return false;
   return mentioned.some((m) => identities.has(canonicalizeWhatsAppUserJid(m)));
