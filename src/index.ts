@@ -19,9 +19,11 @@ import {
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
 import {
+  classifyImSendFailure,
   imSendFailurePolicy,
   isUncertainAfterAcceptImError,
   retryUnscopedImSend,
+  type ImSendFailureRef,
 } from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
@@ -2861,32 +2863,31 @@ async function retryImOperation(
   label: string,
   imJid: string,
   fn: () => Promise<void>,
-  failure?: { error?: unknown },
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
-  for (let attempt = 0; attempt < IM_SEND_MAX_RETRIES; attempt++) {
-    try {
-      await fn();
-      return true;
-    } catch (err) {
-      if (failure) failure.error = err;
+  const result = await retryUnscopedImSend(fn, {
+    maxAttempts: IM_SEND_MAX_RETRIES,
+    delayMs: IM_SEND_RETRY_DELAY_MS,
+    onAttemptFailure: (err, attempt) => {
+      if (failure) {
+        failure.error = err;
+        failure.outcome = classifyImSendFailure(err);
+      }
       logger.warn(
         { imJid, attempt, label, err },
         'IM operation attempt failed',
       );
-      // A WeChat context token can only be refreshed by a new inbound user
-      // message. Retrying the identical send cannot succeed and historically
-      // contributed to the generic failure counter, eventually deleting a
-      // healthy paired chat.
-      if (!imSendFailurePolicy(err).retryable) break;
-      if (attempt < IM_SEND_MAX_RETRIES - 1) {
-        await new Promise((r) =>
-          setTimeout(r, IM_SEND_RETRY_DELAY_MS * (attempt + 1)),
-        );
-      }
-    }
+    },
+  });
+  if (failure) {
+    failure.error = result.error;
+    failure.outcome =
+      result.outcome === 'delivered' ? undefined : result.outcome;
   }
-  logger.error({ imJid, label }, 'IM operation failed after all retries');
-  return false;
+  if (!result.ok) {
+    logger.error({ imJid, label }, 'IM operation failed after all retries');
+  }
+  return result.ok;
 }
 
 /**
@@ -2904,7 +2905,7 @@ async function sendImWithRetry(
     inputTurnId?: string | null;
     logicalChatJid?: string | null;
   },
-  failure?: { error?: unknown },
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
   let ok: boolean;
   const sendFailure = failure ?? {};
@@ -2987,6 +2988,8 @@ async function sendImWithRetry(
       },
     );
     if (result.error !== undefined) sendFailure.error = result.error;
+    sendFailure.outcome =
+      result.outcome === 'delivered' ? undefined : result.outcome;
     ok = result.ok;
     if (!ok) {
       logger.error(
@@ -3290,6 +3293,7 @@ async function sendTaskImageWithRetry(
   caption?: string,
   fileName?: string,
   outbox?: ChannelOutboxDeliveryRef,
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
   const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
@@ -3307,8 +3311,12 @@ async function sendTaskImageWithRetry(
       imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
   });
   if (scoped !== null) return scoped;
-  return retryImOperation('send_task_image', targetJid, () =>
-    imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+  return retryImOperation(
+    'send_task_image',
+    targetJid,
+    () =>
+      imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+    failure,
   );
 }
 
@@ -3317,6 +3325,7 @@ async function sendTaskFileWithRetry(
   filePath: string,
   fileName: string,
   outbox?: ChannelOutboxDeliveryRef,
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
   const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
@@ -3331,8 +3340,11 @@ async function sendTaskFileWithRetry(
     send: () => imManager.sendFile(targetJid, filePath, fileName),
   });
   if (scoped !== null) return scoped;
-  return retryImOperation('send_task_file', targetJid, () =>
-    imManager.sendFile(targetJid, filePath, fileName),
+  return retryImOperation(
+    'send_task_file',
+    targetJid,
+    () => imManager.sendFile(targetJid, filePath, fileName),
+    failure,
   );
 }
 
@@ -10902,8 +10914,10 @@ function startIpcWatcher(): void {
                     const attempts: TaskNotificationDeliveryAttempt[] = [];
                     const addTargetAttempts = (targetJid: string): void => {
                       const channel = getChannelType(targetJid) ?? targetJid;
+                      const textFailure: ImSendFailureRef = {};
                       attempts.push({
                         channel,
+                        failure: textFailure,
                         payload: {
                           kind: 'im_message',
                           targetJid,
@@ -10911,14 +10925,24 @@ function startIpcWatcher(): void {
                           localImagePaths: [],
                         },
                         deliver: () =>
-                          sendImWithRetry(targetJid, data.text, []),
+                          sendImWithRetry(
+                            targetJid,
+                            data.text,
+                            [],
+                            undefined,
+                            undefined,
+                            undefined,
+                            textFailure,
+                          ),
                       });
                       for (const imagePath of taskLocalImages) {
                         const imageBuffer = fs.readFileSync(imagePath);
                         const mimeType = detectImageMimeType(imageBuffer);
                         const fileName = path.basename(imagePath);
+                        const imageFailure: ImSendFailureRef = {};
                         attempts.push({
                           channel,
+                          failure: imageFailure,
                           payload: {
                             kind: 'im_image',
                             targetJid,
@@ -10937,6 +10961,8 @@ function startIpcWatcher(): void {
                               mimeType,
                               undefined,
                               fileName,
+                              undefined,
+                              imageFailure,
                             ),
                         });
                       }
@@ -11435,26 +11461,32 @@ function startIpcWatcher(): void {
                       typeof data.filePath === 'string' ? data.filePath : '';
                     const imageAttempt = (
                       targetJid: string,
-                    ): TaskNotificationDeliveryAttempt => ({
-                      channel: getChannelType(targetJid) ?? targetJid,
-                      payload: {
-                        kind: 'im_image',
-                        targetJid,
-                        workspaceFolder: sourceGroup,
-                        filePath: relativeImagePath,
-                        mimeType,
-                        caption,
-                        fileName,
-                      },
-                      deliver: () =>
-                        sendTaskImageWithRetry(
+                    ): TaskNotificationDeliveryAttempt => {
+                      const failure: ImSendFailureRef = {};
+                      return {
+                        channel: getChannelType(targetJid) ?? targetJid,
+                        failure,
+                        payload: {
+                          kind: 'im_image',
                           targetJid,
-                          imageBuffer,
+                          workspaceFolder: sourceGroup,
+                          filePath: relativeImagePath,
                           mimeType,
                           caption,
                           fileName,
-                        ),
-                    });
+                        },
+                        deliver: () =>
+                          sendTaskImageWithRetry(
+                            targetJid,
+                            imageBuffer,
+                            mimeType,
+                            caption,
+                            fileName,
+                            undefined,
+                            failure,
+                          ),
+                      };
+                    };
                     for (const targetJid of taskImageTargetJids) {
                       attempts.push(imageAttempt(targetJid));
                     }
@@ -14166,18 +14198,28 @@ async function processTaskIpc(
                 fileRoutingDecision,
               );
               const attempts: TaskNotificationDeliveryAttempt[] =
-                targetPlan.targetJids.map((targetJid) => ({
-                  channel: getChannelType(targetJid) ?? targetJid,
-                  payload: {
-                    kind: 'im_file' as const,
-                    targetJid,
-                    workspaceFolder: sourceGroup,
-                    filePath: data.filePath!,
-                    fileName: imFileName,
-                  },
-                  deliver: () =>
-                    sendTaskFileWithRetry(targetJid, resolvedPath, imFileName),
-                }));
+                targetPlan.targetJids.map((targetJid) => {
+                  const failure: ImSendFailureRef = {};
+                  return {
+                    channel: getChannelType(targetJid) ?? targetJid,
+                    failure,
+                    payload: {
+                      kind: 'im_file' as const,
+                      targetJid,
+                      workspaceFolder: sourceGroup,
+                      filePath: data.filePath!,
+                      fileName: imFileName,
+                    },
+                    deliver: () =>
+                      sendTaskFileWithRetry(
+                        targetJid,
+                        resolvedPath,
+                        imFileName,
+                        undefined,
+                        failure,
+                      ),
+                  };
+                });
               for (const channel of targetPlan.unavailableChannels) {
                 attempts.push({
                   channel,
@@ -21773,7 +21815,7 @@ async function main(): Promise<void> {
       const deliveries: Array<{
         channel: string;
         result: Promise<boolean>;
-        failure?: { error?: unknown };
+        failure?: ImSendFailureRef;
       }> = [];
       // A task records the exact place it was scheduled from. Deliver there
       // first: the previous behaviour resolved the target by scanning the
@@ -21786,7 +21828,7 @@ async function main(): Promise<void> {
         !alreadySent.has(boundRoute)
       ) {
         alreadySent.add(boundRoute);
-        const failure: { error?: unknown } = {};
+        const failure: ImSendFailureRef = {};
         deliveries.push({
           channel: getChannelType(boundRoute) ?? boundRoute,
           result: sendImWithRetry(
@@ -21811,7 +21853,7 @@ async function main(): Promise<void> {
           broadcastFolder,
           alreadySent,
           (jid) => {
-            const failure: { error?: unknown } = {};
+            const failure: ImSendFailureRef = {};
             deliveries.push({
               // Notification retries filter on channel type, not the concrete
               // binding jid. Keep the concrete jid only as a defensive fallback.
@@ -21859,24 +21901,42 @@ async function main(): Promise<void> {
           channel: delivery.channel,
           success: await delivery.result,
           error: delivery.failure?.error,
+          outcome: delivery.failure?.outcome,
         })),
       );
+      const uncertainChannels = outcomes
+        .filter(
+          (outcome) =>
+            !outcome.success &&
+            (outcome.outcome === 'uncertain' ||
+              (outcome.error !== undefined &&
+                classifyImSendFailure(outcome.error) === 'uncertain')),
+        )
+        .map((outcome) => outcome.channel);
       const failedChannels = outcomes
         .filter((outcome) => !outcome.success)
         .map((outcome) => outcome.channel);
       const succeeded = outcomes.length - failedChannels.length;
       return {
         status:
-          failedChannels.length === 0
-            ? 'success'
-            : succeeded > 0
-              ? 'partial_failed'
-              : 'failed',
+          uncertainChannels.length > 0
+            ? 'uncertain'
+            : failedChannels.length === 0
+              ? 'success'
+              : succeeded > 0
+                ? 'partial_failed'
+                : 'failed',
         summary: {
           attempted: outcomes.length,
           succeeded,
           failed: failedChannels.length,
           failed_channels: failedChannels,
+          ...(uncertainChannels.length > 0
+            ? {
+                uncertain: uncertainChannels.length,
+                uncertain_channels: [...new Set(uncertainChannels)],
+              }
+            : {}),
         },
         error:
           failedChannels.length > 0
@@ -21910,6 +21970,7 @@ async function main(): Promise<void> {
             : 'notification';
       let success = false;
       let error: string | null = null;
+      const failure: ImSendFailureRef = {};
       try {
         if ('targetChannel' in payload) {
           broadcastToOwnerIMChannels(
@@ -21932,9 +21993,21 @@ async function main(): Promise<void> {
             payload.targetJid,
             payload.text,
             payload.localImagePaths,
+            undefined,
+            undefined,
+            undefined,
+            failure,
           );
         } else if (payload.kind === 'im_channel_message') {
-          success = await sendImWithRetry(targetJid!, payload.text, []);
+          success = await sendImWithRetry(
+            targetJid!,
+            payload.text,
+            [],
+            undefined,
+            undefined,
+            undefined,
+            failure,
+          );
         } else if (
           payload.kind === 'im_image' ||
           payload.kind === 'im_file' ||
@@ -21965,12 +22038,16 @@ async function main(): Promise<void> {
               payload.mimeType,
               payload.caption,
               payload.fileName,
+              undefined,
+              failure,
             );
           } else {
             success = await sendTaskFileWithRetry(
               targetJid!,
               resolvedPath,
               payload.fileName,
+              undefined,
+              failure,
             );
           }
         } else {
@@ -21979,17 +22056,25 @@ async function main(): Promise<void> {
           );
         }
       } catch (err) {
+        failure.error = err;
+        failure.outcome = classifyImSendFailure(err);
         error = err instanceof Error ? err.message : String(err);
       }
       if (!success && !error)
         error = `Notification delivery failed: ${channel}`;
+      const uncertain =
+        !success &&
+        (failure.outcome === 'uncertain' ||
+          (failure.error !== undefined &&
+            classifyImSendFailure(failure.error) === 'uncertain'));
       return {
-        status: success ? 'success' : 'failed',
+        status: success ? 'success' : uncertain ? 'uncertain' : 'failed',
         summary: {
           attempted: 1,
           succeeded: success ? 1 : 0,
           failed: success ? 0 : 1,
           failed_channels: success ? [] : [channel],
+          ...(uncertain ? { uncertain: 1, uncertain_channels: [channel] } : {}),
         },
         error,
       };

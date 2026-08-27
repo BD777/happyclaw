@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  classifyImSendFailure,
   imSendFailurePolicy,
   isUncertainAfterAcceptImError,
 } from '../src/im-send-retry-policy.js';
@@ -16,6 +17,7 @@ describe('imSendFailurePolicy', () => {
       ).toEqual({
         retryable: false,
         countsTowardChannelRemoval: false,
+        outcome: 'rejected',
       });
     },
   );
@@ -26,15 +28,26 @@ describe('imSendFailurePolicy', () => {
       {
         retryable: false,
         countsTowardChannelRemoval: false,
+        outcome: 'rejected',
       },
     );
   });
 
-  test('keeps transient transport failures retryable and health-counted', () => {
-    expect(imSendFailurePolicy(new Error('connection reset'))).toEqual({
+  test('retries only a transport failure proven to be pre-acceptance', () => {
+    expect(
+      imSendFailurePolicy(
+        Object.assign(new Error('connect refused'), {
+          code: 'ECONNREFUSED',
+        }),
+      ),
+    ).toEqual({
       retryable: true,
       countsTowardChannelRemoval: true,
+      outcome: 'pre_accept',
     });
+    expect(classifyImSendFailure(new Error('connection reset'))).toBe(
+      'uncertain',
+    );
   });
 
   test('does not retry or remove a healthy channel after an explicit provider rejection', () => {
@@ -47,6 +60,7 @@ describe('imSendFailurePolicy', () => {
     ).toEqual({
       retryable: false,
       countsTowardChannelRemoval: false,
+      outcome: 'rejected',
     });
   });
 
@@ -61,7 +75,19 @@ describe('imSendFailurePolicy', () => {
       ),
     ).toBe(true);
     expect(isUncertainAfterAcceptImError(new Error('connection reset'))).toBe(
-      false,
+      true,
     );
+  });
+
+  test('an ETIMEDOUT retries only with explicit pre-accept phase evidence', () => {
+    const timeout = Object.assign(new Error('connect timed out'), {
+      code: 'ETIMEDOUT',
+    });
+    expect(classifyImSendFailure(timeout)).toBe('uncertain');
+    expect(
+      classifyImSendFailure(
+        Object.assign(timeout, { deliveryPhase: 'pre_accept' }),
+      ),
+    ).toBe('pre_accept');
   });
 });

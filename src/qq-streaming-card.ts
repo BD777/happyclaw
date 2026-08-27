@@ -495,8 +495,7 @@ export class QQStreamingController {
         );
       }
     } catch (err: any) {
-      const definitivelyRejected =
-        this.onDefinitiveRejection?.(err) === true;
+      const definitivelyRejected = this.onDefinitiveRejection?.(err) === true;
       logger.warn(
         {
           err: err.message,

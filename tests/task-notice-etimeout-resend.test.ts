@@ -28,6 +28,7 @@ describe('unscoped task notice send without outbox', () => {
 
     expect(copies).toBe(1);
     expect(result.ok).toBe(false);
+    expect(result.outcome).toBe('uncertain');
     expect((result.error as NodeJS.ErrnoException | undefined)?.code).toBe(
       'ETIMEDOUT',
     );
@@ -35,8 +36,9 @@ describe('unscoped task notice send without outbox', () => {
 
   test('pre-accept transport failures may still retry', async () => {
     let attempts = 0;
-    const refused = Object.assign(new Error('connect ECONNREFUSED'), {
-      code: 'ECONNREFUSED',
+    const refused = Object.assign(new Error('connect ETIMEDOUT'), {
+      code: 'ETIMEDOUT',
+      deliveryPhase: 'pre_accept',
     });
     const result = await retryUnscopedImSend(
       async () => {
@@ -48,6 +50,7 @@ describe('unscoped task notice send without outbox', () => {
 
     expect(attempts).toBe(3);
     expect(result.ok).toBe(false);
+    expect(result.outcome).toBe('pre_accept');
   });
 
   test('sendImWithRetry else-branch and retryTaskNotification use the unscoped helper', () => {
@@ -80,11 +83,14 @@ describe('unscoped task notice send without outbox', () => {
     expect(retryEnd).toBeGreaterThan(retryStart);
     const retryTaskNotification = source.slice(retryStart, retryEnd);
     expect(retryTaskNotification).toContain('success = await sendImWithRetry(');
+    expect(retryTaskNotification).toContain('targetJid!,');
+    expect(retryTaskNotification).toContain('failure,');
     expect(retryTaskNotification).toContain(
-      'success = await sendImWithRetry(targetJid!, payload.text, [])',
+      "status: success ? 'success' : uncertain ? 'uncertain' : 'failed'",
     );
 
     // Scheduled-task IPC notices also go through the unscoped path.
-    expect(source).toContain('sendImWithRetry(targetJid, data.text, [])');
+    expect(source).toContain('const textFailure: ImSendFailureRef = {}');
+    expect(source).toContain('failure: textFailure');
   });
 });

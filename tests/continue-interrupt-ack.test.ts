@@ -39,7 +39,10 @@ describe('internal continue interrupt emits host interrupted ACK', () => {
       '// After auto-continue, fall through to wait for next IPC message.',
       commonAt,
     );
-    const commonBlock = source.slice(Math.max(interruptAt, commonAt - 250), blockEnd);
+    const commonBlock = source.slice(
+      Math.max(interruptAt, commonAt - 250),
+      blockEnd,
+    );
     expect(commonBlock).toContain('!autoContResult.interruptedDuringQuery');
     expect(commonBlock).toContain('requeueIpcInputMessages');
   });

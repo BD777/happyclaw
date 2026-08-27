@@ -92,6 +92,8 @@ const IMAGE_EXT_MAP: Record<string, string> = {
 // ─── QQ File Upload Types & Constants ──────────────────────────
 
 export class QQApiError extends Error {
+  readonly deliveryPhase: 'rejected' | 'uncertain';
+
   constructor(
     message: string,
     public readonly bizCode?: number,
@@ -99,6 +101,13 @@ export class QQApiError extends Error {
   ) {
     super(message);
     this.name = 'QQApiError';
+    this.deliveryPhase =
+      httpStatus !== undefined &&
+      httpStatus >= 400 &&
+      httpStatus < 500 &&
+      httpStatus !== 408
+        ? 'rejected'
+        : 'uncertain';
   }
 }
 
@@ -2547,11 +2556,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       return passiveReplies.claim(chatId, Date.now(), options);
     },
 
-    rejectPassiveReply(
-      chatId: string,
-      msgId: string,
-      error: unknown,
-    ): boolean {
+    rejectPassiveReply(chatId: string, msgId: string, error: unknown): boolean {
       return rejectPassiveReply(chatId, msgId, error);
     },
 

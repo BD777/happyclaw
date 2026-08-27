@@ -98,12 +98,12 @@ describe('createPassiveReplyStore', () => {
     const text = store.claim('c2c:u1', T0);
     const media = store.claim('c2c:u1', T0);
 
-    expect([typing, stream, text, media].map((claim) => claim?.msgSeq)).toEqual([
-      1, 2, 3, 4,
-    ]);
-    expect(new Set([typing, stream, text, media].map((claim) => claim?.msgId))).toEqual(
-      new Set(['m1']),
+    expect([typing, stream, text, media].map((claim) => claim?.msgSeq)).toEqual(
+      [1, 2, 3, 4],
     );
+    expect(
+      new Set([typing, stream, text, media].map((claim) => claim?.msgId)),
+    ).toEqual(new Set(['m1']));
   });
 
   test('discard retires a definitively rejected reference', () => {

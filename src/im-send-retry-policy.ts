@@ -1,6 +1,14 @@
 export interface ImSendFailurePolicy {
   retryable: boolean;
   countsTowardChannelRemoval: boolean;
+  outcome: ImSendFailureOutcome;
+}
+
+export type ImSendFailureOutcome = 'pre_accept' | 'rejected' | 'uncertain';
+
+export interface ImSendFailureRef {
+  error?: unknown;
+  outcome?: ImSendFailureOutcome;
 }
 
 const REFRESH_REQUIRED_CODE = 'WECHAT_CONTEXT_REFRESH_REQUIRED';
@@ -17,23 +25,83 @@ function errorChainHasCode(error: unknown, expectedCode: string): boolean {
   return false;
 }
 
+function errorChain(error: unknown): Array<Record<string, unknown>> {
+  const chain: Array<Record<string, unknown>> = [];
+  let current = error;
+  const seen = new Set<unknown>();
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    chain.push(current as Record<string, unknown>);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return chain;
+}
+
+/**
+ * Classify only from transport-stage evidence. A bare timeout/reset is
+ * uncertain because it can occur after the provider accepted the mutation.
+ */
+export function classifyImSendFailure(error: unknown): ImSendFailureOutcome {
+  const chain = errorChain(error);
+  if (
+    errorChainHasCode(error, REFRESH_REQUIRED_CODE) ||
+    errorChainHasCode(error, DEFINITIVE_DELIVERY_REJECTION_CODE) ||
+    chain.some(
+      (item) =>
+        item.deliveryPhase === 'rejected' || item.outcome === 'rejected',
+    )
+  ) {
+    return 'rejected';
+  }
+  if (chain.some((item) => item.deliveryPhase === 'pre_accept')) {
+    return 'pre_accept';
+  }
+  if (
+    chain.some(
+      (item) =>
+        item.deliveryPhase === 'uncertain' || item.outcome === 'uncertain',
+    )
+  ) {
+    return 'uncertain';
+  }
+
+  const codes = new Set(chain.map((item) => String(item.code ?? '')));
+  const message = chain.map((item) => String(item.message ?? '')).join(' ');
+  if (
+    codes.has('ENOTFOUND') ||
+    codes.has('EAI_AGAIN') ||
+    codes.has('ECONNREFUSED') ||
+    codes.has('UND_ERR_CONNECT_TIMEOUT') ||
+    /disconnected before secure TLS connection was established/i.test(
+      message,
+    ) ||
+    /^(?:Unknown channel type|No IM channel available|Invalid .*chat ID|.* channel is not connected)/i.test(
+      message,
+    ) ||
+    /(?:file|image).*(?:too large|not found|unavailable)/i.test(message)
+  ) {
+    return 'pre_accept';
+  }
+  return 'uncertain';
+}
+
 /**
  * Decide whether repeating a failed IM send can make progress and whether the
  * failure is evidence that the concrete chat binding is unhealthy.
  */
 export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
-  if (
-    errorChainHasCode(error, REFRESH_REQUIRED_CODE) ||
-    errorChainHasCode(error, DEFINITIVE_DELIVERY_REJECTION_CODE)
-  ) {
+  const outcome = classifyImSendFailure(error);
+  if (outcome !== 'pre_accept') {
     return {
       retryable: false,
       countsTowardChannelRemoval: false,
+      outcome,
     };
   }
   return {
     retryable: true,
     countsTowardChannelRemoval: true,
+    outcome,
   };
 }
 
@@ -42,7 +110,7 @@ export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
  * rejected the message. The request may already have been accepted.
  */
 export function isUncertainAfterAcceptImError(error: unknown): boolean {
-  return errorChainHasCode(error, 'ETIMEDOUT');
+  return classifyImSendFailure(error) === 'uncertain';
 }
 
 export interface RetryUnscopedImSendOptions {
@@ -59,7 +127,11 @@ export interface RetryUnscopedImSendOptions {
 export async function retryUnscopedImSend(
   send: () => Promise<void>,
   options: RetryUnscopedImSendOptions = {},
-): Promise<{ ok: boolean; error?: unknown }> {
+): Promise<{
+  ok: boolean;
+  outcome: 'delivered' | ImSendFailureOutcome;
+  error?: unknown;
+}> {
   const maxAttempts = options.maxAttempts ?? 3;
   const delayMs = options.delayMs ?? 2_000;
   const sleep =
@@ -69,22 +141,20 @@ export async function retryUnscopedImSend(
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       await send();
-      return { ok: true };
+      return { ok: true, outcome: 'delivered' };
     } catch (error) {
       lastError = error;
       options.onAttemptFailure?.(error, attempt);
       // After the physical send started, ETIMEDOUT cannot prove rejection.
       // Retrying would deliver a second visible copy of the same notice.
-      if (
-        isUncertainAfterAcceptImError(error) ||
-        !imSendFailurePolicy(error).retryable
-      ) {
-        return { ok: false, error };
+      const policy = imSendFailurePolicy(error);
+      if (!policy.retryable) {
+        return { ok: false, outcome: policy.outcome, error };
       }
       if (attempt < maxAttempts - 1) {
         await sleep(delayMs * (attempt + 1));
       }
     }
   }
-  return { ok: false, error: lastError };
+  return { ok: false, outcome: 'pre_accept', error: lastError };
 }

@@ -2596,6 +2596,33 @@ describe('scheduled task workspace/session contract', () => {
     expect(result.retryPayload).toEqual(payload);
   });
 
+  test('persisted retry worker never requeues an uncertain provider outcome', async () => {
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_message',
+      targetJid: 'feishu:uncertain',
+      text: 'scheduled output',
+      localImagePaths: [],
+    };
+    const result = await deliverPersistedNotificationPayload(payload, {
+      retryTaskNotification: vi.fn(async () => ({
+        status: 'uncertain' as const,
+        summary: {
+          attempted: 1,
+          succeeded: 0,
+          failed: 1,
+          failed_channels: ['feishu'],
+          uncertain: 1,
+          uncertain_channels: ['feishu'],
+        },
+        error: 'provider acceptance is unknown',
+      })),
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(result.receipt.status).toBe('uncertain');
+    expect(result.retryPayload).toBeUndefined();
+  });
+
   test('persists unresolved explicit channel work until a binding can be resolved', async () => {
     const payload: db.TaskRunNotificationPayload = {
       kind: 'im_channel_file',

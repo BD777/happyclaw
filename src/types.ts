@@ -595,6 +595,7 @@ export type TaskRunNotificationStatus =
   | 'success'
   | 'partial_failed'
   | 'failed'
+  | 'uncertain'
   | 'skipped';
 
 export interface TaskRunNotificationSummary {
@@ -602,6 +603,9 @@ export interface TaskRunNotificationSummary {
   succeeded: number;
   failed: number;
   failed_channels: string[];
+  /** Subset of failed attempts whose provider acceptance is unknown. */
+  uncertain?: number;
+  uncertain_channels?: string[];
 }
 
 export interface TaskRunNotificationReceipt {

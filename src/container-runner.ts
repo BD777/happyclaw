@@ -621,10 +621,7 @@ export function applyProviderFailureDisposition(
       applyKnownProviderFailureDisposition(output, true);
       return true;
     }
-    providerPool.refreshFromConfig(
-      getEnabledProviders(),
-      getBalancingConfig(),
-    );
+    providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
     providerPool.reportModelFailure(selectedProfileId, model);
     const terminal = !poolCanStillServe();
     applyKnownProviderFailureDisposition(output, terminal);
@@ -2756,7 +2753,9 @@ interface HostProcessSnapshot {
   command: string;
 }
 
-function hostProcessGroupSnapshot(processGroupId: number): HostProcessSnapshot[] {
+function hostProcessGroupSnapshot(
+  processGroupId: number,
+): HostProcessSnapshot[] {
   if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return [];
   try {
     const output = execFileSync(
@@ -2843,25 +2842,28 @@ export function cleanupHostBrowserResources(
       // The process may have exited between ps and kill.
     }
   }
-  const killTimer = setTimeout(() => {
-    const remaining = hostProcessGroupSnapshot(processGroupId);
-    const stillManaged = new Set(
-      managedHostBrowserProcesses(processGroupId).map((item) => item.pid),
-    );
-    for (const target of remaining) {
-      if (
-        !stillManaged.has(target.pid) &&
-        identities.get(target.pid) !== target.command
-      ) {
-        continue;
+  const killTimer = setTimeout(
+    () => {
+      const remaining = hostProcessGroupSnapshot(processGroupId);
+      const stillManaged = new Set(
+        managedHostBrowserProcesses(processGroupId).map((item) => item.pid),
+      );
+      for (const target of remaining) {
+        if (
+          !stillManaged.has(target.pid) &&
+          identities.get(target.pid) !== target.command
+        ) {
+          continue;
+        }
+        try {
+          process.kill(target.pid, 'SIGKILL');
+        } catch {
+          // already gone
+        }
       }
-      try {
-        process.kill(target.pid, 'SIGKILL');
-      } catch {
-        // already gone
-      }
-    }
-  }, Math.max(0, killDelayMs));
+    },
+    Math.max(0, killDelayMs),
+  );
   killTimer.unref?.();
   return targets.length;
 }

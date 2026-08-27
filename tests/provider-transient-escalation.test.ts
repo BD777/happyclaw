@@ -46,7 +46,10 @@ const {
 } = await import('../src/provider-failure.js');
 type ContainerOutput = import('../src/container-runner.js').ContainerOutput;
 
-function transient(messageId: string, livenessTimeout = false): ContainerOutput {
+function transient(
+  messageId: string,
+  livenessTimeout = false,
+): ContainerOutput {
   return {
     status: 'success',
     result: null,
@@ -135,14 +138,16 @@ describe('model_not_found disposition', () => {
   test('an explicitly pinned configuration fails terminally without quarantine', () => {
     resetPool();
     const output = missingModel('pinned');
-    expect(
-      applyProviderFailureDisposition(output, 'provider-a', false),
-    ).toBe(true);
-    expect(output.providerFailureNotice).toBe(PROVIDER_MODEL_CONFIG_USER_NOTICE);
+    expect(applyProviderFailureDisposition(output, 'provider-a', false)).toBe(
+      true,
+    );
+    expect(output.providerFailureNotice).toBe(
+      PROVIDER_MODEL_CONFIG_USER_NOTICE,
+    );
     expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
-    expect(
-      providerPool.isModelQuarantined('provider-a', 'primary-model'),
-    ).toBe(false);
+    expect(providerPool.isModelQuarantined('provider-a', 'primary-model')).toBe(
+      false,
+    );
   });
 
   test('an automatic pool fences only the failed provider/model pair and fails over', () => {
@@ -153,12 +158,12 @@ describe('model_not_found disposition', () => {
     );
     expect(first.inputTurnCompleted).toBe(false);
     expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
-    expect(
-      providerPool.isModelQuarantined('provider-a', 'primary-model'),
-    ).toBe(true);
-    expect(
-      providerPool.isModelQuarantined('provider-b', 'primary-model'),
-    ).toBe(false);
+    expect(providerPool.isModelQuarantined('provider-a', 'primary-model')).toBe(
+      true,
+    );
+    expect(providerPool.isModelQuarantined('provider-b', 'primary-model')).toBe(
+      false,
+    );
 
     const second = missingModel('automatic-b');
     expect(applyProviderFailureDisposition(second, 'provider-b', true)).toBe(
