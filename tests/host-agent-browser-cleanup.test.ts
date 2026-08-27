@@ -2,9 +2,8 @@
  * Host-mode agent-browser / Chrome must not survive a successful browse.
  *
  * runHostAgent() spawns the runner with detached:true (own process group).
- * Timeout/error already call killProcessTree(-pid). The success close path
- * historically did not, so a browse that starts agent-browser → Chrome and
- * then exits 0 left those children running.
+ * The success path must reap browser resources without killing an unrelated
+ * background shell job the Agent intentionally left running.
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -146,9 +145,18 @@ const agentBrowser = spawn(
   ],
   { stdio: 'ignore', detached: false },
 );
+const background = spawn(
+  '/bin/bash',
+  ['-c', 'while true; do sleep 60; done', 'happyclaw-background-' + token],
+  { stdio: 'ignore', detached: false },
+);
 fs.writeFileSync(
   pidFile,
-  JSON.stringify({ chrome: chrome.pid, agentBrowser: agentBrowser.pid }),
+  JSON.stringify({
+    chrome: chrome.pid,
+    agentBrowser: agentBrowser.pid,
+    background: background.pid,
+  }),
 );
 process.stdout.write(
   [
@@ -275,15 +283,18 @@ describe('runHostAgent success-path browser cleanup', () => {
       const started = JSON.parse(fs.readFileSync(pidFile, 'utf8')) as {
         chrome: number;
         agentBrowser: number;
+        background: number;
       };
       livePids.add(started.chrome);
       livePids.add(started.agentBrowser);
+      livePids.add(started.background);
       expect(started.chrome).toBeGreaterThan(0);
       expect(started.agentBrowser).toBeGreaterThan(0);
 
       await expect
         .poll(() => listLeftoverBrowserProcesses(token), { timeout: 3_000 })
         .toEqual([]);
+      expect(() => process.kill(started.background, 0)).not.toThrow();
     } finally {
       spy.mockRestore();
     }
