@@ -11,7 +11,6 @@
  */
 import crypto from 'crypto';
 import fs from 'node:fs';
-import http from 'node:http';
 import https from 'node:https';
 import WebSocket from 'ws';
 import {
@@ -22,7 +21,8 @@ import {
 } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
-import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
+import { saveDownloadedFile } from './im-downloader.js';
+import { downloadHttpsBuffer } from './im-media-download.js';
 import { detectImageMimeTypeStrict } from './image-detector.js';
 import path from 'node:path';
 import {
@@ -1343,41 +1343,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
   async function downloadQQAttachment(url: string): Promise<Buffer | null> {
     try {
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        const doRequest = (reqUrl: string, redirectCount: number = 0) => {
-          if (redirectCount > 5) {
-            reject(new Error('Too many redirects'));
-            return;
-          }
-          const parsedUrl = new URL(reqUrl);
-          const protocol = parsedUrl.protocol === 'https:' ? https : http;
-          protocol
-            .get(reqUrl, (res) => {
-              if (
-                res.statusCode &&
-                res.statusCode >= 300 &&
-                res.statusCode < 400 &&
-                res.headers.location
-              ) {
-                doRequest(res.headers.location, redirectCount + 1);
-                return;
-              }
-              const chunks: Buffer[] = [];
-              let total = 0;
-              res.on('data', (chunk: Buffer) => {
-                total += chunk.length;
-                if (total > MAX_FILE_SIZE) {
-                  res.destroy(new Error('File exceeds MAX_FILE_SIZE'));
-                  return;
-                }
-                chunks.push(chunk);
-              });
-              res.on('end', () => resolve(Buffer.concat(chunks)));
-              res.on('error', reject);
-            })
-            .on('error', reject);
-        };
-        doRequest(url);
+      const buffer = await downloadHttpsBuffer(url, {
+        followRedirects: true,
       });
 
       if (buffer.length === 0) return null;

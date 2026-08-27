@@ -51,6 +51,30 @@ describe('imSendFailurePolicy', () => {
     );
   });
 
+  test('does not automatically replay an accepted-but-unacknowledged delivery', () => {
+    const cause = Object.assign(new Error('response lost'), {
+      code: 'CHANNEL_DELIVERY_UNCERTAIN',
+    });
+    expect(imSendFailurePolicy(new Error('adapter failed', { cause }))).toEqual(
+      {
+        retryable: false,
+        countsTowardChannelRemoval: false,
+        outcome: 'uncertain',
+      },
+    );
+  });
+
+  test('does not retry or remove a channel after a partial physical delivery', () => {
+    const error = Object.assign(new Error('1/2 outputs delivered'), {
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+    });
+    expect(imSendFailurePolicy(error)).toEqual({
+      retryable: false,
+      countsTowardChannelRemoval: false,
+      outcome: 'uncertain',
+    });
+  });
+
   test('does not retry or remove a healthy channel after an explicit provider rejection', () => {
     expect(
       imSendFailurePolicy(

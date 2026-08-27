@@ -869,6 +869,7 @@ export class IMConnectionManager {
     mimeType: string,
     caption?: string,
     fileName?: string,
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
@@ -881,17 +882,36 @@ export class IMConnectionManager {
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.sendImage) {
-      await withTypedImSendPhase(() =>
-        channel.sendImage!(chatId, imageBuffer, mimeType, caption, fileName),
-      );
+      if (options) {
+        await withTypedImSendPhase(() =>
+          channel.sendImage!(
+            chatId,
+            imageBuffer,
+            mimeType,
+            caption,
+            fileName,
+            options,
+          ),
+        );
+      } else {
+        await withTypedImSendPhase(() =>
+          channel.sendImage!(chatId, imageBuffer, mimeType, caption, fileName),
+        );
+      }
       return;
     }
 
     // Fallback: if channel doesn't support sendImage, send caption as text
     if (caption && channel) {
-      await withTypedImSendPhase(() =>
-        channel.sendMessage(chatId, `📷 ${caption}`),
-      );
+      if (options) {
+        await withTypedImSendPhase(() =>
+          channel.sendMessage(chatId, `📷 ${caption}`, undefined, options),
+        );
+      } else {
+        await withTypedImSendPhase(() =>
+          channel.sendMessage(chatId, `📷 ${caption}`),
+        );
+      }
       return;
     }
 
@@ -909,6 +929,7 @@ export class IMConnectionManager {
     jid: string,
     filePath: string,
     fileName: string,
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
@@ -918,9 +939,15 @@ export class IMConnectionManager {
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.sendFile) {
-      await withTypedImSendPhase(() =>
-        channel.sendFile!(chatId, filePath, fileName),
-      );
+      if (options) {
+        await withTypedImSendPhase(() =>
+          channel.sendFile!(chatId, filePath, fileName, options),
+        );
+      } else {
+        await withTypedImSendPhase(() =>
+          channel.sendFile!(chatId, filePath, fileName),
+        );
+      }
     } else {
       throw preAcceptImDeliveryError(`通道 ${channelType} 不支持发送文件`);
     }
