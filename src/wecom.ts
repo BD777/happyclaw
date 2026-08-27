@@ -24,6 +24,12 @@ import {
 import { createDedupCache } from './im-utils.js';
 import { ProcessingLock } from './im-safety/processing-lock.js';
 import {
+  MAX_FILE_SIZE,
+  sanitizeImFilename,
+  saveDownloadedFile,
+} from './im-downloader.js';
+import { detectImageMimeTypeStrict } from './image-detector.js';
+import {
   WECOM_MARKDOWN_MAX_BYTES,
   WeComStreamingController,
 } from './wecom-streaming.js';
@@ -35,6 +41,7 @@ const FRAME_TTL_MS = 30 * 60_000;
 const FRAME_CACHE_MAX = 1000;
 const REJECT_COOLDOWN_MS = 60_000;
 const PAGE_HEADER_RESERVE_BYTES = 64;
+const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
 
 export type WeComConnectionState =
   | { status: 'connecting' }
@@ -68,6 +75,7 @@ export interface WeComConnectOpts {
     command: string,
     senderImId?: string,
   ) => Promise<string | null>;
+  resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (chatJid: string) => {
     effectiveJid: string;
     agentId: string | null;
@@ -113,6 +121,9 @@ type WeComGroupMentionState = 'provider_mentioned' | 'not_group';
 
 interface WeComInboundProgress {
   timestamp?: string;
+  content?: string;
+  attachmentsJson?: string;
+  normalized?: boolean;
   registered?: boolean;
   stored?: boolean;
   frameCached?: boolean;
@@ -309,20 +320,8 @@ export function createWeComConnection(
     };
   }
 
-  async function extractInboundPersistText(body: BaseMessage): Promise<string> {
+  function extractInboundAdmissionText(body: BaseMessage): string {
     const msgtype = body.msgtype;
-    const isGroup = body.chattype === 'group';
-    // Official image/voice/file/video callbacks are C2C-only.
-    if (
-      isGroup &&
-      (msgtype === 'image' ||
-        msgtype === 'voice' ||
-        msgtype === 'file' ||
-        msgtype === 'video')
-    ) {
-      return '';
-    }
-
     if (msgtype === 'text') {
       return typeof body.text?.content === 'string'
         ? body.text.content.trim()
@@ -349,51 +348,235 @@ export function createWeComConnection(
         .filter(Boolean);
       return texts.length > 0 ? texts.join('\n') : '[图文消息]';
     }
-    if (msgtype === 'image') {
-      const image = body.image as { url?: string; aeskey?: string } | undefined;
-      if (ws && image?.url) {
-        try {
-          const downloaded = await ws.downloadFile(image.url, image.aeskey);
-          return downloaded.filename
-            ? `[图片: ${downloaded.filename}]`
-            : '[图片]';
-        } catch {
-          return '[图片]';
-        }
-      }
-      return '[图片]';
-    }
-    if (msgtype === 'file') {
-      const file = body.file as { url?: string; aeskey?: string } | undefined;
-      if (ws && file?.url) {
-        try {
-          const downloaded = await ws.downloadFile(file.url, file.aeskey);
-          return `[文件: ${downloaded.filename || 'file'}]`;
-        } catch {
-          return '[文件]';
-        }
-      }
-      return '[文件]';
-    }
-    if (msgtype === 'video') {
-      const video = body.video as { url?: string; aeskey?: string } | undefined;
-      if (ws && video?.url) {
-        try {
-          await ws.downloadFile(video.url, video.aeskey);
-        } catch {
-          // Persist the marker even when the official download fails.
-        }
-      }
-      return '[视频消息]';
-    }
+    if (msgtype === 'image') return '[图片]';
+    if (msgtype === 'file') return '[文件]';
+    if (msgtype === 'video') return '[视频消息]';
     return '';
+  }
+
+  interface WeComImageAttachment {
+    type: 'image';
+    data: string;
+    mimeType: string;
+  }
+
+  interface NormalizedWeComInbound {
+    content: string;
+    attachments: WeComImageAttachment[];
+  }
+
+  function workspaceFolder(sourceJid: string, targetJid: string) {
+    return (
+      opts?.resolveGroupFolder?.(targetJid) ??
+      opts?.resolveGroupFolder?.(sourceJid)
+    );
+  }
+
+  async function downloadInboundImage(
+    image: { url?: string; aeskey?: string } | undefined,
+    sourceJid: string,
+    targetJid: string,
+    fallbackName: string,
+  ): Promise<NormalizedWeComInbound> {
+    const client = ws;
+    if (!client || !image?.url) {
+      logger.warn({ ...logCtx, sourceJid }, 'WeCom image missing download URL');
+      return { content: '[图片]', attachments: [] };
+    }
+    try {
+      const downloaded = await client.downloadFile(image.url, image.aeskey);
+      const buffer = downloaded.buffer;
+      if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+        logger.warn({ ...logCtx, sourceJid }, 'WeCom image download was empty');
+        return { content: '[图片]', attachments: [] };
+      }
+      if (buffer.length > MAX_FILE_SIZE) {
+        logger.warn(
+          { ...logCtx, sourceJid, size: buffer.length },
+          'WeCom image exceeds inbound file limit',
+        );
+        return { content: '[图片（文件过大）]', attachments: [] };
+      }
+
+      const mimeType = detectImageMimeTypeStrict(buffer);
+      const attachments: WeComImageAttachment[] =
+        mimeType && buffer.length <= IMAGE_MAX_BASE64_SIZE
+          ? [{ type: 'image', data: buffer.toString('base64'), mimeType }]
+          : [];
+      const fileName = sanitizeImFilename(downloaded.filename || fallbackName);
+      const folder = workspaceFolder(sourceJid, targetJid);
+      if (!folder) {
+        logger.debug(
+          { ...logCtx, sourceJid, targetJid },
+          'WeCom image has no workspace folder; retaining inline attachment only',
+        );
+        return { content: '[图片]', attachments };
+      }
+      try {
+        const savedPath = await saveDownloadedFile(
+          folder,
+          'wecom',
+          fileName,
+          buffer,
+        );
+        return { content: `[图片: ${savedPath}]`, attachments };
+      } catch (error) {
+        logger.warn(
+          { ...logCtx, sourceJid, targetJid, error },
+          'Failed to save WeCom image to workspace',
+        );
+        return { content: '[图片（保存失败）]', attachments };
+      }
+    } catch (error) {
+      logger.warn(
+        { ...logCtx, sourceJid, error },
+        'Failed to download WeCom image',
+      );
+      return { content: '[图片]', attachments: [] };
+    }
+  }
+
+  async function downloadInboundFile(
+    media: { url?: string; aeskey?: string } | undefined,
+    sourceJid: string,
+    targetJid: string,
+    kind: 'file' | 'video',
+  ): Promise<NormalizedWeComInbound> {
+    const label = kind === 'video' ? '视频' : '文件';
+    const client = ws;
+    if (!client || !media?.url) {
+      logger.warn(
+        { ...logCtx, sourceJid, kind },
+        `WeCom ${kind} missing download URL`,
+      );
+      return { content: `[${label}]`, attachments: [] };
+    }
+    try {
+      const downloaded = await client.downloadFile(media.url, media.aeskey);
+      const buffer = downloaded.buffer;
+      if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+        logger.warn(
+          { ...logCtx, sourceJid, kind },
+          `WeCom ${kind} download was empty`,
+        );
+        return { content: `[${label}]`, attachments: [] };
+      }
+      if (buffer.length > MAX_FILE_SIZE) {
+        logger.warn(
+          { ...logCtx, sourceJid, kind, size: buffer.length },
+          `WeCom ${kind} exceeds inbound file limit`,
+        );
+        return { content: `[${label}（文件过大）]`, attachments: [] };
+      }
+      const fallbackName =
+        kind === 'video' ? `video_${Date.now()}.mp4` : `file_${Date.now()}`;
+      const fileName = sanitizeImFilename(downloaded.filename || fallbackName);
+      const folder = workspaceFolder(sourceJid, targetJid);
+      if (!folder) {
+        logger.warn(
+          { ...logCtx, sourceJid, targetJid, kind },
+          `WeCom ${kind} has no workspace folder`,
+        );
+        return {
+          content: `[${label}: ${fileName}（未注册群组）]`,
+          attachments: [],
+        };
+      }
+      try {
+        const savedPath = await saveDownloadedFile(
+          folder,
+          'wecom',
+          fileName,
+          buffer,
+        );
+        return { content: `[${label}: ${savedPath}]`, attachments: [] };
+      } catch (error) {
+        logger.warn(
+          { ...logCtx, sourceJid, targetJid, kind, error },
+          `Failed to save WeCom ${kind} to workspace`,
+        );
+        return {
+          content: `[${label}: ${fileName}（保存失败）]`,
+          attachments: [],
+        };
+      }
+    } catch (error) {
+      logger.warn(
+        { ...logCtx, sourceJid, kind, error },
+        `Failed to download WeCom ${kind}`,
+      );
+      return { content: `[${label}（下载失败）]`, attachments: [] };
+    }
+  }
+
+  async function normalizeInbound(
+    body: BaseMessage,
+    sourceJid: string,
+    targetJid: string,
+  ): Promise<NormalizedWeComInbound> {
+    const msgtype = body.msgtype;
+    if (
+      body.chattype === 'group' &&
+      (msgtype === 'image' ||
+        msgtype === 'voice' ||
+        msgtype === 'file' ||
+        msgtype === 'video')
+    ) {
+      return { content: '', attachments: [] };
+    }
+    if (msgtype === 'text' || msgtype === 'voice') {
+      return { content: extractInboundAdmissionText(body), attachments: [] };
+    }
+    if (msgtype === 'image') {
+      return downloadInboundImage(
+        body.image,
+        sourceJid,
+        targetJid,
+        `image_${Date.now()}.jpg`,
+      );
+    }
+    if (msgtype === 'file' || msgtype === 'video') {
+      return downloadInboundFile(
+        msgtype === 'video' ? body.video : body.file,
+        sourceJid,
+        targetJid,
+        msgtype,
+      );
+    }
+    if (msgtype === 'mixed') {
+      const items = Array.isArray(body.mixed?.msg_item)
+        ? body.mixed.msg_item
+        : [];
+      const parts: string[] = [];
+      const attachments: WeComImageAttachment[] = [];
+      let imageIndex = 0;
+      for (const item of items) {
+        if (item?.msgtype === 'text') {
+          const text = item.text?.content?.trim();
+          if (text) parts.push(text);
+        } else if (item?.msgtype === 'image') {
+          imageIndex += 1;
+          const normalized = await downloadInboundImage(
+            item.image,
+            sourceJid,
+            targetJid,
+            `mixed_image_${Date.now()}_${imageIndex}.jpg`,
+          );
+          if (normalized.content) parts.push(normalized.content);
+          attachments.push(...normalized.attachments);
+        }
+      }
+      return {
+        content: parts.join('\n') || '[图文消息]',
+        attachments,
+      };
+    }
+    return { content: '', attachments: [] };
   }
 
   async function handleInbound(frame: WsFrame<BaseMessage>): Promise<void> {
     const body = frame.body;
     if (!body) return;
-    const content = await extractInboundPersistText(body);
-    if (!content) return;
     const conversation = rawConversationJid(body);
     if (!conversation) return;
     const eventId = body.msgid || frame.headers?.req_id;
@@ -419,13 +602,15 @@ export function createWeComConnection(
       const fromUserId = body.from?.userid;
       if (!fromUserId) return;
       const senderName = fromUserId;
+      const admissionText = extractInboundAdmissionText(body);
+      if (!admissionText) return;
 
       // WeCom accounts must never inherit evaluateChannelAdmission's legacy
       // open-channel behavior: absent account-scoped auth is a deny.
       const admission = await evaluateChannelAdmission({
         jid,
         chatName: senderName,
-        text: content,
+        text: admissionText,
         isChatAuthorized: opts?.isChatAuthorized ?? (() => false),
         onPairAttempt: opts?.onPairAttempt,
       });
@@ -472,7 +657,7 @@ export function createWeComConnection(
       }
       const { targetJid, routing } = resolvedRoute;
 
-      const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/u);
+      const slashMatch = admissionText.match(/^\/(\S+)(?:\s+(.*))?$/u);
       const commandName = slashMatch?.[1]?.toLowerCase();
       const registeredGroup = conversation.isGroup
         ? opts?.resolveRegisteredGroup?.(jid)
@@ -578,6 +763,21 @@ export function createWeComConnection(
         inboundProgress.delete(dedupKey);
         return;
       }
+      if (!progress.normalized) {
+        const normalized = await normalizeInbound(body, jid, targetJid);
+        progress.content = normalized.content;
+        progress.attachmentsJson =
+          normalized.attachments.length > 0
+            ? JSON.stringify(normalized.attachments)
+            : undefined;
+        progress.normalized = true;
+      }
+      const content = progress.content ?? '';
+      const attachmentsJson = progress.attachmentsJson;
+      if (!content && !attachmentsJson) {
+        inboundProgress.delete(dedupKey);
+        return;
+      }
       // WeCom create_time has only second precision. Cursor polling is ordered
       // by (timestamp,id), so sequence concurrent events after the durable chat
       // tail. Keep the assigned value in staged progress: if persistence
@@ -601,7 +801,7 @@ export function createWeComConnection(
           content,
           timestamp,
           false,
-          { sourceJid: jid },
+          { attachments: attachmentsJson, sourceJid: jid },
         );
         progress.stored = true;
       }
@@ -620,6 +820,7 @@ export function createWeComConnection(
             sender_name: senderName,
             content,
             timestamp,
+            attachments: attachmentsJson,
             is_from_me: false,
           },
           routing?.agentId ?? undefined,

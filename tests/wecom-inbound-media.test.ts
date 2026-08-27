@@ -31,6 +31,13 @@ const sdkMock = vi.hoisted(() => {
   return { MockWSClient, req: 0 };
 });
 
+const mediaStore = vi.hoisted(() => ({
+  saveDownloadedFile: vi.fn(
+    async (_folder: string, channel: string, fileName: string) =>
+      `downloads/${channel}/${fileName}`,
+  ),
+}));
+
 vi.mock('@wecom/aibot-node-sdk', () => ({
   WSClient: sdkMock.MockWSClient,
   generateReqId: (prefix: string) => `${prefix}-${++sdkMock.req}`,
@@ -45,6 +52,10 @@ vi.mock('../src/db.js', () => ({
 }));
 vi.mock('../src/message-notifier.js', () => ({
   notifyNewImMessage: vi.fn(),
+}));
+vi.mock('../src/im-downloader.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/im-downloader.js')>()),
+  saveDownloadedFile: mediaStore.saveDownloadedFile,
 }));
 vi.mock('../src/logger.js', () => ({
   logger: {
@@ -76,8 +87,10 @@ function mediaFrame(input: {
   imageUrl?: string;
   imageAeskey?: string;
   mixedText?: string;
+  mixedImageUrl?: string;
   fileUrl?: string;
   videoUrl?: string;
+  createTime?: number;
 }) {
   const chattype = input.chattype ?? 'single';
   const body: Record<string, unknown> = {
@@ -86,7 +99,7 @@ function mediaFrame(input: {
     chattype,
     chatid: chattype === 'group' ? (input.chatId ?? 'group-1') : undefined,
     from: { userid: input.userId ?? 'user-1' },
-    create_time: Math.floor(Date.now() / 1000),
+    create_time: input.createTime ?? Math.floor(Date.now() / 1000),
     msgtype: input.msgtype,
   };
   if (input.msgtype === 'text') body.text = { content: input.text ?? 'hello' };
@@ -98,10 +111,17 @@ function mediaFrame(input: {
     };
   }
   if (input.msgtype === 'mixed') {
+    const msgItems: Array<Record<string, unknown>> = [
+      { msgtype: 'text', text: { content: input.mixedText ?? 'hello' } },
+    ];
+    if (input.mixedImageUrl) {
+      msgItems.push({
+        msgtype: 'image',
+        image: { url: input.mixedImageUrl, aeskey: 'mixed-key' },
+      });
+    }
     body.mixed = {
-      msg_item: [
-        { msgtype: 'text', text: { content: input.mixedText ?? 'hello' } },
-      ],
+      msg_item: msgItems,
     };
   }
   if (input.msgtype === 'file') {
@@ -137,6 +157,7 @@ async function connect(overrides: Record<string, unknown> = {}): Promise<{
       effectiveJid: jid,
       agentId: null,
     })),
+    resolveGroupFolder: vi.fn(() => 'workspace-1'),
     onMessagePersisted: vi.fn(),
     ...overrides,
   };
@@ -155,6 +176,9 @@ describe('WeCom inbound media persist/notify', () => {
       (_chatJid, proposedTimestamp) => proposedTimestamp,
     );
     vi.mocked(storeMessageDirect).mockImplementation(() => 'stored');
+    mediaStore.saveDownloadedFile.mockImplementation(
+      async (_folder, channel, fileName) => `downloads/${channel}/${fileName}`,
+    );
     sdkMock.MockWSClient.instances.length = 0;
     sdkMock.req = 0;
   });
@@ -172,19 +196,43 @@ describe('WeCom inbound media persist/notify', () => {
 
   test('authorized C2C mixed persists text items and notifies', async () => {
     const { client } = await connect();
+    const imageBuffer = Buffer.from([
+      0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    client.downloadFile.mockResolvedValue({
+      buffer: imageBuffer,
+      filename: 'mixed.jpg',
+    });
     client.emit(
       'message.mixed',
-      mediaFrame({ reqId: 'mixed-1', msgtype: 'mixed', mixedText: 'hello' }),
+      mediaFrame({
+        reqId: 'mixed-1',
+        msgtype: 'mixed',
+        mixedText: 'hello',
+        mixedImageUrl: 'https://example.com/mixed.jpg',
+      }),
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
-    expect(storeMessageDirect.mock.calls[0][4]).toBe('hello');
+    expect(storeMessageDirect.mock.calls[0][4]).toBe(
+      'hello\n[图片: downloads/wecom/mixed.jpg]',
+    );
+    expect(client.downloadFile).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(storeMessageDirect.mock.calls[0][7].attachments)).toEqual(
+      [
+        {
+          type: 'image',
+          data: imageBuffer.toString('base64'),
+          mimeType: 'image/jpeg',
+        },
+      ],
+    );
     expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('authorized C2C image downloads and persists a picture marker', async () => {
     const { client } = await connect();
     client.downloadFile.mockResolvedValue({
-      buffer: Buffer.from('img'),
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
       filename: 'a.jpg',
     });
     client.emit(
@@ -193,7 +241,10 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(client.downloadFile).toHaveBeenCalled();
-    expect(storeMessageDirect.mock.calls[0][4]).toBe('[图片: a.jpg]');
+    expect(storeMessageDirect.mock.calls[0][4]).toBe(
+      '[图片: downloads/wecom/a.jpg]',
+    );
+    expect(storeMessageDirect.mock.calls[0][7].attachments).toBeTruthy();
     expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
@@ -208,6 +259,66 @@ describe('WeCom inbound media persist/notify', () => {
     await vi.waitFor(() => expect(client.replyStream).toHaveBeenCalled());
     expect(storeMessageDirect).not.toHaveBeenCalled();
     expect(notifyNewImMessage).not.toHaveBeenCalled();
+  });
+
+  test('authorization rejects image before any download', async () => {
+    const { client } = await connect({
+      isChatAuthorized: vi.fn(() => false),
+    });
+    client.emit(
+      'message.image',
+      mediaFrame({ reqId: 'image-deny', msgtype: 'image' }),
+    );
+    await vi.waitFor(() => expect(client.replyStream).toHaveBeenCalled());
+    expect(client.downloadFile).not.toHaveBeenCalled();
+    expect(mediaStore.saveDownloadedFile).not.toHaveBeenCalled();
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+  });
+
+  test('stale media is rejected before admission and download', async () => {
+    const isChatAuthorized = vi.fn(() => true);
+    const { client } = await connect({
+      isChatAuthorized,
+      ignoreMessagesBefore: Date.now(),
+    });
+    client.emit(
+      'message.image',
+      mediaFrame({
+        reqId: 'image-stale',
+        msgtype: 'image',
+        createTime: Math.floor(Date.now() / 1000) - 60,
+      }),
+    );
+    await Promise.resolve();
+    expect(isChatAuthorized).not.toHaveBeenCalled();
+    expect(client.downloadFile).not.toHaveBeenCalled();
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+  });
+
+  test('duplicate media callbacks download and persist only once', async () => {
+    const { client } = await connect();
+    client.downloadFile.mockResolvedValue({
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
+      filename: 'once.jpg',
+    });
+    const frame = mediaFrame({ reqId: 'image-duplicate', msgtype: 'image' });
+    client.emit('message.image', frame);
+    client.emit('message.image', frame);
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
+    expect(client.downloadFile).toHaveBeenCalledTimes(1);
+    expect(storeMessageDirect).toHaveBeenCalledTimes(1);
+  });
+
+  test('durable media replay is detected before download', async () => {
+    vi.mocked(getMessage).mockReturnValue({ id: 'stored' } as any);
+    const { client } = await connect();
+    client.emit(
+      'message.image',
+      mediaFrame({ reqId: 'image-durable', msgtype: 'image' }),
+    );
+    await vi.waitFor(() => expect(getMessage).toHaveBeenCalled());
+    expect(client.downloadFile).not.toHaveBeenCalled();
+    expect(storeMessageDirect).not.toHaveBeenCalled();
   });
 
   test('group image is dropped because official media is C2C-only', async () => {
@@ -254,7 +365,15 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(client.downloadFile).toHaveBeenCalled();
-    expect(storeMessageDirect.mock.calls[0][4]).toBe('[文件: notes.pdf]');
+    expect(mediaStore.saveDownloadedFile).toHaveBeenCalledWith(
+      'workspace-1',
+      'wecom',
+      'notes.pdf',
+      Buffer.from('pdf'),
+    );
+    expect(storeMessageDirect.mock.calls[0][4]).toBe(
+      '[文件: downloads/wecom/notes.pdf]',
+    );
     expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
@@ -270,7 +389,9 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(client.downloadFile).toHaveBeenCalled();
-    expect(storeMessageDirect.mock.calls[0][4]).toBe('[视频消息]');
+    expect(storeMessageDirect.mock.calls[0][4]).toBe(
+      '[视频: downloads/wecom/clip.mp4]',
+    );
     expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
@@ -295,7 +416,7 @@ describe('WeCom inbound media persist/notify', () => {
       mediaFrame({ reqId: 'file-fail', msgtype: 'file' }),
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
-    expect(storeMessageDirect.mock.calls[0][4]).toBe('[文件]');
+    expect(storeMessageDirect.mock.calls[0][4]).toBe('[文件（下载失败）]');
     expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
@@ -307,7 +428,7 @@ describe('WeCom inbound media persist/notify', () => {
       mediaFrame({ reqId: 'video-fail', msgtype: 'video' }),
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
-    expect(storeMessageDirect.mock.calls[0][4]).toBe('[视频消息]');
+    expect(storeMessageDirect.mock.calls[0][4]).toBe('[视频（下载失败）]');
     expect(notifyNewImMessage).toHaveBeenCalled();
   });
   test('existing authorized C2C text path still persists and notifies', async () => {
