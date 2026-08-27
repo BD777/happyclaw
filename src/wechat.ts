@@ -61,9 +61,9 @@ const MESSAGE_TYPE_BOT = 2;
 // iLink message item types
 const MESSAGE_ITEM_TYPE_TEXT = 1;
 const MESSAGE_ITEM_TYPE_IMAGE = 2;
-// const MESSAGE_ITEM_TYPE_VOICE = 3;
+const MESSAGE_ITEM_TYPE_VOICE = 3;
 const MESSAGE_ITEM_TYPE_FILE = 4;
-// const MESSAGE_ITEM_TYPE_VIDEO = 5;
+const MESSAGE_ITEM_TYPE_VIDEO = 5;
 
 // iLink message state
 // const MESSAGE_STATE_NEW = 0;
@@ -359,11 +359,11 @@ function extractTextContent(items: MessageItem[]): string {
       if (!item.image_item?.media?.encrypt_query_param) {
         parts.push('(image)');
       }
-    } else if (item.type === 3 /* VOICE */) {
+    } else if (item.type === MESSAGE_ITEM_TYPE_VOICE) {
       // Voice: prefer speech-to-text transcription
       if (item.voice_item?.text) {
         parts.push(item.voice_item.text);
-      } else {
+      } else if (!item.voice_item?.media?.encrypt_query_param) {
         parts.push('(voice)');
       }
     } else if (item.type === MESSAGE_ITEM_TYPE_FILE) {
@@ -372,8 +372,10 @@ function extractTextContent(items: MessageItem[]): string {
       if (!item.file_item?.media?.encrypt_query_param) {
         parts.push(`(file: ${item.file_item?.file_name ?? 'unknown'})`);
       }
-    } else if (item.type === 5 /* VIDEO */) {
-      parts.push('(video)');
+    } else if (item.type === MESSAGE_ITEM_TYPE_VIDEO) {
+      if (!item.video_item?.media?.encrypt_query_param) {
+        parts.push('(video)');
+      }
     }
   }
   return parts.join('\n').trim();
@@ -899,6 +901,38 @@ export function createWeChatConnection(
     }
   }
 
+  async function processVoiceOrVideoItem(
+    item: MessageItem,
+    kind: 'voice' | 'video',
+    msgIdentifier: string,
+    groupFolder: string | undefined,
+  ): Promise<string | null> {
+    const media =
+      kind === 'video' ? item.video_item?.media : item.voice_item?.media;
+    const fallback = kind === 'video' ? '[视频消息]' : '[语音消息]';
+    const fileName =
+      kind === 'video'
+        ? `wechat_vid_${msgIdentifier}.mp4`
+        : `wechat_voice_${msgIdentifier}.silk`;
+    try {
+      const result = await downloadCdnMediaItem(
+        media,
+        groupFolder,
+        kind,
+        () => fileName,
+      );
+      if (result?.savedPath) {
+        return kind === 'video'
+          ? `[视频: ${result.savedPath}]`
+          : `[语音: ${result.savedPath}]`;
+      }
+      return fallback;
+    } catch (err) {
+      logger.warn({ err, kind }, `WeChat ${kind} download/decrypt failed`);
+      return fallback;
+    }
+  }
+
   async function processFileItem(
     item: MessageItem,
     groupFolder: string | undefined,
@@ -1111,6 +1145,28 @@ export function createWeChatConnection(
           } else if (item.type === MESSAGE_ITEM_TYPE_FILE) {
             mediaPromises.push(
               processFileItem(item, groupFolder).then((label) => {
+                if (label) textPrefixes.push(label);
+              }),
+            );
+          } else if (item.type === MESSAGE_ITEM_TYPE_VIDEO) {
+            mediaPromises.push(
+              processVoiceOrVideoItem(
+                item,
+                'video',
+                msgId.slice(-8),
+                groupFolder,
+              ).then((label) => {
+                if (label) textPrefixes.push(label);
+              }),
+            );
+          } else if (item.type === MESSAGE_ITEM_TYPE_VOICE) {
+            mediaPromises.push(
+              processVoiceOrVideoItem(
+                item,
+                'voice',
+                msgId.slice(-8),
+                groupFolder,
+              ).then((label) => {
                 if (label) textPrefixes.push(label);
               }),
             );
