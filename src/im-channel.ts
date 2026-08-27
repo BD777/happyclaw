@@ -964,6 +964,7 @@ export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
           onPairAttempt: opts.onPairAttempt,
           onConnectionStateChange: opts.onWeComConnectionStateChange,
           onCommand: opts.onCommand,
+          resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
           onMessagePersisted: opts.onMessagePersisted,

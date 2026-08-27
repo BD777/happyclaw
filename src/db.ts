@@ -13645,6 +13645,21 @@ export function getMessage(
   return row ?? null;
 }
 
+/** Read only the durable payload needed to resume post-persist channel effects. */
+export function getMessagePayload(
+  chatJid: string,
+  messageId: string,
+): { content: string; attachments: string | null } | null {
+  const row = db
+    .prepare(
+      'SELECT content, attachments FROM messages WHERE id = ? AND chat_jid = ?',
+    )
+    .get(messageId, chatJid) as
+    | { content: string; attachments: string | null }
+    | undefined;
+  return row ?? null;
+}
+
 /** Read the host-persisted human input used to authorize Agent Builder calls. */
 export function getAgentBuilderInputMessage(
   chatJid: string,

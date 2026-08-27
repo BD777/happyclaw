@@ -274,6 +274,61 @@ async function downloadAttachment(url: string): Promise<Buffer | null> {
 
 // ─── Factory Function ───────────────────────────────────────────
 
+function iterDiscordCollection<T>(
+  value: { values?: () => Iterable<T> } | T[] | undefined | null,
+): T[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value.values === 'function') return [...value.values()];
+  return [];
+}
+
+/** Sticker-only and forwarded-snapshot text used before the empty persist gate. */
+export function discordSupplementalInboundText(msg: {
+  stickers?:
+    | { values?: () => Iterable<{ name?: string | null }> }
+    | Array<{ name?: string | null }>;
+  stickerItems?:
+    | { values?: () => Iterable<{ name?: string | null }> }
+    | Array<{ name?: string | null }>;
+  sticker_items?: Array<{ name?: string | null }>;
+  messageSnapshots?: { values?: () => Iterable<any> } | any[];
+  message_snapshots?: any[];
+}): string {
+  const stickerNames: string[] = [];
+  for (const sticker of [
+    ...iterDiscordCollection(msg.stickers),
+    ...iterDiscordCollection(msg.stickerItems),
+    ...(msg.sticker_items ?? []),
+  ]) {
+    const name = sticker?.name?.trim();
+    if (name) stickerNames.push(name);
+  }
+  const uniqueStickers = [...new Set(stickerNames)];
+  const stickerText = uniqueStickers.length
+    ? uniqueStickers.map((name) => `[表情包: ${name}]`).join('\n')
+    : '';
+
+  const snapshots = [
+    ...iterDiscordCollection(msg.messageSnapshots),
+    ...(msg.message_snapshots ?? []),
+  ];
+  const snapshotBits: string[] = [];
+  for (const snap of snapshots) {
+    const inner = snap?.message ?? snap;
+    const text = typeof inner?.content === 'string' ? inner.content.trim() : '';
+    if (text) snapshotBits.push(text);
+    const nested = discordSupplementalInboundText({
+      stickers: inner?.stickers,
+      stickerItems: inner?.stickerItems,
+      sticker_items: inner?.sticker_items,
+    });
+    if (nested) snapshotBits.push(nested);
+  }
+
+  return [...snapshotBits, stickerText].filter(Boolean).join('\n');
+}
+
 export function createDiscordConnection(
   config: DiscordConnectionConfig,
 ): DiscordConnection {
@@ -623,6 +678,11 @@ export function createDiscordConnection(
 
         if (imageAttachments.length > 0) {
           attachmentsJson = JSON.stringify(imageAttachments);
+        }
+
+        const supplemental = discordSupplementalInboundText(msg);
+        if (supplemental) {
+          content = content ? `${content}\n${supplemental}` : supplemental;
         }
 
         // Skip empty messages

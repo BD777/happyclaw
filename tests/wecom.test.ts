@@ -37,6 +37,7 @@ vi.mock('@wecom/aibot-node-sdk', () => ({
 
 vi.mock('../src/db.js', () => ({
   getMessage: vi.fn(() => null),
+  getMessagePayload: vi.fn(() => null),
   sequenceInboundTimestampAfterChatTail: vi.fn(
     (_chatJid: string, proposedTimestamp: string) => proposedTimestamp,
   ),
@@ -56,6 +57,7 @@ vi.mock('../src/logger.js', () => ({
 
 import {
   getMessage,
+  getMessagePayload,
   sequenceInboundTimestampAfterChatTail,
   storeMessageDirect,
 } from '../src/db.js';
@@ -125,6 +127,19 @@ describe('WeCom connection security and delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getMessage).mockReturnValue(null);
+    vi.mocked(getMessagePayload).mockImplementation((chatJid, messageId) => {
+      const call = vi
+        .mocked(storeMessageDirect)
+        .mock.calls.find(
+          (entry) => entry[0] === messageId && entry[1] === chatJid,
+        );
+      return call
+        ? {
+            content: call[4],
+            attachments: call[7]?.attachments ?? null,
+          }
+        : null;
+    });
     vi.mocked(sequenceInboundTimestampAfterChatTail).mockImplementation(
       (_chatJid, proposedTimestamp) => proposedTimestamp,
     );

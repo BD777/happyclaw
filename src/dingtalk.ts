@@ -14,6 +14,7 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
+import { parseBuffer as parseMediaMetadata } from 'music-metadata';
 import {
   DWClient,
   TOPIC_ROBOT,
@@ -33,7 +34,7 @@ import {
   createDedupCache,
 } from './im-utils.js';
 import { extractRepliedMsg, type RepliedMsg } from './dingtalk-reply-parser.js';
-import { ProcessingLock, isStale } from './im-safety/index.js';
+import { isStale } from './im-safety/index.js';
 import {
   evaluateChannelAdmission,
   resolveAdmittedChannelRoute,
@@ -52,6 +53,144 @@ const MSG_SPLIT_LIMIT = 4000; // DingTalk markdown card limit
 const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
 // Minimum valid image size (bytes) — discard responses that are too small to be real images
 const MIN_IMAGE_SIZE = 500;
+/** Match QQ's outbound API request budget so a blackhole peer cannot hang a send. */
+export const DINGTALK_HTTPS_REQUEST_TIMEOUT_MS = 30_000;
+
+export interface DingTalkHttpsRequestOverrides {
+  hostname?: string;
+  port?: number;
+  timeoutMs?: number;
+  rejectUnauthorized?: boolean;
+}
+
+export function dingtalkHttpsRequest(
+  options: https.RequestOptions & { timeoutMs?: number },
+  body?: string | Buffer,
+): Promise<{ statusCode: number | undefined; body: Buffer }> {
+  const timeoutMs = options.timeoutMs ?? DINGTALK_HTTPS_REQUEST_TIMEOUT_MS;
+  const requestOptions: https.RequestOptions = { ...options };
+  delete (requestOptions as { timeoutMs?: number }).timeoutMs;
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        ...requestOptions,
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks) });
+        });
+        res.on('error', reject);
+      },
+    );
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(
+        new Error(`DingTalk HTTPS request timed out after ${timeoutMs}ms`),
+      );
+    });
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+export async function downloadDingTalkHttpBuffer(
+  url: string,
+  maxBytes = MAX_FILE_SIZE,
+  timeoutMs = DINGTALK_HTTPS_REQUEST_TIMEOUT_MS,
+): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const requestUrl = (current: URL, redirectCount: number): void => {
+      if (!['http:', 'https:'].includes(current.protocol)) {
+        reject(
+          new Error(`Unsupported DingTalk media protocol: ${current.protocol}`),
+        );
+        return;
+      }
+      if (redirectCount > 5) {
+        reject(new Error('Too many DingTalk media redirects'));
+        return;
+      }
+
+      const transport = current.protocol === 'https:' ? https : http;
+      const req = transport.request(current, (res) => {
+        const status = res.statusCode ?? 0;
+        if (status >= 300 && status < 400) {
+          const location = res.headers.location;
+          res.destroy();
+          if (!location) {
+            reject(
+              new Error(`DingTalk media redirect ${status} has no Location`),
+            );
+            return;
+          }
+          let next: URL;
+          try {
+            next = new URL(location, current);
+          } catch (error) {
+            reject(
+              new Error('Invalid DingTalk media redirect URL', {
+                cause: error,
+              }),
+            );
+            return;
+          }
+          requestUrl(next, redirectCount + 1);
+          return;
+        }
+        if (status < 200 || status >= 300) {
+          res.destroy();
+          reject(new Error(`DingTalk media GET HTTP failed (${status})`));
+          return;
+        }
+
+        const contentLength = Number(res.headers['content-length']);
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+          res.destroy();
+          reject(new Error('DingTalk media exceeds the download byte limit'));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let total = 0;
+        let exceeded = false;
+        res.on('data', (chunk: Buffer) => {
+          if (exceeded) return;
+          total += chunk.length;
+          if (total > maxBytes) {
+            exceeded = true;
+            res.destroy(
+              new Error('DingTalk media exceeds the download byte limit'),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          if (!exceeded) resolve(Buffer.concat(chunks, total));
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(
+          new Error(`DingTalk media request timed out after ${timeoutMs}ms`),
+        );
+      });
+      req.end();
+    };
+
+    let initial: URL;
+    try {
+      initial = new URL(url);
+    } catch (error) {
+      reject(new Error('Invalid DingTalk media URL', { cause: error }));
+      return;
+    }
+    requestUrl(initial, 0);
+  });
+}
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -205,6 +344,388 @@ export function parseDingTalkGroupMessageResponse(
   return data;
 }
 
+interface DingTalkSendEnvelope {
+  errcode?: number;
+  errmsg?: string;
+  code?: string | number;
+  message?: string;
+}
+
+export interface DingTalkBatchSendSuccess extends DingTalkSendEnvelope {
+  processQueryKey: string;
+  invalidStaffIdList?: string[];
+  flowControlledStaffIdList?: string[];
+}
+
+export type DingTalkBatchFailureClassification =
+  | 'permanent'
+  | 'rate_limited'
+  | 'mixed';
+
+export class DingTalkBatchRecipientError extends Error {
+  readonly code = 'DINGTALK_BATCH_RECIPIENT_FAILURE';
+
+  constructor(
+    readonly classification: DingTalkBatchFailureClassification,
+    readonly invalidStaffIds: string[],
+    readonly flowControlledStaffIds: string[],
+  ) {
+    super(
+      `DingTalk batchSend recipient failure (${classification}): ` +
+        `${invalidStaffIds.length} invalid, ${flowControlledStaffIds.length} flow-controlled`,
+    );
+    this.name = 'DingTalkBatchRecipientError';
+  }
+}
+
+function parseDingTalkJsonEnvelope(
+  statusCode: number | undefined,
+  body: string,
+  endpoint: string,
+): DingTalkSendEnvelope {
+  if (!statusCode || statusCode < 200 || statusCode >= 300) {
+    throw new Error(
+      `DingTalk ${endpoint} HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
+    );
+  }
+  if (!body.trim()) {
+    throw new Error(`DingTalk ${endpoint} returned an empty response`);
+  }
+
+  let data: DingTalkSendEnvelope;
+  try {
+    data = JSON.parse(body) as DingTalkSendEnvelope;
+  } catch {
+    throw new Error(`DingTalk ${endpoint} returned invalid JSON`);
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error(`DingTalk ${endpoint} returned an invalid envelope`);
+  }
+  if (data.errcode !== undefined && Number(data.errcode) !== 0) {
+    throw new Error(
+      `DingTalk ${endpoint} API error: ${data.errcode} ${data.errmsg ?? ''}`,
+    );
+  }
+  if (
+    data.code !== undefined &&
+    !['0', 'ok', 'success'].includes(String(data.code).toLowerCase())
+  ) {
+    throw new Error(
+      `DingTalk ${endpoint} API error: ${String(data.code)} ${data.message ?? data.errmsg ?? ''}`,
+    );
+  }
+  return data;
+}
+
+/** Session webhooks acknowledge success only with the documented errcode=0. */
+export function parseDingTalkSessionWebhookResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkSendEnvelope {
+  const data = parseDingTalkJsonEnvelope(statusCode, body, 'sessionWebhook');
+  if (data.errcode !== 0) {
+    throw new Error(
+      'DingTalk sessionWebhook returned an unrecognized success envelope',
+    );
+  }
+  return data;
+}
+
+/** Persistent C2C sends may partially reject individual recipients. */
+export function parseDingTalkBatchSendResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkBatchSendSuccess {
+  const data = parseDingTalkJsonEnvelope(
+    statusCode,
+    body,
+    'batchSend',
+  ) as DingTalkBatchSendSuccess;
+  const invalid = data.invalidStaffIdList ?? [];
+  const flowControlled = data.flowControlledStaffIdList ?? [];
+  if (
+    !Array.isArray(invalid) ||
+    !invalid.every((id) => typeof id === 'string')
+  ) {
+    throw new Error('DingTalk batchSend returned invalidStaffIdList metadata');
+  }
+  if (
+    !Array.isArray(flowControlled) ||
+    !flowControlled.every((id) => typeof id === 'string')
+  ) {
+    throw new Error(
+      'DingTalk batchSend returned flowControlledStaffIdList metadata',
+    );
+  }
+  if (invalid.length > 0 || flowControlled.length > 0) {
+    const classification =
+      invalid.length > 0 && flowControlled.length > 0
+        ? 'mixed'
+        : invalid.length > 0
+          ? 'permanent'
+          : 'rate_limited';
+    throw new DingTalkBatchRecipientError(
+      classification,
+      invalid,
+      flowControlled,
+    );
+  }
+  if (
+    typeof data.processQueryKey !== 'string' ||
+    data.processQueryKey.trim().length === 0
+  ) {
+    throw new Error(
+      'DingTalk batchSend returned an unrecognized success envelope',
+    );
+  }
+  return data;
+}
+
+/**
+ * POST /v1.0/robot/oToMessages/batchSend
+ * Used by C2C text, file, and image message senders.
+ */
+export async function batchSendToUser(
+  userIds: string[],
+  robotCode: string,
+  token: string,
+  msgKey: string,
+  msgParam: string,
+  requestOverrides?: DingTalkHttpsRequestOverrides,
+): Promise<void> {
+  const body = JSON.stringify({ robotCode, userIds, msgKey, msgParam });
+  const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+    {
+      hostname: requestOverrides?.hostname ?? 'api.dingtalk.com',
+      port: requestOverrides?.port,
+      path: '/v1.0/robot/oToMessages/batchSend',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-acs-dingtalk-access-token': token,
+      },
+      rejectUnauthorized: requestOverrides?.rejectUnauthorized,
+      timeoutMs: requestOverrides?.timeoutMs,
+    },
+    body,
+  );
+  const respBody = respBuf.toString('utf8');
+  parseDingTalkBatchSendResponse(statusCode, respBody);
+}
+
+/**
+ * POST /v1.0/robot/groupMessages/send
+ * Uses openConversationId (stable group ID) instead of ephemeral sessionWebhook.
+ * Ref: https://open.dingtalk.com/document/group/the-robot-sends-a-group-message
+ */
+export async function sendViaGroupMessagesAPI(
+  openConversationId: string,
+  robotCode: string,
+  token: string,
+  msgKey: string,
+  msgParam: string,
+  requestOverrides?: DingTalkHttpsRequestOverrides,
+): Promise<DingTalkGroupMessageSuccess> {
+  const body = JSON.stringify({
+    openConversationId,
+    robotCode,
+    msgKey,
+    msgParam,
+  });
+  const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+    {
+      hostname: requestOverrides?.hostname ?? 'api.dingtalk.com',
+      port: requestOverrides?.port,
+      path: '/v1.0/robot/groupMessages/send',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-acs-dingtalk-access-token': token,
+      },
+      rejectUnauthorized: requestOverrides?.rejectUnauthorized,
+      timeoutMs: requestOverrides?.timeoutMs,
+    },
+    body,
+  );
+  const respBody = respBuf.toString('utf8');
+  const data = parseDingTalkGroupMessageResponse(statusCode, respBody);
+  logger.info(
+    {
+      statusCode,
+      errcode: data.errcode,
+      errmsg: data.errmsg,
+      processQueryKey: data.processQueryKey,
+    },
+    'DingTalk sendViaGroupMessagesAPI response',
+  );
+  return data;
+}
+
+const DINGTALK_IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp']);
+const DINGTALK_VOICE_EXTENSIONS = new Set(['amr', 'ogg']);
+const DINGTALK_VIDEO_EXTENSIONS = new Set(['mp4']);
+const DINGTALK_VOICE_MAX_BYTES = 2 * 1024 * 1024;
+
+export interface DingTalkNativeMediaMetadata {
+  /** Parsed media duration in seconds. */
+  durationSeconds?: number;
+  /** Separately uploaded image media ID required by sampleVideo. */
+  picMediaId?: string;
+}
+
+function parseAmrDurationSeconds(buffer: Buffer): number | undefined {
+  const narrowBandMagic = Buffer.from('#!AMR\n');
+  const wideBandMagic = Buffer.from('#!AMR-WB\n');
+  let offset: number;
+  let frameSizes: Array<number | undefined>;
+
+  if (buffer.subarray(0, narrowBandMagic.length).equals(narrowBandMagic)) {
+    offset = narrowBandMagic.length;
+    frameSizes = [
+      13,
+      14,
+      16,
+      18,
+      20,
+      21,
+      27,
+      32,
+      6,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      1,
+      1,
+    ];
+  } else if (buffer.subarray(0, wideBandMagic.length).equals(wideBandMagic)) {
+    offset = wideBandMagic.length;
+    frameSizes = [
+      18,
+      24,
+      33,
+      37,
+      41,
+      47,
+      51,
+      59,
+      61,
+      6,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      1,
+      1,
+    ];
+  } else {
+    return undefined;
+  }
+
+  let frameCount = 0;
+  while (offset < buffer.length) {
+    const frameType = (buffer[offset] >> 3) & 0x0f;
+    const frameSize = frameSizes[frameType];
+    if (!frameSize || offset + frameSize > buffer.length) return undefined;
+    offset += frameSize;
+    frameCount += 1;
+  }
+  return frameCount > 0 ? frameCount * 0.02 : undefined;
+}
+
+export async function getDingTalkMediaDurationSeconds(
+  buffer: Buffer,
+  ext: string,
+): Promise<number | undefined> {
+  const normalizedExt = ext.toLowerCase();
+  if (normalizedExt === 'amr') return parseAmrDurationSeconds(buffer);
+
+  const mimeTypeByExtension: Record<string, string> = {
+    ogg: 'audio/ogg',
+    mp4: 'video/mp4',
+  };
+  const mimeType = mimeTypeByExtension[normalizedExt];
+  if (!mimeType) return undefined;
+
+  try {
+    const metadata = await parseMediaMetadata(
+      buffer,
+      { mimeType, size: buffer.length },
+      { duration: true, skipCovers: true },
+    );
+    const duration = metadata.format.duration;
+    return duration !== undefined && Number.isFinite(duration) && duration > 0
+      ? duration
+      : undefined;
+  } catch (err) {
+    logger.debug(
+      { err, ext: normalizedExt },
+      'Unable to parse DingTalk outbound media duration',
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Map validated uploaded media to the DingTalk robot msgKey + body.
+ * Unsupported formats or incomplete native metadata deliberately degrade to
+ * sampleFile instead of producing a provider-invalid audio/video payload.
+ */
+export function buildDingTalkFileSendPayload(
+  mediaType: string,
+  mediaId: string,
+  fileName: string,
+  ext: string,
+  metadata: DingTalkNativeMediaMetadata = {},
+): { msgKey: string; msgParam: Record<string, string> } {
+  const normalizedExt = ext.toLowerCase();
+  if (mediaType === 'image' && DINGTALK_IMAGE_EXTENSIONS.has(normalizedExt)) {
+    return { msgKey: 'sampleImageMsg', msgParam: { photoURL: mediaId } };
+  }
+  const durationSeconds = metadata.durationSeconds;
+  const hasDuration =
+    durationSeconds !== undefined &&
+    Number.isFinite(durationSeconds) &&
+    durationSeconds > 0;
+  if (
+    mediaType === 'voice' &&
+    DINGTALK_VOICE_EXTENSIONS.has(normalizedExt) &&
+    hasDuration
+  ) {
+    return {
+      msgKey: 'sampleAudio',
+      // sampleAudio expects milliseconds.
+      msgParam: {
+        mediaId,
+        duration: String(Math.max(1, Math.round(durationSeconds * 1000))),
+      },
+    };
+  }
+  if (
+    mediaType === 'video' &&
+    DINGTALK_VIDEO_EXTENSIONS.has(normalizedExt) &&
+    hasDuration &&
+    metadata.picMediaId &&
+    metadata.picMediaId !== mediaId
+  ) {
+    return {
+      msgKey: 'sampleVideo',
+      msgParam: {
+        // sampleVideo expects whole seconds.
+        duration: String(Math.max(1, Math.ceil(durationSeconds))),
+        videoMediaId: mediaId,
+        videoType: normalizedExt,
+        picMediaId: metadata.picMediaId,
+      },
+    };
+  }
+  return {
+    msgKey: 'sampleFile',
+    msgParam: { mediaId, fileName, fileType: normalizedExt },
+  };
+}
+
 interface DingTalkAccessToken {
   token: string;
   expiresAt: number;
@@ -346,6 +867,31 @@ function sanitizeFileName(raw: string): string {
   return cleaned.length > 200 ? cleaned.slice(0, 200) + '…' : cleaned;
 }
 
+function detectDingTalkAudioExtension(buffer: Buffer): string {
+  if (
+    buffer.subarray(0, 6).equals(Buffer.from('#!AMR\n')) ||
+    buffer.subarray(0, 9).equals(Buffer.from('#!AMR-WB\n'))
+  ) {
+    return 'amr';
+  }
+  if (
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WAVE'
+  ) {
+    return 'wav';
+  }
+  if (buffer.subarray(0, 4).toString('ascii') === 'OggS') return 'ogg';
+  if (buffer.subarray(0, 4).toString('ascii') === 'fLaC') return 'flac';
+  if (
+    buffer.subarray(0, 3).toString('ascii') === 'ID3' ||
+    (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0)
+  ) {
+    return 'mp3';
+  }
+  if (buffer.subarray(4, 8).toString('ascii') === 'ftyp') return 'm4a';
+  return 'bin';
+}
+
 /**
  * Build a prompt content block for an attached/quoted file. When possible we
  * inline the extracted text so weaker models (e.g. MiniMax through Anthropic
@@ -405,7 +951,10 @@ export function createDingTalkConnection(
   // Message deduplication
   // LRU deduplication cache（共享 helper）
   const dedup = createDedupCache({ ttlMs: 30 * 60 * 1000, max: 1000 });
-  const processingLock = new ProcessingLock();
+  // Stream may redeliver the same callback while the first attempt is still
+  // running. Share that exact attempt so a concurrent delivery cannot return
+  // early and ACK work that later fails.
+  const inFlightRobotMessages = new Map<string, Promise<void>>();
 
   // Last message ID per chat (for reply context)
   const lastMessageIds = new Map<string, string>();
@@ -478,44 +1027,25 @@ export function createDingTalkConnection(
     }
 
     // Fetch new token using GET method (钉钉 API 支持 GET 和 POST)
-    return new Promise<string>((resolve, reject) => {
-      const url = new URL('https://oapi.dingtalk.com/gettoken');
-      url.searchParams.set('appkey', config.clientId);
-      url.searchParams.set('appsecret', config.clientSecret);
-
-      const req = https.request(
-        {
-          hostname: url.hostname,
-          path: url.pathname + url.search,
-          method: 'GET',
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            try {
-              const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-              if (data.errcode !== 0) {
-                reject(new Error(`DingTalk token error: ${data.errmsg}`));
-                return;
-              }
-              const expiresIn = Number(data.expires_in) || 7200;
-              tokenInfo = {
-                token: data.access_token,
-                expiresAt: Date.now() + expiresIn * 1000,
-              };
-              logger.info({ expiresIn }, 'DingTalk access token refreshed');
-              resolve(data.access_token);
-            } catch (err) {
-              reject(err);
-            }
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.end();
+    const url = new URL('https://oapi.dingtalk.com/gettoken');
+    url.searchParams.set('appkey', config.clientId);
+    url.searchParams.set('appsecret', config.clientSecret);
+    const { body: tokenBuf } = await dingtalkHttpsRequest({
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'GET',
     });
+    const data = JSON.parse(tokenBuf.toString('utf-8'));
+    if (data.errcode !== 0) {
+      throw new Error(`DingTalk token error: ${data.errmsg}`);
+    }
+    const expiresIn = Number(data.expires_in) || 7200;
+    tokenInfo = {
+      token: data.access_token,
+      expiresAt: Date.now() + expiresIn * 1000,
+    };
+    logger.info({ expiresIn }, 'DingTalk access token refreshed');
+    return data.access_token;
   }
 
   // ─── REST API ──────────────────────────────────────────────
@@ -528,57 +1058,42 @@ export function createDingTalkConnection(
     const token = await getAccessToken();
     const url = new URL(path, DINGTALK_API_BASE);
     const bodyStr = body ? JSON.stringify(body) : undefined;
-
-    return new Promise<T>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: url.hostname,
-          path: url.pathname + url.search,
-          method,
-          headers: {
-            'x-acs-dingtalk-access-token': token,
-            'Content-Type': 'application/json',
-            ...(bodyStr
-              ? { 'Content-Length': String(Buffer.byteLength(bodyStr)) }
-              : {}),
-          },
+    const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+      {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method,
+        headers: {
+          'x-acs-dingtalk-access-token': token,
+          'Content-Type': 'application/json',
+          ...(bodyStr
+            ? { 'Content-Length': String(Buffer.byteLength(bodyStr)) }
+            : {}),
         },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const text = Buffer.concat(chunks).toString('utf-8');
-            try {
-              const data = JSON.parse(text);
-              if (res.statusCode && res.statusCode >= 400) {
-                const errMsg = data.message || data.msg || text;
-                reject(
-                  new Error(
-                    `DingTalk API ${method} ${path} failed (${res.statusCode}): ${errMsg}`,
-                  ),
-                );
-                return;
-              }
-              resolve(data as T);
-            } catch {
-              if (res.statusCode && res.statusCode >= 400) {
-                reject(
-                  new Error(
-                    `DingTalk API ${method} ${path} failed (${res.statusCode}): ${text}`,
-                  ),
-                );
-              } else {
-                resolve({} as T);
-              }
-            }
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      if (bodyStr) req.write(bodyStr);
-      req.end();
-    });
+      },
+      bodyStr,
+    );
+    const text = respBuf.toString('utf-8');
+    try {
+      const data = JSON.parse(text);
+      if (statusCode && statusCode >= 400) {
+        const errMsg = data.message || data.msg || text;
+        throw new Error(
+          `DingTalk API ${method} ${path} failed (${statusCode}): ${errMsg}`,
+        );
+      }
+      return data as T;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        if (statusCode && statusCode >= 400) {
+          throw new Error(
+            `DingTalk API ${method} ${path} failed (${statusCode}): ${text}`,
+          );
+        }
+        return {} as T;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -728,120 +1243,29 @@ export function createDingTalkConnection(
           },
         };
 
-    return new Promise<void>((resolve, reject) => {
-      const url = new URL(sessionWebhook);
-      const req = https.request(
-        {
-          hostname: url.hostname,
-          path: url.pathname + url.search,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-acs-dingtalk-access-token': token,
-          },
+    const url = new URL(sessionWebhook);
+    const { statusCode, body: respBuf } = await dingtalkHttpsRequest(
+      {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-acs-dingtalk-access-token': token,
         },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const body = Buffer.concat(chunks).toString('utf-8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(`DingTalk HTTP failed (${res.statusCode}): ${body}`),
-              );
-              return;
-            }
-            // Also check DingTalk API-level errcode
-            try {
-              const data = JSON.parse(body);
-              logger.info(
-                {
-                  statusCode: res.statusCode,
-                  errcode: data.errcode,
-                  errmsg: data.errmsg,
-                },
-                'DingTalk sendViaSessionWebhook response',
-              );
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
-            }
-            resolve();
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.write(JSON.stringify(body));
-      req.end();
-    });
-  }
-
-  /**
-   * Common helper: POST /v1.0/robot/oToMessages/batchSend
-   * Used by C2C text, file, and image message senders.
-   */
-  async function batchSendToUser(
-    userIds: string[],
-    robotCode: string,
-    token: string,
-    msgKey: string,
-    msgParam: string,
-  ): Promise<void> {
-    const body = JSON.stringify({ robotCode, userIds, msgKey, msgParam });
-    return new Promise<void>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: 'api.dingtalk.com',
-          path: '/v1.0/robot/oToMessages/batchSend',
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-acs-dingtalk-access-token': token,
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const respBody = Buffer.concat(chunks).toString('utf8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(
-                  `DingTalk batchSend HTTP failed (${res.statusCode}): ${respBody}`,
-                ),
-              );
-              return;
-            }
-            try {
-              const data = JSON.parse(respBody);
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk batchSend API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
-            }
-            resolve();
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
+      },
+      JSON.stringify(body),
+    );
+    const respBody = respBuf.toString('utf-8');
+    const data = parseDingTalkSessionWebhookResponse(statusCode, respBody);
+    logger.info(
+      {
+        statusCode,
+        errcode: data.errcode,
+        errmsg: data.errmsg,
+      },
+      'DingTalk sendViaSessionWebhook response',
+    );
   }
 
   /**
@@ -869,65 +1293,20 @@ export function createDingTalkConnection(
   /**
    * Send a group message via the persistent robot/groupMessages API.
    * Uses openConversationId (stable group ID) instead of ephemeral sessionWebhook.
-   * Ref: https://open.dingtalk.com/document/group/the-robot-sends-a-group-message
    */
-  async function sendViaGroupMessagesAPI(
+  async function sendPersistentGroupMessage(
     openConversationId: string,
     msgKey: string,
     msgParam: string,
   ): Promise<void> {
     const token = await getAccessToken();
-    const robotCode = config.clientId;
-    const body = JSON.stringify({
+    await sendViaGroupMessagesAPI(
       openConversationId,
-      robotCode,
+      config.clientId,
+      token,
       msgKey,
       msgParam,
-    });
-
-    return new Promise<void>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: 'api.dingtalk.com',
-          path: '/v1.0/robot/groupMessages/send',
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-acs-dingtalk-access-token': token,
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            const respBody = Buffer.concat(chunks).toString('utf8');
-            try {
-              const data = parseDingTalkGroupMessageResponse(
-                res.statusCode,
-                respBody,
-              );
-              logger.info(
-                {
-                  statusCode: res.statusCode,
-                  errcode: data.errcode,
-                  errmsg: data.errmsg,
-                  processQueryKey: data.processQueryKey,
-                },
-                'DingTalk sendViaGroupMessagesAPI response',
-              );
-            } catch (err) {
-              reject(err);
-              return;
-            }
-            resolve();
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
+    );
   }
 
   // ─── File Download ─────────────────────────────────────────
@@ -936,42 +1315,7 @@ export function createDingTalkConnection(
     url: string,
   ): Promise<{ base64: string; mimeType: string } | null> {
     try {
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        const doRequest = (reqUrl: string, redirectCount: number = 0) => {
-          if (redirectCount > 5) {
-            reject(new Error('Too many redirects'));
-            return;
-          }
-          const parsedUrl = new URL(reqUrl);
-          const protocol = parsedUrl.protocol === 'https:' ? https : http;
-          protocol
-            .get(reqUrl, (res) => {
-              if (
-                res.statusCode &&
-                res.statusCode >= 300 &&
-                res.statusCode < 400 &&
-                res.headers.location
-              ) {
-                doRequest(res.headers.location, redirectCount + 1);
-                return;
-              }
-              const chunks: Buffer[] = [];
-              let total = 0;
-              res.on('data', (chunk: Buffer) => {
-                total += chunk.length;
-                if (total > MAX_FILE_SIZE) {
-                  res.destroy(new Error('Image exceeds MAX_FILE_SIZE'));
-                  return;
-                }
-                chunks.push(chunk);
-              });
-              res.on('end', () => resolve(Buffer.concat(chunks)));
-              res.on('error', reject);
-            })
-            .on('error', reject);
-        };
-        doRequest(url);
-      });
+      const buffer = await downloadDingTalkHttpBuffer(url);
 
       if (buffer.length === 0) return null;
       const mimeType = detectImageMimeType(buffer);
@@ -991,58 +1335,42 @@ export function createDingTalkConnection(
     robotCode: string,
     token: string,
   ): Promise<string> {
-    const downloadUrlResp = await new Promise<{ downloadUrl?: string }>(
-      (resolve, reject) => {
-        const body = JSON.stringify({ downloadCode, robotCode });
-        const req = https.request(
-          {
-            hostname: 'api.dingtalk.com',
-            path: '/v1.0/robot/messageFiles/download',
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-acs-dingtalk-access-token': token,
-            },
-          },
-          (res) => {
-            const statusCode = res.statusCode ?? 0;
-            const chunks: Buffer[] = [];
-            res.on('data', (chunk: Buffer) => chunks.push(chunk));
-            res.on('end', () => {
-              const buf = Buffer.concat(chunks);
-              if (statusCode < 200 || statusCode >= 300) {
-                logger.warn(
-                  {
-                    statusCode,
-                    bodyUtf8: buf.toString('utf8').slice(0, 300),
-                  },
-                  'DingTalk download URL API non-2xx response',
-                );
-                reject(
-                  new Error(
-                    `DingTalk download URL API HTTP failed (${statusCode}): ${buf.toString('utf8').slice(0, 200)}`,
-                  ),
-                );
-                return;
-              }
-              try {
-                resolve(JSON.parse(buf.toString('utf8')));
-              } catch {
-                reject(
-                  new Error(
-                    `Invalid JSON from download URL API: ${buf.toString('utf8').slice(0, 200)}`,
-                  ),
-                );
-              }
-            });
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.write(body);
-        req.end();
+    const body = JSON.stringify({ downloadCode, robotCode });
+    const { statusCode, body: buf } = await dingtalkHttpsRequest(
+      {
+        hostname: 'api.dingtalk.com',
+        path: '/v1.0/robot/messageFiles/download',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-acs-dingtalk-access-token': token,
+        },
       },
+      body,
     );
+    const status = statusCode ?? 0;
+    if (status < 200 || status >= 300) {
+      logger.warn(
+        {
+          statusCode: status,
+          bodyUtf8: buf.toString('utf8').slice(0, 300),
+        },
+        'DingTalk download URL API non-2xx response',
+      );
+      throw new Error(
+        `DingTalk download URL API HTTP failed (${status}): ${buf.toString('utf8').slice(0, 200)}`,
+      );
+    }
+    let downloadUrlResp: { downloadUrl?: string };
+    try {
+      downloadUrlResp = JSON.parse(buf.toString('utf8')) as {
+        downloadUrl?: string;
+      };
+    } catch {
+      throw new Error(
+        `Invalid JSON from download URL API: ${buf.toString('utf8').slice(0, 200)}`,
+      );
+    }
 
     const downloadUrl = downloadUrlResp?.downloadUrl;
     if (!downloadUrl) {
@@ -1071,47 +1399,8 @@ export function createDingTalkConnection(
         token,
       );
 
-      // Step 2: Download the actual image from the temporary URL
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        const isHttps = downloadUrl.startsWith('https://');
-        const urlObj = new URL(downloadUrl);
-        const protocol = isHttps ? https : http;
-        const req = protocol.request(
-          {
-            hostname: urlObj.hostname,
-            path: urlObj.pathname + urlObj.search,
-            method: 'GET',
-          },
-          (res) => {
-            if (
-              !res.statusCode ||
-              res.statusCode < 200 ||
-              res.statusCode >= 300
-            ) {
-              reject(
-                new Error(`DingTalk image GET HTTP failed (${res.statusCode})`),
-              );
-              return;
-            }
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(
-                  new Error('Downloaded image exceeds MAX_FILE_SIZE'),
-                );
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.end();
-      });
+      // Step 2: Download the actual image from the temporary URL.
+      const buffer = await downloadDingTalkHttpBuffer(downloadUrl);
 
       if (buffer.length === 0) return null;
 
@@ -1162,45 +1451,8 @@ export function createDingTalkConnection(
         token,
       );
 
-      // Step 2: Download raw file bytes (no MIME check — any file type allowed)
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        const isHttps = downloadUrl.startsWith('https://');
-        const urlObj = new URL(downloadUrl);
-        const protocol = isHttps ? https : http;
-        const req = protocol.request(
-          {
-            hostname: urlObj.hostname,
-            path: urlObj.pathname + urlObj.search,
-            method: 'GET',
-          },
-          (res) => {
-            if (
-              !res.statusCode ||
-              res.statusCode < 200 ||
-              res.statusCode >= 300
-            ) {
-              reject(
-                new Error(`DingTalk file GET HTTP failed (${res.statusCode})`),
-              );
-              return;
-            }
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(new Error('Downloaded file exceeds MAX_FILE_SIZE'));
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.end();
-      });
+      // Step 2: Download raw file bytes (no MIME check — any file type allowed).
+      const buffer = await downloadDingTalkHttpBuffer(downloadUrl);
 
       if (buffer.length === 0) return null;
       return buffer;
@@ -1252,38 +1504,32 @@ export function createDingTalkConnection(
 
       const body = Buffer.concat(parts);
 
-      const result = await new Promise<{
+      const { body: respBuf } = await dingtalkHttpsRequest(
+        {
+          hostname: 'oapi.dingtalk.com',
+          path: `/media/upload?access_token=${token}&type=${type}`,
+          method: 'POST',
+          headers: {
+            'Content-Type': `multipart/form-data; boundary=${boundary}`,
+            'Content-Length': body.length,
+          },
+        },
+        body,
+      );
+      let result: {
         media_id?: string;
         errcode?: number;
         errmsg?: string;
-      }>((resolve, reject) => {
-        const req = https.request(
-          {
-            hostname: 'oapi.dingtalk.com',
-            path: `/media/upload?access_token=${token}&type=${type}`,
-            method: 'POST',
-            headers: {
-              'Content-Type': `multipart/form-data; boundary=${boundary}`,
-              'Content-Length': body.length,
-            },
-          },
-          (res) => {
-            const chunks: Buffer[] = [];
-            res.on('data', (chunk: Buffer) => chunks.push(chunk));
-            res.on('end', () => {
-              try {
-                resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-              } catch {
-                reject(new Error('Invalid JSON from DingTalk media upload'));
-              }
-            });
-            res.on('error', reject);
-          },
-        );
-        req.on('error', reject);
-        req.write(body);
-        req.end();
-      });
+      };
+      try {
+        result = JSON.parse(respBuf.toString('utf8')) as {
+          media_id?: string;
+          errcode?: number;
+          errmsg?: string;
+        };
+      } catch {
+        throw new Error('Invalid JSON from DingTalk media upload');
+      }
 
       if (result.errcode && result.errcode !== 0) {
         logger.warn(
@@ -1322,11 +1568,26 @@ export function createDingTalkConnection(
     mediaId: string,
     fileName: string,
     fileType: string,
+    mediaType = 'file',
+    metadata: DingTalkNativeMediaMetadata = {},
   ): Promise<void> {
     try {
       const token = await getAccessToken();
-      const msgParam = JSON.stringify({ mediaId, fileName, fileType });
-      await batchSendToUser([userId], robotCode, token, 'sampleFile', msgParam);
+      const payload = buildDingTalkFileSendPayload(
+        mediaType,
+        mediaId,
+        fileName,
+        fileType,
+        metadata,
+      );
+      const msgParam = JSON.stringify(payload.msgParam);
+      await batchSendToUser(
+        [userId],
+        robotCode,
+        token,
+        payload.msgKey,
+        msgParam,
+      );
       logger.info({ userId, mediaId, fileName }, 'DingTalk file message sent');
     } catch (err) {
       logger.error(
@@ -1464,12 +1725,17 @@ export function createDingTalkConnection(
         logger.info({ msgId }, 'DingTalk dropped: duplicate');
         return;
       }
-      if (!processingLock.acquire(msgId)) {
-        logger.debug({ msgId }, 'DingTalk message already in-flight, skipping');
+      const existingAttempt = inFlightRobotMessages.get(msgId);
+      if (existingAttempt) {
+        logger.debug(
+          { msgId },
+          'DingTalk message already in-flight, awaiting shared result',
+        );
+        await existingAttempt;
         return;
       }
-      dedup.markSeen(msgId);
-      try {
+
+      const processMessage = (async (): Promise<void> => {
         // Skip stale messages from before connection (hot-reload scenario)
         if (opts.ignoreMessagesBefore && data.createAt) {
           const msgTime = data.createAt;
@@ -1504,21 +1770,38 @@ export function createDingTalkConnection(
         });
         if (admission.kind === 'paired') {
           if (data.sessionWebhook) {
-            await sendViaSessionWebhook(
-              data.sessionWebhook,
-              '配对成功！此聊天已连接到你的账号。',
-              isGroup,
-            );
+            try {
+              await sendViaSessionWebhook(
+                data.sessionWebhook,
+                '配对成功！此聊天已连接到你的账号。',
+                isGroup,
+              );
+            } catch (err) {
+              // Pairing has already committed. Retrying the callback would
+              // consume the same one-time code again and cannot repair the
+              // best-effort confirmation reply.
+              logger.warn(
+                { err, jid, msgId },
+                'DingTalk pairing succeeded but confirmation reply failed',
+              );
+            }
           }
           return;
         }
         if (admission.kind === 'pair_rejected') {
           if (data.sessionWebhook) {
-            await sendViaSessionWebhook(
-              data.sessionWebhook,
-              '配对码无效或已过期，请在 Web 设置页重新生成。',
-              isGroup,
-            );
+            try {
+              await sendViaSessionWebhook(
+                data.sessionWebhook,
+                '配对码无效或已过期，请在 Web 设置页重新生成。',
+                isGroup,
+              );
+            } catch (err) {
+              logger.warn(
+                { err, jid, msgId },
+                'DingTalk pairing rejection reply failed',
+              );
+            }
           }
           return;
         }
@@ -1886,6 +2169,98 @@ export function createDingTalkConnection(
             logger.warn({ msgId }, 'DingTalk file download failed, skipping');
             return;
           }
+        } else if (data.msgtype === 'audio' && 'content' in data) {
+          // Official C2C: { duration, downloadCode, recognition }
+          interface AudioContent {
+            duration?: number;
+            downloadCode?: string;
+            recognition?: string;
+          }
+          const audioContent = (data as { content: AudioContent }).content;
+          const recognition = audioContent?.recognition?.trim();
+          const downloadCode = audioContent?.downloadCode;
+          let audioBlock = '[语音消息]';
+          if (downloadCode) {
+            const fileBuffer = await downloadDingTalkFileByDownloadCode(
+              downloadCode,
+              data.robotCode ?? '',
+            );
+            if (fileBuffer) {
+              const extension = detectDingTalkAudioExtension(fileBuffer);
+              const groupFolder = opts.resolveGroupFolder?.(jid);
+              if (groupFolder) {
+                try {
+                  const savedPath = await saveDownloadedFile(
+                    groupFolder,
+                    'dingtalk',
+                    `audio_${Date.now()}.${extension}`,
+                    fileBuffer,
+                  );
+                  audioBlock = `[语音: audio.${extension} → ${savedPath}]`;
+                } catch (err) {
+                  logger.warn(
+                    { err, msgId },
+                    'Failed to save DingTalk audio to disk',
+                  );
+                  audioBlock = '[语音消息（保存失败）]';
+                }
+              } else {
+                audioBlock = '[语音消息（未注册群组）]';
+              }
+            } else {
+              audioBlock = '[语音消息（下载失败）]';
+            }
+          }
+          content = recognition
+            ? `${recognition}\n\n${audioBlock}`
+            : audioBlock;
+        } else if (data.msgtype === 'video' && 'content' in data) {
+          // Official C2C: { duration, downloadCode, videoType }
+          interface VideoContent {
+            duration?: number;
+            downloadCode?: string;
+            videoType?: string;
+          }
+          const videoContent = (data as { content: VideoContent }).content;
+          const downloadCode = videoContent?.downloadCode;
+          const videoType =
+            (videoContent?.videoType || 'mp4').replace(/[^a-z0-9]/gi, '') ||
+            'mp4';
+          const fileName = `video.${videoType}`;
+          if (downloadCode) {
+            const fileBuffer = await downloadDingTalkFileByDownloadCode(
+              downloadCode,
+              data.robotCode ?? '',
+            );
+            if (fileBuffer) {
+              const groupFolder = opts.resolveGroupFolder?.(jid);
+              if (groupFolder) {
+                try {
+                  const savedPath = await saveDownloadedFile(
+                    groupFolder,
+                    'dingtalk',
+                    `video_${Date.now()}.${videoType}`,
+                    fileBuffer,
+                  );
+                  content = await buildFileContentBlock({
+                    fileName,
+                    savedRelPath: savedPath,
+                    groupFolder,
+                    prefixLabel: '视频',
+                  });
+                } catch (err) {
+                  logger.warn({ err }, 'Failed to save DingTalk video to disk');
+                  content = `[视频: ${sanitizeFileName(fileName)}（保存失败）]`;
+                }
+              } else {
+                content = `[视频: ${sanitizeFileName(fileName)}（未注册群组）]`;
+              }
+            } else {
+              content = '[视频消息]';
+            }
+          } else {
+            content = '[视频消息]';
+          }
         } else if (data.msgtype === 'image' && 'image' in data) {
           // Image message via contentUrl (legacy/native format)
           const contentUrl = (data as DingTalkRobotMessage).image?.contentUrl;
@@ -1953,22 +2328,35 @@ export function createDingTalkConnection(
           false,
           { attachments: attachmentsJson, sourceJid: jid },
         );
+        // Only mark after persist. An earlier mark would suppress Stream
+        // redelivery after a failed store, which is how ACK-before-handle
+        // silently drops the message.
+        dedup.markSeen(msgId);
 
-        opts.onMessagePersisted?.(
-          targetJid,
-          {
-            id,
-            chat_jid: targetJid,
-            source_jid: jid,
-            sender: senderId,
-            sender_name: senderName,
-            content,
-            timestamp,
-            attachments: attachmentsJson,
-            is_from_me: false,
-          },
-          agentRouting?.agentId ?? undefined,
-        );
+        try {
+          opts.onMessagePersisted?.(
+            targetJid,
+            {
+              id,
+              chat_jid: targetJid,
+              source_jid: jid,
+              sender: senderId,
+              sender_name: senderName,
+              content,
+              timestamp,
+              attachments: attachmentsJson,
+              is_from_me: false,
+            },
+            agentRouting?.agentId ?? undefined,
+          );
+        } catch (err) {
+          // Persistence is the ACK boundary. A notification hook failure must
+          // not replay the already-stored inbound message.
+          logger.error(
+            { err, jid, targetJid, msgId },
+            'DingTalk post-persist callback failed',
+          );
+        }
 
         // ── Ack Reaction：确认已收到消息 ──
         const chatId = extractProviderTarget(jid);
@@ -1980,10 +2368,24 @@ export function createDingTalkConnection(
           )
           .catch(() => {});
 
-        notifyNewImMessage();
+        try {
+          notifyNewImMessage();
+        } catch (err) {
+          logger.error(
+            { err, jid, targetJid, msgId },
+            'DingTalk post-persist notifier failed',
+          );
+        }
 
         if (agentRouting?.agentId) {
-          opts.onAgentMessage?.(jid, agentRouting.agentId);
+          try {
+            opts.onAgentMessage?.(jid, agentRouting.agentId);
+          } catch (err) {
+            logger.error(
+              { err, jid, targetJid, msgId, agentId: agentRouting.agentId },
+              'DingTalk post-persist agent notification failed',
+            );
+          }
           logger.info(
             { jid, effectiveJid: targetJid, agentId: agentRouting.agentId },
             'DingTalk message routed to agent',
@@ -1994,11 +2396,21 @@ export function createDingTalkConnection(
             'DingTalk message stored',
           );
         }
+      })();
+      inFlightRobotMessages.set(msgId, processMessage);
+      try {
+        await processMessage;
+        // Successful terminal outcomes (including pairing, commands, ignored
+        // messages, and empty supported payloads) must also be idempotent.
+        dedup.markSeen(msgId);
       } finally {
-        processingLock.release(msgId);
+        if (inFlightRobotMessages.get(msgId) === processMessage) {
+          inFlightRobotMessages.delete(msgId);
+        }
       }
     } catch (err) {
       logger.error({ err }, 'Error handling DingTalk robot message');
+      throw err;
     }
   }
 
@@ -2049,17 +2461,21 @@ export function createDingTalkConnection(
               'DingTalk robot message received',
             );
 
-            // Ack immediately
+            // ACK only after handle succeeds. socketCallBackResponse tells
+            // DingTalk Stream to stop retrying; an ACK-before-handle drop
+            // is silent because the platform will not redeliver.
+            try {
+              await handleRobotMessage(downstream, opts);
+            } catch (err) {
+              logger.error({ err }, 'Error in DingTalk message handler');
+              return;
+            }
+
             const messageId = downstream.headers?.messageId;
             if (messageId && client) {
               client.socketCallBackResponse(messageId, { success: true });
               logger.debug({ messageId }, 'DingTalk callback acknowledged');
             }
-
-            // Process in background
-            handleRobotMessage(downstream, opts).catch((err) => {
-              logger.error({ err }, 'Error in DingTalk message handler');
-            });
           },
         );
 
@@ -2118,7 +2534,6 @@ export function createDingTalkConnection(
       lastSenderIds.clear();
       lastSenderStaffIds.clear();
       groupNameCache.clear();
-      processingLock.dispose();
       logger.info('DingTalk bot disconnected');
     },
 
@@ -2207,7 +2622,7 @@ export function createDingTalkConnection(
           text: chunk,
         });
         try {
-          await sendViaGroupMessagesAPI(
+          await sendPersistentGroupMessage(
             openConversationId,
             'sampleMarkdown',
             msgParam,
@@ -2223,7 +2638,7 @@ export function createDingTalkConnection(
           // Fall back to plain text
           const plainContent = markdownToPlainText(chunk);
           const plainMsgParam = JSON.stringify({ content: plainContent });
-          await sendViaGroupMessagesAPI(
+          await sendPersistentGroupMessage(
             openConversationId,
             'sampleText',
             plainMsgParam,
@@ -2274,7 +2689,7 @@ export function createDingTalkConnection(
       if (isGroup && openConversationId) {
         const msgParam = JSON.stringify({ photoURL: mediaId });
         try {
-          await sendViaGroupMessagesAPI(
+          await sendPersistentGroupMessage(
             openConversationId,
             'sampleImageMsg',
             msgParam,
@@ -2356,13 +2771,67 @@ export function createDingTalkConnection(
       const ext = fileName.includes('.')
         ? fileName.split('.').pop()!.toLowerCase()
         : '';
-      const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
-      const voiceExts = ['amr', 'mp3', 'wav'];
-      const videoExts = ['mp4'];
       let mediaType = 'file';
-      if (imageExts.includes(ext)) mediaType = 'image';
-      else if (voiceExts.includes(ext)) mediaType = 'voice';
-      else if (videoExts.includes(ext)) mediaType = 'video';
+      if (DINGTALK_IMAGE_EXTENSIONS.has(ext)) mediaType = 'image';
+      else if (DINGTALK_VOICE_EXTENSIONS.has(ext)) mediaType = 'voice';
+      else if (DINGTALK_VIDEO_EXTENSIONS.has(ext)) mediaType = 'video';
+
+      const nativeMetadata: DingTalkNativeMediaMetadata = {};
+      if (mediaType === 'voice') {
+        if (fileBuffer.length > DINGTALK_VOICE_MAX_BYTES) {
+          logger.info(
+            { chatId, fileName, size: fileBuffer.length },
+            'DingTalk voice exceeds native media limit; sending as file',
+          );
+          mediaType = 'file';
+        } else {
+          nativeMetadata.durationSeconds =
+            await getDingTalkMediaDurationSeconds(fileBuffer, ext);
+          if (!nativeMetadata.durationSeconds) {
+            logger.info(
+              { chatId, fileName },
+              'DingTalk voice duration unavailable; sending as file',
+            );
+            mediaType = 'file';
+          }
+        }
+      } else if (mediaType === 'video') {
+        nativeMetadata.durationSeconds = await getDingTalkMediaDurationSeconds(
+          fileBuffer,
+          ext,
+        );
+        if (!nativeMetadata.durationSeconds) {
+          logger.info(
+            { chatId, fileName },
+            'DingTalk video duration unavailable; sending as file',
+          );
+          mediaType = 'file';
+        } else {
+          try {
+            const coverBuffer = await fs.readFile(
+              new URL('../web/public/icons/icon-512.png', import.meta.url),
+            );
+            nativeMetadata.picMediaId =
+              (await uploadDingTalkMedia(
+                coverBuffer,
+                'happyclaw-video-cover.png',
+                'image',
+              )) ?? undefined;
+          } catch (err) {
+            logger.warn(
+              { err, chatId, fileName },
+              'Failed to prepare DingTalk video cover',
+            );
+          }
+          if (!nativeMetadata.picMediaId) {
+            logger.info(
+              { chatId, fileName },
+              'DingTalk video cover unavailable; sending as file',
+            );
+            mediaType = 'file';
+          }
+        }
+      }
 
       // Upload to DingTalk media API
       const mediaId = await uploadDingTalkMedia(
@@ -2383,25 +2852,18 @@ export function createDingTalkConnection(
       if (isGroup && openConversationId) {
         // Send via persistent groupMessages API
         try {
-          if (mediaType === 'image') {
-            const msgParam = JSON.stringify({ photoURL: mediaId });
-            await sendViaGroupMessagesAPI(
-              openConversationId,
-              'sampleImageMsg',
-              msgParam,
-            );
-          } else {
-            const msgParam = JSON.stringify({
-              mediaId,
-              fileName,
-              fileType: ext,
-            });
-            await sendViaGroupMessagesAPI(
-              openConversationId,
-              'sampleFile',
-              msgParam,
-            );
-          }
+          const payload = buildDingTalkFileSendPayload(
+            mediaType,
+            mediaId,
+            fileName,
+            ext,
+            nativeMetadata,
+          );
+          await sendPersistentGroupMessage(
+            openConversationId,
+            payload.msgKey,
+            JSON.stringify(payload.msgParam),
+          );
           logger.info(
             { chatId, fileName, mediaId },
             'DingTalk group file sent via persistent API',
@@ -2435,6 +2897,8 @@ export function createDingTalkConnection(
             mediaId,
             fileName,
             ext,
+            mediaType,
+            nativeMetadata,
           );
         }
         logger.info(
