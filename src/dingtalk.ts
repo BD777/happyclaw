@@ -33,7 +33,7 @@ import {
   createDedupCache,
 } from './im-utils.js';
 import { extractRepliedMsg, type RepliedMsg } from './dingtalk-reply-parser.js';
-import { ProcessingLock, isStale } from './im-safety/index.js';
+import { isStale } from './im-safety/index.js';
 import {
   evaluateChannelAdmission,
   resolveAdmittedChannelRoute,
@@ -574,7 +574,10 @@ export function createDingTalkConnection(
   // Message deduplication
   // LRU deduplication cache（共享 helper）
   const dedup = createDedupCache({ ttlMs: 30 * 60 * 1000, max: 1000 });
-  const processingLock = new ProcessingLock();
+  // Stream may redeliver the same callback while the first attempt is still
+  // running. Share that exact attempt so a concurrent delivery cannot return
+  // early and ACK work that later fails.
+  const inFlightRobotMessages = new Map<string, Promise<void>>();
 
   // Last message ID per chat (for reply context)
   const lastMessageIds = new Map<string, string>();
@@ -1462,11 +1465,17 @@ export function createDingTalkConnection(
         logger.info({ msgId }, 'DingTalk dropped: duplicate');
         return;
       }
-      if (!processingLock.acquire(msgId)) {
-        logger.debug({ msgId }, 'DingTalk message already in-flight, skipping');
+      const existingAttempt = inFlightRobotMessages.get(msgId);
+      if (existingAttempt) {
+        logger.debug(
+          { msgId },
+          'DingTalk message already in-flight, awaiting shared result',
+        );
+        await existingAttempt;
         return;
       }
-      try {
+
+      const processMessage = (async (): Promise<void> => {
         // Skip stale messages from before connection (hot-reload scenario)
         if (opts.ignoreMessagesBefore && data.createAt) {
           const msgTime = data.createAt;
@@ -1501,21 +1510,38 @@ export function createDingTalkConnection(
         });
         if (admission.kind === 'paired') {
           if (data.sessionWebhook) {
-            await sendViaSessionWebhook(
-              data.sessionWebhook,
-              '配对成功！此聊天已连接到你的账号。',
-              isGroup,
-            );
+            try {
+              await sendViaSessionWebhook(
+                data.sessionWebhook,
+                '配对成功！此聊天已连接到你的账号。',
+                isGroup,
+              );
+            } catch (err) {
+              // Pairing has already committed. Retrying the callback would
+              // consume the same one-time code again and cannot repair the
+              // best-effort confirmation reply.
+              logger.warn(
+                { err, jid, msgId },
+                'DingTalk pairing succeeded but confirmation reply failed',
+              );
+            }
           }
           return;
         }
         if (admission.kind === 'pair_rejected') {
           if (data.sessionWebhook) {
-            await sendViaSessionWebhook(
-              data.sessionWebhook,
-              '配对码无效或已过期，请在 Web 设置页重新生成。',
-              isGroup,
-            );
+            try {
+              await sendViaSessionWebhook(
+                data.sessionWebhook,
+                '配对码无效或已过期，请在 Web 设置页重新生成。',
+                isGroup,
+              );
+            } catch (err) {
+              logger.warn(
+                { err, jid, msgId },
+                'DingTalk pairing rejection reply failed',
+              );
+            }
           }
           return;
         }
@@ -1955,21 +1981,30 @@ export function createDingTalkConnection(
         // silently drops the message.
         dedup.markSeen(msgId);
 
-        opts.onMessagePersisted?.(
-          targetJid,
-          {
-            id,
-            chat_jid: targetJid,
-            source_jid: jid,
-            sender: senderId,
-            sender_name: senderName,
-            content,
-            timestamp,
-            attachments: attachmentsJson,
-            is_from_me: false,
-          },
-          agentRouting?.agentId ?? undefined,
-        );
+        try {
+          opts.onMessagePersisted?.(
+            targetJid,
+            {
+              id,
+              chat_jid: targetJid,
+              source_jid: jid,
+              sender: senderId,
+              sender_name: senderName,
+              content,
+              timestamp,
+              attachments: attachmentsJson,
+              is_from_me: false,
+            },
+            agentRouting?.agentId ?? undefined,
+          );
+        } catch (err) {
+          // Persistence is the ACK boundary. A notification hook failure must
+          // not replay the already-stored inbound message.
+          logger.error(
+            { err, jid, targetJid, msgId },
+            'DingTalk post-persist callback failed',
+          );
+        }
 
         // ── Ack Reaction：确认已收到消息 ──
         const chatId = extractProviderTarget(jid);
@@ -1981,10 +2016,24 @@ export function createDingTalkConnection(
           )
           .catch(() => {});
 
-        notifyNewImMessage();
+        try {
+          notifyNewImMessage();
+        } catch (err) {
+          logger.error(
+            { err, jid, targetJid, msgId },
+            'DingTalk post-persist notifier failed',
+          );
+        }
 
         if (agentRouting?.agentId) {
-          opts.onAgentMessage?.(jid, agentRouting.agentId);
+          try {
+            opts.onAgentMessage?.(jid, agentRouting.agentId);
+          } catch (err) {
+            logger.error(
+              { err, jid, targetJid, msgId, agentId: agentRouting.agentId },
+              'DingTalk post-persist agent notification failed',
+            );
+          }
           logger.info(
             { jid, effectiveJid: targetJid, agentId: agentRouting.agentId },
             'DingTalk message routed to agent',
@@ -1995,8 +2044,17 @@ export function createDingTalkConnection(
             'DingTalk message stored',
           );
         }
+      })();
+      inFlightRobotMessages.set(msgId, processMessage);
+      try {
+        await processMessage;
+        // Successful terminal outcomes (including pairing, commands, ignored
+        // messages, and empty supported payloads) must also be idempotent.
+        dedup.markSeen(msgId);
       } finally {
-        processingLock.release(msgId);
+        if (inFlightRobotMessages.get(msgId) === processMessage) {
+          inFlightRobotMessages.delete(msgId);
+        }
       }
     } catch (err) {
       logger.error({ err }, 'Error handling DingTalk robot message');
@@ -2124,7 +2182,6 @@ export function createDingTalkConnection(
       lastSenderIds.clear();
       lastSenderStaffIds.clear();
       groupNameCache.clear();
-      processingLock.dispose();
       logger.info('DingTalk bot disconnected');
     },
 
