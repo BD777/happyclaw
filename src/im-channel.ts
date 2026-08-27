@@ -455,8 +455,8 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onCardCreated,
         lifecycle,
         // 降级可观测性：卡片连续更新失败进入 error 态时记一条 warn。
-        // 终态收口与静态消息兜底分别由 schedulePatch 的 best-effort patch
-        // 和 index.ts 的 result 路径负责，这里只补日志。
+        // 终态收口与是否允许静态消息兜底由 controller/index.ts 的严格
+        // delivery phase 负责；这里仅补可观测日志。
         onFallback: () =>
           logger.warn(
             { chatId: target.chatId },

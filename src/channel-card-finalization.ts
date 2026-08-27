@@ -1,6 +1,10 @@
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+
 export interface FinalizableChannelCard {
   complete(text: string): Promise<void>;
   abort(reason?: string): Promise<void>;
+  /** Provider-confirmed visible messages already owned by this presentation. */
+  getAcknowledgedProviderOutputCount?(): number;
 }
 
 export interface ChannelCardFinalizationResult {
@@ -21,8 +25,26 @@ export async function finalizeChannelCardAfterDelivery(
   abortReason: string,
 ): Promise<ChannelCardFinalizationResult> {
   if (!prerequisitesAcknowledged) {
-    await card.abort(abortReason).catch(() => {});
-    return { acknowledged: false };
+    try {
+      await card.abort(abortReason);
+      const acknowledged = Math.max(
+        0,
+        card.getAcknowledgedProviderOutputCount?.() ?? 0,
+      );
+      if (acknowledged > 0) {
+        return {
+          acknowledged: false,
+          error: new PartialChannelDeliveryError(
+            acknowledged,
+            acknowledged + 1,
+            new Error(abortReason),
+          ),
+        };
+      }
+      return { acknowledged: false };
+    } catch (error) {
+      return { acknowledged: false, error };
+    }
   }
 
   try {
