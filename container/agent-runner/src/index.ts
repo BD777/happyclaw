@@ -4469,6 +4469,31 @@ async function main(): Promise<void> {
             } catch {
               /* ignore */
             }
+            clearInterruptRequested();
+            if (autoContResult.pipedMessagesDuringQuery.length > 0) {
+              requeueIpcInputMessages(
+                IPC_INPUT_DIR,
+                autoContResult.pipedMessagesDuringQuery,
+              );
+            }
+            writeOutput({
+              status: 'stream',
+              result: null,
+              streamEvent: {
+                eventType: 'status',
+                statusText: 'interrupted',
+                queryRunId: containerInput.queryRunId,
+                turnId: containerInput.turnId,
+                sessionId,
+              },
+              newSessionId: sessionId,
+              turnId: containerInput.turnId,
+              sessionId,
+              ...(autoContResult.cancelledIpcReceipts?.length
+                ? { ipcReceipts: autoContResult.cancelledIpcReceipts }
+                : {}),
+              queryIdle: autoContResult.pipedMessagesDuringQuery.length === 0,
+            });
           }
           // Auto-continue can consume user IPC while it is running. A query
           // that ends without a healthy result leaves those messages in the
@@ -4610,6 +4635,31 @@ async function main(): Promise<void> {
           } catch {
             /* ignore */
           }
+          clearInterruptRequested();
+          if (contResult.pipedMessagesDuringQuery.length > 0) {
+            requeueIpcInputMessages(
+              IPC_INPUT_DIR,
+              contResult.pipedMessagesDuringQuery,
+            );
+          }
+          writeOutput({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'status',
+              statusText: 'interrupted',
+              queryRunId: containerInput.queryRunId,
+              turnId: containerInput.turnId,
+              sessionId,
+            },
+            newSessionId: sessionId,
+            turnId: containerInput.turnId,
+            sessionId,
+            ...(contResult.cancelledIpcReceipts?.length
+              ? { ipcReceipts: contResult.cancelledIpcReceipts }
+              : {}),
+            queryIdle: contResult.pipedMessagesDuringQuery.length === 0,
+          });
           break;
         }
         // 续写本身又被截断 → 带新结尾再续，直到写完或触顶
