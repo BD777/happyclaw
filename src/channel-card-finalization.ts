@@ -3,7 +3,7 @@ import { PartialChannelDeliveryError } from './im-delivery-progress.js';
 export interface FinalizableChannelCard {
   complete(text: string): Promise<void>;
   abort(reason?: string): Promise<void>;
-  /** Optional exact provider progress retained after terminal abort. */
+  /** Provider-confirmed visible messages already owned by this presentation. */
   getAcknowledgedProviderOutputCount?(): number;
 }
 
@@ -27,8 +27,10 @@ export async function finalizeChannelCardAfterDelivery(
   if (!prerequisitesAcknowledged) {
     try {
       await card.abort(abortReason);
-      const acknowledgedOutputs =
-        card.getAcknowledgedProviderOutputCount?.() ?? 0;
+      const acknowledgedOutputs = Math.max(
+        0,
+        card.getAcknowledgedProviderOutputCount?.() ?? 0,
+      );
       if (acknowledgedOutputs > 0) {
         return {
           acknowledged: false,
@@ -36,7 +38,7 @@ export async function finalizeChannelCardAfterDelivery(
             acknowledgedOutputs,
             acknowledgedOutputs + 1,
             new Error(
-              'Provider stream was terminalized after final-delivery prerequisites failed',
+              `Provider stream was terminalized after final-delivery prerequisites failed: ${abortReason}`,
             ),
           ),
         };

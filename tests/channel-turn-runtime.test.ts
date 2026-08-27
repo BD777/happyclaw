@@ -967,8 +967,8 @@ describe('durable channel turn runtime', () => {
 
 describe('provider reconciliation', () => {
   test('updates the original CardKit card instead of creating a replacement', async () => {
-    const settings = vi.fn().mockResolvedValue({});
-    const update = vi.fn().mockResolvedValue({});
+    const settings = vi.fn().mockResolvedValue({ code: 0 });
+    const update = vi.fn().mockResolvedValue({ code: 0 });
     const create = vi.fn();
     const client = {
       cardkit: { v1: { card: { settings, update, create } } },
