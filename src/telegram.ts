@@ -1,7 +1,7 @@
 import { Bot, InputFile } from 'grammy';
 import crypto from 'crypto';
 import fsPromises from 'node:fs/promises';
-import https from 'node:https';
+import { downloadHttpsBuffer } from './im-media-download.js';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
@@ -419,25 +419,9 @@ export function createTelegramConnection(
       }
 
       const url = `https://api.telegram.org/file/bot${config.botToken}/${filePath}`;
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        https
-          .get(url, { agent: telegramApiAgent }, (res) => {
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(
-                  new Error('File exceeds MAX_FILE_SIZE during download'),
-                );
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          })
-          .on('error', reject);
+      const buffer = await downloadHttpsBuffer(url, {
+        agent: telegramApiAgent,
+        oversizedMessage: 'File exceeds MAX_FILE_SIZE during download',
       });
 
       // 使用 file_path 中的最后一段作为文件名（若无则用 originalFilename）
@@ -495,25 +479,9 @@ export function createTelegramConnection(
         return null;
       }
       const url = `https://api.telegram.org/file/bot${config.botToken}/${filePath}`;
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        https
-          .get(url, { agent: telegramApiAgent }, (res) => {
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(
-                  new Error('Photo exceeds MAX_FILE_SIZE during download'),
-                );
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          })
-          .on('error', reject);
+      const buffer = await downloadHttpsBuffer(url, {
+        agent: telegramApiAgent,
+        oversizedMessage: 'Photo exceeds MAX_FILE_SIZE during download',
       });
       if (buffer.length === 0) {
         logger.warn({ fileId }, 'Empty response from Telegram photo download');
