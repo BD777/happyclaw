@@ -40,7 +40,13 @@ function makeController(
   return new DingTalkStreamingCardController(
     makeConfig(),
     target ?? makeGroupTarget(),
-    opts,
+    {
+      // Production adapters always provide a strict-ACK plain fallback. Keep
+      // lifecycle-only tests on that real call shape instead of relying on a
+      // missing fallback being treated as successful delivery.
+      fallbackSend: async () => {},
+      ...opts,
+    },
   );
 }
 
