@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
   sendDocument: vi.fn(async () => ({})),
   sendVideo: vi.fn(async () => ({})),
   sendAudio: vi.fn(async () => ({})),
+  sendVoice: vi.fn(async () => ({})),
   getMe: vi.fn(async () => ({ id: 1, username: 'sendfile_bot' })),
   config: { use: vi.fn() },
   stop: null as (() => void) | null,
@@ -29,6 +30,7 @@ vi.mock('grammy', () => ({
       sendDocument: api.sendDocument,
       sendVideo: api.sendVideo,
       sendAudio: api.sendAudio,
+      sendVoice: api.sendVoice,
     };
     on() {
       return this;
@@ -104,11 +106,23 @@ describe('Telegram sendFile media routing (live connection)', () => {
     expect(api.sendAudio).not.toHaveBeenCalled();
   });
 
-  test('sendFile(voice.ogg) uses sendAudio, not sendDocument', async () => {
+  test('sendFile(voice.ogg) uses sendVoice, not sendAudio', async () => {
     const conn = await connect();
     await conn.sendFile('424242', touch('voice.ogg'), 'voice.ogg');
-    expect(api.sendAudio).toHaveBeenCalledOnce();
+    expect(api.sendVoice).toHaveBeenCalledOnce();
+    expect(api.sendAudio).not.toHaveBeenCalled();
     expect(api.sendDocument).not.toHaveBeenCalled();
+    expect(api.sendVideo).not.toHaveBeenCalled();
+  });
+
+  test('sendFile(song.m4a) uses audio while MOV/WebM/WAV stay documents', async () => {
+    const conn = await connect();
+    await conn.sendFile('424242', touch('song.m4a'), 'song.m4a');
+    expect(api.sendAudio).toHaveBeenCalledOnce();
+    for (const name of ['clip.mov', 'clip.webm', 'sample.wav']) {
+      await conn.sendFile('424242', touch(name), name);
+    }
+    expect(api.sendDocument).toHaveBeenCalledTimes(3);
     expect(api.sendVideo).not.toHaveBeenCalled();
   });
 

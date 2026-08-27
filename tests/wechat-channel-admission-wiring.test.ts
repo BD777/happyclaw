@@ -4,6 +4,7 @@ import type { WeChatConnectOpts } from '../src/wechat.js';
 
 const capture = vi.hoisted(() => ({
   connectOpts: null as WeChatConnectOpts | null,
+  sendMessage: vi.fn(),
 }));
 
 vi.mock('../src/wechat.js', () => ({
@@ -12,7 +13,7 @@ vi.mock('../src/wechat.js', () => ({
       capture.connectOpts = opts;
     },
     async disconnect() {},
-    async sendMessage() {},
+    sendMessage: capture.sendMessage,
     async sendImage() {},
     async sendFile() {},
     async sendTyping() {},
@@ -28,6 +29,7 @@ const { IMConnectionManager } = await import('../src/im-manager.js');
 describe('WeChat admission and lifecycle wiring', () => {
   beforeEach(() => {
     capture.connectOpts = null;
+    capture.sendMessage.mockReset();
   });
 
   test('adapter forwards authorization, pairing, and connection state callbacks', async () => {
@@ -70,6 +72,20 @@ describe('WeChat admission and lifecycle wiring', () => {
     await expect(
       channel.sendFile?.('peer', '/tmp/file', 'file.txt'),
     ).rejects.toThrow('not connected');
+  });
+
+  test('adapter forwards the stable durable delivery identity', async () => {
+    const channel = createWeChatChannel({
+      botToken: 'token',
+      ilinkBotId: 'bot',
+    });
+    await channel.connect({ onNewChat: vi.fn() });
+    await channel.sendMessage('peer', 'hello', [], {
+      deliveryId: 'turn-1:reply-0',
+    });
+    expect(capture.sendMessage).toHaveBeenCalledWith('peer', 'hello', [], {
+      deliveryId: 'turn-1:reply-0',
+    });
   });
 
   test('manager account-scopes WeChat admission callbacks and forwards expiry', async () => {

@@ -25,45 +25,115 @@ export function downloadHttpsBuffer(
     options.oversizedMessage ?? 'File exceeds MAX_FILE_SIZE';
 
   return new Promise<Buffer>((resolve, reject) => {
-    const doRequest = (reqUrl: string, redirectCount: number) => {
+    let settled = false;
+    let activeRequest: http.ClientRequest | null = null;
+    let activeResponse: http.IncomingMessage | null = null;
+
+    const finish = (error?: Error, value?: Buffer): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      activeRequest = null;
+      activeResponse = null;
+      if (error) reject(error);
+      else resolve(value ?? Buffer.alloc(0));
+    };
+
+    // One timer covers DNS/connect time, every redirect hop, and the complete
+    // response body. Resetting a per-socket timeout at each hop would let a
+    // redirect chain or trickle response hold an admitted turn indefinitely.
+    const deadlineTimer = setTimeout(
+      () => {
+        const error = new Error(
+          `IM media download timed out after ${timeoutMs}ms`,
+        );
+        activeResponse?.destroy(error);
+        activeRequest?.destroy(error);
+        finish(error);
+      },
+      Math.max(0, timeoutMs),
+    );
+
+    const parseHttpUrl = (raw: string | URL, base?: URL): URL => {
+      const parsed = raw instanceof URL ? raw : new URL(raw, base);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(
+          `Unsupported IM media URL protocol: ${parsed.protocol || '<none>'}`,
+        );
+      }
+      return parsed;
+    };
+
+    const doRequest = (requestUrl: URL, redirectCount: number): void => {
+      if (settled) return;
       if (redirectCount > 5) {
-        reject(new Error('Too many redirects'));
+        finish(new Error('Too many redirects'));
         return;
       }
-      const parsed = new URL(reqUrl);
-      const protocol = parsed.protocol === 'https:' ? https : http;
-      const req = protocol.get(reqUrl, { agent: options.agent }, (res) => {
-        if (
-          followRedirects &&
-          res.statusCode &&
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          res.resume();
-          doRequest(res.headers.location, redirectCount + 1);
+
+      const transport = requestUrl.protocol === 'https:' ? https : http;
+      const req = transport.get(requestUrl, { agent: options.agent }, (res) => {
+        if (settled) {
+          res.destroy();
           return;
         }
+        activeResponse = res;
+        const status = res.statusCode ?? 0;
+        const isRedirect = status >= 300 && status < 400;
+        if (followRedirects && isRedirect && res.headers.location) {
+          let nextUrl: URL;
+          try {
+            nextUrl = parseHttpUrl(res.headers.location, requestUrl);
+          } catch (error) {
+            res.resume();
+            finish(
+              error instanceof Error
+                ? error
+                : new Error('Invalid IM media redirect URL'),
+            );
+            return;
+          }
+          res.resume();
+          activeResponse = null;
+          activeRequest = null;
+          doRequest(nextUrl, redirectCount + 1);
+          return;
+        }
+
+        if (status < 200 || status >= 300) {
+          res.resume();
+          finish(new Error(`IM media download HTTP ${status || 'unknown'}`));
+          return;
+        }
+
         const chunks: Buffer[] = [];
         let total = 0;
-        res.on('data', (chunk: Buffer) => {
+        res.on('data', (rawChunk: Buffer | Uint8Array | string) => {
+          const chunk = Buffer.isBuffer(rawChunk)
+            ? rawChunk
+            : Buffer.from(rawChunk);
           total += chunk.length;
           if (total > maxBytes) {
-            res.destroy(new Error(oversizedMessage));
+            const error = new Error(oversizedMessage);
+            res.destroy(error);
+            finish(error);
             return;
           }
           chunks.push(chunk);
         });
-        res.on('end', () => resolve(Buffer.concat(chunks)));
-        res.on('error', reject);
+        res.on('end', () => finish(undefined, Buffer.concat(chunks)));
+        res.on('error', (error) => finish(error));
       });
-      req.on('error', reject);
-      req.setTimeout(timeoutMs, () => {
-        req.destroy(
-          new Error(`IM media download timed out after ${timeoutMs}ms`),
-        );
-      });
+      activeRequest = req;
+      req.on('error', (error) => finish(error));
     };
-    doRequest(url, 0);
+
+    try {
+      doRequest(parseHttpUrl(url), 0);
+    } catch (error) {
+      finish(
+        error instanceof Error ? error : new Error('Invalid IM media URL'),
+      );
+    }
   });
 }

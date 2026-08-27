@@ -172,12 +172,13 @@ describe('WhatsApp inbound sticker / location / contact (live upsert)', () => {
             degreesLatitude: 31.2,
             degreesLongitude: 121.5,
             name: '外滩',
+            address: '上海市中山东一路',
           },
         }),
       ],
     });
     expect(db.storeMessageDirect.mock.calls[0][4]).toBe(
-      '[位置: 外滩 (31.2, 121.5)]',
+      '[位置: 外滩 | 地址: 上海市中山东一路 | 坐标: 31.2, 121.5]',
     );
     expect(notify.notifyNewImMessage).toHaveBeenCalled();
   });
@@ -188,11 +189,17 @@ describe('WhatsApp inbound sticker / location / contact (live upsert)', () => {
       type: 'notify',
       messages: [
         upsertMessage('15559876543@s.whatsapp.net', 'contact-1', {
-          contactMessage: { displayName: '张三' },
+          contactMessage: {
+            displayName: '张三',
+            vcard:
+              'BEGIN:VCARD\nVERSION:3.0\nFN:张三\nTEL;TYPE=CELL:+86 13800000000\nEMAIL:zhangsan@example.com\nORG:示例公司;研发部\nEND:VCARD',
+          },
         }),
       ],
     });
-    expect(db.storeMessageDirect.mock.calls[0][4]).toBe('[联系人: 张三]');
+    expect(db.storeMessageDirect.mock.calls[0][4]).toBe(
+      '[联系人: 张三]\n电话: +86 13800000000\n邮箱: zhangsan@example.com\n组织: 示例公司 / 研发部',
+    );
     expect(notify.notifyNewImMessage).toHaveBeenCalled();
   });
 
@@ -227,13 +234,31 @@ describe('detectMedia / extractMessageText helpers', () => {
           degreesLatitude: 31.2,
           degreesLongitude: 121.5,
           name: '外滩',
+          address: '上海市中山东一路',
         },
       } as proto.IMessage),
-    ).toBe('[位置: 外滩 (31.2, 121.5)]');
+    ).toBe('[位置: 外滩 | 地址: 上海市中山东一路 | 坐标: 31.2, 121.5]');
     expect(
       extractMessageText({
-        contactMessage: { displayName: '张三' },
+        contactMessage: {
+          displayName: '张三',
+          vcard:
+            'BEGIN:VCARD\nN:Zhang;San;;;\nTEL:+8613800000000\nEMAIL:san@example.com\nORG:Acme;R&D\nEND:VCARD',
+        },
       } as proto.IMessage),
-    ).toBe('[联系人: 张三]');
+    ).toBe(
+      '[联系人: 张三]\n电话: +8613800000000\n邮箱: san@example.com\n组织: Acme / R&D',
+    );
+  });
+
+  test('vCard parser ignores executable/unknown fields and unfolds safe values', () => {
+    expect(
+      extractMessageText({
+        contactMessage: {
+          vcard:
+            'BEGIN:VCARD\r\nN:Doe;Jane;;;\r\nTEL;TYPE=CELL:+1-555-0100\r\nEMAIL:jane@exam\r\n ple.com\r\nURL:javascript:alert(1)\r\nEND:VCARD',
+        },
+      } as proto.IMessage),
+    ).toBe('[联系人: Jane Doe]\n电话: +1-555-0100\n邮箱: jane@example.com');
   });
 });

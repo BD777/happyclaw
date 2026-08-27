@@ -1172,28 +1172,113 @@ export function extractMessageText(content: proto.IMessage): string | null {
   return null;
 }
 
-function formatWhatsAppLocation(loc: {
+function boundedWhatsAppText(value: string | null | undefined): string {
+  return (value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 512);
+}
+
+export function formatWhatsAppLocation(loc: {
   degreesLatitude?: number | null;
   degreesLongitude?: number | null;
   name?: string | null;
   address?: string | null;
 }): string {
-  const name = loc.name?.trim() || loc.address?.trim();
+  const name = boundedWhatsAppText(loc.name);
+  const address = boundedWhatsAppText(loc.address);
   const lat = loc.degreesLatitude;
   const lon = loc.degreesLongitude;
-  const coords = lat != null && lon != null ? `${lat}, ${lon}` : '';
-  if (name && coords) return `[位置: ${name} (${coords})]`;
-  if (name) return `[位置: ${name}]`;
-  if (coords) return `[位置: ${coords}]`;
+  const coords =
+    Number.isFinite(lat) && Number.isFinite(lon) ? `${lat}, ${lon}` : '';
+  const details: string[] = [];
+  if (name) details.push(name);
+  if (address && address !== name) details.push(`地址: ${address}`);
+  if (coords) details.push(`坐标: ${coords}`);
+  if (details.length > 0) return `[位置: ${details.join(' | ')}]`;
   return '[位置]';
 }
 
-function formatWhatsAppContact(contact: {
+interface ParsedWhatsAppVCard {
+  name?: string;
+  phones: string[];
+  emails: string[];
+  organizations: string[];
+}
+
+function decodeVCardValue(value: string): string {
+  return boundedWhatsAppText(
+    value.replace(/\\n/gi, ' ').replace(/\\([,;\\])/g, '$1'),
+  );
+}
+
+function pushUniqueBounded(values: string[], value: string): void {
+  if (value && values.length < 5 && !values.includes(value)) values.push(value);
+}
+
+/** Parse only the human-facing, non-executable vCard fields we persist. */
+export function parseWhatsAppVCard(
+  vcard: string | null | undefined,
+): ParsedWhatsAppVCard {
+  const parsed: ParsedWhatsAppVCard = {
+    phones: [],
+    emails: [],
+    organizations: [],
+  };
+  if (!vcard) return parsed;
+
+  // RFC 6350 folded lines begin with SP/HTAB. Bound input before parsing so a
+  // hostile contact card cannot grow a durable message without limit.
+  const unfolded = vcard.slice(0, 32 * 1024).replace(/\r?\n[ \t]/g, '');
+  let structuredName: string | undefined;
+  for (const line of unfolded.split(/\r?\n/)) {
+    const separator = line.indexOf(':');
+    if (separator <= 0) continue;
+    const rawKey = line.slice(0, separator).split(';', 1)[0] ?? '';
+    const key = (rawKey.split('.').pop() ?? '').toUpperCase();
+    const rawValue = line.slice(separator + 1);
+    if (key === 'FN') {
+      parsed.name ||= decodeVCardValue(rawValue);
+    } else if (key === 'N') {
+      const fields = rawValue.split(';').map(decodeVCardValue);
+      structuredName ||= [fields[3], fields[1], fields[2], fields[0], fields[4]]
+        .filter(Boolean)
+        .join(' ');
+    } else if (key === 'TEL') {
+      pushUniqueBounded(
+        parsed.phones,
+        decodeVCardValue(rawValue).replace(/^tel:/i, ''),
+      );
+    } else if (key === 'EMAIL') {
+      pushUniqueBounded(
+        parsed.emails,
+        decodeVCardValue(rawValue).replace(/^mailto:/i, ''),
+      );
+    } else if (key === 'ORG') {
+      pushUniqueBounded(
+        parsed.organizations,
+        rawValue.split(';').map(decodeVCardValue).filter(Boolean).join(' / '),
+      );
+    }
+  }
+  parsed.name ||= structuredName;
+  return parsed;
+}
+
+export function formatWhatsAppContact(contact: {
   displayName?: string | null;
   vcard?: string | null;
 }): string {
-  const name = contact.displayName?.trim();
-  return name ? `[联系人: ${name}]` : '[联系人]';
+  const vcard = parseWhatsAppVCard(contact.vcard);
+  const name = boundedWhatsAppText(contact.displayName) || vcard.name;
+  const lines = [name ? `[联系人: ${name}]` : '[联系人]'];
+  if (vcard.phones.length > 0) lines.push(`电话: ${vcard.phones.join(', ')}`);
+  if (vcard.emails.length > 0) lines.push(`邮箱: ${vcard.emails.join(', ')}`);
+  if (vcard.organizations.length > 0) {
+    lines.push(`组织: ${vcard.organizations.join(', ')}`);
+  }
+  return lines.join('\n').slice(0, 4096);
 }
 
 /**
@@ -1415,18 +1500,29 @@ export type WhatsAppSendFileContent =
   | { audio: Buffer; mimetype: string }
   | { document: Buffer; mimetype: string; fileName: string };
 
-/** Pick Baileys' native video/audio envelope from guessMimeType; PDFs stay document. */
+const WHATSAPP_NATIVE_VIDEO_MIME = new Map([['mp4', 'video/mp4']]);
+const WHATSAPP_NATIVE_AUDIO_MIME = new Map([
+  ['mp3', 'audio/mpeg'],
+  ['m4a', 'audio/mp4'],
+  ['ogg', 'audio/ogg'],
+  ['opus', 'audio/ogg'],
+]);
+
+/**
+ * Only formats verified against WhatsApp's native media envelopes are routed
+ * as video/audio. A browser-playable MOV/WebM/WAV is not necessarily accepted
+ * by WhatsApp's upload contract, so every non-allowlisted file stays a document.
+ */
 export function buildWhatsAppSendFileContent(
   buf: Buffer,
   fileName: string,
 ): WhatsAppSendFileContent {
+  const ext = fileName.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? '';
+  const videoMime = WHATSAPP_NATIVE_VIDEO_MIME.get(ext);
+  if (videoMime) return { video: buf, mimetype: videoMime };
+  const audioMime = WHATSAPP_NATIVE_AUDIO_MIME.get(ext);
+  if (audioMime) return { audio: buf, mimetype: audioMime };
   const mime = guessMimeType(fileName) || 'application/octet-stream';
-  if (mime.startsWith('video/')) {
-    return { video: buf, mimetype: mime };
-  }
-  if (mime.startsWith('audio/')) {
-    return { audio: buf, mimetype: mime };
-  }
   return { document: buf, mimetype: mime, fileName };
 }
 
@@ -1446,7 +1542,8 @@ export function guessMimeType(fileName: string): string | null {
   // Audio
   if (ext === 'mp3') return 'audio/mpeg';
   if (ext === 'ogg' || ext === 'opus') return 'audio/ogg';
-  if (ext === 'm4a' || ext === 'aac') return 'audio/aac';
+  if (ext === 'm4a') return 'audio/mp4';
+  if (ext === 'aac') return 'audio/aac';
   if (ext === 'wav') return 'audio/wav';
   // Document
   if (ext === 'pdf') return 'application/pdf';

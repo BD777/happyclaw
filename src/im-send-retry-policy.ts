@@ -5,6 +5,7 @@ export interface ImSendFailurePolicy {
 
 const REFRESH_REQUIRED_CODE = 'WECHAT_CONTEXT_REFRESH_REQUIRED';
 const DEFINITIVE_DELIVERY_REJECTION_CODE = 'CHANNEL_DELIVERY_REJECTED';
+const UNCERTAIN_DELIVERY_CODE = 'CHANNEL_DELIVERY_UNCERTAIN';
 
 function errorChainHasCode(error: unknown, expectedCode: string): boolean {
   let current = error;
@@ -24,7 +25,8 @@ function errorChainHasCode(error: unknown, expectedCode: string): boolean {
 export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
   if (
     errorChainHasCode(error, REFRESH_REQUIRED_CODE) ||
-    errorChainHasCode(error, DEFINITIVE_DELIVERY_REJECTION_CODE)
+    errorChainHasCode(error, DEFINITIVE_DELIVERY_REJECTION_CODE) ||
+    errorChainHasCode(error, UNCERTAIN_DELIVERY_CODE)
   ) {
     return {
       retryable: false,

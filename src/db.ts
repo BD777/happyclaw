@@ -10778,9 +10778,9 @@ export function claimWeChatContextToken(input: {
 }
 
 /**
- * Return unused sendmessage reservations when a later chunk never received a
- * provider ACK. Compare-and-swap on the same generation as claim so a concurrent
- * inbound refresh cannot have its quota rewritten by a stale batch.
+ * Low-level rollback for a reservation proven not to have reached the provider.
+ * HTTP/transport/ACK uncertainty must never call this: those attempts remain
+ * charged. Compare-and-swap prevents a stale rollback from rewriting a refresh.
  */
 export function releaseWeChatContextToken(input: {
   channelAccountId: string;

@@ -1,3 +1,4 @@
+import http from 'node:http';
 import net from 'node:net';
 import { afterEach, describe, expect, test } from 'vitest';
 
@@ -85,5 +86,83 @@ describe('Inbound IM media download timeout against a blackhole peer', () => {
       }),
     ).rejects.toThrow(/timed out/i);
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  test('follows a relative redirect and accepts only the final 2xx body', async () => {
+    const server = http.createServer((req, res) => {
+      if (req.url === '/start') {
+        res.writeHead(302, { location: '/media/file.bin' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.end('payload');
+    });
+    closers.push(trackClose(server));
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('missing HTTP port');
+
+    await expect(
+      downloadHttpsBuffer(`http://127.0.0.1:${addr.port}/start`, {
+        followRedirects: true,
+      }),
+    ).resolves.toEqual(Buffer.from('payload'));
+  });
+
+  test('rejects unsupported schemes and terminal non-2xx responses', async () => {
+    await expect(downloadHttpsBuffer('file:///etc/passwd')).rejects.toThrow(
+      /unsupported.*protocol/i,
+    );
+
+    const server = http.createServer((_req, res) => {
+      res.writeHead(404);
+      res.end('not found');
+    });
+    closers.push(trackClose(server));
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('missing HTTP port');
+
+    await expect(
+      downloadHttpsBuffer(`http://127.0.0.1:${addr.port}/missing`),
+    ).rejects.toThrow(/HTTP 404/);
+  });
+
+  test('uses one absolute deadline across redirect latency and body latency', async () => {
+    const server = http.createServer((req, res) => {
+      if (req.url === '/slow-redirect') {
+        setTimeout(() => {
+          res.writeHead(302, { location: '/slow-body' });
+          res.end();
+        }, 90).unref();
+        return;
+      }
+      res.writeHead(200);
+      res.write('partial');
+      setTimeout(() => res.end('late'), 120).unref();
+    });
+    closers.push(trackClose(server));
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('missing HTTP port');
+
+    const started = Date.now();
+    await expect(
+      downloadHttpsBuffer(`http://127.0.0.1:${addr.port}/slow-redirect`, {
+        timeoutMs: 150,
+        followRedirects: true,
+      }),
+    ).rejects.toThrow(/timed out/i);
+    expect(Date.now() - started).toBeLessThan(300);
   });
 });

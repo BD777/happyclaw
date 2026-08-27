@@ -2899,6 +2899,14 @@ async function sendImWithRetry(
   let ok: boolean;
   const sendFailure = failure ?? {};
   const durableScoped = outbox !== undefined;
+  const connectorDeliveryOptions: ChannelMessageDeliveryOptions = {
+    ...deliveryOptions,
+    deliveryId:
+      deliveryOptions?.deliveryId ??
+      (outbox
+        ? `${outbox.scopeKey}:${outbox.operationKey}:${outbox.ordinalSlot ?? 'message'}:text`
+        : crypto.randomUUID()),
+  };
   if (durableScoped) {
     ok = true;
     if (text) {
@@ -2916,7 +2924,8 @@ async function sendImWithRetry(
             deliveryOptions?.presentation,
             outboxMetadata,
           ),
-          send: () => imManager.sendMessage(imJid, text, [], deliveryOptions),
+          send: () =>
+            imManager.sendMessage(imJid, text, [], connectorDeliveryOptions),
           failure: sendFailure,
         },
       );
@@ -2963,7 +2972,12 @@ async function sendImWithRetry(
       'send_message',
       imJid,
       () =>
-        imManager.sendMessage(imJid, text, localImagePaths, deliveryOptions),
+        imManager.sendMessage(
+          imJid,
+          text,
+          localImagePaths,
+          connectorDeliveryOptions,
+        ),
       sendFailure,
     );
   }

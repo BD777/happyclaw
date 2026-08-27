@@ -201,7 +201,7 @@ describe('WeChat connection durable context_token integration', () => {
     await connection.disconnect();
   });
 
-  test('multi-chunk send does not burn unused slots or resend a delivered prefix after a mid-batch 502', async () => {
+  test('multi-chunk send claims only attempted chunks and treats a mid-batch 502 as uncertain', async () => {
     const store = new SharedStore();
     store.record = {
       accountId: 'account',
@@ -217,7 +217,6 @@ describe('WeChat connection durable context_token integration', () => {
       close: vi.fn(async () => undefined),
     } as unknown as Dispatcher;
     const attemptedTexts: string[] = [];
-    const ackedTexts: string[] = [];
     let sendAttempts = 0;
     const fetchMock = vi.fn(
       async (
@@ -235,7 +234,6 @@ describe('WeChat connection durable context_token integration', () => {
               statusText: 'Bad Gateway',
             });
           }
-          ackedTexts.push(text);
           return Response.json({ ret: 0 });
         }
         return waitUntilAborted(init?.signal);
@@ -256,25 +254,140 @@ describe('WeChat connection durable context_token integration', () => {
     await connection.connect({ onNewChat: vi.fn() });
 
     const longText = 'A'.repeat(2500);
-    await expect(connection.sendMessage('peer', longText)).rejects.toThrow(
-      'HTTP 502',
-    );
+    await expect(
+      connection.sendMessage('peer', longText, [], {
+        deliveryId: 'delivery-mid-batch',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_UNCERTAIN',
+      deliveryId: 'delivery-mid-batch',
+      chunkIndex: 1,
+    });
 
-    const prefix = ackedTexts[0];
-    expect(prefix.length).toBeGreaterThan(0);
-    expect(prefix.length).toBeLessThan(longText.length);
     expect(attemptedTexts).toHaveLength(2);
-    expect(store.record?.sendCount).toBe(1);
-    expect(attemptedTexts.filter((text) => text === prefix)).toHaveLength(1);
-
-    await expect(connection.sendMessage('peer', longText)).resolves.toBe(
-      undefined,
-    );
-    expect(attemptedTexts.filter((text) => text === prefix)).toHaveLength(1);
-    expect(ackedTexts.join('')).toBe(longText);
     expect(store.record?.sendCount).toBe(2);
-    expect(sendAttempts).toBe(3);
+    expect(sendAttempts).toBe(2);
 
+    await connection.disconnect();
+  });
+
+  test('two concurrent identical texts remain distinct durable deliveries', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-1',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const clientIds: string[] = [];
+    const texts: string[] = [];
+    const fetchMock = vi.fn(
+      async (
+        url: string,
+        init?: { body?: unknown; signal?: AbortSignal | null },
+      ) => {
+        if (url.includes('sendmessage')) {
+          const body = JSON.parse(String(init?.body));
+          clientIds.push(String(body.msg.client_id));
+          texts.push(String(body.msg.item_list[0].text_item.text));
+          await Promise.resolve();
+          return Response.json({ ret: 0 });
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+
+    await Promise.all([
+      connection.sendMessage('peer', 'same text', [], {
+        deliveryId: 'delivery-a',
+      }),
+      connection.sendMessage('peer', 'same text', [], {
+        deliveryId: 'delivery-b',
+      }),
+    ]);
+    expect(texts).toEqual(['same text', 'same text']);
+    expect(new Set(clientIds).size).toBe(2);
+    expect(store.record?.sendCount).toBe(2);
+    await connection.disconnect();
+  });
+
+  test('accepted response lost is charged once and never retried internally', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-1',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const acceptedClientIds: string[] = [];
+    let attempts = 0;
+    const fetchMock = vi.fn(
+      async (
+        url: string,
+        init?: { body?: unknown; signal?: AbortSignal | null },
+      ) => {
+        if (url.includes('sendmessage')) {
+          attempts += 1;
+          const body = JSON.parse(String(init?.body));
+          acceptedClientIds.push(String(body.msg.client_id));
+          throw new TypeError('socket closed after provider accepted request');
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+
+    await expect(
+      connection.sendMessage('peer', 'accepted but ack lost', [], {
+        deliveryId: 'durable-delivery-7',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_UNCERTAIN',
+      deliveryId: 'durable-delivery-7',
+      chunkIndex: 0,
+    });
+    expect(attempts).toBe(1);
+    expect(store.record?.sendCount).toBe(1);
+    expect(acceptedClientIds).toHaveLength(1);
     await connection.disconnect();
   });
 

@@ -265,6 +265,8 @@ export interface IMChannel {
 export interface ChannelMessageDeliveryOptions {
   /** `native` avoids bot/card presentation for Proactive-mode workspace Agents. */
   presentation?: 'default' | 'native';
+  /** Stable durable identity reused across transport retries. */
+  deliveryId?: string;
 }
 
 /**
@@ -872,13 +874,20 @@ export function createWeChatChannel(
       }
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+      options?: ChannelMessageDeliveryOptions,
+    ): Promise<void> {
       if (!inner) {
         throw new Error(
           `WeChat channel is not connected; message to ${chatId} was not sent`,
         );
       }
-      await inner.sendMessage(chatId, text);
+      await inner.sendMessage(chatId, text, localImagePaths, {
+        deliveryId: options?.deliveryId,
+      });
     },
 
     async sendImage(

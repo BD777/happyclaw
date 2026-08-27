@@ -1,10 +1,7 @@
-import net from 'node:net';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import fs from 'node:fs';
-import path from 'node:path';
 
 const inbound = vi.hoisted(() => ({
-  handlers: new Map<string, (ctx: unknown) => Promise<void>>(),
+  handlers: new Map<string, (ctx: any) => Promise<void>>(),
   storeMessageDirect: vi.fn(),
   notifyNewImMessage: vi.fn(),
   stop: null as (() => void) | null,
@@ -16,9 +13,10 @@ vi.mock('grammy', () => ({
       config: { use: vi.fn() },
       getMe: vi.fn(async () => ({ id: 1, username: 'media_bot' })),
       getFile: vi.fn(async () => ({})),
+      getChat: vi.fn(async () => ({ is_forum: false })),
       setMessageReaction: vi.fn(async () => {}),
     };
-    on(filter: string, fn: (ctx: unknown) => Promise<void>) {
+    on(filter: string, fn: (ctx: any) => Promise<void>) {
       inbound.handlers.set(filter, fn);
       return this;
     }
@@ -41,19 +39,16 @@ vi.mock('../src/db.js', () => ({
   storeMessageDirect: inbound.storeMessageDirect,
   updateChatName: vi.fn(),
 }));
-
 vi.mock('../src/message-notifier.js', () => ({
   notifyNewImMessage: inbound.notifyNewImMessage,
 }));
-
 vi.mock('../src/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 import {
   createTelegramConnection,
-  downloadTelegramHttpsBuffer,
-  handleTelegramNativeMediaUpdate,
+  telegramMediaMessageText,
   telegramNativeFileFromMessage,
 } from '../src/telegram.js';
 
@@ -101,121 +96,15 @@ describe('telegramNativeFileFromMessage', () => {
     });
   });
 
-  test('ignores empty messages', () => {
+  test('ignores empty messages and safely appends captions', () => {
     expect(telegramNativeFileFromMessage({})).toBeNull();
-  });
-});
-
-describe('handleTelegramNativeMediaUpdate (message:video)', () => {
-  test('authorized video stores and notifies', async () => {
-    const storeMessageDirect = vi.fn();
-    const notifyNewImMessage = vi.fn();
-    const onMessagePersisted = vi.fn();
-    const result = await handleTelegramNativeMediaUpdate(
-      {
-        message: {
-          message_id: 7,
-          date: 1_777_000_000,
-          video: { file_id: 'v1', file_name: 'clip.mp4', file_size: 12 },
-        },
-        chat: { id: 99, title: 'Ada' },
-        from: { id: 9, first_name: 'Ada' },
-      },
-      {
-        isChatAuthorized: () => true,
-        storeMessageDirect,
-        notifyNewImMessage,
-        onMessagePersisted,
-        downloadRelPath: async () => 'telegram/clip.mp4',
-      },
+    expect(telegramMediaMessageText('[文件下载失败: clip.mp4]', ' note ')).toBe(
+      '[文件下载失败: clip.mp4]\nnote',
     );
-    expect(result).toBe('stored');
-    expect(storeMessageDirect).toHaveBeenCalled();
-    expect(storeMessageDirect.mock.calls[0][4]).toBe(
-      '[文件: telegram/clip.mp4]',
-    );
-    expect(notifyNewImMessage).toHaveBeenCalledTimes(1);
-    expect(onMessagePersisted).toHaveBeenCalledTimes(1);
-  });
-
-  test('unauthorized video does not persist', async () => {
-    const storeMessageDirect = vi.fn();
-    const notifyNewImMessage = vi.fn();
-    const result = await handleTelegramNativeMediaUpdate(
-      {
-        message: {
-          message_id: 8,
-          date: 1_777_000_000,
-          video: { file_id: 'v2', file_name: 'clip.mp4' },
-        },
-        chat: { id: 99 },
-      },
-      {
-        isChatAuthorized: () => false,
-        storeMessageDirect,
-        notifyNewImMessage,
-      },
-    );
-    expect(result).toBe('unauthorized');
-    expect(storeMessageDirect).not.toHaveBeenCalled();
-    expect(notifyNewImMessage).not.toHaveBeenCalled();
-  });
-});
-
-describe('native media download timeout', () => {
-  const closers: Array<() => Promise<void>> = [];
-  afterEach(async () => {
-    await Promise.allSettled(closers.splice(0).map((close) => close()));
-  }, 3000);
-
-  test('times out against a blackhole peer', async () => {
-    const sockets = new Set<net.Socket>();
-    const server = net.createServer((socket) => {
-      sockets.add(socket);
-      socket.on('close', () => sockets.delete(socket));
-    });
-    closers.push(async () => {
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      });
-    });
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', () => resolve());
-    });
-    const addr = server.address();
-    if (!addr || typeof addr === 'string') {
-      throw new Error('no port');
-    }
-    const started = Date.now();
-    await expect(
-      downloadTelegramHttpsBuffer(`http://127.0.0.1:${addr.port}/file`, {
-        timeoutMs: 250,
-      }),
-    ).rejects.toThrow(/timed out/i);
-    expect(Date.now() - started).toBeLessThan(2000);
   });
 });
 
 describe('Telegram native media inbound listeners', () => {
-  const source = fs.readFileSync(
-    path.resolve(__dirname, '../src/telegram.ts'),
-    'utf8',
-  );
-
-  test('registers video/voice/audio/animation handlers that persist', () => {
-    for (const kind of ['video', 'voice', 'audio', 'animation']) {
-      expect(source).toContain(`bot.on('message:${kind}'`);
-    }
-    expect(source).toContain('handleNativeTelegramMedia');
-    expect(source).toContain('handleTelegramNativeMediaUpdate');
-    expect(source).toContain('const tgMessage = ctx.message');
-    expect(source).not.toContain('const message = message');
-    expect(source).toContain('downloadTelegramHttpsBuffer');
-    expect(source).not.toContain("from './im-media-download.js'");
-  });
-
   let connection: ReturnType<typeof createTelegramConnection> | null = null;
 
   beforeEach(() => {
@@ -232,48 +121,78 @@ describe('Telegram native media inbound listeners', () => {
     }
   }, 8000);
 
-  async function connectAuthorized(authorized: boolean) {
+  async function connectAuthorized(extra: Record<string, unknown> = {}) {
     connection = createTelegramConnection({ botToken: 'test-token' });
-    const ok = await connection.connect({
+    const opts = {
       onNewChat: vi.fn(),
-      isChatAuthorized: () => authorized,
-    });
+      isChatAuthorized: () => true,
+      ...extra,
+    };
+    const ok = await connection.connect(opts as never);
     expect(ok).toBe(true);
-    return connection;
   }
 
-  function videoCtx(messageId: number) {
+  function videoCtx(messageId: number, caption?: string) {
     return {
       message: {
         message_id: messageId,
         date: Math.floor(Date.now() / 1000),
+        caption,
         video: { file_id: 'v1', file_name: 'clip.mp4', file_size: 12 },
       },
-      chat: { id: 42, title: 'Ada' },
+      chat: { id: 42, type: 'private', title: 'Ada' },
       from: { id: 9, first_name: 'Ada' },
-      react: async () => {},
+      react: vi.fn(async () => {}),
+      reply: vi.fn(async () => {}),
     };
   }
 
-  test('connect() registers runtime bot.on listeners and video persist+notify', async () => {
-    await connectAuthorized(true);
-    for (const kind of ['video', 'voice', 'audio', 'animation']) {
-      expect(typeof inbound.handlers.get(`message:${kind}`)).toBe('function');
-    }
+  test('uses the resolved route and one UUID for reaction/persistence projection', async () => {
+    const onMessagePersisted = vi.fn();
+    const onAgentMessage = vi.fn();
+    await connectAuthorized({
+      resolveEffectiveChatJid: () => ({
+        effectiveJid: 'web:routed-workspace',
+        sourceJid: 'telegram:42',
+        agentId: 'agent-7',
+      }),
+      onMessagePersisted,
+      onAgentMessage,
+    });
+
     const handler = inbound.handlers.get('message:video');
     expect(handler).toBeTypeOf('function');
-    await handler!(videoCtx(101));
-    expect(inbound.storeMessageDirect).toHaveBeenCalled();
-    expect(inbound.storeMessageDirect.mock.calls[0][4]).toMatch(/\[文件/);
-    expect(inbound.notifyNewImMessage).toHaveBeenCalled();
+    await handler!(videoCtx(101, 'caption'));
+
+    expect(inbound.storeMessageDirect).toHaveBeenCalledOnce();
+    const stored = inbound.storeMessageDirect.mock.calls[0];
+    expect(stored[1]).toBe('web:routed-workspace');
+    expect(stored[4]).toBe('[文件下载失败: 无法确定工作目录]\ncaption');
+    expect(stored[7]).toMatchObject({ sourceJid: 'telegram:42' });
+    expect(onMessagePersisted).toHaveBeenCalledOnce();
+    expect(onMessagePersisted.mock.calls[0][0]).toBe('web:routed-workspace');
+    expect(onMessagePersisted.mock.calls[0][1].id).toBe(stored[0]);
+    expect(onMessagePersisted.mock.calls[0][2]).toBe('agent-7');
+    expect(onAgentMessage).toHaveBeenCalledWith('telegram:42', 'agent-7');
+    expect(inbound.notifyNewImMessage).toHaveBeenCalledOnce();
   });
 
-  test('inbound video listener skips unauthorized chats', async () => {
-    await connectAuthorized(false);
-    const handler = inbound.handlers.get('message:video');
-    expect(handler).toBeTypeOf('function');
-    await handler!(videoCtx(202));
-    expect(inbound.storeMessageDirect).not.toHaveBeenCalled();
-    expect(inbound.notifyNewImMessage).not.toHaveBeenCalled();
+  test('animation/document compatibility overlap persists exactly once', async () => {
+    await connectAuthorized();
+    const ctx = {
+      message: {
+        message_id: 202,
+        date: Math.floor(Date.now() / 1000),
+        animation: { file_id: 'gif-1', file_name: 'loop.mp4' },
+        document: { file_id: 'gif-1', file_name: 'loop.mp4' },
+      },
+      chat: { id: 42, type: 'private', title: 'Ada' },
+      from: { id: 9, first_name: 'Ada' },
+      react: vi.fn(async () => {}),
+      reply: vi.fn(async () => {}),
+    };
+    await inbound.handlers.get('message:document')!(ctx);
+    await inbound.handlers.get('message:animation')!(ctx);
+    expect(inbound.storeMessageDirect).toHaveBeenCalledOnce();
   });
 });

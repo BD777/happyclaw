@@ -25,7 +25,8 @@ vi.mock('../src/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-const { createWeChatConnection } = await import('../src/wechat.js');
+const { createWeChatConnection, detectWeChatVoiceExtension } =
+  await import('../src/wechat.js');
 
 function waitUntilAborted(signal?: AbortSignal | null): Promise<Response> {
   return new Promise((_resolve, reject) => {
@@ -176,5 +177,69 @@ describe('WeChat inbound video CDN persist', () => {
     expect(crypto.downloadAndDecryptMedia).toHaveBeenCalled();
     expect(downloader.saveDownloadedFile).toHaveBeenCalled();
     expect(String(db.storeMessageDirect.mock.calls[0][4])).toMatch(/文件/);
+  });
+
+  test('voice filenames follow the decrypted container signature', () => {
+    expect(detectWeChatVoiceExtension(Buffer.from('#!SILK_V3bytes'))).toBe(
+      '.silk',
+    );
+    expect(detectWeChatVoiceExtension(Buffer.from('#!AMR\nbytes'))).toBe(
+      '.amr',
+    );
+    expect(detectWeChatVoiceExtension(Buffer.from('OggSbytes'))).toBe('.ogg');
+    expect(
+      detectWeChatVoiceExtension(Buffer.from('unknown-voice-container')),
+    ).toBe('.bin');
+  });
+
+  test('downloadable voice keeps transcription once and saves the detected encoding', async () => {
+    crypto.downloadAndDecryptMedia.mockResolvedValue(
+      Buffer.from('#!AMR\nvoice'),
+    );
+    const fetchMock = fetchOnceThenHang({
+      get_updates_buf: 'c1',
+      msgs: [
+        inboundMsg(
+          {
+            type: 3,
+            voice_item: {
+              text: '转写内容',
+              media: {
+                encrypt_query_param: 'q-voice',
+                aes_key: 'k-voice',
+              },
+            },
+          },
+          'voice-1',
+        ),
+      ],
+    });
+    await connectAndDrain(fetchMock);
+    expect(downloader.saveDownloadedFile.mock.calls[0][2]).toMatch(/\.amr$/);
+    const content = String(db.storeMessageDirect.mock.calls[0][4]);
+    expect(content).toContain('[语音: ws/');
+    expect(content).toContain('转写内容');
+    expect(content).not.toContain('(voice)');
+    expect(content).not.toContain('[语音消息]');
+  });
+
+  test('incomplete voice media emits one placeholder without a download attempt', async () => {
+    const fetchMock = fetchOnceThenHang({
+      get_updates_buf: 'c1',
+      msgs: [
+        inboundMsg(
+          {
+            type: 3,
+            voice_item: {
+              media: { encrypt_query_param: 'missing-aes-key' },
+            },
+          },
+          'voice-incomplete',
+        ),
+      ],
+    });
+    await connectAndDrain(fetchMock);
+    expect(crypto.downloadAndDecryptMedia).not.toHaveBeenCalled();
+    expect(db.storeMessageDirect.mock.calls[0][4]).toBe('(voice)');
   });
 });

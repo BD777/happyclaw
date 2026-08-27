@@ -380,6 +380,7 @@ export class WeChatContextTokenManager {
     throw new WeChatContextTokenError('missing', userId);
   }
 
+  /** Only valid when the caller can prove no provider request was attempted. */
   release(record: WeChatContextTokenRecord, releaseCount = 1): boolean {
     if (!Number.isInteger(releaseCount) || releaseCount <= 0) {
       throw new Error('WeChat context_token releaseCount must be positive');
