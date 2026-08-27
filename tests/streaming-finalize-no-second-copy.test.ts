@@ -12,6 +12,7 @@ vi.mock('../src/logger.js', () => ({
 import { DiscordStreamingEditController } from '../src/discord-streaming-edit.js';
 import { QQStreamingController } from '../src/qq-streaming-card.js';
 import { WeComStreamingController } from '../src/wecom-streaming.js';
+import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -23,13 +24,14 @@ describe('streaming finalize must not send a second full copy', () => {
     vi.useFakeTimers();
 
     const fallbackSend = vi.fn(async () => {});
+    const finalizeError = new Error('discord finalize edit failed');
     let editCount = 0;
     const message = {
       id: 'msg-preview',
       edit: vi.fn(async (_content: string) => {
         editCount += 1;
         // First edit is the preview flush; the finalize edit fails.
-        if (editCount > 1) throw new Error('discord finalize edit failed');
+        if (editCount > 1) throw finalizeError;
         return message;
       }),
     };
@@ -47,8 +49,20 @@ describe('streaming finalize must not send a second full copy', () => {
     expect(message.edit).toHaveBeenCalledTimes(1);
     expect(fallbackSend).not.toHaveBeenCalled();
 
-    await ctrl.complete('Hello from the preview — final');
+    const finalized = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Hello from the preview — final',
+      true,
+      'finalize failed',
+    );
 
+    expect(finalized).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        cause: finalizeError,
+      },
+    });
     expect(message.edit).toHaveBeenCalledTimes(2);
     expect(fallbackSend).not.toHaveBeenCalled();
     expect(channel.send).toHaveBeenCalledTimes(1);
@@ -107,7 +121,10 @@ describe('streaming finalize must not send a second full copy', () => {
 
     await expect(
       ctrl.complete('Hello from the preview — final'),
-    ).rejects.toThrow('qq finalize DONE failed');
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      cause: expect.objectContaining({ message: 'qq finalize DONE failed' }),
+    });
 
     expect(streamCalls.some((c) => c.input_state === 10)).toBe(true);
     expect(fallbackSend).not.toHaveBeenCalled();
@@ -117,10 +134,11 @@ describe('streaming finalize must not send a second full copy', () => {
     vi.useFakeTimers();
 
     const fallbackSend = vi.fn(async () => {});
+    const finalizeError = new Error('wecom finalize DONE failed');
     const streamCalls: Array<{ content: string; finish: boolean }> = [];
     const sendStream = vi.fn(async (content: string, finish: boolean) => {
       streamCalls.push({ content, finish });
-      if (finish) throw new Error('wecom finalize DONE failed');
+      if (finish) throw finalizeError;
     });
 
     const ctrl = new WeComStreamingController({
@@ -136,8 +154,20 @@ describe('streaming finalize must not send a second full copy', () => {
     ]);
     expect(fallbackSend).not.toHaveBeenCalled();
 
-    await ctrl.complete('Hello from the preview — final');
+    const finalized = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Hello from the preview — final',
+      true,
+      'finalize failed',
+    );
 
+    expect(finalized).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        cause: finalizeError,
+      },
+    });
     expect(streamCalls).toContainEqual({
       content: 'Hello from the preview — final',
       finish: true,

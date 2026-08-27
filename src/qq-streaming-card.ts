@@ -37,6 +37,7 @@
  */
 
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -98,6 +99,7 @@ export class QQStreamingController {
   private passiveMsgId: string | undefined;
   private definitiveStartRejection = false;
   private uncertainStartError: unknown;
+  private visibleDeliveryError: unknown;
   private onDefinitiveRejection?: (error: unknown) => boolean;
 
   // Tool state remains available to the shared streaming-session interface.
@@ -152,6 +154,9 @@ export class QQStreamingController {
   }
 
   async complete(finalText: string): Promise<void> {
+    if (this.state === 'aborted' && this.visibleDeliveryError) {
+      throw this.visibleDeliveryError;
+    }
     if (
       this.state === 'completed' ||
       this.state === 'aborted' ||
@@ -170,6 +175,10 @@ export class QQStreamingController {
     // Wait for any in-flight flush to settle so we don't race the DONE chunk
     if (this.currentFlushPromise) {
       await this.currentFlushPromise.catch(() => {});
+    }
+    if (this.visibleDeliveryError) {
+      this.state = 'aborted';
+      throw this.visibleDeliveryError;
     }
 
     // Now safe to set baseline. accumulatedText is whatever the last
@@ -254,8 +263,13 @@ export class QQStreamingController {
         { err: err.message, openid: this.openid },
         'QQ streaming finalize failed; refusing duplicate plain fallback',
       );
+      this.visibleDeliveryError = new PartialChannelDeliveryError(
+        this.sentChunkCount,
+        this.sentChunkCount + 1,
+        err,
+      );
       this.state = 'aborted';
-      throw err;
+      throw this.visibleDeliveryError;
     }
   }
 
@@ -411,11 +425,10 @@ export class QQStreamingController {
     if (!rawText.trim()) return;
     if (this.definitiveStartRejection || this.uncertainStartError) return;
 
-    // Length guard: QQ stream_messages caps content_raw (~5000 chars). Once we
-    // cross the conservative threshold, every subsequent chunk would hit the
-    // same upper-bound and fail in a tight loop. Switch to fallback once and
-    // stop streaming — fallbackUsed guard ensures only one plain message is
-    // sent even if this path is hit repeatedly before complete() fires.
+    // Length guard: QQ stream_messages caps content_raw (~5000 chars). A plain
+    // fallback is safe only before any stream mutation is visible. Once a
+    // preview exists, sending the whole body again would duplicate it; fence
+    // the partial-visible delivery for host-side manual reconciliation.
     if (rawText.length > MAX_STREAM_CONTENT) {
       logger.warn(
         {
@@ -423,14 +436,24 @@ export class QQStreamingController {
           contentLen: rawText.length,
           limit: MAX_STREAM_CONTENT,
         },
-        'QQ streaming accumulated text exceeds per-chunk cap, switching to fallback',
+        'QQ streaming accumulated text exceeds per-chunk cap',
       );
       this.clearTimers();
       this.flushPending = false;
-      // Aborted (not completed) so complete() early-returns without sending DONE.
+      if (this.sentChunkCount === 0) {
+        await this.finishWithFallback(rawText);
+        return;
+      }
+      const overflow = new Error(
+        `QQ streaming content exceeds ${MAX_STREAM_CONTENT} characters after a visible preview`,
+      );
+      this.visibleDeliveryError = new PartialChannelDeliveryError(
+        this.sentChunkCount,
+        this.sentChunkCount + 1,
+        overflow,
+      );
       this.state = 'aborted';
-      await this.tryFallback(rawText);
-      return;
+      throw this.visibleDeliveryError;
     }
 
     // CRITICAL: QQ stream API requires strict prefix stability across chunks.
@@ -450,6 +473,13 @@ export class QQStreamingController {
           { err: err.message, contentLen: rawText.length },
           'QQ streaming chunk failed',
         );
+        this.visibleDeliveryError = new PartialChannelDeliveryError(
+          this.sentChunkCount,
+          this.sentChunkCount + 1,
+          err,
+        );
+        this.state = 'aborted';
+        throw this.visibleDeliveryError;
       }
     }
   }

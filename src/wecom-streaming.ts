@@ -29,6 +29,7 @@
  */
 
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -225,9 +226,21 @@ export class WeComStreamingController {
       // Preview bubble already exists. A plain sendMessage would deliver a
       // second full copy of the same reply.
       if (this.sentChunkCount === 0) {
-        await this.tryFallback(finalBody);
+        try {
+          await this.tryFallback(finalBody);
+          this.state = 'completed';
+          return;
+        } catch (fallbackError) {
+          this.state = 'aborted';
+          throw fallbackError;
+        }
       }
-      this.state = 'completed';
+      this.state = 'aborted';
+      throw new PartialChannelDeliveryError(
+        this.sentChunkCount,
+        this.sentChunkCount + 1,
+        err,
+      );
     }
   }
 

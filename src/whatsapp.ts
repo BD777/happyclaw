@@ -42,6 +42,7 @@ import {
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
 import { canonicalizeWhatsAppProviderConversationJid } from './whatsapp-jid.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 export {
   getWhatsAppAuthDir,
   migrateLegacyWhatsAppAuthDir,
@@ -994,6 +995,9 @@ export function createWhatsAppConnection(
       // so we pick the safe option: drop formatting, send plain text.
       const plain = markdownToPlainText(text);
       const chunks = splitTextChunks(plain, TEXT_CHUNK_LIMIT);
+      const tracker = new PhysicalDeliveryTracker(
+        chunks.length + (localImagePaths?.length ?? 0),
+      );
 
       try {
         for (let i = 0; i < chunks.length; i++) {
@@ -1001,7 +1005,9 @@ export function createWhatsAppConnection(
             chunks.length > 1
               ? `${chunks[i]}\n\n(${i + 1}/${chunks.length})`
               : chunks[i];
-          await sock.sendMessage(jid, { text: chunk });
+          await tracker.send(() =>
+            sock!.sendMessage(jid, { text: chunk }).then(() => undefined),
+          );
           // Throttle between chunks to stay under WhatsApp Web's anti-spam
           // burst threshold; same reason qq/dingtalk soft-throttle bulk sends.
           if (i < chunks.length - 1) {
@@ -1016,7 +1022,11 @@ export function createWhatsAppConnection(
             try {
               const buf = await readFile(imgPath);
               const mime = guessMimeType(imgPath) || 'image/jpeg';
-              await sock.sendMessage(jid, { image: buf, mimetype: mime });
+              await tracker.send(() =>
+                sock!
+                  .sendMessage(jid, { image: buf, mimetype: mime })
+                  .then(() => undefined),
+              );
             } catch (err) {
               logger.error(
                 { err, imgPath, chatId },

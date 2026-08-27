@@ -221,15 +221,19 @@ async function runScenario({ mode, port, timeoutMs, tmp }) {
   env.ANTHROPIC_API_KEY = 'stub-key-not-a-real-credential';
   env.ANTHROPIC_MODEL = MODEL;
   env.HAPPYCLAW_WORKSPACE_IPC = ipcDir;
+  env.HAPPYCLAW_WORKSPACE_GROUP = workDir;
+  env.HAPPYCLAW_REQUIRE_BUNDLED_CLAUDE = '1';
   env.HAPPYCLAW_AGENT_RUNNER_MODE = 'development';
 
   const child = spawn(process.execPath, [RUNNER], {
     cwd: workDir,
     env,
-    stdio: ['pipe', 'pipe', 'ignore'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stdout = '';
+  let stderr = '';
   child.stdout.on('data', (d) => (stdout += d));
+  child.stderr.on('data', (d) => (stderr += d));
   child.stdin.end(
     JSON.stringify({
       prompt: 'reply with exactly: STUB_PROBE',
@@ -259,6 +263,7 @@ async function runScenario({ mode, port, timeoutMs, tmp }) {
     actual: failure ? (failure.providerFailureClass ?? '(unclassified)') : null,
     livenessTimeout: failure?.providerLivenessTimeout === true,
     answer: answered?.result?.slice(0, 40),
+    stderr: stderr.slice(-2000),
   };
 }
 
@@ -298,7 +303,10 @@ for (const scenario of selected) {
     timeoutMs,
     tmp,
   });
-  const ok = r.actual === scenario.expect;
+  const ok =
+    scenario.expect === null
+      ? r.actual === null && r.answer === 'STUB_OK'
+      : r.actual === scenario.expect;
   if (!ok) failed += 1;
   const detail =
     scenario.expect === null
@@ -308,6 +316,9 @@ for (const scenario of selected) {
     `${ok ? 'PASS' : 'FAIL'}  ${scenario.mode.padEnd(12)} ${String(r.elapsedSec).padStart(3)}s  ` +
       `expect=${scenario.expect ?? 'no failure'}  ${detail}  (${scenario.note})`,
   );
+  if (!ok && r.stderr) {
+    console.error(`runner stderr (${scenario.mode}):\n${r.stderr}`);
+  }
 }
 
 stub.server.close();

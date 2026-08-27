@@ -41,6 +41,7 @@ import {
   type PassiveReplyClaim,
 } from './qq-passive-reply.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 import {
   isRuntimeControlLike,
   parseRuntimeControl,
@@ -2399,16 +2400,23 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
       try {
         const chunks = splitTextChunks(text, MSG_SPLIT_LIMIT);
+        const tracker = new PhysicalDeliveryTracker(
+          chunks.length + (localImagePaths?.length ?? 0),
+        );
 
         for (const chunk of chunks) {
-          await sendQQMessage(parsed.type, parsed.openid, chunk);
+          await tracker.send(() =>
+            sendQQMessage(parsed.type, parsed.openid, chunk),
+          );
         }
 
         // Send local images after text (same pattern as Feishu)
         for (const imgPath of localImagePaths || []) {
           try {
             const buf = fs.readFileSync(imgPath);
-            await sendQQImageMessage(parsed.type, parsed.openid, buf);
+            await tracker.send(() =>
+              sendQQImageMessage(parsed.type, parsed.openid, buf),
+            );
             logger.info({ chatId, imgPath }, 'QQ local image sent');
           } catch (imgErr) {
             logger.error(

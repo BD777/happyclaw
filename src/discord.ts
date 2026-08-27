@@ -45,6 +45,7 @@ import {
   ExactAsyncIndicatorRegistry,
   processingIndicatorKey,
 } from './processing-indicator.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -792,6 +793,7 @@ export function createDiscordConnection(
     }
 
     const chunks = splitDiscordChunks(text);
+    const tracker = new PhysicalDeliveryTracker(chunks.length);
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
@@ -812,12 +814,14 @@ export function createDiscordConnection(
           }
         }
         if (files.length > 0) {
-          await channel.send({ content: chunk, files });
+          await tracker.send(() =>
+            channel.send({ content: chunk, files }).then(() => undefined),
+          );
         } else {
-          await channel.send(chunk);
+          await tracker.send(() => channel.send(chunk).then(() => undefined));
         }
       } else {
-        await channel.send(chunk);
+        await tracker.send(() => channel.send(chunk).then(() => undefined));
       }
     }
   }

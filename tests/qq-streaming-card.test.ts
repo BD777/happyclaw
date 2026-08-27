@@ -78,4 +78,83 @@ describe('QQ streaming passive rejection fallback', () => {
     });
     expect(controller.isActive()).toBe(false);
   });
+
+  test('visible stream overflow is fenced instead of sending a plain duplicate', async () => {
+    vi.useFakeTimers();
+    try {
+      const send = vi.fn(async () => ({ id: 'stream-visible' }));
+      const fallback = vi.fn(async () => {});
+      const controller = new QQStreamingController({
+        openid: 'user',
+        msgSeq: 1,
+        passiveMsgId: 'message',
+        sendStreamChunk: send,
+        fallbackSend: fallback,
+      });
+
+      controller.append('x'.repeat(1000));
+      await vi.advanceTimersByTimeAsync(600);
+      controller.append('x'.repeat(4600));
+      await vi.advanceTimersByTimeAsync(600);
+
+      const finalized = await finalizeChannelCardAfterDelivery(
+        controller,
+        'x'.repeat(4600),
+        true,
+        'delivery failed',
+      );
+
+      expect(finalized.acknowledged).toBe(false);
+      expect(finalized.error).toMatchObject({
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+      });
+      expect(send).toHaveBeenCalledOnce();
+      expect(fallback).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('visible stream DONE rejection is partial-visible and never falls back', async () => {
+    vi.useFakeTimers();
+    try {
+      const rejection = Object.assign(new Error('QQ rejected DONE'), {
+        httpStatus: 403,
+      });
+      let calls = 0;
+      const send = vi.fn(async () => {
+        calls += 1;
+        if (calls > 1) throw rejection;
+        return { id: 'stream-visible' };
+      });
+      const fallback = vi.fn(async () => {});
+      const controller = new QQStreamingController({
+        openid: 'user',
+        msgSeq: 1,
+        passiveMsgId: 'message',
+        sendStreamChunk: send,
+        fallbackSend: fallback,
+        onDefinitiveRejection: () => true,
+      });
+
+      controller.append('visible preview');
+      await vi.advanceTimersByTimeAsync(600);
+      const finalized = await finalizeChannelCardAfterDelivery(
+        controller,
+        'visible preview and final',
+        true,
+        'delivery failed',
+      );
+
+      expect(finalized.acknowledged).toBe(false);
+      expect(finalized.error).toMatchObject({
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        cause: rejection,
+      });
+      expect(fallback).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

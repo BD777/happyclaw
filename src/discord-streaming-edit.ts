@@ -16,6 +16,7 @@
 
 import type { TextChannel, DMChannel, NewsChannel, Message } from 'discord.js';
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -70,8 +71,10 @@ export class DiscordStreamingEditController {
   >();
   private recentEvents: string[] = [];
 
-  // Fallback flag
-  private fallbackUsed = false;
+  // A fallback is one physical send. Reuse the same Promise so concurrent or
+  // repeated callers observe the same ACK/failure instead of treating a prior
+  // failed attempt as success.
+  private fallbackPromise: Promise<void> | null = null;
   // Creation guard
   private messageCreationPromise: Promise<void> | null = null;
   // 上次已推送到 Discord 的完整 content（含 aux prefix），用于跳过 no-op edit，
@@ -171,9 +174,21 @@ export class DiscordStreamingEditController {
       // A preview is already visible on the existing message. Sending the
       // full text again via fallback would duplicate the reply.
       if (this.lastPushedContent == null) {
-        await this.tryFallback(finalText);
+        try {
+          await this.tryFallback(finalText);
+          this.state = 'completed';
+          return;
+        } catch (fallbackError) {
+          this.state = 'aborted';
+          throw fallbackError;
+        }
       }
-      this.state = 'error';
+      this.state = 'aborted';
+      throw new PartialChannelDeliveryError(
+        Math.max(1, this.messages.length),
+        Math.max(1, this.messages.length) + 1,
+        err,
+      );
     }
   }
 
@@ -578,12 +593,15 @@ export class DiscordStreamingEditController {
   }
 
   private async tryFallback(text: string): Promise<void> {
-    if (this.fallbackUsed || !this.fallbackSend) return;
-    this.fallbackUsed = true;
+    if (!this.fallbackSend) {
+      throw new Error('Discord streaming fallback is unavailable');
+    }
+    this.fallbackPromise ??= this.fallbackSend(text);
     try {
-      await this.fallbackSend(text);
+      await this.fallbackPromise;
     } catch (err: any) {
       logger.warn({ err: err.message }, 'Discord fallback send also failed');
+      throw err;
     }
   }
 }

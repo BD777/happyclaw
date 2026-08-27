@@ -15,6 +15,7 @@
 
 import https from 'node:https';
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -278,7 +279,7 @@ export class DingTalkStreamingCardController {
 
   // Fallback: sendMessage callback when card fails
   private fallbackSend: ((text: string) => Promise<void>) | null;
-  private fallbackUsed = false;
+  private fallbackPromise: Promise<void> | null = null;
 
   // Auxiliary flush throttle (separate from text flush)
   private auxFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -406,9 +407,17 @@ export class DingTalkStreamingCardController {
       // The card already has streamed preview content. A plain sendMessage
       // would deliver a second full copy of the same reply.
       if (!this.inputingStarted) {
-        await this.tryFallback(finalText);
+        try {
+          await this.tryFallback(finalText);
+          this.state = 'completed';
+          return;
+        } catch (fallbackError) {
+          this.state = 'aborted';
+          throw fallbackError;
+        }
       }
-      this.state = 'error';
+      this.state = 'aborted';
+      throw new PartialChannelDeliveryError(1, 2, err);
     }
   }
 
@@ -883,12 +892,15 @@ export class DingTalkStreamingCardController {
   }
 
   private async tryFallback(text: string): Promise<void> {
-    if (this.fallbackUsed || !this.fallbackSend) return;
-    this.fallbackUsed = true;
+    if (!this.fallbackSend) {
+      throw new Error('DingTalk streaming fallback is unavailable');
+    }
+    this.fallbackPromise ??= this.fallbackSend(text);
     try {
-      await this.fallbackSend(text);
+      await this.fallbackPromise;
     } catch (err: any) {
       logger.warn({ err: err.message }, 'DingTalk fallback send also failed');
+      throw err;
     }
   }
 }

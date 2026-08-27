@@ -102,6 +102,7 @@ import {
   type DingTalkStreamingCardConfig,
   type DingTalkCardTarget,
 } from '../src/dingtalk-streaming-card.js';
+import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -139,8 +140,15 @@ describe('DingTalk streaming finalize must not send a second full copy', () => {
     expect(fallbackSend).not.toHaveBeenCalled();
 
     dingtalkHttps.setFailFinalize(true);
-    await ctrl.complete('Hello from the preview — final');
+    const finalized = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Hello from the preview — final',
+      true,
+      'finalize failed',
+    );
 
+    expect(finalized.acknowledged).toBe(false);
+    expect(finalized.error).toBeInstanceOf(Error);
     expect(
       dingtalkHttps.requests.some(
         (req) =>

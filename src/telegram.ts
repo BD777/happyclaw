@@ -24,6 +24,7 @@ import {
   extractProviderTarget,
 } from './channel-address.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 import type { ChannelMessageMeta, NewMessage } from './types.js';
 import {
   ExactAsyncIndicatorRegistry,
@@ -1882,6 +1883,7 @@ export function createTelegramConnection(
       if (!bot) {
         throw new Error('Telegram bot is not initialized');
       }
+      const activeBot = bot;
 
       const target = parseTelegramProviderTarget(chatId);
       if (!target) {
@@ -1894,33 +1896,46 @@ export function createTelegramConnection(
       try {
         // Split original markdown into chunks (leave room for HTML tag overhead)
         const mdChunks = splitMarkdownChunks(text, 3800);
+        const tracker = new PhysicalDeliveryTracker(
+          mdChunks.length + (localImagePaths?.length ?? 0),
+        );
 
         for (const mdChunk of mdChunks) {
-          const html = markdownToTelegramHtml(mdChunk);
-          try {
-            await bot.api.sendMessage(target.chatId, html, {
-              parse_mode: 'HTML',
-              ...threadOptions,
-            });
-          } catch (err) {
-            if (!isTelegramHtmlParseError(err)) {
-              throw err;
+          await tracker.send(async () => {
+            const html = markdownToTelegramHtml(mdChunk);
+            try {
+              await activeBot.api.sendMessage(target.chatId, html, {
+                parse_mode: 'HTML',
+                ...threadOptions,
+              });
+            } catch (err) {
+              if (!isTelegramHtmlParseError(err)) {
+                throw err;
+              }
+              // HTML parse failed (e.g. unclosed tags), fallback to plain text
+              logger.debug(
+                { err, chatId },
+                'HTML parse failed, fallback to plain',
+              );
+              await activeBot.api.sendMessage(
+                target.chatId,
+                mdChunk,
+                threadOptions,
+              );
             }
-            // HTML parse failed (e.g. unclosed tags), fallback to plain text
-            logger.debug(
-              { err, chatId },
-              'HTML parse failed, fallback to plain',
-            );
-            await bot.api.sendMessage(target.chatId, mdChunk, threadOptions);
-          }
+          });
         }
 
         for (const localImagePath of localImagePaths || []) {
           try {
-            await bot.api.sendPhoto(
-              target.chatId,
-              new InputFile(localImagePath),
-              threadOptions,
+            await tracker.send(() =>
+              activeBot.api
+                .sendPhoto(
+                  target.chatId,
+                  new InputFile(localImagePath),
+                  threadOptions,
+                )
+                .then(() => undefined),
             );
           } catch (imageErr) {
             logger.error(
