@@ -375,6 +375,24 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
     expect(stuck[0].reason).toBe('ipc_injected');
   });
 
+  test('internal-continue preserve hint still closes a query with no real IPC debt', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: null,
+      lastActivityAt: Date.now() - 1000,
+    });
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+
+    expect(getState(q, jid).queryInFlight).toBe(false);
+    expect(getState(q, jid).queryId).toBeNull();
+    expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
+  });
+
   test('ordinary query idle still clears IPC debt', () => {
     const q = new GroupQueue();
     const jid = `web:${folder}`;

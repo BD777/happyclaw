@@ -4479,6 +4479,7 @@ async function main(): Promise<void> {
             writeOutput({
               status: 'stream',
               result: null,
+              sourceKind: 'auto_continue',
               streamEvent: {
                 eventType: 'status',
                 statusText: 'interrupted',
@@ -4499,7 +4500,10 @@ async function main(): Promise<void> {
           // that ends without a healthy result leaves those messages in the
           // delivery tracker; requeue them now so they become the next turn
           // instead of remaining invisible until host-side exit recovery.
-          if (autoContResult.pipedMessagesDuringQuery.length > 0) {
+          if (
+            !autoContResult.interruptedDuringQuery &&
+            autoContResult.pipedMessagesDuringQuery.length > 0
+          ) {
             const pending = autoContResult.pipedMessagesDuringQuery;
             log(
               `Auto-continue ended with ${pending.length} unacknowledged IPC message(s); re-enqueueing`,
@@ -4645,6 +4649,7 @@ async function main(): Promise<void> {
           writeOutput({
             status: 'stream',
             result: null,
+            sourceKind: 'truncation_continue',
             streamEvent: {
               eventType: 'status',
               statusText: 'interrupted',

@@ -1164,7 +1164,7 @@ export class GroupQueue {
     // Truncation/compaction continues report queryIdle even though they
     // refused later user IPC (acceptIpc=false). Wiping the #618/#622 debt
     // clock here hides a leftover IPC file from stuck recovery.
-    if (options?.preserveIpcDebt) {
+    if (options?.preserveIpcDebt && state.ipcOwedSinceAt !== null) {
       return;
     }
     const completedQueryId = state.queryId;
