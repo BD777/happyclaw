@@ -163,9 +163,11 @@ describe('resolveTurnOutcome', () => {
     expect(deliveryBranch).toContain(
       'replyDeliveryAcknowledged &&\n                isGenuineReplyResult',
     );
-    expect(deliveryBranch).toMatch(
-      /result\.inputTurnCompleted\s*&&\s*replyDeliveryAcknowledged/,
+    expect(deliveryBranch).toContain('result.inputTurnCompleted &&');
+    expect(deliveryBranch).toContain(
+      '(replyDeliveryAcknowledged ||\n                  Boolean(',
     );
+    expect(deliveryBranch).toContain('getFailedChannelOutboxForTurn(');
     expect(deliveryBranch).not.toContain(
       'if (result.inputTurnCompleted) commitCursor()',
     );
@@ -219,6 +221,27 @@ describe('resolveTurnOutcome', () => {
     expect(fileBranch).toContain(
       'await imManager.sendMessage(regularFileImRoute, failMsg)',
     );
+  });
+
+  test('main and agent definitive outbox failures terminalize failed with an independent notice', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const mainCompletion = main.slice(
+      main.indexOf('const completeChannelRuntimesForOutput'),
+      main.indexOf('const channelScopeForOutput'),
+    );
+    const agentCompletion = main.slice(
+      main.indexOf('const completeAgentChannelRuntimesForOutput'),
+      main.indexOf('const agentScopeForOutput'),
+    );
+    for (const branch of [mainCompletion, agentCompletion]) {
+      expect(branch).toContain('getFailedChannelOutboxForTurn(runtime.runId)');
+      expect(branch).toContain('runtime.fail(');
+      expect(branch).toContain('deliverChannelDefinitiveFailureNotice({');
+      expect(branch).not.toContain('runtime.retry(');
+    }
   });
 
   test('returns a negative MCP image acknowledgement when physical delivery is unconfirmed', () => {

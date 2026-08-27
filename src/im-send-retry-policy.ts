@@ -25,6 +25,39 @@ export class ImDeliveryPhaseError extends Error {
   }
 }
 
+/**
+ * A multi-part/chunk send acknowledged at least one physical side effect
+ * before a later part failed. Replaying the enclosing operation would resend
+ * the acknowledged prefix, so every host retry path must treat it as
+ * uncertain regardless of the tail error's errno.
+ */
+export class PhysicalDeliveryProgressError extends ImDeliveryPhaseError {
+  readonly acknowledgedParts: number;
+
+  constructor(
+    message: string,
+    acknowledgedParts: number,
+    options: { cause?: unknown } = {},
+  ) {
+    super('uncertain', message, options);
+    this.name = 'PhysicalDeliveryProgressError';
+    this.acknowledgedParts = Math.max(1, Math.trunc(acknowledgedParts));
+  }
+}
+
+export function physicalDeliveryProgressError(
+  error: unknown,
+  acknowledgedParts: number,
+): PhysicalDeliveryProgressError {
+  return new PhysicalDeliveryProgressError(
+    `Physical delivery failed after ${Math.max(1, Math.trunc(acknowledgedParts))} acknowledged part(s): ${
+      error instanceof Error ? error.message : String(error)
+    }`,
+    acknowledgedParts,
+    { cause: error },
+  );
+}
+
 export function preAcceptImDeliveryError(
   message: string,
   cause?: unknown,
@@ -60,6 +93,22 @@ function errorChain(error: unknown): Array<Record<string, unknown>> {
   return chain;
 }
 
+export function explicitImDeliveryPhase(
+  error: unknown,
+): ImSendFailureOutcome | undefined {
+  for (const item of errorChain(error)) {
+    const phase = item.deliveryPhase ?? item.outcome;
+    if (
+      phase === 'pre_accept' ||
+      phase === 'rejected' ||
+      phase === 'uncertain'
+    ) {
+      return phase;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Classify only from transport-stage evidence. A bare timeout/reset is
  * uncertain because it can occur after the provider accepted the mutation.
@@ -69,10 +118,7 @@ export function classifyImSendFailure(error: unknown): ImSendFailureOutcome {
   if (
     errorChainHasCode(error, REFRESH_REQUIRED_CODE) ||
     errorChainHasCode(error, DEFINITIVE_DELIVERY_REJECTION_CODE) ||
-    chain.some(
-      (item) =>
-        item.deliveryPhase === 'rejected' || item.outcome === 'rejected',
-    )
+    explicitImDeliveryPhase(error) === 'rejected'
   ) {
     return 'rejected';
   }
@@ -82,15 +128,10 @@ export function classifyImSendFailure(error: unknown): ImSendFailureOutcome {
   ) {
     return 'uncertain';
   }
-  if (chain.some((item) => item.deliveryPhase === 'pre_accept')) {
+  if (explicitImDeliveryPhase(error) === 'pre_accept') {
     return 'pre_accept';
   }
-  if (
-    chain.some(
-      (item) =>
-        item.deliveryPhase === 'uncertain' || item.outcome === 'uncertain',
-    )
-  ) {
+  if (explicitImDeliveryPhase(error) === 'uncertain') {
     return 'uncertain';
   }
 
