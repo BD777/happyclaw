@@ -75,6 +75,13 @@ import {
   setSessionProviderId,
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
+import {
+  DEFAULT_MAX_TRANSIENT_RETRIES,
+  TransientRetryLedger,
+  resolveProviderFailureClass,
+  resolveTerminalProviderFailureNotice,
+  resolveTransientRetryKey,
+} from './provider-failure.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
 import {
   loadManagedMcpLayers,
@@ -520,8 +527,18 @@ function quarantineFromOutput(
     | 'providerRateLimitScope'
     | 'providerRateLimitModel'
     | 'providerRateLimitResetsAt'
+    | 'providerFailureClass'
+    | 'providerLivenessTimeout'
   >,
 ): void {
+  // Only an account-class verdict may change account health.
+  //
+  // A transient failure says nothing about the account — the stream stalled, or
+  // the upstream returned 529/5xx — and quarantining on it is what turned an
+  // upstream hiccup into a fake "quota exhausted" verdict for single-account
+  // pools. A config failure would fail identically on every account, so
+  // quarantining would drain the whole pool over one unservable model name.
+  if (resolveProviderFailureClass(output) !== 'account') return;
   // Fail safe: a model-scope report with no model name cannot be recorded as a
   // tier quarantine, and silently dropping it would let the same failing pair
   // be selected forever. Degrade to an account-scope quarantine instead.
@@ -557,11 +574,68 @@ function poolCanStillServe(): boolean {
   return !!fallbackModel && providerPool.hasCandidateForTier(fallbackModel);
 }
 
-function applyProviderFailureDisposition(
+/** Host-process replay budget; each transient retry runs a fresh runner. */
+const transientRetries = new TransientRetryLedger();
+
+/**
+ * Exported for tests: the transient escalation spans this function, the
+ * host-process retry ledger and the provider pool, so asserting it on source
+ * text alone would not prove that a second failure actually quarantines the
+ * account or that the pool then decides failover.
+ */
+export function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
   allowFailover = true,
 ): boolean {
+  const failureClass = resolveProviderFailureClass(output);
+  // Transient failures never consult the pool: no account was judged, so the
+  // only question is whether this input still has a retry left. This is
+  // identical for single- and multi-account installs by design — a 529 is not a
+  // reason to move the conversation to a different account.
+  if (failureClass === 'transient') {
+    if (transientRetries.consume(resolveTransientRetryKey(output))) {
+      applyKnownProviderFailureDisposition(output, false);
+      return false;
+    }
+    // The replay is spent and the same input failed transiently again.
+    //
+    // "Transient" is a claim that the upstream will be back shortly, and two
+    // consecutive failures spanning both liveness deadlines are evidence
+    // against it. Measured against the stub upstream, a 401 and a 429 are both
+    // retried silently by the CLI until the watchdog fires, so they are
+    // indistinguishable from a stall on first sight — refusing to ever escalate
+    // would leave a dead key or an exhausted quota permanently un-quarantined
+    // and strand a multi-account pool on its one broken profile.
+    //
+    // Escalating rewrites the class, so everything downstream — the quarantine
+    // here, the pool disposition below, the session-clearing guard, and the
+    // notice — treats it as the account verdict it now looks like.
+    output.providerFailureClass = 'account';
+    output.providerFailureEscalatedFrom = 'transient';
+    // WARN, not info: this is the one line that says an account was taken out
+    // of rotation for repeated silence rather than for anything the upstream
+    // actually reported, and it is the only in-log evidence that the
+    // escalation fired at all.
+    logger.warn(
+      {
+        providerId: selectedProfileId,
+        livenessTimeout: output.providerLivenessTimeout === true,
+      },
+      'Transient provider failure repeated after its replay; escalating to an account verdict and quarantining',
+    );
+    if (selectedProfileId !== null) {
+      quarantineFromOutput(selectedProfileId, output);
+    }
+    // fall through to the account disposition
+  }
+  // A config failure is terminal on arrival. Every account would be asked for
+  // the same unservable model, so a retry and a failover both just reproduce
+  // it — and neither would tell the user what to actually fix.
+  if (failureClass === 'config') {
+    applyKnownProviderFailureDisposition(output, true);
+    return true;
+  }
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
   // Ask the pool across both dimensions. A model wall leaves the account
@@ -584,6 +658,13 @@ function applyKnownProviderFailureDisposition(
   output.result = null;
   output.providerFailureTerminal = terminal;
   output.inputTurnCompleted = terminal;
+  // Set here rather than in the disposition helper so every path that forces a
+  // non-account failure terminal — including the scheduled replay loop's
+  // no-progress bail-out — names the real cause instead of a quota verdict.
+  if (terminal) {
+    const notice = resolveTerminalProviderFailureNotice(output);
+    if (notice) output.providerFailureNotice = notice;
+  }
 }
 
 export interface VolumeMount {
@@ -3568,8 +3649,21 @@ export async function runAgentWithModelFallback(
     : Math.max(1, enabledProviders.length + fallbackOnlyCombinations);
   let lastOutput: ContainerOutput | undefined;
   let availabilityState = providerPool.getAvailabilityStateKey();
+  // A transient replay is not a distinct combination — it re-runs the same
+  // (account, tier) on purpose — so it must not consume the combination budget.
+  // Without this a single-account install computes maxAttempts = 1 and a
+  // scheduled task could never use the retry the disposition granted it, while
+  // adding the headroom up front would instead hand a pinned Agent a second
+  // attempt it must not get for an account failure. Granted only after an
+  // observed transient failure, and capped independently of the per-input
+  // ledger that is the real bound.
+  let transientReplayBudget = 0;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < maxAttempts + transientReplayBudget;
+    attempt += 1
+  ) {
     let completedInputBeforeProviderFailure = false;
     let attemptedProviderId: string | null = null;
     const gatedOnOutput = onOutput
@@ -3629,8 +3723,23 @@ export async function runAgentWithModelFallback(
     }
 
     const nextAvailabilityState = providerPool.getAvailabilityStateKey();
+    // A transient failure deliberately leaves availability untouched, so the
+    // no-progress guard below would read "nothing changed" and stop — burning
+    // the replay budget the disposition just granted without ever using it.
+    // Reaching here already proves the failure was non-terminal, i.e. the
+    // bounded ledger allowed one more attempt, so the same-provider replay this
+    // guard normally prevents is exactly the intended behaviour here.
+    const replayableTransient =
+      resolveProviderFailureClass(lastOutput) === 'transient';
+    if (
+      replayableTransient &&
+      transientReplayBudget < DEFAULT_MAX_TRANSIENT_RETRIES
+    ) {
+      transientReplayBudget += 1;
+    }
     if (
       attemptedProviderId !== null &&
+      !replayableTransient &&
       nextAvailabilityState === availabilityState
     ) {
       logger.error(
@@ -3652,7 +3761,9 @@ export async function runAgentWithModelFallback(
         attempt: attempt + 1,
         maxAttempts,
       },
-      'Scheduled task provider failed; retrying the same prompt on another provider',
+      replayableTransient
+        ? 'Scheduled task hit a transient provider failure; replaying the same prompt on the same provider'
+        : 'Scheduled task provider failed; retrying the same prompt on another provider',
     );
   }
 

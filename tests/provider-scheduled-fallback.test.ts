@@ -44,6 +44,8 @@ vi.mock('../src/runtime-config.js', async () => {
 const { runAgentWithModelFallback } =
   await import('../src/container-runner.js');
 const { providerPool } = await import('../src/provider-pool.js');
+const { PROVIDER_TRANSIENT_FAILURE_USER_NOTICE } =
+  await import('../src/provider-failure.js');
 type AgentRunner = import('../src/container-runner.js').AgentRunner;
 type ContainerOutput = import('../src/container-runner.js').ContainerOutput;
 
@@ -224,6 +226,82 @@ describe('scheduled provider fallback', () => {
 
     expect(runFn).toHaveBeenCalledTimes(1);
     expect(output).toMatchObject({ providerFailure: true });
+  });
+
+  const scheduledInput = (prompt: string) => ({
+    prompt,
+    groupFolder: group.folder,
+    chatJid: group.jid,
+    isMain: false,
+    isHome: false,
+    isAdminHome: false,
+    isScheduledTask: true,
+  });
+
+  test('replays a transient failure on the same provider instead of stopping', async () => {
+    for (const provider of mocks.enabledProviders) {
+      providerPool.resetHealth(provider.id);
+    }
+    // A transient failure deliberately leaves availability untouched. The
+    // no-progress guard reads that as "nothing changed" and used to stop after
+    // a single attempt, spending the granted retry without ever running it.
+    let attempts = 0;
+    const runFn = vi.fn(async (): Promise<ContainerOutput> => {
+      attempts += 1;
+      return {
+        status: 'success',
+        result: null,
+        providerFailure: true,
+        providerFailureClass: 'transient',
+        // Mirrors the per-input ledger, which lives inside the real runner and
+        // is bypassed by this mock: one replay, then terminal.
+        providerFailureTerminal: attempts > 1,
+      };
+    });
+
+    await runAgentWithModelFallback(
+      runFn as unknown as AgentRunner,
+      group,
+      scheduledInput('upstream is having a moment'),
+      () => {},
+    );
+
+    expect(runFn).toHaveBeenCalledTimes(2);
+    // Neither the account nor any tier may be quarantined by upstream noise.
+    for (const provider of mocks.enabledProviders) {
+      expect(providerPool.getHealthStatus(provider.id).healthy).toBe(true);
+    }
+  });
+
+  test('a permanently transient upstream stays bounded and gets its own notice', async () => {
+    for (const provider of mocks.enabledProviders) {
+      providerPool.resetHealth(provider.id);
+    }
+    const runFn = vi.fn(
+      async (): Promise<ContainerOutput> => ({
+        status: 'success',
+        result: null,
+        providerFailure: true,
+        providerFailureClass: 'transient',
+        providerFailureTerminal: false,
+      }),
+    );
+
+    const output = await runAgentWithModelFallback(
+      runFn as unknown as AgentRunner,
+      group,
+      scheduledInput('upstream never recovers'),
+      () => {},
+    );
+
+    // The transient headroom must not become an unbounded replay loop even
+    // when every attempt reports non-terminal.
+    expect(runFn.mock.calls.length).toBeLessThanOrEqual(6);
+    expect(output.providerFailureTerminal).toBe(true);
+    expect(output.providerFailureNotice).toBe(
+      PROVIDER_TRANSIENT_FAILURE_USER_NOTICE,
+    );
+    expect(output.providerFailureNotice).not.toContain('额度已用尽');
   });
 
   test('does not replay a scheduled prompt after its durable input completed', async () => {

@@ -352,6 +352,27 @@ export interface ContainerOutput {
   /** The model that was actually in use when the limit was reported. */
   providerRateLimitModel?: string;
   /**
+   * What the failure says about the account, which is what the host's
+   * disposition is keyed on:
+   *
+   * - `account` — a verdict on this profile: quarantine it and let the pool
+   *   decide whether another account replays the input.
+   * - `transient` — upstream/transport noise: never touch account health, keep
+   *   the durable input replayable on the same provider within its budget.
+   * - `config` — unserviceable as configured: end visibly without quarantining,
+   *   because every account would fail the same way.
+   *
+   * Absent on outputs from an older runner; the host then falls back to the
+   * pre-classification behaviour of treating the failure as `account`.
+   */
+  providerFailureClass?: 'account' | 'transient' | 'config';
+  /**
+   * Host-set: arrived as `transient` and was rewritten to `account` once its
+   * replay budget was spent and the same input failed transiently again. The
+   * runner never sets this; it only ever reports what it observed.
+   */
+  providerFailureEscalatedFrom?: 'transient';
+  /**
    * Set by the host after it quarantines the failed provider and checks the
    * remaining pool. The agent runner itself only emits providerFailure.
    */
@@ -363,6 +384,14 @@ export interface ContainerOutput {
    * completed. The host quarantines it without replaying or notifying again.
    */
   providerFailureMaintenance?: boolean;
+  /**
+   * The SDK stream produced no model response event within the liveness
+   * deadline. Always accompanied by `providerFailureClass: 'transient'`, which
+   * is what suppresses the quarantine and keeps the input replayable; this flag
+   * only distinguishes a silent stall from a reported upstream error so the
+   * user-facing wording can name the right cause.
+   */
+  providerLivenessTimeout?: boolean;
   streamEvent?: StreamEvent;
   /**
    * Immutable identity of the user input turn that produced this output.
@@ -381,6 +410,7 @@ export interface ContainerOutput {
     | 'sdk_send_message'
     | 'proactive_sdk_fallback'
     | 'input_rejection_warning'
+    | 'provider_fallback_notice'
     | 'interrupt_partial'
     | 'overflow_partial'
     | 'compact_partial'

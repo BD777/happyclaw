@@ -98,7 +98,10 @@ import {
 } from './stuck-runner-recovery.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
-import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
+import {
+  PROVIDER_FAILURE_USER_NOTICE,
+  resolveProviderFailureClass,
+} from './provider-failure.js';
 import {
   closeDatabase,
   createTask,
@@ -8917,7 +8920,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           await streamingSession.abort(heldNote).catch(() => {});
         } else if (providerFailoverPending) {
           await streamingSession
-            .abort('模型服务切换中，正在重试')
+            .abort('模型服务暂时异常，正在重试')
             .catch(() => {});
         } else if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
@@ -15759,7 +15762,19 @@ async function processAgentConversation(
 
     // #549: a provider switch surfaced as a failure clears the agent session so
     // the next turn starts fresh on the newly-selected provider.
-    if (output.providerFailure) {
+    //
+    // Only when a switch can actually happen. Transient and config failures
+    // judged no account at all, and a single-provider pool has nothing to switch
+    // to — clearing the session there just destroys the conversation for nothing.
+    if (
+      output.providerFailure &&
+      resolveProviderFailureClass(output) === 'account' &&
+      willClearSessionOnProviderSwitch(
+        effectiveGroup.folder,
+        agentId,
+        agentProfile?.model_config_id,
+      )
+    ) {
       try {
         deleteSession(effectiveGroup.folder, agentId);
         currentAgentSessionId = undefined;
@@ -17093,7 +17108,7 @@ async function processAgentConversation(
           await agentStreamingSession.abort(heldNote).catch(() => {});
         } else if (agentProviderFailoverPending) {
           await agentStreamingSession
-            .abort('模型服务切换中，正在重试')
+            .abort('模型服务暂时异常，正在重试')
             .catch(() => {});
         } else if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
