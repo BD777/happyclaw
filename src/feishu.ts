@@ -43,8 +43,8 @@ import {
 import { parseChannelAddress, scopeChannelJid } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
-  isFeishuRuntimeControlLike,
-  parseFeishuRuntimeControl,
+  isRuntimeControlLike,
+  parseRuntimeControl,
 } from './follow-up-policy.js';
 import {
   definitiveFeishuHttpRejection,
@@ -2207,7 +2207,7 @@ export function createFeishuConnection(
         isGroupOwnerMessage,
         conversationPlan,
       });
-      const runtimeControl = parseFeishuRuntimeControl({
+      const runtimeControl = parseRuntimeControl({
         commandText: textForSlash,
         eligible:
           chatType !== 'group' || (mentionedBot && runtimeControlGate.allow),
@@ -2222,7 +2222,7 @@ export function createFeishuConnection(
         textForSlash = runtimeControl.text;
       }
       const slashMatch = textForSlash.match(/^\/(\S+)(.*)$/);
-      const runtimeControlLike = isFeishuRuntimeControlLike(textForSlash);
+      const runtimeControlLike = isRuntimeControlLike(textForSlash);
       if (
         slashMatch &&
         !requestedFollowUpMode &&

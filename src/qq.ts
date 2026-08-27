@@ -36,7 +36,13 @@ import {
   getReconnectDelay,
   classifyCloseCode,
 } from './qq-reconnect.js';
+import { createPassiveReplyStore } from './qq-passive-reply.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import {
+  isRuntimeControlLike,
+  parseRuntimeControl,
+} from './follow-up-policy.js';
+import type { FollowUpDisposition, FollowUpMode } from './types.js';
 // ─── Constants ──────────────────────────────────────────────────
 
 const QQ_TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken';
@@ -57,6 +63,22 @@ const QQ_TOKEN_REQUEST_TIMEOUT_MS = 15_000;
 const QQ_API_REQUEST_TIMEOUT_MS = 30_000;
 const QQ_MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024;
 
+/**
+ * How long the platform shows the typing state for one notification.
+ *
+ * The refresh cadence in the channel adapter is derived from this, so the two
+ * cannot drift apart.
+ */
+export const TYPING_NOTIFY_SECONDS = 60;
+
+/**
+ * Passive-reply uses the typing indicator refuses to touch.
+ *
+ * A long turn refreshes the indicator repeatedly, so without a floor it would
+ * drain the per-msg_id budget and force the actual answer into an active push.
+ */
+const TYPING_PASSIVE_RESERVE = 2;
+
 const IMAGE_EXT_MAP: Record<string, string> = {
   'image/jpeg': '.jpg',
   'image/png': '.png',
@@ -76,7 +98,7 @@ class QQApiError extends Error {
   }
 }
 
-enum QQMediaFileType {
+export enum QQMediaFileType {
   IMAGE = 1,
   VIDEO = 2,
   VOICE = 3,
@@ -108,7 +130,40 @@ interface QQMediaUploadResponse {
   ttl: number;
 }
 
-const QQ_FILE_MAX_SIZE = 30 * 1024 * 1024; // 30MB (consistent with other channels)
+/**
+ * Per-media-type upload ceilings for the QQ Open Platform.
+ *
+ * Mirrors `MEDIA_FILE_TYPE_INFO` in `@tencent-connect/qqbot-nodejs` 1.0.4
+ * (`protocol/utils/file-utils.ts`), i.e. what a maintained first-party client
+ * enforces. That package's own README quotes lower numbers for image (20MB)
+ * and video (30MB); if the platform rejects an upload that passed this check,
+ * trust the rejection and lower the entry here.
+ *
+ * These bound outbound uploads only. Inbound attachments and Web uploads stay
+ * under the global `MAX_FILE_SIZE`.
+ */
+export const QQ_MEDIA_MAX_SIZE: Record<QQMediaFileType, number> = {
+  [QQMediaFileType.IMAGE]: 30 * 1024 * 1024,
+  [QQMediaFileType.VIDEO]: 100 * 1024 * 1024,
+  [QQMediaFileType.VOICE]: 20 * 1024 * 1024,
+  [QQMediaFileType.FILE]: 100 * 1024 * 1024,
+};
+
+const QQ_MEDIA_TYPE_NAME: Record<QQMediaFileType, string> = {
+  [QQMediaFileType.IMAGE]: 'image',
+  [QQMediaFileType.VIDEO]: 'video',
+  [QQMediaFileType.VOICE]: 'voice',
+  [QQMediaFileType.FILE]: 'file',
+};
+
+/**
+ * Ceiling for the one-shot base64 upload API backing `uploadMedia`.
+ *
+ * Lower than the image entry above on purpose: that path posts the whole
+ * payload in a single request rather than going through chunked upload, and
+ * 20MB is the documented limit of the one-shot endpoint itself.
+ */
+export const QQ_ONESHOT_UPLOAD_MAX_SIZE = 20 * 1024 * 1024;
 const MD5_10M_SIZE = 10_002_432;
 const PART_UPLOAD_TIMEOUT = 300_000; // 5 min
 const PART_UPLOAD_MAX_RETRIES = 2;
@@ -123,7 +178,7 @@ const COMPLETE_UPLOAD_BASE_DELAY_MS = 1000;
 const DEFAULT_CONCURRENT_PARTS = 1;
 const MAX_CONCURRENT_PARTS = 10;
 
-function getQQMediaFileType(fileName: string): QQMediaFileType {
+export function getQQMediaFileType(fileName: string): QQMediaFileType {
   const ext = path.extname(fileName).toLowerCase();
   if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext))
     return QQMediaFileType.IMAGE;
@@ -291,6 +346,25 @@ export interface QQConnectOpts {
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
+  /**
+   * Offer a persisted inbound message to the durable follow-up queue. Returns
+   * whether it starts a turn now or waits behind the active one.
+   */
+  onFollowUpMessage?: (input: {
+    targetJid: string;
+    sourceJid: string;
+    messageId: string;
+    senderImId: string;
+    requestedMode?: FollowUpMode;
+  }) => FollowUpDisposition;
+  /** Notify host projections after the durable follow-up queue changes. */
+  onFollowUpsChanged?: import('./channel-contracts.js').OnChannelFollowUpsChanged;
+  /** `/break` — cancel the pending queue and interrupt the active query. */
+  onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
   normalizeIncomingJid?: (jid: string) => string | null;
 }
 
@@ -331,6 +405,14 @@ export interface QQConnection {
   getNextMsgSeq(chatId: string): number;
   /** Latest msg_id received from a C2C openid, for passive reply. */
   getLastIncomingMsgId(openid: string): string | undefined;
+  /**
+   * Show the "bot is typing" state to a C2C user for `TYPING_NOTIFY_SECONDS`.
+   *
+   * Resolves to whether the platform was actually told. A `false` is normal
+   * rather than an error: the indicator is a courtesy and is skipped when it
+   * would eat into the passive-reply budget a real message needs.
+   */
+  sendTypingIndicator(openid: string): Promise<boolean>;
 }
 
 interface TokenInfo {
@@ -362,6 +444,53 @@ function parseQQChatId(
     return { type: 'group', openid: chatId.slice(6) };
   }
   return null;
+}
+
+export interface QQFollowUpOutcome {
+  /**
+   * Whether the caller should start a turn now. A queued or steered message is
+   * released later by the scheduler, so starting one here would run it twice.
+   */
+  shouldStartTurn: boolean;
+  disposition: FollowUpDisposition['disposition'];
+  /** Projection fields describing the outcome to `onMessagePersisted`. */
+  deliveryFields: Record<string, unknown>;
+  position?: number;
+}
+
+/**
+ * Translate the host's follow-up decision into projection fields.
+ *
+ * Split out from the connector so the mapping can be pinned by tests: the
+ * steer case is easy to get wrong because it reports as `steered` but must be
+ * persisted as `queued`.
+ */
+export function describeFollowUpOutcome(
+  followUp: FollowUpDisposition,
+  now: string = new Date().toISOString(),
+): QQFollowUpOutcome {
+  if (followUp.disposition === 'started') {
+    return {
+      shouldStartTurn: true,
+      disposition: 'started',
+      deliveryFields: {},
+    };
+  }
+
+  return {
+    shouldStartTurn: false,
+    disposition: followUp.disposition,
+    position: followUp.position,
+    deliveryFields: {
+      delivery_mode: followUp.disposition === 'steered' ? 'steer' : 'queue',
+      // Steering stays `queued`: it is a durable hand-off, and the row is only
+      // released once the interrupted query reports idle. Marking it anything
+      // else would hide it from the queue readers that must eventually run it.
+      delivery_status: 'queued',
+      delivery_run_id: followUp.runId ?? null,
+      delivery_updated_at: now,
+    },
+  };
 }
 
 export function validateQQGatewayUrl(value: string): string {
@@ -415,6 +544,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   // Latest incoming msg_id per C2C openid, used as passive-reply reference
   // for stream_messages (QQ API rejects the endpoint without msg_id).
   const lastIncomingMsgId = new Map<string, string>();
+
+  // Passive-reply budget per chat. Replying with an inbound msg_id is free;
+  // once the budget is spent we fall back to a (quota-billed) active push.
+  const passiveReplies = createPassiveReplyStore();
 
   // Rate-limit rejection messages
   const rejectTimestamps = new Map<string, number>();
@@ -495,6 +628,71 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     const next = current + 1;
     msgSeqCounters.set(chatId, next);
     return next;
+  }
+
+  /**
+   * Offer a just-persisted inbound message to the durable follow-up queue.
+   *
+   * Order matters and mirrors the Feishu intake: the host applies its decision
+   * with an UPDATE keyed on the message row, so the row has to exist before
+   * this runs. Returns the projection fields describing the outcome plus
+   * whether the caller should start a turn now — a queued or steered message
+   * is released later by the scheduler, so starting one here would run it
+   * twice.
+   */
+  function offerFollowUp(
+    opts: QQConnectOpts,
+    input: {
+      targetJid: string;
+      sourceJid: string;
+      messageId: string;
+      senderImId: string;
+      requestedMode?: FollowUpMode;
+    },
+  ): QQFollowUpOutcome {
+    const followUp: FollowUpDisposition = opts.onFollowUpMessage?.(input) ?? {
+      disposition: 'started',
+    };
+    return describeFollowUpOutcome(followUp);
+  }
+
+  /**
+   * Pick the addressing fields for one outbound message.
+   *
+   * Prefers a passive reply (echo an inbound `msg_id`) because QQ does not
+   * bill those against the active-push quota. When no inbound reference is
+   * still within its window or budget, falls back to an active push, which is
+   * what this channel did unconditionally before.
+   *
+   * `msg_seq` comes from the claim for passive replies because QQ dedupes on
+   * `(msg_id, msg_seq)`; active pushes keep the per-chat counter.
+   *
+   * The outcome is logged because it is the only signal that this channel is
+   * spending the bot's limited active-push quota: the request body is
+   * otherwise identical and QQ does not report which class a send was billed
+   * as. The inbound `msg_id` itself is deliberately left out of the log.
+   */
+  function resolveSendRef(
+    chatKey: string,
+    kind: 'text' | 'image' | 'file',
+  ): {
+    msg_id?: string;
+    msg_seq: number;
+  } {
+    const chatType = chatKey.split(':')[0];
+    const claim = passiveReplies.claim(chatKey);
+    if (claim) {
+      logger.info(
+        { chatType, kind, mode: 'passive', msgSeq: claim.msgSeq },
+        'QQ outbound addressing',
+      );
+      return { msg_id: claim.msgId, msg_seq: claim.msgSeq };
+    }
+    logger.info(
+      { chatType, kind, mode: 'active-push' },
+      'QQ outbound addressing',
+    );
+    return { msg_seq: getNextMsgSeq(chatKey) };
   }
 
   // ─── Token Management ──────────────────────────────────────
@@ -685,7 +883,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     content: string,
   ): Promise<void> {
     const chatKey = `${chatType}:${openid}`;
-    const msgSeq = getNextMsgSeq(chatKey);
 
     const endpoint =
       chatType === 'c2c'
@@ -695,22 +892,21 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     await apiRequest('POST', endpoint, {
       markdown: { content },
       msg_type: 2, // markdown
-      msg_seq: msgSeq,
+      ...resolveSendRef(chatKey, 'text'),
     });
   }
 
   // ─── Image Sending ───────────────────────────────────────
-
-  const QQ_UPLOAD_MAX_SIZE = 10 * 1024 * 1024; // 10MB
 
   async function uploadMedia(
     chatType: 'c2c' | 'group',
     openid: string,
     imageBuffer: Buffer,
   ): Promise<string> {
-    if (imageBuffer.length > QQ_UPLOAD_MAX_SIZE) {
+    if (imageBuffer.length > QQ_ONESHOT_UPLOAD_MAX_SIZE) {
       throw new Error(
-        `Image too large for QQ upload: ${(imageBuffer.length / 1024 / 1024).toFixed(1)}MB (max 10MB)`,
+        `Image too large for QQ upload: ${(imageBuffer.length / 1024 / 1024).toFixed(1)}MB ` +
+          `(max ${QQ_ONESHOT_UPLOAD_MAX_SIZE / 1024 / 1024}MB)`,
       );
     }
 
@@ -765,7 +961,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   ): Promise<void> {
     const fileInfo = await uploadMedia(chatType, openid, imageBuffer);
     const chatKey = `${chatType}:${openid}`;
-    const msgSeq = getNextMsgSeq(chatKey);
 
     const endpoint =
       chatType === 'c2c'
@@ -776,7 +971,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       msg_type: 7, // rich media
       media: { file_info: fileInfo },
       content: caption || '',
-      msg_seq: msgSeq,
+      ...resolveSendRef(chatKey, 'image'),
     });
   }
 
@@ -1042,18 +1237,19 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     filePath: string,
     fileName: string,
   ): Promise<void> {
+    const fileType = getQQMediaFileType(fileName);
+    const maxSize = QQ_MEDIA_MAX_SIZE[fileType];
     const stat = await fs.promises.stat(filePath);
-    if (stat.size > QQ_FILE_MAX_SIZE) {
+    if (stat.size > maxSize) {
       throw new Error(
-        `File too large for QQ upload: ${(stat.size / 1024 / 1024).toFixed(1)}MB (max ${QQ_FILE_MAX_SIZE / 1024 / 1024}MB)`,
+        `File too large for QQ upload: ${(stat.size / 1024 / 1024).toFixed(1)}MB ` +
+          `(max ${maxSize / 1024 / 1024}MB for ${QQ_MEDIA_TYPE_NAME[fileType]})`,
       );
     }
 
-    const fileType = getQQMediaFileType(fileName);
     const fileInfo = await chunkedUpload(chatType, openid, filePath, fileType);
 
     const chatKey = `${chatType}:${openid}`;
-    const msgSeq = getNextMsgSeq(chatKey);
 
     const endpoint =
       chatType === 'c2c'
@@ -1064,7 +1260,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       msg_type: 7,
       media: { file_info: fileInfo },
       content: '',
-      msg_seq: msgSeq,
+      ...resolveSendRef(chatKey, 'file'),
     });
   }
 
@@ -1346,6 +1542,20 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             lastSequence = null;
             scheduleReconnect(opts);
             break;
+          case 'intents-rejected':
+            // A RESUME would replay the same rejected IDENTIFY, so drop the
+            // session, and back off rather than retrying immediately: nothing
+            // about the request changes between attempts, so a fast retry is
+            // pure load on a gateway that already said no.
+            sessionId = null;
+            lastSequence = null;
+            logger.error(
+              { code, intents: INTENTS },
+              'QQ gateway refused the requested intents; check the bot permissions ' +
+                'on the QQ Open Platform',
+            );
+            scheduleReconnect(opts, RATE_LIMIT_DELAY_MS);
+            break;
           default:
             scheduleReconnect(opts);
         }
@@ -1604,6 +1814,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
         // Only a routable message may update reply context caches.
         lastIncomingMsgId.set(userOpenId, msgId);
+        passiveReplies.record(`c2c:${userOpenId}`, msgId);
 
         // ── Authorized: process message ──
         storeChatMetadata(jid, new Date().toISOString());
@@ -1623,9 +1834,43 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           opts.onNewChat(jid, existing?.name ?? chatName);
         }
 
+        // Runtime controls are parsed before the generic slash handler so
+        // `/steer` and `/break` cannot be swallowed as unknown commands.
+        // A C2C message is always eligible: it is addressed to the bot by
+        // construction.
+        const runtimeControl = parseRuntimeControl({
+          commandText: content,
+          eligible: true,
+          hasAttachments: Boolean(data.attachments?.length),
+        });
+        let requestedFollowUpMode: FollowUpMode | undefined;
+        if (runtimeControl?.kind === 'steer') {
+          requestedFollowUpMode = 'steer';
+          content = runtimeControl.text;
+        } else if (runtimeControl?.kind === 'break') {
+          const reply = opts.onSessionBreak
+            ? await opts.onSessionBreak({
+                sourceJid: jid,
+                targetJid,
+                senderImId: `c2c:${userOpenId}`,
+              })
+            : '当前运行环境不支持 /break。';
+          await sendQQMessage('c2c', userOpenId, markdownToPlainText(reply));
+          return;
+        }
+
         // Handle slash commands
         const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-        if (slashMatch && opts.onCommand) {
+        if (
+          slashMatch &&
+          !requestedFollowUpMode &&
+          opts.onCommand &&
+          // Control lookalikes (`/queue ...`, a bare `/steer`, `/break` with
+          // arguments) are deliberately not commands: they fall through to the
+          // Agent as ordinary input rather than becoming "unknown command".
+          // `/clear` is the exception -- it is a real command here.
+          (runtimeControl?.kind === 'clear' || !isRuntimeControlLike(content))
+        ) {
           const cmdBody = (
             slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
           ).trim();
@@ -1694,6 +1939,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
+        const followUp = offerFollowUp(opts, {
+          targetJid,
+          sourceJid: jid,
+          messageId: id,
+          senderImId: senderId,
+          requestedMode: requestedFollowUpMode,
+        });
+
         opts.onMessagePersisted?.(
           targetJid,
           {
@@ -1706,9 +1959,26 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             timestamp,
             attachments: attachmentsJson,
             is_from_me: false,
+            ...followUp.deliveryFields,
           },
           agentRouting?.agentId ?? undefined,
         );
+
+        if (!followUp.shouldStartTurn) {
+          opts.onFollowUpsChanged?.(targetJid);
+          logger.info(
+            {
+              jid,
+              effectiveJid: targetJid,
+              msgId,
+              disposition: followUp.disposition,
+              position: followUp.position ?? 1,
+            },
+            'QQ C2C message queued behind active query',
+          );
+          return;
+        }
+
         notifyNewImMessage();
 
         if (agentRouting?.agentId) {
@@ -1817,6 +2087,11 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         }
         const { targetJid, routing: agentRouting } = resolvedRoute;
 
+        // Only a routable message may update reply context caches. Groups have
+        // no streaming endpoint, so unlike C2C this is the passive-reply
+        // reference only.
+        passiveReplies.record(`group:${groupOpenId}`, msgId);
+
         // ── Authorized: process message ──
         storeChatMetadata(jid, new Date().toISOString());
 
@@ -1831,9 +2106,49 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           opts.onNewChat(jid, existing.name ?? chatName);
         }
 
+        // Runtime controls are parsed before the generic slash handler so
+        // `/steer` and `/break` cannot be swallowed as unknown commands.
+        // Eligibility is structural here: the gateway only delivers
+        // GROUP_AT_MESSAGE_CREATE for messages that actually @-mention the
+        // bot, so reaching this point is the proof Feishu has to compute.
+        const runtimeControl = parseRuntimeControl({
+          commandText: content,
+          eligible: true,
+          hasAttachments: Boolean(data.attachments?.length),
+        });
+        let requestedFollowUpMode: FollowUpMode | undefined;
+        if (runtimeControl?.kind === 'steer') {
+          requestedFollowUpMode = 'steer';
+          content = runtimeControl.text;
+        } else if (runtimeControl?.kind === 'break') {
+          // An unidentifiable sender is refused rather than passed through
+          // under a placeholder id: the host ignores senderImId today, but a
+          // synthetic one would silently defeat any check added later.
+          const reply = !memberOpenId
+            ? '无法确认发送者身份，未执行 /break。'
+            : opts.onSessionBreak
+              ? await opts.onSessionBreak({
+                  sourceJid: jid,
+                  targetJid,
+                  senderImId: `group:${memberOpenId}`,
+                })
+              : '当前运行环境不支持 /break。';
+          await sendQQMessage('group', groupOpenId, markdownToPlainText(reply));
+          return;
+        }
+
         // Handle slash commands
         const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-        if (slashMatch && opts.onCommand) {
+        if (
+          slashMatch &&
+          !requestedFollowUpMode &&
+          opts.onCommand &&
+          // Control lookalikes (`/queue ...`, a bare `/steer`, `/break` with
+          // arguments) are deliberately not commands: they fall through to the
+          // Agent as ordinary input rather than becoming "unknown command".
+          // `/clear` is the exception -- it is a real command here.
+          (runtimeControl?.kind === 'clear' || !isRuntimeControlLike(content))
+        ) {
           const cmdBody = (
             slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
           ).trim();
@@ -1902,6 +2217,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
+        const followUp = offerFollowUp(opts, {
+          targetJid,
+          sourceJid: jid,
+          messageId: id,
+          senderImId: senderId,
+          requestedMode: requestedFollowUpMode,
+        });
+
         opts.onMessagePersisted?.(
           targetJid,
           {
@@ -1914,9 +2237,26 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             timestamp,
             attachments: attachmentsJson,
             is_from_me: false,
+            ...followUp.deliveryFields,
           },
           agentRouting?.agentId ?? undefined,
         );
+
+        if (!followUp.shouldStartTurn) {
+          opts.onFollowUpsChanged?.(targetJid);
+          logger.info(
+            {
+              jid,
+              effectiveJid: targetJid,
+              msgId,
+              disposition: followUp.disposition,
+              position: followUp.position ?? 1,
+            },
+            'QQ group message queued behind active query',
+          );
+          return;
+        }
+
         notifyNewImMessage();
 
         if (agentRouting?.agentId) {
@@ -1999,6 +2339,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       lastErrorIsTransient = false;
       dedup.clear();
       msgSeqCounters.clear();
+      passiveReplies.clear();
       rejectTimestamps.clear();
       processingLock.dispose();
       logger.info('QQ bot disconnected');
@@ -2092,7 +2433,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     },
 
     async sendChatAction(_chatId: string, _action: 'typing'): Promise<void> {
-      // QQ Bot API v2 does not support typing indicators
+      // Deliberately inert. QQ does support a typing state, but it is not a
+      // fire-and-forget action: it is addressed to one C2C user and spends
+      // passive-reply budget, so it goes through sendTypingIndicator() and the
+      // lease tracking in createQQChannel instead.
     },
 
     isConnected(): boolean {
@@ -2140,6 +2484,28 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
     getLastIncomingMsgId(openid: string): string | undefined {
       return lastIncomingMsgId.get(openid);
+    },
+
+    async sendTypingIndicator(openid: string): Promise<boolean> {
+      // Reserve the rest of the budget for real messages. The indicator is a
+      // courtesy: dropping it costs nothing, while spending the last passive
+      // reply on it would push an actual reply onto the active-push quota.
+      // For the same reason it never falls back to an active push.
+      const claim = passiveReplies.claim(`c2c:${openid}`, Date.now(), {
+        reserve: TYPING_PASSIVE_RESERVE,
+      });
+      if (!claim) return false;
+
+      await apiRequest('POST', `/v2/users/${openid}/messages`, {
+        msg_type: 6, // input notification
+        input_notify: {
+          input_type: 1, // "typing"
+          input_second: TYPING_NOTIFY_SECONDS,
+        },
+        msg_id: claim.msgId,
+        msg_seq: claim.msgSeq,
+      });
+      return true;
     },
   };
 
