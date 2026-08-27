@@ -14,6 +14,7 @@ import { settleTaskNotificationDeliveries } from '../src/task-notification.js';
 import {
   ImDeliveryPhaseError,
   preAcceptImDeliveryError,
+  retryUnscopedImSend,
 } from '../src/im-send-retry-policy.js';
 
 const tmpDir = fs.mkdtempSync(
@@ -2705,6 +2706,86 @@ describe('scheduled task workspace/session contract', () => {
     expect(result.receipt.status).toBe('uncertain');
     expect(result.retryPayload).toBeUndefined();
   });
+
+  test.each(['im_image', 'im_file'] as const)(
+    '%s accepted-timeout removes durable retry work after one physical attempt',
+    async (kind) => {
+      const taskId = createTask({ id: `media-accepted-timeout-${kind}` });
+      const task = db.getTaskById(taskId)!;
+      const created = db.createTaskRun({ task, triggerType: 'manual' });
+      const execution = db.claimNextTaskRun(
+        `media-accepted-timeout-executor-${kind}`,
+        60_000,
+      )!;
+      expect(
+        db.completeTaskRun(
+          execution.id,
+          execution.lease_owner,
+          execution.lease_token,
+          { status: 'success', notificationStatus: 'pending' },
+        ),
+      ).toBe(true);
+
+      let sends = 0;
+      const transport = await retryUnscopedImSend(async () => {
+        sends += 1;
+        throw Object.assign(new Error('provider accepted; ACK timed out'), {
+          code: 'ETIMEDOUT',
+        });
+      });
+      const payload: db.TaskRunAtomicNotificationPayload =
+        kind === 'im_image'
+          ? {
+              kind,
+              targetJid: 'feishu:media-timeout',
+              workspaceFolder: GROUP_FOLDER,
+              filePath: 'same-artifact.png',
+              mimeType: 'image/png',
+              fileName: 'same-artifact.png',
+            }
+          : {
+              kind,
+              targetJid: 'feishu:media-timeout',
+              workspaceFolder: GROUP_FOLDER,
+              filePath: 'same-artifact.bin',
+              fileName: 'same-artifact.bin',
+            };
+      const initial = await settleTaskNotificationDeliveries([
+        {
+          channel: 'feishu',
+          payload,
+          failure: {
+            error: transport.error,
+            outcome:
+              transport.outcome === 'delivered' ? undefined : transport.outcome,
+          },
+          deliver: async () => transport.ok,
+        },
+      ]);
+
+      expect(sends).toBe(1);
+      expect(initial.receipt.status).toBe('uncertain');
+      expect(initial.retryPayload).toBeUndefined();
+      expect(
+        db.recordTaskRunNotificationReceipt(
+          created.run.id,
+          initial.receipt,
+          initial.retryPayload,
+        ),
+      ).toBe(true);
+      expect(
+        db.claimTaskRunNotificationById(
+          created.run.id,
+          `must-not-resend-${kind}`,
+          60_000,
+        ),
+      ).toBeUndefined();
+      expect(db.getTaskRunById(created.run.id)).toMatchObject({
+        notification_status: 'uncertain',
+        notification_payload: null,
+      });
+    },
+  );
 
   test('typed pre-send failure survives the DB scheduler retry chain', async () => {
     const taskId = createTask({ id: 'typed-pre-send-retry-chain' });
