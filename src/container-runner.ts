@@ -594,7 +594,12 @@ export function applyProviderFailureDisposition(
   // identical for single- and multi-account installs by design — a 529 is not a
   // reason to move the conversation to a different account.
   if (failureClass === 'transient') {
-    if (transientRetries.consume(resolveTransientRetryKey(output))) {
+    if (
+      transientRetries.consume(
+        resolveTransientRetryKey(output),
+        selectedProfileId,
+      )
+    ) {
       applyKnownProviderFailureDisposition(output, false);
       return false;
     }
@@ -1152,6 +1157,7 @@ export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
   modelConfigId?: string | null,
+  transientRetryProfileId?: string | null,
 ): {
   profileId: string;
   resolved: ResolvedProvider;
@@ -1220,6 +1226,67 @@ export function trySelectPoolProvider(
     new Map(
       enabledProviders.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
     );
+
+  // A transient verdict authorizes one replay of the same provider attempt,
+  // not one extra pool rotation. Honor that pin even for round-robin/weighted
+  // strategies, but only while the member remains enabled, account-healthy,
+  // and able to serve the current model tier.
+  if (transientRetryProfileId) {
+    const pinned = enabledProviders.find(
+      (provider) => provider.id === transientRetryProfileId,
+    );
+    const healthy = providerPool.getHealthStatus(
+      transientRetryProfileId,
+    ).healthy;
+    const tierAvailable =
+      !!pinned &&
+      stickyBindingCanServeTier(
+        transientRetryProfileId,
+        enabledProviders,
+        tierModel,
+      );
+    if (pinned && healthy && tierAvailable) {
+      try {
+        const resolved = resolveProviderById(transientRetryProfileId);
+        providerPool.acquireSession(transientRetryProfileId);
+        setSessionProviderId(groupFolder, agentId, transientRetryProfileId);
+        logger.info(
+          {
+            groupFolder,
+            agentId: agentId || null,
+            providerId: transientRetryProfileId,
+          },
+          'Reusing provider selected by transient replay fence',
+        );
+        return {
+          profileId: transientRetryProfileId,
+          resolved: {
+            config: resolved.config,
+            customEnv: resolved.customEnv,
+          },
+          previousProviderId: existingBoundId,
+          resetSession:
+            !!existingBoundId && existingBoundId !== transientRetryProfileId,
+          ...(tierModel ? { modelOverride: tierModel } : {}),
+        };
+      } catch (err) {
+        logger.warn(
+          { err, providerId: transientRetryProfileId },
+          'Transient replay provider could not be resolved; returning to pool selection',
+        );
+      }
+    } else {
+      logger.warn(
+        {
+          providerId: transientRetryProfileId,
+          enabled: !!pinned,
+          healthy,
+          tierAvailable,
+        },
+        'Transient replay provider is no longer eligible; returning to pool selection',
+      );
+    }
+  }
 
   // Sticky path: respect previous session→provider binding when the bound
   // provider is still enabled. Only the failover strategy is sticky — the
@@ -2211,6 +2278,7 @@ export async function runContainerAgent(
     group.folder,
     sessionAgentId,
     input.agentProfile?.modelConfigId,
+    transientRetries.pinnedProfileId(input.turnId),
   );
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
@@ -2746,11 +2814,82 @@ export function killProcessTree(
   return false;
 }
 
-interface HostProcessSnapshot {
+export interface HostProcessSnapshot {
   pid: number;
   ppid: number;
   pgid: number;
-  command: string;
+  startIdentity: string;
+  executable: string;
+  argv: string[];
+}
+
+interface HostBrowserCleanupDeps {
+  snapshot?: (processGroupId: number) => HostProcessSnapshot[];
+  signal?: (pid: number, signal: NodeJS.Signals) => void;
+  schedule?: (callback: () => void, delayMs: number) => { unref?: () => void };
+}
+
+function splitPsArgs(value: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const char of value.trim()) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) tokens.push(current);
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function readHostProcessLaunch(pid: number): {
+  executable: string;
+  argv: string[];
+} {
+  try {
+    const executable = fs.readlinkSync(`/proc/${pid}/exe`);
+    const argv = fs
+      .readFileSync(`/proc/${pid}/cmdline`)
+      .toString('utf8')
+      .split('\0')
+      .filter(Boolean);
+    return { executable, argv };
+  } catch {
+    // macOS has no /proc. Query `comm` separately so paths containing spaces
+    // (notably Google Chrome.app) remain unambiguous.
+  }
+  const executable = execFileSync('ps', ['-p', String(pid), '-o', 'comm='], {
+    encoding: 'utf8',
+  }).trim();
+  const argsText = execFileSync('ps', ['-p', String(pid), '-o', 'args='], {
+    encoding: 'utf8',
+  }).trim();
+  const tail = argsText.startsWith(executable)
+    ? argsText.slice(executable.length).trim()
+    : argsText;
+  return { executable, argv: [executable, ...splitPsArgs(tail)] };
 }
 
 function hostProcessGroupSnapshot(
@@ -2760,20 +2899,30 @@ function hostProcessGroupSnapshot(
   try {
     const output = execFileSync(
       'ps',
-      ['-ax', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'command='],
+      ['-ax', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'lstart='],
       { encoding: 'utf8' },
     );
     return output
       .split('\n')
       .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/))
       .filter((match): match is RegExpMatchArray => !!match)
-      .map((match) => ({
-        pid: Number(match[1]),
-        ppid: Number(match[2]),
-        pgid: Number(match[3]),
-        command: match[4],
-      }))
-      .filter((item) => item.pgid === processGroupId);
+      .filter((match) => Number(match[3]) === processGroupId)
+      .flatMap((match) => {
+        try {
+          return [
+            {
+              pid: Number(match[1]),
+              ppid: Number(match[2]),
+              pgid: Number(match[3]),
+              startIdentity: match[4].trim(),
+              ...readHostProcessLaunch(Number(match[1])),
+            },
+          ];
+        } catch {
+          // Process exited between the group listing and identity reads.
+          return [];
+        }
+      });
   } catch (err) {
     logger.warn(
       { processGroupId, err },
@@ -2783,22 +2932,82 @@ function hostProcessGroupSnapshot(
   }
 }
 
-function isManagedHostBrowserCommand(command: string): boolean {
-  return (
-    /(?:^|[\s/])agent-browser(?:\s|$)/i.test(command) ||
-    /(?:^|[\s/])(?:Google Chrome|Chromium(?:-browser)?|chrome|chrome_crashpad_handler)(?:\s|$)/i.test(
-      command,
+const MANAGED_BROWSER_EXECUTABLES = new Set([
+  'agent-browser',
+  'agent-browser.js',
+  'google chrome',
+  'chromium',
+  'chromium-browser',
+  'chrome',
+  'chrome_crashpad_handler',
+]);
+
+function normalizedExecutableName(value: string): string {
+  return path.basename(value).trim().toLowerCase();
+}
+
+function interpreterScript(argv: readonly string[]): string | undefined {
+  const executable = normalizedExecutableName(argv[0] ?? '');
+  const shell = new Set(['bash', 'sh', 'zsh', 'dash']);
+  const interpreter = new Set([
+    'node',
+    'nodejs',
+    'bun',
+    'deno',
+    'python',
+    'python3',
+  ]);
+  if (!shell.has(executable) && !interpreter.has(executable)) return undefined;
+  if (argv.slice(1).some((arg) => arg === '-c' || arg === '--command')) {
+    return undefined;
+  }
+  const optionsWithValues = new Set([
+    '-r',
+    '--require',
+    '--loader',
+    '--import',
+    '--config',
+  ]);
+  for (let index = 1; index < argv.length; index++) {
+    const value = argv[index] ?? '';
+    if (optionsWithValues.has(value)) {
+      index += 1;
+      continue;
+    }
+    if (value.startsWith('-')) continue;
+    return value;
+  }
+  return undefined;
+}
+
+/** Match executable/script identity, never arbitrary command arguments. */
+export function isManagedHostBrowserProcess(
+  process: Pick<HostProcessSnapshot, 'executable' | 'argv'>,
+): boolean {
+  if (
+    MANAGED_BROWSER_EXECUTABLES.has(
+      normalizedExecutableName(process.executable),
     )
+  ) {
+    return true;
+  }
+  const script = interpreterScript(process.argv);
+  if (!script) return false;
+  const scriptName = normalizedExecutableName(script);
+  if (MANAGED_BROWSER_EXECUTABLES.has(scriptName)) return true;
+  const normalized = script.replaceAll('\\', '/').toLowerCase();
+  return (
+    normalized.includes('/agent-browser/') &&
+    ['agent-browser.js', 'cli.js', 'index.js'].includes(scriptName)
   );
 }
 
 function managedHostBrowserProcesses(
-  processGroupId: number,
+  members: HostProcessSnapshot[],
 ): HostProcessSnapshot[] {
-  const members = hostProcessGroupSnapshot(processGroupId);
   const selected = new Set(
     members
-      .filter((member) => isManagedHostBrowserCommand(member.command))
+      .filter((member) => isManagedHostBrowserProcess(member))
       .map((member) => member.pid),
   );
   // Browser helpers do not all carry a recognizable executable name. Once a
@@ -2817,6 +3026,32 @@ function managedHostBrowserProcesses(
   return members.filter((member) => selected.has(member.pid));
 }
 
+function processIdentity(process: HostProcessSnapshot): string {
+  return JSON.stringify([
+    process.pid,
+    process.pgid,
+    process.startIdentity,
+    process.executable,
+    process.argv,
+  ]);
+}
+
+function signalOriginalBrowserTargets(
+  originalTargets: ReadonlyMap<number, string>,
+  current: HostProcessSnapshot[],
+  signal: NodeJS.Signals,
+  sendSignal: (pid: number, signal: NodeJS.Signals) => void,
+): void {
+  for (const process of current) {
+    if (originalTargets.get(process.pid) !== processIdentity(process)) continue;
+    try {
+      sendSignal(process.pid, signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
 /**
  * Reap only browser resources left by a successful host-mode turn.
  *
@@ -2829,38 +3064,36 @@ function managedHostBrowserProcesses(
 export function cleanupHostBrowserResources(
   processGroupId: number,
   killDelayMs = 1_000,
+  deps: HostBrowserCleanupDeps = {},
 ): number {
-  const targets = managedHostBrowserProcesses(processGroupId);
+  const snapshot = deps.snapshot ?? hostProcessGroupSnapshot;
+  const sendSignal =
+    deps.signal ?? ((pid, signal) => process.kill(pid, signal));
+  const schedule =
+    deps.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const targets = managedHostBrowserProcesses(snapshot(processGroupId));
   if (targets.length === 0) return 0;
-  const identities = new Map(
-    targets.map((target) => [target.pid, target.command] as const),
+  const originalTargets = new Map(
+    targets.map((target) => [target.pid, processIdentity(target)] as const),
   );
-  for (const target of targets) {
-    try {
-      process.kill(target.pid, 'SIGTERM');
-    } catch {
-      // The process may have exited between ps and kill.
-    }
-  }
-  const killTimer = setTimeout(
+  // Re-read before TERM too: a short-lived browser PID can be reused between
+  // discovery and signalling. Exact start/launch identity must still match.
+  signalOriginalBrowserTargets(
+    originalTargets,
+    snapshot(processGroupId),
+    'SIGTERM',
+    sendSignal,
+  );
+  const killTimer = schedule(
     () => {
-      const remaining = hostProcessGroupSnapshot(processGroupId);
-      const stillManaged = new Set(
-        managedHostBrowserProcesses(processGroupId).map((item) => item.pid),
+      // Never expand the delayed target set. A newly-launched browser or a
+      // reused PID belongs to a later lifecycle and must not be killed.
+      signalOriginalBrowserTargets(
+        originalTargets,
+        snapshot(processGroupId),
+        'SIGKILL',
+        sendSignal,
       );
-      for (const target of remaining) {
-        if (
-          !stillManaged.has(target.pid) &&
-          identities.get(target.pid) !== target.command
-        ) {
-          continue;
-        }
-        try {
-          process.kill(target.pid, 'SIGKILL');
-        } catch {
-          // already gone
-        }
-      }
     },
     Math.max(0, killDelayMs),
   );
@@ -3101,6 +3334,7 @@ export async function runHostAgent(
     group.folder,
     sessionAgentId,
     input.agentProfile?.modelConfigId,
+    transientRetries.pinnedProfileId(input.turnId),
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(

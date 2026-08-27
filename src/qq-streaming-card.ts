@@ -211,8 +211,7 @@ export class QQStreamingController {
         { openid: this.openid },
         'QQ stream start was rejected; using one observable plain-message fallback',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
+      await this.finishWithFallback(finalText);
       return;
     }
     if (this.uncertainStartError) {
@@ -224,8 +223,7 @@ export class QQStreamingController {
     if (this.sentChunkCount === 0) {
       await this.tryStartStream(safeFinal);
       if (this.definitiveStartRejection) {
-        await this.tryFallback(finalText);
-        this.state = 'completed';
+        await this.finishWithFallback(finalText);
         return;
       }
       if (this.uncertainStartError) {
@@ -544,6 +542,17 @@ export class QQStreamingController {
         { err: err.message },
         'QQ streaming fallback send also failed',
       );
+      throw err;
+    }
+  }
+
+  private async finishWithFallback(text: string): Promise<void> {
+    try {
+      await this.tryFallback(text);
+      this.state = 'completed';
+    } catch (error) {
+      this.state = 'aborted';
+      throw error;
     }
   }
 

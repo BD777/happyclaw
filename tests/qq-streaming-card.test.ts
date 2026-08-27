@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from 'vitest';
 
 import { QQStreamingController } from '../src/qq-streaming-card.js';
+import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
 
 describe('QQ streaming passive rejection fallback', () => {
   test('definitive start rejection falls back once with the final text', async () => {
@@ -45,5 +46,36 @@ describe('QQ streaming passive rejection fallback', () => {
     );
     expect(send).toHaveBeenCalledOnce();
     expect(fallback).not.toHaveBeenCalled();
+  });
+
+  test('failed plain fallback rejects finalization so the cursor is not acknowledged', async () => {
+    const rejection = new Error('verified expired reference');
+    const fallbackFailure = new Error('active push rejected');
+    const controller = new QQStreamingController({
+      openid: 'user',
+      msgSeq: 1,
+      passiveMsgId: 'message',
+      sendStreamChunk: vi.fn(async () => {
+        throw rejection;
+      }),
+      fallbackSend: vi.fn(async () => {
+        throw fallbackFailure;
+      }),
+      onDefinitiveRejection: (error) => error === rejection,
+    });
+    controller.append('partial');
+
+    const finalized = await finalizeChannelCardAfterDelivery(
+      controller,
+      'complete answer',
+      true,
+      'delivery failed',
+    );
+
+    expect(finalized).toEqual({
+      acknowledged: false,
+      error: fallbackFailure,
+    });
+    expect(controller.isActive()).toBe(false);
   });
 });

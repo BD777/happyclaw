@@ -102,7 +102,13 @@ vi.mock('../src/macos-keychain-credentials.js', () => ({
 }));
 
 const db = await import('../src/db.js');
-const { runHostAgent } = await import('../src/container-runner.js');
+const {
+  cleanupHostBrowserResources,
+  isManagedHostBrowserProcess,
+  runHostAgent,
+} = await import('../src/container-runner.js');
+type HostProcessSnapshot =
+  import('../src/container-runner.js').HostProcessSnapshot;
 
 const FOLDER = 'host-browser-cleanup';
 const livePids = new Set<number>();
@@ -298,5 +304,115 @@ describe('runHostAgent success-path browser cleanup', () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe('host browser process identity policy', () => {
+  test('matches Linux interpreter scripts and macOS app executables', () => {
+    expect(
+      isManagedHostBrowserProcess({
+        executable: '/usr/bin/node',
+        argv: [
+          '/usr/bin/node',
+          '/opt/node_modules/agent-browser/bin/agent-browser.js',
+          'open',
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      isManagedHostBrowserProcess({
+        executable:
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        argv: [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '--headless=new',
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  test('does not match shell/python jobs that only mention agent-browser in arguments', () => {
+    expect(
+      isManagedHostBrowserProcess({
+        executable: '/bin/bash',
+        argv: ['/bin/bash', '-c', 'echo agent-browser && sleep 60'],
+      }),
+    ).toBe(false);
+    expect(
+      isManagedHostBrowserProcess({
+        executable: '/usr/bin/python3',
+        argv: [
+          '/usr/bin/python3',
+          '/tmp/worker.py',
+          '--label',
+          'agent-browser',
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  test('TERM/KILL use one fixed target set and reject PID identity reuse', () => {
+    const root: HostProcessSnapshot = {
+      pid: 10,
+      ppid: 1,
+      pgid: 9,
+      startIdentity: 'Thu Aug 27 12:00:00 2026',
+      executable: '/usr/bin/node',
+      argv: ['/usr/bin/node', '/opt/agent-browser/bin/agent-browser.js'],
+    };
+    const child: HostProcessSnapshot = {
+      pid: 11,
+      ppid: 10,
+      pgid: 9,
+      startIdentity: 'Thu Aug 27 12:00:01 2026',
+      executable: '/usr/bin/helper',
+      argv: ['/usr/bin/helper'],
+    };
+    const decoy: HostProcessSnapshot = {
+      pid: 20,
+      ppid: 1,
+      pgid: 9,
+      startIdentity: 'Thu Aug 27 12:00:02 2026',
+      executable: '/bin/bash',
+      argv: ['/bin/bash', '-c', 'echo agent-browser'],
+    };
+    const snapshots: HostProcessSnapshot[][] = [
+      [root, child, decoy],
+      [root, child, decoy],
+      [
+        root,
+        { ...child, startIdentity: 'Thu Aug 27 12:01:00 2026' },
+        decoy,
+        {
+          ...root,
+          pid: 30,
+          startIdentity: 'Thu Aug 27 12:01:01 2026',
+        },
+      ],
+    ];
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    let delayed: (() => void) | undefined;
+
+    expect(
+      cleanupHostBrowserResources(9, 1_000, {
+        snapshot: () => snapshots.shift() ?? [],
+        signal: (pid, signal) => signals.push([pid, signal]),
+        schedule: (callback) => {
+          delayed = callback;
+          return { unref: () => {} };
+        },
+      }),
+    ).toBe(2);
+    expect(signals).toEqual([
+      [10, 'SIGTERM'],
+      [11, 'SIGTERM'],
+    ]);
+
+    delayed?.();
+    expect(signals).toEqual([
+      [10, 'SIGTERM'],
+      [11, 'SIGTERM'],
+      [10, 'SIGKILL'],
+    ]);
   });
 });

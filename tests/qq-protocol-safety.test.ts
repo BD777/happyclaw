@@ -23,12 +23,16 @@ describe('QQ protocol safety', () => {
 });
 
 describe('QQ passive fallback evidence', () => {
-  test('only an explicit HTTP 400 is safe to retry without msg_id', () => {
+  test('unclassified HTTP 400 business codes never authorize active replay', () => {
     expect(
       isDefinitiveQQPassiveReplyRejection(
         new QQApiError('bad passive reference', 40034025, 400),
       ),
-    ).toBe(true);
+    ).toBe(false);
+    expect(
+      new QQApiError('duplicate or already exists', 40054005, 400)
+        .deliveryPhase,
+    ).toBe('uncertain');
     expect(
       isDefinitiveQQPassiveReplyRejection(
         new QQApiError('server error', undefined, 500),

@@ -106,7 +106,7 @@ describe('host disposition is keyed on the class, not on individual flags', () =
 
   test('transient failures are replayed and never consult the pool', () => {
     expect(hostRunner).toMatch(
-      /if \(failureClass === 'transient'\) \{[\s\S]*?transientRetries\.consume\(resolveTransientRetryKey\(output\)\)/,
+      /if \(failureClass === 'transient'\) \{[\s\S]*?transientRetries\.consume\([\s\S]*?resolveTransientRetryKey\(output\),[\s\S]*?selectedProfileId/,
     );
     // Ordering matters: refreshFromConfig/poolCanStillServe must stay below the
     // transient branch, or a 529 would still be answered by a failover.
@@ -130,7 +130,7 @@ describe('host disposition is keyed on the class, not on individual flags', () =
 
   test('the first transient failure still replays without touching the account', () => {
     expect(hostRunner).toMatch(
-      /if \(transientRetries\.consume\(resolveTransientRetryKey\(output\)\)\) \{\s*applyKnownProviderFailureDisposition\(output, false\);\s*return false;\s*\}/,
+      /if \([\s\S]*?transientRetries\.consume\([\s\S]*?resolveTransientRetryKey\(output\),[\s\S]*?selectedProfileId[\s\S]*?\)[\s\S]*?\) \{\s*applyKnownProviderFailureDisposition\(output, false\);\s*return false;\s*\}/,
     );
   });
 

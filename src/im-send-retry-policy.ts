@@ -11,6 +11,27 @@ export interface ImSendFailureRef {
   outcome?: ImSendFailureOutcome;
 }
 
+export class ImDeliveryPhaseError extends Error {
+  constructor(
+    readonly deliveryPhase: ImSendFailureOutcome,
+    message: string,
+    options: { cause?: unknown } = {},
+  ) {
+    super(
+      message,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
+    this.name = 'ImDeliveryPhaseError';
+  }
+}
+
+export function preAcceptImDeliveryError(
+  message: string,
+  cause?: unknown,
+): ImDeliveryPhaseError {
+  return new ImDeliveryPhaseError('pre_accept', message, { cause });
+}
+
 const REFRESH_REQUIRED_CODE = 'WECHAT_CONTEXT_REFRESH_REQUIRED';
 const DEFINITIVE_DELIVERY_REJECTION_CODE = 'CHANNEL_DELIVERY_REJECTED';
 

@@ -24,6 +24,7 @@ import {
   isUncertainAfterAcceptImError,
   retryUnscopedImSend,
   type ImSendFailureRef,
+  preAcceptImDeliveryError,
 } from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
@@ -21983,7 +21984,7 @@ async function main(): Promise<void> {
             [payload.targetChannel],
           );
           if (!targetJid) {
-            throw new Error(
+            throw preAcceptImDeliveryError(
               `No connected ${payload.targetChannel} binding exists for this workspace`,
             );
           }
@@ -22023,10 +22024,14 @@ async function main(): Promise<void> {
             resolvedPath !== workspaceRoot &&
             !resolvedPath.startsWith(`${workspaceRoot}${path.sep}`)
           ) {
-            throw new Error('Persisted notification path left its workspace');
+            throw preAcceptImDeliveryError(
+              'Persisted notification path left its workspace',
+            );
           }
           if (!isRealpathInside(resolvedPath, workspaceRoot)) {
-            throw new Error('Persisted notification file is unavailable');
+            throw preAcceptImDeliveryError(
+              'Persisted notification file is unavailable',
+            );
           }
           if (
             payload.kind === 'im_image' ||
@@ -22051,7 +22056,7 @@ async function main(): Promise<void> {
             );
           }
         } else {
-          throw new Error(
+          throw preAcceptImDeliveryError(
             `Unsupported direct notification kind: ${payload.kind}`,
           );
         }

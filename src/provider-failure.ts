@@ -132,7 +132,10 @@ const DEFAULT_MAX_TRACKED_TRANSIENT_TURNS = 512;
  * wedged upstream from replaying one input forever.
  */
 export class TransientRetryLedger {
-  private readonly used = new Map<string, number>();
+  private readonly used = new Map<
+    string,
+    { attempts: number; profileId: string | null }
+  >();
 
   constructor(
     private readonly maxRetries: number = DEFAULT_MAX_TRANSIENT_RETRIES,
@@ -145,10 +148,17 @@ export class TransientRetryLedger {
    * Without a durable turn identity there is nothing to bound a replay with, so
    * this fails closed rather than risk an unbounded loop.
    */
-  consume(inputTurnId: string | undefined): boolean {
+  consume(
+    inputTurnId: string | undefined,
+    selectedProfileId: string | null = null,
+  ): boolean {
     if (!inputTurnId) return false;
-    const spent = this.used.get(inputTurnId) ?? 0;
-    if (spent >= this.maxRetries) {
+    const entry = this.used.get(inputTurnId);
+    const spent = entry?.attempts ?? 0;
+    if (
+      spent >= this.maxRetries ||
+      (entry && entry.profileId !== selectedProfileId)
+    ) {
       this.used.delete(inputTurnId);
       return false;
     }
@@ -158,8 +168,21 @@ export class TransientRetryLedger {
       const oldest = this.used.keys().next().value;
       if (oldest !== undefined) this.used.delete(oldest);
     }
-    this.used.set(inputTurnId, spent + 1);
+    this.used.set(inputTurnId, {
+      attempts: spent + 1,
+      profileId: entry?.profileId ?? selectedProfileId,
+    });
     return true;
+  }
+
+  /** Provider that owns the one authorized replay for this durable input. */
+  pinnedProfileId(inputTurnId: string | undefined): string | null {
+    if (!inputTurnId) return null;
+    return this.used.get(inputTurnId)?.profileId ?? null;
+  }
+
+  clear(inputTurnId: string | undefined): void {
+    if (inputTurnId) this.used.delete(inputTurnId);
   }
 
   /** Test/diagnostic hook: number of turns currently holding a spent retry. */

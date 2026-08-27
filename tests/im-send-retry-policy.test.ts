@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   classifyImSendFailure,
+  ImDeliveryPhaseError,
   imSendFailurePolicy,
   isUncertainAfterAcceptImError,
 } from '../src/im-send-retry-policy.js';
@@ -89,5 +90,14 @@ describe('imSendFailurePolicy', () => {
         Object.assign(timeout, { deliveryPhase: 'pre_accept' }),
       ),
     ).toBe('pre_accept');
+  });
+
+  test('typed local validation evidence is pre-accept even without errno text', () => {
+    const error = new ImDeliveryPhaseError(
+      'pre_accept',
+      'persisted path rejected locally',
+    );
+    expect(classifyImSendFailure(error)).toBe('pre_accept');
+    expect(imSendFailurePolicy(error)).toMatchObject({ retryable: true });
   });
 });

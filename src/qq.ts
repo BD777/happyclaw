@@ -102,20 +102,27 @@ export class QQApiError extends Error {
     super(message);
     this.name = 'QQApiError';
     this.deliveryPhase =
-      httpStatus !== undefined &&
-      httpStatus >= 400 &&
-      httpStatus < 500 &&
-      httpStatus !== 408
-        ? 'rejected'
-        : 'uncertain';
+      httpStatus === 400
+        ? 'uncertain'
+        : httpStatus !== undefined &&
+            httpStatus >= 400 &&
+            httpStatus < 500 &&
+            httpStatus !== 408
+          ? 'rejected'
+          : 'uncertain';
   }
 }
 
-/** A received validation rejection proves the passive mutation was not sent. */
+/**
+ * QQ has not published a stable business-code contract that distinguishes an
+ * expired reply reference from duplicate/already-accepted delivery. Until a
+ * code is verified against the production API, every HTTP 400 stays uncertain
+ * and must not trigger an active-push replay.
+ */
 export function isDefinitiveQQPassiveReplyRejection(
-  error: unknown,
-): error is QQApiError {
-  return error instanceof QQApiError && error.httpStatus === 400;
+  _error: unknown,
+): _error is QQApiError {
+  return false;
 }
 
 export enum QQMediaFileType {
@@ -719,17 +726,19 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     msgId: string,
     error: unknown,
   ): boolean {
-    if (!isDefinitiveQQPassiveReplyRejection(error)) return false;
-    passiveReplies.discard(chatKey, msgId);
-    logger.warn(
-      {
-        chatType: chatKey.split(':')[0],
-        httpStatus: error.httpStatus,
-        bizCode: error.bizCode,
-      },
-      'QQ passive reply was definitively rejected; retiring reference',
-    );
-    return true;
+    if (error instanceof QQApiError && error.httpStatus === 400) {
+      passiveReplies.discard(chatKey, msgId);
+      logger.warn(
+        {
+          chatType: chatKey.split(':')[0],
+          httpStatus: error.httpStatus,
+          bizCode: error.bizCode,
+          outcome: 'uncertain',
+        },
+        'QQ passive reply returned an unclassified HTTP 400; retiring reference without replay',
+      );
+    }
+    return isDefinitiveQQPassiveReplyRejection(error);
   }
 
   async function sendWithQQAddressing(
@@ -741,20 +750,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     try {
       await send(ref);
     } catch (error) {
-      if (!ref.msg_id || !rejectPassiveReply(chatKey, ref.msg_id, error)) {
-        throw error;
-      }
-      const fallback = { msg_seq: getNextMsgSeq(chatKey) };
-      logger.warn(
-        {
-          chatType: chatKey.split(':')[0],
-          kind,
-          mode: 'active-push-fallback',
-          msgSeq: fallback.msg_seq,
-        },
-        'QQ passive reply rejected; retrying once without msg_id',
-      );
-      await send(fallback);
+      if (ref.msg_id) rejectPassiveReply(chatKey, ref.msg_id, error);
+      throw error;
     }
   }
 
