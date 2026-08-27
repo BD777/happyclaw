@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'vitest';
 
-import { imSendFailurePolicy } from '../src/im-send-retry-policy.js';
+import {
+  imSendFailurePolicy,
+  isUncertainAfterAcceptImError,
+} from '../src/im-send-retry-policy.js';
 import { DefinitiveChannelDeliveryError } from '../src/channel-outbox-delivery.js';
 import { WeChatContextTokenError } from '../src/wechat-context-token.js';
 
@@ -45,5 +48,20 @@ describe('imSendFailurePolicy', () => {
       retryable: false,
       countsTowardChannelRemoval: false,
     });
+  });
+
+  test('treats ETIMEDOUT in the error chain as uncertain after accept', () => {
+    const timeout = Object.assign(new Error('socket hang up'), {
+      code: 'ETIMEDOUT',
+    });
+    expect(isUncertainAfterAcceptImError(timeout)).toBe(true);
+    expect(
+      isUncertainAfterAcceptImError(
+        new Error('adapter failed', { cause: timeout }),
+      ),
+    ).toBe(true);
+    expect(isUncertainAfterAcceptImError(new Error('connection reset'))).toBe(
+      false,
+    );
   });
 });
