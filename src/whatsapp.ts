@@ -1156,6 +1156,10 @@ export function extractMessageText(content: proto.IMessage): string | null {
   // so the user at least sees what was sent. Media binary download is M3.
   if (content.imageMessage?.caption) return content.imageMessage.caption;
   if (content.videoMessage?.caption) return content.videoMessage.caption;
+  const ptvCaption = (
+    content as proto.IMessage & { ptvMessage?: { caption?: string | null } }
+  ).ptvMessage?.caption;
+  if (ptvCaption) return ptvCaption;
   if (content.documentMessage?.caption) return content.documentMessage.caption;
   return null;
 }
@@ -1196,12 +1200,15 @@ function detectMedia(content: proto.IMessage): DetectedMedia | null {
       node: content.imageMessage as DetectedMedia['node'],
     };
   }
-  if (content.videoMessage) {
+  const ptvMessage = (
+    content as proto.IMessage & { ptvMessage?: DetectedMedia['node'] }
+  ).ptvMessage;
+  if (content.videoMessage || ptvMessage) {
     return {
       kind: 'video',
       label: '视频',
       defaultExt: '.mp4',
-      node: content.videoMessage as DetectedMedia['node'],
+      node: (content.videoMessage || ptvMessage) as DetectedMedia['node'],
     };
   }
   if (content.audioMessage) {
