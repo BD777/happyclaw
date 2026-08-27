@@ -225,11 +225,27 @@ export function persistTelegramNativeMediaMessage(input: {
   return id;
 }
 
-/** Caption or text `/pair CODE` — Telegram puts media captions on `caption`, not `text`. */
-export function matchTelegramPairCode(text: string | undefined): string | null {
+/**
+ * Caption or text `/pair CODE` (optionally addressed to this bot).
+ * Telegram puts media commands on `caption`, not `text`.
+ */
+export function matchTelegramPairCode(
+  text: string | undefined,
+  expectedBotUsername?: string,
+): string | null {
   if (!text) return null;
-  const match = text.trim().match(/^\/pair\s+(\S+)/i);
-  return match?.[1] ?? null;
+  const match = text.trim().match(/^\/pair(?:@([A-Z0-9_]+))?\s+(\S+)/i);
+  if (!match) return null;
+  const addressedUsername = match[1];
+  const normalizedExpected = expectedBotUsername?.replace(/^@/, '');
+  if (
+    addressedUsername &&
+    (!normalizedExpected ||
+      addressedUsername.toLowerCase() !== normalizedExpected.toLowerCase())
+  ) {
+    return null;
+  }
+  return match[2] ?? null;
 }
 
 export function telegramMediaMessageText(
@@ -538,6 +554,7 @@ export function createTelegramConnection(
   let stopping = false;
   let readyFired = false;
   let connected = false;
+  let botUsername: string | undefined;
   const telegramApiAgent =
     config.proxyUrl && config.proxyUrl.trim()
       ? new ProxyAgent({
@@ -708,7 +725,7 @@ export function createTelegramConnection(
   }): Promise<boolean> {
     if (input.opts.isChatAuthorized(input.jid)) return true;
 
-    const pairCode = matchTelegramPairCode(input.caption);
+    const pairCode = matchTelegramPairCode(input.caption, botUsername);
     if (pairCode && input.opts.onPairAttempt) {
       try {
         const success = await input.opts.onPairAttempt(
@@ -890,7 +907,7 @@ export function createTelegramConnection(
             const text = ctx.message.text;
 
             // ── /pair <code> command ──
-            const pairCode = matchTelegramPairCode(text);
+            const pairCode = matchTelegramPairCode(text, botUsername);
             if (pairCode && opts.onPairAttempt) {
               const code = pairCode;
               try {
@@ -1753,7 +1770,8 @@ export function createTelegramConnection(
       });
 
       // Validate credentials/network before reporting transport readiness.
-      await bot.api.getMe();
+      const me = await bot.api.getMe();
+      botUsername = me.username;
 
       let settleInitialReady: ((ready: boolean) => void) | null = null;
       const initialReady = new Promise<boolean>((resolve) => {
@@ -1873,6 +1891,7 @@ export function createTelegramConnection(
       }
       processingLock.dispose();
       nativeContextReported.clear();
+      botUsername = undefined;
     },
 
     async sendMessage(

@@ -49,6 +49,16 @@ describe('matchTelegramPairCode', () => {
     expect(matchTelegramPairCode('/pair ABC123')).toBe('ABC123');
     expect(matchTelegramPairCode('/PAIR xyz')).toBe('xyz');
     expect(matchTelegramPairCode('  /pair code-1  ')).toBe('code-1');
+    expect(matchTelegramPairCode('/pair@pair_bot CODE', 'pair_bot')).toBe(
+      'CODE',
+    );
+    expect(matchTelegramPairCode('/pair@PAIR_BOT CODE', '@pair_bot')).toBe(
+      'CODE',
+    );
+    expect(
+      matchTelegramPairCode('/pair@other_bot CODE', 'pair_bot'),
+    ).toBeNull();
+    expect(matchTelegramPairCode('/pair@pair_bot CODE')).toBeNull();
     expect(matchTelegramPairCode('not /pair CODE')).toBeNull();
     expect(matchTelegramPairCode(undefined)).toBeNull();
   });
@@ -77,7 +87,12 @@ describe('Telegram unified media caption admission', () => {
     });
   }
 
-  function context(kind: string, id: number, reply = vi.fn(async () => {})) {
+  function context(
+    kind: string,
+    id: number,
+    reply = vi.fn(async () => {}),
+    caption = '/pair@pair_bot PAIR-CODE',
+  ) {
     const media =
       kind === 'photo'
         ? { photo: [{ file_id: `f-${id}` }] }
@@ -88,7 +103,7 @@ describe('Telegram unified media caption admission', () => {
       message: {
         message_id: id,
         date: Math.floor(Date.now() / 1000),
-        caption: '/pair PAIR-CODE',
+        caption,
         ...media,
       },
       chat: { id: 99, type: 'private', title: 'Ada' },
@@ -123,6 +138,42 @@ describe('Telegram unified media caption admission', () => {
     await harness.handlers.get('message:video')!(ctx);
     expect(ctx.reply).toHaveBeenCalledWith(
       'Pairing failed due to an internal error. Please try again.',
+    );
+    expect(harness.stored).not.toHaveBeenCalled();
+  });
+
+  test('text /pair@BotUsername uses the same verified username parser', async () => {
+    const onPairAttempt = vi.fn(async () => true);
+    await connect(onPairAttempt);
+    const reply = vi.fn(async () => {});
+    await harness.handlers.get('message:text')!({
+      message: {
+        message_id: 50,
+        date: Math.floor(Date.now() / 1000),
+        text: '/pair@PAIR_BOT TEXT-CODE',
+      },
+      chat: { id: 99, type: 'private', title: 'Ada' },
+      from: { id: 7, first_name: 'Ada' },
+      reply,
+    });
+    expect(onPairAttempt).toHaveBeenCalledWith(
+      'telegram:99',
+      'Ada',
+      'TEXT-CODE',
+    );
+    expect(harness.stored).not.toHaveBeenCalled();
+  });
+
+  test('caption addressed to a different bot is denied without consuming the code', async () => {
+    const onPairAttempt = vi.fn(async () => true);
+    await connect(onPairAttempt);
+    const reply = vi.fn(async () => {});
+    await harness.handlers.get('message:video')!(
+      context('video', 60, reply, '/pair@other_bot WRONG-CODE'),
+    );
+    expect(onPairAttempt).not.toHaveBeenCalled();
+    expect(reply).toHaveBeenCalledWith(
+      expect.stringMatching(/not yet paired/i),
     );
     expect(harness.stored).not.toHaveBeenCalled();
   });

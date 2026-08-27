@@ -70,6 +70,7 @@ function robotDownstream(input: {
   msgId?: string;
   content?: string;
   senderId?: string;
+  sessionWebhook?: string;
 }) {
   const senderId = input.senderId ?? 'staff-1';
   return {
@@ -84,7 +85,83 @@ function robotDownstream(input: {
       createAt: Date.now(),
       msgtype: 'text',
       text: { content: input.content ?? 'hello from dingtalk' },
+      sessionWebhook: input.sessionWebhook,
     }),
+  };
+}
+
+function mockDingTalkRequests(options: { holdWebhook?: boolean } = {}) {
+  const webhookBodies: string[] = [];
+  let webhookStarted = false;
+  let webhookAborted = false;
+  vi.spyOn(https, 'request').mockImplementation(
+    (requestOptions: any, callback?: any) => {
+      const path = String(requestOptions.path ?? '');
+      const isToken = path.includes('/gettoken');
+      let written = '';
+      const req = new EventEmitter() as EventEmitter & {
+        setTimeout: () => void;
+        write: (chunk: string | Buffer) => void;
+        end: () => void;
+        destroy: () => void;
+      };
+      req.setTimeout = () => undefined;
+      req.write = (chunk) => {
+        written += chunk.toString();
+      };
+      req.destroy = () => undefined;
+      req.end = () => {
+        if (!isToken) {
+          webhookStarted = true;
+          webhookBodies.push(written);
+          if (options.holdWebhook) return;
+        }
+        const res = new EventEmitter() as EventEmitter & {
+          statusCode: number;
+          headers: Record<string, string>;
+          destroy: () => void;
+        };
+        res.statusCode = 200;
+        res.headers = {};
+        res.destroy = () => undefined;
+        callback?.(res);
+        res.emit(
+          'data',
+          Buffer.from(
+            JSON.stringify(
+              isToken
+                ? {
+                    errcode: 0,
+                    access_token: 'ding-token',
+                    expires_in: 7200,
+                  }
+                : { errcode: 0 },
+            ),
+          ),
+        );
+        res.emit('end');
+      };
+      requestOptions.signal?.addEventListener(
+        'abort',
+        () => {
+          webhookAborted = !isToken;
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          req.emit('error', error);
+        },
+        { once: true },
+      );
+      return req as any;
+    },
+  );
+  return {
+    webhookBodies,
+    get webhookStarted() {
+      return webhookStarted;
+    },
+    get webhookAborted() {
+      return webhookAborted;
+    },
   };
 }
 
@@ -254,6 +331,74 @@ describe('DingTalk inbound Stream ACK must not precede handle', () => {
     expect(storeMessageDirect).toHaveBeenCalledTimes(1);
     expect(onMessagePersisted).toHaveBeenCalledTimes(1);
     expect(client.socketCallBackResponse).toHaveBeenCalledTimes(2);
+  });
+
+  test('unpaired chat receives one /pair hint and ACK follows webhook success', async () => {
+    const requests = mockDingTalkRequests();
+    const { client, connection } = await connect({
+      isChatAuthorized: () => false,
+    });
+
+    await deliver(client, {
+      msgId: 'deny-1',
+      messageId: 'deny-stream-1',
+      sessionWebhook: 'https://hook.example/session',
+    });
+
+    expect(requests.webhookBodies).toHaveLength(1);
+    expect(JSON.parse(requests.webhookBodies[0]!).text.content).toMatch(
+      /\/pair <code>/,
+    );
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+    expect(client.socketCallBackResponse).toHaveBeenCalledWith(
+      'deny-stream-1',
+      { success: true },
+    );
+    await connection.disconnect();
+  });
+
+  test('unpaired hint cooldown suppresses amplification but both callbacks ACK', async () => {
+    const requests = mockDingTalkRequests();
+    const { client, connection } = await connect({
+      isChatAuthorized: () => false,
+    });
+
+    await deliver(client, {
+      msgId: 'deny-cooldown-1',
+      messageId: 'deny-cooldown-stream-1',
+      sessionWebhook: 'https://hook.example/session',
+    });
+    await deliver(client, {
+      msgId: 'deny-cooldown-2',
+      messageId: 'deny-cooldown-stream-2',
+      sessionWebhook: 'https://hook.example/session',
+    });
+
+    expect(requests.webhookBodies).toHaveLength(1);
+    expect(client.socketCallBackResponse).toHaveBeenCalledTimes(2);
+    await connection.disconnect();
+  });
+
+  test('disconnect aborts a held deny webhook and never ACKs the stale client', async () => {
+    const requests = mockDingTalkRequests({ holdWebhook: true });
+    const { client, connection } = await connect({
+      isChatAuthorized: () => false,
+    });
+    const delivery = client.listener!(
+      robotDownstream({
+        msgId: 'deny-held-1',
+        messageId: 'deny-held-stream-1',
+        sessionWebhook: 'https://hook.example/session',
+      }),
+    );
+    await vi.waitFor(() => expect(requests.webhookStarted).toBe(true));
+
+    await connection.disconnect();
+    await delivery;
+
+    expect(requests.webhookAborted).toBe(true);
+    expect(client.socketCallBackResponse).not.toHaveBeenCalled();
+    expect(storeMessageDirect).not.toHaveBeenCalled();
   });
 
   test('disconnect fences immediately but waits for a non-abortable inbound callback', async () => {

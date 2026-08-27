@@ -1125,6 +1125,10 @@ export function createDingTalkConnection(
   // Session webhook expiry per chat
   const sessionWebhookExpiry = new Map<string, number>();
 
+  // Avoid turning an unauthorized sender into a reply-amplification source.
+  const rejectTimestamps = new Map<string, number>();
+  const REJECT_COOLDOWN_MS = 60_000;
+
   // Sender ID per chat (for sending files back to user)
   const lastSenderIds = new Map<string, string>();
 
@@ -1403,8 +1407,9 @@ export function createDingTalkConnection(
     sessionWebhook: string,
     content: string,
     useMarkdown = false,
+    signal?: AbortSignal,
   ): Promise<void> {
-    const token = await getAccessToken();
+    const token = await getAccessToken(signal);
     const body = useMarkdown
       ? {
           msgtype: 'markdown',
@@ -1430,6 +1435,7 @@ export function createDingTalkConnection(
           'Content-Type': 'application/json',
           'x-acs-dingtalk-access-token': token,
         },
+        signal,
       },
       JSON.stringify(body),
     );
@@ -1998,6 +2004,7 @@ export function createDingTalkConnection(
                 data.sessionWebhook,
                 '配对成功！此聊天已连接到你的账号。',
                 isGroup,
+                signal,
               );
               assertInboundGeneration(generation, signal);
             } catch (err) {
@@ -2020,6 +2027,7 @@ export function createDingTalkConnection(
                 data.sessionWebhook,
                 '配对码无效或已过期，请在 Web 设置页重新生成。',
                 isGroup,
+                signal,
               );
               assertInboundGeneration(generation, signal);
             } catch (err) {
@@ -2033,6 +2041,28 @@ export function createDingTalkConnection(
           return;
         }
         if (admission.kind === 'deny') {
+          if (data.sessionWebhook) {
+            const now = Date.now();
+            const lastReject = rejectTimestamps.get(jid) ?? 0;
+            if (now - lastReject >= REJECT_COOLDOWN_MS) {
+              rejectTimestamps.set(jid, now);
+              try {
+                await sendViaSessionWebhook(
+                  data.sessionWebhook,
+                  '此聊天尚未配对。请在 Web 设置页生成配对码，然后发送 /pair <code>。',
+                  isGroup,
+                  signal,
+                );
+                assertInboundGeneration(generation, signal);
+              } catch (err) {
+                assertInboundGeneration(generation, signal);
+                logger.warn(
+                  { err, jid, msgId },
+                  'DingTalk unpaired hint reply failed',
+                );
+              }
+            }
+          }
           logger.debug({ jid }, 'DingTalk chat not authorized');
           return;
         }
@@ -2586,6 +2616,7 @@ export function createDingTalkConnection(
                   data.sessionWebhook,
                   plainText,
                   isGroup,
+                  signal,
                 );
                 assertInboundGeneration(generation, signal);
               }
@@ -2876,6 +2907,7 @@ export function createDingTalkConnection(
       lastMessageIds.clear();
       lastSessionWebhooks.clear();
       sessionWebhookExpiry.clear();
+      rejectTimestamps.clear();
       lastSenderIds.clear();
       lastSenderStaffIds.clear();
       groupNameCache.clear();
