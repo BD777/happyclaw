@@ -222,8 +222,11 @@ Host 模式没有 `maxConcurrentHostProcesses`。旧客户端提交该字段时�
 破坏性命令受 `OWNER_REQUIRED_IM_COMMANDS` 和渠道原生 sender ID 约束。
 响应对象策略不能因服务重启、同步聊天或恢复绑定而回退成默认值。
 
-飞书另有三个精确的 Session 运行时控制命令。群聊必须由渠道结构证明真实 `@Bot`，
-命令大小写敏感；私聊可直接使用：
+另有三个精确的 Session 运行时控制命令，由渠道连接器在通用斜杠命令之前解析。
+群聊必须由渠道结构证明真实 `@Bot`，命令大小写敏感；私聊可直接使用。
+飞书支持全部三个；QQ 支持 `/steer` 和 `/break`，其 `/clear` 仍走通用命令处理器。
+QQ 群聊的结构证明来自平台本身 —— 网关只在真实 `@Bot` 时投递
+`GROUP_AT_MESSAGE_CREATE`：
 
 - `/steer <非空消息>`：先可靠进入当前 Session 的 durable pending，再 clean interrupt
   当前 generation；当前已 pending 的普通消息与 steer 按可见顺序在下一轮合批，命令前缀
@@ -304,18 +307,19 @@ Web 持久设置 > 环境变量 > 代码默认值
 
 常用环境变量：
 
-| 变量                        | 默认值                            | 说明                              |
-| --------------------------- | --------------------------------- | --------------------------------- |
-| `WEB_PORT`                  | `3000`                            | HTTP、WebSocket 端口              |
-| `WEB_SESSION_SECRET`        | 自动生成并持久化                  | Cookie 签名                       |
-| `CONTAINER_IMAGE`           | `riba2534/happyclaw-agent:latest` | GitHub Actions 发布的 Runner 镜像 |
-| `CONTAINER_TIMEOUT`         | `1800000`                         | 默认运行超时                      |
-| `IDLE_TIMEOUT`              | `1800000`                         | 暖 Runner 空闲时间                |
-| `MAX_CONCURRENT_CONTAINERS` | `20`                              | Docker 并发                       |
-| `MAX_FILE_SIZE_MB`          | `50`                              | Web/IM 入站文件上限               |
-| `CORS_ALLOWED_ORIGINS`      | 仅 localhost                      | WebSocket Origin 白名单           |
-| `TRUST_PROXY`               | `false`                           | 是否信任反向代理来源头            |
-| `TZ`                        | 系统时区                          | 调度时区                          |
+| 变量                                 | 默认值                            | 说明                               |
+| ------------------------------------ | --------------------------------- | ---------------------------------- |
+| `WEB_PORT`                           | `3000`                            | HTTP、WebSocket 端口               |
+| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Cookie 签名                        |
+| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | GitHub Actions 发布的 Runner 镜像  |
+| `CONTAINER_TIMEOUT`                  | `1800000`                         | 默认运行超时                       |
+| `IDLE_TIMEOUT`                       | `1800000`                         | 暖 Runner 空闲时间                 |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（4–120 分钟） |
+| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | Docker 并发                        |
+| `MAX_FILE_SIZE_MB`                   | `50`                              | Web/IM 入站文件上限                |
+| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | WebSocket Origin 白名单            |
+| `TRUST_PROXY`                        | `false`                           | 是否信任反向代理来源头             |
+| `TZ`                                 | 系统时区                          | 调度时区                           |
 
 Provider 和渠道账号应优先通过 Web 配置。Legacy `/api/config/user-im/*` 只用于兼容，
 新功能统一使用 `/api/channel-accounts`。

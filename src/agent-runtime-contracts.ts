@@ -12,9 +12,11 @@ export interface ContainerOutput {
   providerFailureNotice?: string;
   providerRateLimitScope?: 'account' | 'model';
   providerRateLimitModel?: string;
+  providerFailureClass?: 'account' | 'transient' | 'config';
   providerFailureTerminal?: boolean;
   providerFailureRetrying?: boolean;
   providerFailureMaintenance?: boolean;
+  providerLivenessTimeout?: boolean;
   streamEvent?: StreamEvent;
   readonly inputTurnId?: string;
   turnId?: string;

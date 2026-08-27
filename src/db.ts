@@ -5938,7 +5938,8 @@ export function completeIsolatedTaskRunWithWorkspaceResultIntent(input: {
     if (!mergedPayload) return false;
     const notificationStatus: TaskRunNotificationStatus =
       current.notification_status === 'failed' ||
-      current.notification_status === 'partial_failed'
+      current.notification_status === 'partial_failed' ||
+      current.notification_status === 'uncertain'
         ? current.notification_status
         : 'pending';
     const startedAt = current.started_at
@@ -6791,6 +6792,10 @@ function subtractNotificationSummary(
     (current?.succeeded ?? 0) - (baseline?.succeeded ?? 0),
   );
   const failed = Math.max(0, (current?.failed ?? 0) - (baseline?.failed ?? 0));
+  const uncertain = Math.max(
+    0,
+    (current?.uncertain ?? 0) - (baseline?.uncertain ?? 0),
+  );
   let failedChannels: string[] = [];
   if (failed > 0) {
     const baselineChannels = new Set(baseline?.failed_channels ?? []);
@@ -6804,7 +6809,25 @@ function subtractNotificationSummary(
       failedChannels = [...(current?.failed_channels ?? [])];
     }
   }
-  return { attempted, succeeded, failed, failed_channels: failedChannels };
+  const baselineUncertainChannels = new Set(baseline?.uncertain_channels ?? []);
+  const uncertainChannels = (current?.uncertain_channels ?? []).filter(
+    (channel) => !baselineUncertainChannels.has(channel),
+  );
+  return {
+    attempted,
+    succeeded,
+    failed,
+    failed_channels: failedChannels,
+    ...(uncertain > 0
+      ? {
+          uncertain,
+          uncertain_channels:
+            uncertainChannels.length > 0
+              ? uncertainChannels
+              : [...(current?.uncertain_channels ?? [])],
+        }
+      : {}),
+  };
 }
 
 function subtractNotificationError(
@@ -6841,13 +6864,15 @@ function removeNotificationError(
 function notificationStatusForSummary(
   summary: TaskRunNotificationSummary,
 ): TaskRunNotificationReceipt['status'] {
-  return summary.failed === 0
-    ? summary.attempted === 0
-      ? 'skipped'
-      : 'success'
-    : summary.succeeded > 0
-      ? 'partial_failed'
-      : 'failed';
+  return (summary.uncertain ?? 0) > 0
+    ? 'uncertain'
+    : summary.failed === 0
+      ? summary.attempted === 0
+        ? 'skipped'
+        : 'success'
+      : summary.succeeded > 0
+        ? 'partial_failed'
+        : 'failed';
 }
 
 function mergeTaskRunNotificationReceipts(
@@ -6867,16 +6892,21 @@ function mergeTaskRunNotificationReceipts(
         ...next.summary.failed_channels,
       ]),
     ],
+    ...((currentSummary.uncertain ?? 0) + (next.summary.uncertain ?? 0) > 0
+      ? {
+          uncertain:
+            (currentSummary.uncertain ?? 0) + (next.summary.uncertain ?? 0),
+          uncertain_channels: [
+            ...new Set([
+              ...(currentSummary.uncertain_channels ?? []),
+              ...(next.summary.uncertain_channels ?? []),
+            ]),
+          ],
+        }
+      : {}),
   };
   return {
-    status:
-      summary.failed === 0
-        ? summary.attempted === 0
-          ? 'skipped'
-          : 'success'
-        : summary.succeeded > 0
-          ? 'partial_failed'
-          : 'failed',
+    status: notificationStatusForSummary(summary),
     summary,
     error: [currentError, next.error].filter(Boolean).join('; ') || null,
   };
@@ -6967,7 +6997,9 @@ function recordTaskRunNotificationReceiptInTransaction(
     receipt,
   );
   const shouldRetry =
-    (receipt.status === 'failed' || receipt.status === 'partial_failed') &&
+    (receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain') &&
     !!retryPayload;
   const mergedPayload = mergeTaskRunNotificationPayloads(
     currentPayload,
@@ -7155,6 +7187,12 @@ export function replaceTaskRunNotificationReceipt(
         currentSummary.failed - previousReceipt.summary.failed,
       ),
       failed_channels: [],
+      uncertain: Math.max(
+        0,
+        (currentSummary.uncertain ?? 0) -
+          (previousReceipt.summary.uncertain ?? 0),
+      ),
+      uncertain_channels: [],
     };
     if (baseSummary.failed > 0) {
       const removedChannels = new Set(previousReceipt.summary.failed_channels);
@@ -7170,6 +7208,17 @@ export function replaceTaskRunNotificationReceipt(
       if (baseSummary.failed_channels.length === 0) {
         baseSummary.failed_channels = [...currentSummary.failed_channels];
       }
+    }
+    if ((baseSummary.uncertain ?? 0) > 0) {
+      const removedUncertainChannels = new Set(
+        previousReceipt.summary.uncertain_channels ?? [],
+      );
+      baseSummary.uncertain_channels = (
+        currentSummary.uncertain_channels ?? []
+      ).filter((channel) => !removedUncertainChannels.has(channel));
+    } else {
+      delete baseSummary.uncertain;
+      delete baseSummary.uncertain_channels;
     }
     const baseError = removeNotificationError(
       row.notification_error,
@@ -7191,7 +7240,8 @@ export function replaceTaskRunNotificationReceipt(
           );
     const shouldRetryNext =
       (nextReceipt.status === 'failed' ||
-        nextReceipt.status === 'partial_failed') &&
+        nextReceipt.status === 'partial_failed' ||
+        nextReceipt.status === 'uncertain') &&
       !!nextRetryPayload;
     const mergedPayload = mergeTaskRunNotificationPayloads(
       remainingPayload,
@@ -7327,7 +7377,7 @@ function claimTaskRunNotification(
            )
            AND notification_attempt < ?
            AND (
-             (notification_status IN ('failed','partial_failed','pending')
+             (notification_status IN ('failed','partial_failed','uncertain','pending')
                AND notification_available_at IS NOT NULL
                AND notification_available_at <= ?
                AND notification_lease_owner IS NULL)
@@ -7606,7 +7656,9 @@ export function completeTaskRunNotificationAttempt(
   const now = new Date();
   const nowIso = now.toISOString();
   const workerRetryable =
-    (receipt.status === 'failed' || receipt.status === 'partial_failed') &&
+    (receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain') &&
     claim.attempt < MAX_TASK_NOTIFICATION_ATTEMPTS &&
     !!retryPayload;
   const delayMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, claim.attempt - 1));
@@ -7692,6 +7744,10 @@ export function completeTaskRunNotificationAttempt(
       claim.notificationSummary.failed === 0 &&
       (claim.notificationStatus === 'pending' ||
         claim.notificationError === PENDING_NOTIFICATION_RETRY_ERROR);
+    const claimedSummaryHasUncertainty =
+      claim.notificationStatus === 'uncertain' &&
+      !!claim.notificationSummary &&
+      (claim.notificationSummary.uncertain ?? 0) > 0;
     let nextReceipt =
       currentSummary &&
       row.notification_error?.includes(FINAL_NOTIFICATION_UNKNOWN_ERROR)
@@ -7701,14 +7757,21 @@ export function completeTaskRunNotificationAttempt(
             row.notification_error,
             receipt,
           )
-        : claimedSummaryIsHistoricalSuccess && claim.notificationSummary
+        : claimedSummaryHasUncertainty && claim.notificationSummary
           ? mergeTaskRunNotificationReceipts(
-              notificationStatusForSummary(claim.notificationSummary),
+              'uncertain',
               claim.notificationSummary,
-              null,
+              claim.notificationError,
               receipt,
             )
-          : receipt;
+          : claimedSummaryIsHistoricalSuccess && claim.notificationSummary
+            ? mergeTaskRunNotificationReceipts(
+                notificationStatusForSummary(claim.notificationSummary),
+                claim.notificationSummary,
+                null,
+                receipt,
+              )
+            : receipt;
     if (concurrentWrite) {
       const lateSummary = subtractNotificationSummary(
         currentSummary,
@@ -7725,14 +7788,7 @@ export function completeTaskRunNotificationAttempt(
           nextReceipt.summary,
           nextReceipt.error ?? null,
           {
-            status:
-              lateSummary.failed === 0
-                ? lateSummary.attempted === 0
-                  ? 'skipped'
-                  : 'success'
-                : lateSummary.succeeded > 0
-                  ? 'partial_failed'
-                  : 'failed',
+            status: notificationStatusForSummary(lateSummary),
             summary: lateSummary,
             error: subtractNotificationError(
               row.notification_error,
@@ -7794,7 +7850,9 @@ export function completeTaskRunNotificationAttempt(
       );
     const discardedPayload =
       !workerRetryable &&
-      (receipt.status === 'failed' || receipt.status === 'partial_failed')
+      (receipt.status === 'failed' ||
+        receipt.status === 'partial_failed' ||
+        receipt.status === 'uncertain')
         ? (retryPayload ?? claim.payload)
         : null;
     if (result.changes === 1 && discardedPayload) {
@@ -7822,7 +7880,7 @@ export function getNextTaskRunWakeAt(): string | null {
              AND notification_available_at IS NOT NULL
              AND notification_lease_owner IS NULL
              AND status IN ('success','failed','delivered')
-             AND notification_status IN ('failed','partial_failed','pending')
+             AND notification_status IN ('failed','partial_failed','uncertain','pending')
          UNION ALL
          SELECT notification_lease_expires_at AS wake_at FROM task_runs
            WHERE notification_lease_owner IS NOT NULL
@@ -7840,7 +7898,7 @@ export function getNextTaskRunWakeAt(): string | null {
          AND notification_attempt < ?
          AND notification_available_at IS NOT NULL
          AND notification_lease_owner IS NULL
-         AND notification_status IN ('failed','partial_failed','pending')`,
+         AND notification_status IN ('failed','partial_failed','uncertain','pending')`,
     )
     .all(MAX_TASK_NOTIFICATION_ATTEMPTS) as Array<{
     id: string;
@@ -10610,6 +10668,10 @@ export type WeChatContextTokenClaimResult =
   | { status: 'claimed'; record: StoredWeChatContextToken }
   | { status: 'missing' | 'changed' | 'expired' | 'quota_exhausted' };
 
+export type WeChatContextTokenReleaseResult =
+  | { status: 'released'; record: StoredWeChatContextToken }
+  | { status: 'missing' | 'changed' };
+
 /** List only one channel account's reply credentials; tokens never cross accounts. */
 export function listWeChatContextTokens(
   channelAccountId: string,
@@ -10767,6 +10829,70 @@ export function claimWeChatContextToken(input: {
           ...record,
           send_count: sendCount,
           last_sent_at_ms: input.nowMs,
+        },
+      };
+    })
+    .immediate();
+}
+
+/**
+ * Low-level rollback for a reservation proven not to have reached the provider.
+ * HTTP/transport/ACK uncertainty must never call this: those attempts remain
+ * charged. Compare-and-swap prevents a stale rollback from rewriting a refresh.
+ */
+export function releaseWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  expectedToken: string;
+  expectedRefreshedAtMs: number;
+  expectedSourceMessageId?: string | null;
+  releaseCount: number;
+}): WeChatContextTokenReleaseResult {
+  if (!Number.isInteger(input.releaseCount) || input.releaseCount <= 0) {
+    throw new Error('WeChat context_token releaseCount must be positive');
+  }
+  return db
+    .transaction((): WeChatContextTokenReleaseResult => {
+      const record = db
+        .prepare(
+          `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+                  source_message_id, source_sequence, send_count, last_sent_at_ms
+           FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?`,
+        )
+        .get(input.channelAccountId, input.userId) as
+        | StoredWeChatContextToken
+        | undefined;
+      if (!record) return { status: 'missing' };
+      if (
+        record.context_token !== input.expectedToken ||
+        record.refreshed_at_ms !== input.expectedRefreshedAtMs ||
+        (input.expectedSourceMessageId !== undefined &&
+          record.source_message_id !== input.expectedSourceMessageId)
+      ) {
+        return { status: 'changed' };
+      }
+      if (record.send_count < input.releaseCount) {
+        return { status: 'changed' };
+      }
+      const sendCount = record.send_count - input.releaseCount;
+      db.prepare(
+        `UPDATE wechat_context_tokens
+         SET send_count = ?
+         WHERE channel_account_id = ? AND user_id = ?
+           AND context_token = ? AND refreshed_at_ms = ?`,
+      ).run(
+        sendCount,
+        input.channelAccountId,
+        input.userId,
+        input.expectedToken,
+        input.expectedRefreshedAtMs,
+      );
+      return {
+        status: 'released',
+        record: {
+          ...record,
+          send_count: sendCount,
         },
       };
     })
@@ -13641,6 +13767,21 @@ export function getMessage(
         sender: string | null;
         is_from_me: number;
       }
+    | undefined;
+  return row ?? null;
+}
+
+/** Read only the durable payload needed to resume post-persist channel effects. */
+export function getMessagePayload(
+  chatJid: string,
+  messageId: string,
+): { content: string; attachments: string | null } | null {
+  const row = db
+    .prepare(
+      'SELECT content, attachments FROM messages WHERE id = ? AND chat_jid = ?',
+    )
+    .get(messageId, chatJid) as
+    | { content: string; attachments: string | null }
     | undefined;
   return row ?? null;
 }

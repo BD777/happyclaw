@@ -21,6 +21,9 @@ vi.mock('../src/logger.js', () => ({
 const db = await import('../src/db.js');
 const reliability = await import('../src/channel-reliability-store.js');
 const { ChannelTurnRuntime } = await import('../src/channel-turn-runtime.js');
+const { deliverChannelOutboxItem, DefinitiveChannelDeliveryError } =
+  await import('../src/channel-outbox-delivery.js');
+const runtimeScope = await import('../src/channel-outbox-runtime-scope.js');
 const {
   reconcileChannelReliabilityOnStartup,
   startChannelReliabilityRecoveryLoop,
@@ -125,6 +128,53 @@ describe('durable channel turn runtime', () => {
     );
     expect(runtime.interrupt('Provider side effect is uncertain')).toBe(true);
     runtime.dispose();
+  });
+
+  test('definitive outbox rejection terminalizes failed instead of retry_wait', async () => {
+    const input = {
+      ...route,
+      externalMessageId: 'msg-definitive-outbox-failure',
+      agentId: 'agent-definitive-outbox-failure',
+    };
+    const runtime = ChannelTurnRuntime.start(input);
+    const payload = { text: 'provider rejects this message' };
+    const identity = runtimeScope.semanticChannelOutboxIdentity({
+      route,
+      kind: 'text',
+      payload,
+    });
+    const delivery = await deliverChannelOutboxItem({
+      ...route,
+      turnRunId: runtime.runId,
+      ordinal: runtimeScope.stableChannelOutboxOrdinal(identity),
+      kind: 'text',
+      payload,
+      idempotencyKey: `${runtime.runId}:${identity}`,
+      owner: 'definitive-outbox-test',
+      delivery: {
+        mode: 'single',
+        send: async () => {
+          throw new DefinitiveChannelDeliveryError('provider rejected');
+        },
+      },
+    });
+    expect(delivery.status).toBe('failed');
+    expect(runtime.fail('Web completed; native delivery rejected')).toBe(true);
+    expect(reliability.getChannelTurnRun(runtime.runId)).toMatchObject({
+      status: 'failed',
+      error: 'Web completed; native delivery rejected',
+    });
+    // A later healthy SDK terminal cannot move the already-failed Turn or put
+    // it back into retry_wait.
+    expect(runtime.markFinalizing()).toBe(false);
+    expect(runtime.complete({ healthySdkTerminal: true })).toBe(true);
+    expect(runtime.retry('must not replay')).toBe(false);
+    expect(reliability.getChannelTurnRun(runtime.runId)?.status).toBe('failed');
+    runtime.dispose();
+
+    const replay = ChannelTurnRuntime.start(input);
+    expect(replay.executionDisposition).toBe('skip_terminal');
+    replay.dispose();
   });
 
   test('restart never re-executes after a delivered Outbox ACK survived the process', () => {
@@ -917,8 +967,8 @@ describe('durable channel turn runtime', () => {
 
 describe('provider reconciliation', () => {
   test('updates the original CardKit card instead of creating a replacement', async () => {
-    const settings = vi.fn().mockResolvedValue({});
-    const update = vi.fn().mockResolvedValue({});
+    const settings = vi.fn().mockResolvedValue({ code: 0 });
+    const update = vi.fn().mockResolvedValue({ code: 0 });
     const create = vi.fn();
     const client = {
       cardkit: { v1: { card: { settings, update, create } } },

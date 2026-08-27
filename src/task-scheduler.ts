@@ -109,6 +109,7 @@ import {
 import { getScriptTaskHostExecutionError } from './script-task-policy.js';
 import { resolveScheduledGroupDeliveryContract } from './reply-delivery.js';
 import { resolveRuntimeInteractionMode } from './workspace-interaction-runtime.js';
+import { explicitImDeliveryPhase } from './im-send-retry-policy.js';
 
 export function shouldFinalizeScheduledRunOutput(
   output: Pick<
@@ -2505,20 +2506,33 @@ function mergeNotificationReceipts(
       ...next.summary.failed_channels,
     ]),
   ];
+  const uncertain =
+    (current.summary.uncertain ?? 0) + (next.summary.uncertain ?? 0);
+  const uncertainChannels = [
+    ...new Set([
+      ...(current.summary.uncertain_channels ?? []),
+      ...(next.summary.uncertain_channels ?? []),
+    ]),
+  ];
   const summary: TaskRunNotificationSummary = {
     attempted: current.summary.attempted + next.summary.attempted,
     succeeded: current.summary.succeeded + next.summary.succeeded,
     failed: current.summary.failed + next.summary.failed,
     failed_channels: failedChannels,
+    ...(uncertain > 0
+      ? { uncertain, uncertain_channels: uncertainChannels }
+      : {}),
   };
   const status =
-    summary.failed === 0
-      ? summary.attempted === 0
-        ? 'skipped'
-        : 'success'
-      : summary.succeeded > 0
-        ? 'partial_failed'
-        : 'failed';
+    uncertain > 0
+      ? 'uncertain'
+      : summary.failed === 0
+        ? summary.attempted === 0
+          ? 'skipped'
+          : 'success'
+        : summary.succeeded > 0
+          ? 'partial_failed'
+          : 'failed';
   return {
     status,
     summary,
@@ -2530,13 +2544,16 @@ function failedNotificationReceipt(
   channel: string,
   error: unknown,
 ): TaskRunNotificationReceipt {
+  const deliveryPhase = explicitImDeliveryPhase(error);
+  const uncertain = deliveryPhase === 'uncertain';
   return {
-    status: 'failed',
+    status: uncertain ? 'uncertain' : 'failed',
     summary: {
       attempted: 1,
       succeeded: 0,
       failed: 1,
       failed_channels: [channel],
+      ...(uncertain ? { uncertain: 1, uncertain_channels: [channel] } : {}),
     },
     error: error instanceof Error ? error.message : String(error),
   };
@@ -2567,10 +2584,16 @@ function trackTaskRunNotifications(
     payload?: TaskRunNotificationPayload,
   ) => {
     aggregate = mergeNotificationReceipts(aggregate, receipt);
-    if (receipt.status === 'failed' || receipt.status === 'partial_failed') {
+    if (
+      receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain'
+    ) {
       const retryPayload = payload
         ? payload.kind === 'batch'
-          ? payload
+          ? receipt.status === 'uncertain'
+            ? undefined
+            : payload
           : retryPayloadForReceipt(payload, receipt)
         : undefined;
       // Failure recovery must survive a process crash before the execution
@@ -2611,14 +2634,17 @@ function trackTaskRunNotifications(
       } catch (err) {
         directlyDeliveredJids.delete(jid);
         const receipt = failedNotificationReceipt(jid, err);
+        const retryPayload = retryPayloadForReceipt(payload, receipt);
         // Persist before returning to Agent/script work: the process may crash
         // or continue running for a long time before the owner fallback/finish.
-        recordTaskRunNotificationReceipt(claim.id, receipt, payload);
-        pendingDirectFailure = {
-          jid,
-          receipt,
-          payload,
-        };
+        recordTaskRunNotificationReceipt(claim.id, receipt, retryPayload);
+        if (retryPayload) {
+          pendingDirectFailure = { jid, receipt, payload: retryPayload };
+        } else {
+          // Uncertain delivery is historical evidence, not provisional retry
+          // work that a later fallback may replace or erase.
+          trackPersistedReceipt(receipt);
+        }
         // Notification transport is independent of execution. The durable
         // retry payload above owns recovery; do not turn successful script or
         // Agent work into an execution failure.
@@ -2701,7 +2727,8 @@ function trackTaskRunNotifications(
                   directFailure.payload,
                   receipt,
                   receipt.status === 'failed' ||
-                    receipt.status === 'partial_failed'
+                    receipt.status === 'partial_failed' ||
+                    receipt.status === 'uncertain'
                     ? retryPayloadForReceipt(payload, receipt)
                     : undefined,
                 );
@@ -3152,7 +3179,11 @@ function materializeDueOccurrences(): void {
 function retryPayloadForReceipt(
   payload: TaskRunAtomicNotificationPayload,
   receipt: TaskRunNotificationReceipt,
-): TaskRunAtomicNotificationPayload {
+): TaskRunAtomicNotificationPayload | undefined {
+  const uncertainChannels = new Set(receipt.summary.uncertain_channels ?? []);
+  const retryableFailures =
+    receipt.summary.failed - (receipt.summary.uncertain ?? 0);
+  if (retryableFailures <= 0) return undefined;
   if (
     payload.kind !== 'store_result_and_notify' ||
     !payload.options ||
@@ -3170,8 +3201,9 @@ function retryPayloadForReceipt(
     'discord',
     'whatsapp',
   ]);
-  let failedChannels = receipt.summary.failed_channels.filter((channel) =>
-    knownChannelTypes.has(channel),
+  let failedChannels = receipt.summary.failed_channels.filter(
+    (channel) =>
+      knownChannelTypes.has(channel) && !uncertainChannels.has(channel),
   );
   const originalChannels = payload.options.notifyChannels;
   if (Array.isArray(originalChannels)) {
@@ -3301,9 +3333,13 @@ export async function deliverPersistedNotificationPayload(
       receipt = failedNotificationReceipt(channel, err);
     }
     aggregate = mergeNotificationReceipts(aggregate, receipt);
-    if (receipt.status === 'failed' || receipt.status === 'partial_failed') {
+    if (
+      receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain'
+    ) {
       const retry = retryPayloadForReceipt(item, receipt);
-      failedItems.push(retry);
+      if (retry) failedItems.push(retry);
     }
   }
 

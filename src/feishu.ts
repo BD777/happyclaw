@@ -1,4 +1,3 @@
-import fs from 'fs';
 import { randomUUID } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
@@ -43,8 +42,8 @@ import {
 import { parseChannelAddress, scopeChannelJid } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
-  isFeishuRuntimeControlLike,
-  parseFeishuRuntimeControl,
+  isRuntimeControlLike,
+  parseRuntimeControl,
 } from './follow-up-policy.js';
 import {
   definitiveFeishuHttpRejection,
@@ -55,6 +54,11 @@ import {
   type FeishuCapabilityResult,
 } from './feishu-capability.js';
 import { DefinitiveChannelDeliveryError } from './channel-outbox-delivery.js';
+import {
+  PartialChannelDeliveryError,
+  PhysicalDeliveryTracker,
+} from './im-delivery-progress.js';
+import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
 import { enrichFeishuInboundContent } from './feishu-rich-content.js';
 import {
   FeishuForwardBundleResolver,
@@ -687,6 +691,11 @@ function assertFeishuApiSuccess(operation: string, response: unknown): void {
   // explicit success code so malformed or partial acknowledgements can never
   // make the durable outbox believe an unsent message was delivered. Upload
   // endpoints have a separate unwrapped-payload contract below.
+  if (typeof result.code !== 'number') {
+    throw new Error(
+      `${operation} acknowledgement is missing an explicit success code (code=${String(result.code)})`,
+    );
+  }
   if (result.code !== 0) {
     logger.error(
       { operation, response },
@@ -742,7 +751,7 @@ function requireFeishuUploadKey(
     data?: { image_key?: string; file_key?: string };
   };
   if (typeof result.code === 'number' && result.code !== 0) {
-    throw new Error(
+    throw new FeishuApiRejectedError(
       `${operation} failed (code=${result.code}, msg=${result.msg || 'unknown'})`,
     );
   }
@@ -751,6 +760,26 @@ function requireFeishuUploadKey(
     throw new Error(`${operation} returned no ${key}`);
   }
   return uploadKey;
+}
+
+/**
+ * Uploads and local file reads happen before their corresponding visible
+ * message mutation. A lost upload ACK can waste an upload when retried, but it
+ * cannot duplicate a user-visible message. Preserve authoritative provider
+ * rejections; classify every other failure at this stage as pre-acceptance.
+ */
+function preVisibleFeishuDeliveryError(
+  operation: string,
+  error: unknown,
+): Error {
+  const detail = error instanceof Error ? `: ${error.message}` : '';
+  return (
+    definitiveFeishuChannelDeliveryError(error) ??
+    preAcceptImDeliveryError(
+      `${operation} failed before a visible Feishu message was sent${detail}`,
+      error,
+    )
+  );
 }
 
 export function buildFeishuRouteTarget(
@@ -1887,7 +1916,9 @@ export function createFeishuConnection(
   ): Promise<void> {
     await withFeishuPreAcceptanceRetry(
       async () => {
-        if (!client) throw new Error('Feishu client is not initialized');
+        if (!client) {
+          throw preAcceptImDeliveryError('Feishu client is not initialized');
+        }
         const target = requireFeishuRouteTarget(chatId);
         const receiveIdType = target.chatId.startsWith('oc_')
           ? 'chat_id'
@@ -2207,7 +2238,7 @@ export function createFeishuConnection(
         isGroupOwnerMessage,
         conversationPlan,
       });
-      const runtimeControl = parseFeishuRuntimeControl({
+      const runtimeControl = parseRuntimeControl({
         commandText: textForSlash,
         eligible:
           chatType !== 'group' || (mentionedBot && runtimeControlGate.allow),
@@ -2222,7 +2253,7 @@ export function createFeishuConnection(
         textForSlash = runtimeControl.text;
       }
       const slashMatch = textForSlash.match(/^\/(\S+)(.*)$/);
-      const runtimeControlLike = isFeishuRuntimeControlLike(textForSlash);
+      const runtimeControlLike = isRuntimeControlLike(textForSlash);
       if (
         slashMatch &&
         !requestedFollowUpMode &&
@@ -4048,29 +4079,43 @@ export function createFeishuConnection(
       options?: { presentation?: 'default' | 'native' },
     ): Promise<void> {
       if (!client) {
-        throw new Error('Feishu client is not initialized');
+        throw preAcceptImDeliveryError('Feishu client is not initialized');
       }
 
-      requireFeishuRouteTarget(chatId);
+      try {
+        requireFeishuRouteTarget(chatId);
+      } catch (error) {
+        throw preVisibleFeishuDeliveryError('Feishu route validation', error);
+      }
+      const imagePaths = localImagePaths ?? [];
+      const tracker = new PhysicalDeliveryTracker(1 + imagePaths.length);
 
       try {
-        // Proactive-mode workspace Agents speak as ordinary native rich-text
-        // messages. They never enter the interactive-card presentation lane.
-        if (options?.presentation === 'native') {
-          await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-        } else {
+        await tracker.send(async () => {
+          // Proactive-mode workspace Agents speak as ordinary native rich-text
+          // messages. They never enter the interactive-card presentation lane.
+          if (options?.presentation === 'native') {
+            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
+            return;
+          }
+
+          let prebuiltCard: string | undefined;
           if (text.startsWith('{"type":"interactive"')) {
-            // Detect pre-built Feishu interactive card JSON — send directly
-            // without wrapping.
+            // Parse independently from delivery. A send rejection must never be
+            // swallowed as if the JSON itself were malformed.
             try {
               const parsed = JSON.parse(text);
               if (parsed.type === 'interactive' && parsed.card) {
-                await sendToFeishu(chatId, 'interactive', text);
-                return;
+                prebuiltCard = text;
               }
             } catch {
-              // Not valid card JSON, fall through to normal handling
+              // Not valid card JSON, fall through to normal handling.
             }
+          }
+
+          if (prebuiltCard) {
+            await sendToFeishu(chatId, 'interactive', prebuiltCard);
+            return;
           }
 
           // Count markdown tables to decide format upfront — Feishu cards have
@@ -4080,46 +4125,62 @@ export function createFeishuConnection(
 
           if (usePostMd) {
             await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-          } else {
-            const card = buildInteractiveCard(text);
-            const content = JSON.stringify(card);
-            try {
-              await sendToFeishu(chatId, 'interactive', content);
-            } catch (err) {
-              logger.warn(
-                { err, chatId },
-                'Feishu interactive send failed, fallback to post+md',
-              );
-              await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-            }
+            return;
           }
-        }
+
+          const card = buildInteractiveCard(text);
+          const content = JSON.stringify(card);
+          try {
+            await sendToFeishu(chatId, 'interactive', content);
+          } catch (err) {
+            // A format fallback is a second provider mutation. It is safe only
+            // when the first mutation was authoritatively rejected (including a
+            // transport failure proven to precede TLS/request acceptance).
+            if (!definitiveFeishuChannelDeliveryError(err)) throw err;
+            logger.warn(
+              { err, chatId },
+              'Feishu interactive send was rejected, fallback to post+md',
+            );
+            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
+          }
+        });
         logger.debug(
           { chatId, presentation: options?.presentation ?? 'default' },
           'Sent Feishu message',
         );
 
-        for (const localImagePath of localImagePaths || []) {
+        for (const localImagePath of imagePaths) {
           try {
-            const uploadRes = (await client.im.v1.image.create({
-              data: {
-                image_type: 'message',
-                image: fs.createReadStream(localImagePath),
-              },
-            })) as
-              | { image_key?: string; data?: { image_key?: string } }
-              | null
-              | undefined;
-            const imageKey = requireFeishuUploadKey(
-              'Feishu image.create',
-              uploadRes,
-              'image_key',
-            );
-            await sendToFeishu(
-              chatId,
-              'image',
-              JSON.stringify({ image_key: imageKey }),
-            );
+            await tracker.send(async () => {
+              let imageKey: string;
+              try {
+                const image = await fsPromises.readFile(localImagePath);
+                const uploadRes = (await client!.im.v1.image.create({
+                  data: {
+                    image_type: 'message',
+                    image,
+                  },
+                })) as
+                  | { image_key?: string; data?: { image_key?: string } }
+                  | null
+                  | undefined;
+                imageKey = requireFeishuUploadKey(
+                  'Feishu image.create',
+                  uploadRes,
+                  'image_key',
+                );
+              } catch (error) {
+                throw preVisibleFeishuDeliveryError(
+                  'Feishu image attachment upload',
+                  error,
+                );
+              }
+              await sendToFeishu(
+                chatId,
+                'image',
+                JSON.stringify({ image_key: imageKey }),
+              );
+            });
           } catch (imageErr) {
             logger.error(
               { chatId, localImagePath, err: imageErr },
@@ -4130,6 +4191,7 @@ export function createFeishuConnection(
         }
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Feishu message');
+        if (err instanceof PartialChannelDeliveryError) throw err;
         throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },
@@ -4142,39 +4204,52 @@ export function createFeishuConnection(
       _fileName?: string /* Feishu image API has no filename field, intentionally unused */,
     ): Promise<void> {
       if (!client) {
-        throw new Error('Feishu client is not initialized');
+        throw preAcceptImDeliveryError('Feishu client is not initialized');
       }
 
-      requireFeishuRouteTarget(chatId);
+      try {
+        requireFeishuRouteTarget(chatId);
+      } catch (error) {
+        throw preVisibleFeishuDeliveryError('Feishu route validation', error);
+      }
 
       try {
-        // Step 1: Upload image to Feishu to get image_key
-        const uploadResult = (await client.im.v1.image.create({
-          data: {
-            image_type: 'message',
-            image: imageBuffer,
-          },
-        })) as
-          | { image_key?: string; data?: { image_key?: string } }
-          | null
-          | undefined;
+        const tracker = new PhysicalDeliveryTracker(caption ? 2 : 1);
+        let imageKey: string | undefined;
 
-        const imageKey = requireFeishuUploadKey(
-          'Feishu image.create',
-          uploadResult,
-          'image_key',
-        );
-
-        // Step 2: Send image message
-        await sendToFeishu(
-          chatId,
-          'image',
-          JSON.stringify({ image_key: imageKey }),
-        );
+        // Uploading is pre-visible. Keep it inside the first tracked operation
+        // so only the subsequent message ACK advances physical progress.
+        await tracker.send(async () => {
+          try {
+            const uploadResult = (await client!.im.v1.image.create({
+              data: {
+                image_type: 'message',
+                image: imageBuffer,
+              },
+            })) as
+              | { image_key?: string; data?: { image_key?: string } }
+              | null
+              | undefined;
+            imageKey = requireFeishuUploadKey(
+              'Feishu image.create',
+              uploadResult,
+              'image_key',
+            );
+          } catch (error) {
+            throw preVisibleFeishuDeliveryError('Feishu image upload', error);
+          }
+          await sendToFeishu(
+            chatId,
+            'image',
+            JSON.stringify({ image_key: imageKey }),
+          );
+        });
 
         // Step 3: If caption provided, send it as a follow-up text message
         if (caption) {
-          await sendToFeishu(chatId, 'text', JSON.stringify({ text: caption }));
+          await tracker.send(() =>
+            sendToFeishu(chatId, 'text', JSON.stringify({ text: caption })),
+          );
         }
         logger.info(
           { chatId, imageKey, mimeType, size: imageBuffer.length },
@@ -4182,6 +4257,7 @@ export function createFeishuConnection(
         );
       } catch (err) {
         logger.error({ err, chatId, mimeType }, 'Failed to send Feishu image');
+        if (err instanceof PartialChannelDeliveryError) throw err;
         throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },
@@ -4192,19 +4268,28 @@ export function createFeishuConnection(
       fileName: string,
     ): Promise<void> {
       if (!client) {
-        throw new Error('Feishu client is not initialized');
+        throw preAcceptImDeliveryError('Feishu client is not initialized');
       }
 
-      requireFeishuRouteTarget(chatId);
+      try {
+        requireFeishuRouteTarget(chatId);
+      } catch (error) {
+        throw preVisibleFeishuDeliveryError('Feishu route validation', error);
+      }
 
       try {
-        const buffer = await fsPromises.readFile(filePath);
+        let buffer: Buffer;
+        try {
+          buffer = await fsPromises.readFile(filePath);
+        } catch (error) {
+          throw preVisibleFeishuDeliveryError('Feishu file read', error);
+        }
 
         // Check file size limit (30MB)
         const MAX_FILE_SIZE = 30 * 1024 * 1024;
         if (buffer.length > MAX_FILE_SIZE) {
-          throw new Error(
-            `文件大小超过 30MB 限制 (${(buffer.length / 1024 / 1024).toFixed(2)}MB)`,
+          throw preAcceptImDeliveryError(
+            `Feishu file exceeds the 30MB limit (${(buffer.length / 1024 / 1024).toFixed(2)}MB)`,
           );
         }
 
@@ -4212,22 +4297,27 @@ export function createFeishuConnection(
         const fileType = getFileType(ext);
 
         // Upload file
-        const uploadResult = (await client.im.v1.file.create({
-          data: {
-            file_type: fileType,
-            file_name: fileName,
-            file: buffer,
-          },
-        })) as
-          | { file_key?: string; data?: { file_key?: string } }
-          | null
-          | undefined;
+        let fileKey: string;
+        try {
+          const uploadResult = (await client.im.v1.file.create({
+            data: {
+              file_type: fileType,
+              file_name: fileName,
+              file: buffer,
+            },
+          })) as
+            | { file_key?: string; data?: { file_key?: string } }
+            | null
+            | undefined;
 
-        const fileKey = requireFeishuUploadKey(
-          'Feishu file.create',
-          uploadResult,
-          'file_key',
-        );
+          fileKey = requireFeishuUploadKey(
+            'Feishu file.create',
+            uploadResult,
+            'file_key',
+          );
+        } catch (error) {
+          throw preVisibleFeishuDeliveryError('Feishu file upload', error);
+        }
 
         // Determine msg_type: Feishu requires upload file_type and send msg_type to match.
         // mp4 → media (video message), opus → audio (audio message), others → file.
@@ -4235,10 +4325,9 @@ export function createFeishuConnection(
           fileType === 'mp4' ? 'media' : fileType === 'opus' ? 'audio' : 'file';
 
         // Send file message
-        await sendToFeishu(
-          chatId,
-          msgType,
-          JSON.stringify({ file_key: fileKey }),
+        const tracker = new PhysicalDeliveryTracker(1);
+        await tracker.send(() =>
+          sendToFeishu(chatId, msgType, JSON.stringify({ file_key: fileKey })),
         );
         logger.info(
           { chatId, fileName, fileSize: buffer.length },
@@ -4249,6 +4338,7 @@ export function createFeishuConnection(
           { err, chatId, filePath },
           'Failed to send file to Feishu',
         );
+        if (err instanceof PartialChannelDeliveryError) throw err;
         throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },

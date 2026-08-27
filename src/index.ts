@@ -18,8 +18,21 @@ import {
 } from './config.js';
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
-import { imSendFailurePolicy } from './im-send-retry-policy.js';
+import {
+  classifyImSendFailure,
+  ImDeliveryPhaseError,
+  imSendFailurePolicy,
+  isUncertainAfterAcceptImError,
+  retryUnscopedImSend,
+  type ImSendFailureRef,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
+import {
+  deliverTextAndLocalImages,
+  prepareLocalImages,
+  type PreparedLocalImage,
+} from './im-local-attachments.js';
 import {
   acknowledgeIpcReplyTurn,
   decideAssistantPrimaryProjection,
@@ -27,6 +40,7 @@ import {
   occupiesPrimaryReplyDeliverySlot,
   resolveScheduledGroupDeliveryContract,
   resolveScheduledProactiveArchiveCandidate,
+  resolveStreamingCardReplyAcknowledgement,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
   shouldFinalizeScheduledGroupPrimaryResult,
@@ -58,6 +72,7 @@ import {
 export { buildInterruptedReply } from './reply-finalization.js';
 import { resolveTurnOutcome } from './turn-outcome.js';
 import { finalizeChannelCardAfterDelivery } from './channel-card-finalization.js';
+import { persistUncertainStreamingDelivery } from './channel-streaming-uncertainty.js';
 import { resolveContainerOutputInputTurnId } from './channel-output-correlation.js';
 import { SteeringTransitionRegistry } from './steering-transition.js';
 import {
@@ -65,7 +80,7 @@ import {
   type ProcessingIndicatorInput,
   type ProcessingIndicatorOwner,
 } from './processing-indicator-batch.js';
-import { resolveFeishuFollowUpMode } from './follow-up-policy.js';
+import { resolveFollowUpMode } from './follow-up-policy.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
 import {
   DeferredOutOfBandCursorLedger,
@@ -92,9 +107,13 @@ import {
   decideStuckRunnerRecovery,
   resolveRunnerCpuActivity,
 } from './stuck-runner-recovery.js';
+import { parseStuckRunnerForceRestartMs } from './stuck-runner-config.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
-import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
+import {
+  PROVIDER_FAILURE_USER_NOTICE,
+  resolveProviderFailureClass,
+} from './provider-failure.js';
 import {
   closeDatabase,
   createTask,
@@ -271,10 +290,14 @@ import {
 } from './channel-outbox-runtime-scope.js';
 import {
   cleanupChannelReliability,
+  getDeliveredChannelOutboxForTurn,
+  getFailedChannelOutboxForTurn,
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
   CHANNEL_RELIABILITY_TERMINAL_STATUSES,
+  type ChannelOutboxItem,
 } from './channel-reliability-store.js';
+import { prepareWeChatTextChunks } from './wechat-outbound.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp-auth.js';
@@ -344,6 +367,7 @@ import {
 import {
   buildFailedTaskImageNotification,
   settleTaskNotificationDeliveries,
+  taskNotificationPreAcceptFailure,
   type TaskNotificationDeliveryAttempt,
 } from './task-notification.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
@@ -1275,10 +1299,12 @@ const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 3 * 60 * 1000;
-// Recovery grace is bounded at 10 minutes. IPC-injected work measures this
+// Recovery grace ceiling. IPC-injected work measures this
 // against its dedicated debt clock so ordinary runner output cannot postpone
 // the ceiling; other candidates use their uninterrupted idle age (#618).
-const STUCK_RUNNER_FORCE_RESTART_MS = 10 * 60 * 1000;
+const STUCK_RUNNER_FORCE_RESTART_MS = parseStuckRunnerForceRestartMs(
+  process.env.STUCK_RUNNER_FORCE_RESTART_MINUTES,
+);
 let stuckRunnerCheckCounter = 0;
 
 // OOM auto-recovery: track consecutive OOM (exit code 137) exits per folder.
@@ -2654,13 +2680,48 @@ interface ChannelOutboxDeliveryRef {
   ordinalSlot?: string;
 }
 
+function childChannelOutboxRef(
+  ref: ChannelOutboxDeliveryRef,
+  suffix: string,
+): ChannelOutboxDeliveryRef {
+  return {
+    ...ref,
+    operationKey: `${ref.operationKey}:${suffix}`,
+    ordinalSlot: `${ref.ordinalSlot ?? 'message'}:${suffix}`,
+  };
+}
+
 class ScopedChannelDeliveryError extends Error {
+  readonly deliveryPhase: 'rejected' | 'uncertain';
+
   constructor(
     readonly status: Exclude<ChannelOutboxDeliveryOutcome, 'delivered'>,
     message: string,
+    options: { cause?: unknown } = {},
   ) {
-    super(message);
+    super(
+      message,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
     this.name = 'ScopedChannelDeliveryError';
+    this.deliveryPhase = status === 'failed' ? 'rejected' : 'uncertain';
+  }
+}
+
+class ScopedChannelPartialDeliveryError extends ScopedChannelDeliveryError {
+  readonly code = 'CHANNEL_DELIVERY_PARTIAL';
+
+  constructor(
+    readonly deliveredOutputs: number,
+    readonly totalOutputs: number,
+    tail: ScopedChannelDeliveryError,
+  ) {
+    super(
+      tail.status,
+      `Channel delivery is partial: ${deliveredOutputs}/${totalOutputs} physical outputs were acknowledged; ${tail.message}`,
+      { cause: tail },
+    );
+    this.name = 'ScopedChannelPartialDeliveryError';
   }
 }
 
@@ -2726,7 +2787,7 @@ async function deliverScopedChannelOutput(
   input: {
     kind: 'text' | 'card' | 'image' | 'file';
     payload: unknown;
-    send: () => Promise<void>;
+    send: (item: ChannelOutboxItem) => Promise<void>;
     failure?: { error?: unknown };
   },
 ): Promise<boolean | null> {
@@ -2749,6 +2810,12 @@ async function deliverScopedChannelOutput(
       },
       'Suppressed channel side effect because its exact outbox scope is unavailable',
     );
+    if (input.failure) {
+      input.failure.error = new ScopedChannelDeliveryError(
+        'failed',
+        'Exact outbox scope is unavailable',
+      );
+    }
     return false;
   }
   // The scope projection deliberately outlives a single input turn so a late
@@ -2773,6 +2840,12 @@ async function deliverScopedChannelOutput(
       },
       'Suppressed channel side effect because its turn already closed its output window',
     );
+    if (input.failure) {
+      input.failure.error = new ScopedChannelDeliveryError(
+        'cancelled',
+        'Channel turn already closed its output window',
+      );
+    }
     return false;
   }
   const uncertainSibling = getUncertainChannelOutboxForTurn(scope.turnRunId);
@@ -2786,6 +2859,13 @@ async function deliverScopedChannelOutput(
       },
       'Blocked channel side effect until uncertain turn is manually reconciled',
     );
+    if (input.failure) {
+      input.failure.error = new ScopedChannelDeliveryError(
+        'uncertain',
+        uncertainSibling.error ??
+          'Earlier physical channel output is uncertain; automatic replay is blocked',
+      );
+    }
     return false;
   }
   const semanticIdentity = semanticChannelOutboxIdentity({
@@ -2812,7 +2892,7 @@ async function deliverScopedChannelOutput(
       mode: 'single',
       send: async ({ item }) => {
         // deliverChannelOutboxItem persists `sending` before entering here.
-        await input.send();
+        await input.send(item);
         return {
           providerMessageId: syntheticChannelProviderAck({
             turnRunId: scope.turnRunId,
@@ -2851,32 +2931,31 @@ async function retryImOperation(
   label: string,
   imJid: string,
   fn: () => Promise<void>,
-  failure?: { error?: unknown },
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
-  for (let attempt = 0; attempt < IM_SEND_MAX_RETRIES; attempt++) {
-    try {
-      await fn();
-      return true;
-    } catch (err) {
-      if (failure) failure.error = err;
+  const result = await retryUnscopedImSend(fn, {
+    maxAttempts: IM_SEND_MAX_RETRIES,
+    delayMs: IM_SEND_RETRY_DELAY_MS,
+    onAttemptFailure: (err, attempt) => {
+      if (failure) {
+        failure.error = err;
+        failure.outcome = classifyImSendFailure(err);
+      }
       logger.warn(
         { imJid, attempt, label, err },
         'IM operation attempt failed',
       );
-      // A WeChat context token can only be refreshed by a new inbound user
-      // message. Retrying the identical send cannot succeed and historically
-      // contributed to the generic failure counter, eventually deleting a
-      // healthy paired chat.
-      if (!imSendFailurePolicy(err).retryable) break;
-      if (attempt < IM_SEND_MAX_RETRIES - 1) {
-        await new Promise((r) =>
-          setTimeout(r, IM_SEND_RETRY_DELAY_MS * (attempt + 1)),
-        );
-      }
-    }
+    },
+  });
+  if (failure) {
+    failure.error = result.error;
+    failure.outcome =
+      result.outcome === 'delivered' ? undefined : result.outcome;
   }
-  logger.error({ imJid, label }, 'IM operation failed after all retries');
-  return false;
+  if (!result.ok) {
+    logger.error({ imJid, label }, 'IM operation failed after all retries');
+  }
+  return result.ok;
 }
 
 /**
@@ -2894,49 +2973,100 @@ async function sendImWithRetry(
     inputTurnId?: string | null;
     logicalChatJid?: string | null;
   },
-  failure?: { error?: unknown },
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
   let ok: boolean;
   const sendFailure = failure ?? {};
   const durableScoped = outbox !== undefined;
   if (durableScoped) {
     ok = true;
-    if (text) {
+    const weChat = getChannelType(imJid) === 'wechat';
+    const textChunks = text
+      ? weChat
+        ? prepareWeChatTextChunks(text)
+        : [text]
+      : [];
+    const totalPhysicalOutputs = textChunks.length + localImagePaths.length;
+    let deliveredOutputs = 0;
+
+    const recordTailFailure = (tail: unknown): void => {
+      const scopedTail =
+        tail instanceof ScopedChannelDeliveryError
+          ? tail
+          : new ScopedChannelDeliveryError(
+              'busy',
+              tail instanceof Error
+                ? tail.message
+                : 'Physical channel output did not complete',
+              { cause: tail },
+            );
+      sendFailure.error =
+        deliveredOutputs > 0
+          ? new ScopedChannelPartialDeliveryError(
+              deliveredOutputs,
+              totalPhysicalOutputs,
+              scopedTail,
+            )
+          : scopedTail;
+    };
+
+    for (let index = 0; index < textChunks.length; index++) {
+      const chunk = textChunks[index]!;
+      const chunkFailure: { error?: unknown } = {};
       const delivered = await deliverScopedChannelOutput(
         imJid,
-        {
-          ...outbox!,
-          operationKey: `${outbox!.operationKey}:text`,
-          ordinalSlot: `${outbox!.ordinalSlot ?? 'message'}:text`,
-        },
+        childChannelOutboxRef(outbox!, weChat ? `text:${index}` : 'text'),
         {
           kind: 'text',
           payload: buildInteractionTextOutboxPayload(
-            text,
+            chunk,
             deliveryOptions?.presentation,
             outboxMetadata,
           ),
-          send: () => imManager.sendMessage(imJid, text, [], deliveryOptions),
-          failure: sendFailure,
+          send: (item) =>
+            imManager.sendMessage(imJid, chunk, [], {
+              ...deliveryOptions,
+              deliveryId: item.id,
+              chunkIndex: index,
+              physicalOutput: weChat,
+            }),
+          failure: chunkFailure,
         },
       );
-      ok = delivered === true;
+      if (delivered !== true) {
+        ok = false;
+        recordTailFailure(chunkFailure.error);
+        break;
+      }
+      deliveredOutputs += 1;
     }
-    for (let index = 0; index < localImagePaths.length; index++) {
+
+    for (let index = 0; ok && index < localImagePaths.length; index++) {
       const imagePath = localImagePaths[index];
-      const imageBuffer = fs.readFileSync(imagePath);
-      const contentHash = crypto
-        .createHash('sha256')
-        .update(imageBuffer)
-        .digest('hex');
-      const mimeType = detectImageMimeType(imageBuffer);
+      let imageBuffer: Buffer;
+      let contentHash: string;
+      let mimeType: string;
+      try {
+        imageBuffer = fs.readFileSync(imagePath);
+        contentHash = crypto
+          .createHash('sha256')
+          .update(imageBuffer)
+          .digest('hex');
+        mimeType = detectImageMimeType(imageBuffer);
+      } catch (error) {
+        ok = false;
+        recordTailFailure(
+          new ScopedChannelDeliveryError(
+            'failed',
+            `Image attachment preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          ),
+        );
+        break;
+      }
       const delivered = await deliverScopedChannelOutput(
         imJid,
-        {
-          ...outbox!,
-          operationKey: `${outbox!.operationKey}:image:${index}`,
-          ordinalSlot: `${outbox!.ordinalSlot ?? 'message'}:image:${index}`,
-        },
+        childChannelOutboxRef(outbox!, `image:${index}`),
         {
           kind: 'image',
           payload: {
@@ -2945,27 +3075,111 @@ async function sendImWithRetry(
           },
           // One physical attachment per outbox row. A later attachment failure
           // therefore cannot cause the already delivered body to be resent.
-          send: () =>
+          send: (item) =>
             imManager.sendImage(
               imJid,
               imageBuffer,
               mimeType,
               undefined,
               path.basename(imagePath),
+              {
+                deliveryId: item.id,
+                chunkIndex: textChunks.length + index,
+                physicalOutput: weChat,
+              },
             ),
           failure: sendFailure,
         },
       );
-      if (delivered !== true) ok = false;
+      if (delivered !== true) {
+        ok = false;
+        recordTailFailure(sendFailure.error);
+        break;
+      }
+      deliveredOutputs += 1;
     }
   } else {
-    ok = await retryImOperation(
-      'send_message',
-      imJid,
-      () =>
-        imManager.sendMessage(imJid, text, localImagePaths, deliveryOptions),
-      sendFailure,
+    const connectorDeliveryOptions: ChannelMessageDeliveryOptions = {
+      ...deliveryOptions,
+      deliveryId: deliveryOptions?.deliveryId ?? crypto.randomUUID(),
+      chunkIndex: deliveryOptions?.chunkIndex ?? 0,
+    };
+    let preparedImages: PreparedLocalImage[];
+    let textPhysicalOutputs: number;
+    try {
+      preparedImages = prepareLocalImages(localImagePaths);
+      const sendsText = text.length > 0 || preparedImages.length === 0;
+      textPhysicalOutputs = sendsText
+        ? getChannelType(imJid) === 'wechat'
+          ? prepareWeChatTextChunks(text).length
+          : 1
+        : 0;
+    } catch (error) {
+      const preflightError = preAcceptImDeliveryError(
+        'Local image attachment preflight failed before provider send',
+        error,
+      );
+      sendFailure.error = preflightError;
+      sendFailure.outcome = 'pre_accept';
+      if (failure) {
+        failure.error = preflightError;
+        failure.outcome = 'pre_accept';
+      }
+      logger.error(
+        { imJid, err: preflightError },
+        'IM local image preflight failed',
+      );
+      return false;
+    }
+    // Task/notice sends have no outbox fence. An ETIMEDOUT after the
+    // provider accepted the request must not physically resend.
+    const result = await retryUnscopedImSend(
+      async () => {
+        await deliverTextAndLocalImages({
+          text,
+          images: preparedImages,
+          sendText: () =>
+            imManager.sendMessage(imJid, text, [], connectorDeliveryOptions),
+          sendImage: (image, index) =>
+            imManager.sendImage(
+              imJid,
+              image.buffer,
+              image.mimeType,
+              undefined,
+              image.fileName,
+              {
+                ...connectorDeliveryOptions,
+                chunkIndex:
+                  (connectorDeliveryOptions.chunkIndex ?? 0) +
+                  textPhysicalOutputs +
+                  index,
+                physicalOutput: getChannelType(imJid) === 'wechat',
+              },
+            ),
+        });
+      },
+      {
+        maxAttempts: IM_SEND_MAX_RETRIES,
+        delayMs: IM_SEND_RETRY_DELAY_MS,
+        onAttemptFailure: (err, attempt) => {
+          sendFailure.error = err;
+          logger.warn(
+            { imJid, attempt, label: 'send_message', err },
+            'IM operation attempt failed',
+          );
+        },
+      },
     );
+    if (result.error !== undefined) sendFailure.error = result.error;
+    sendFailure.outcome =
+      result.outcome === 'delivered' ? undefined : result.outcome;
+    ok = result.ok;
+    if (!ok) {
+      logger.error(
+        { imJid, label: 'send_message' },
+        'IM operation failed after all retries',
+      );
+    }
   }
   if (ok) {
     imSendFailCounts.delete(imJid);
@@ -2974,6 +3188,7 @@ async function sendImWithRetry(
   // `uncertain` is not evidence that the channel is unhealthy. In particular,
   // do not auto-unbind a Bot merely because its ACK was lost after acceptance.
   if (durableScoped) return false;
+  if (isUncertainAfterAcceptImError(sendFailure.error)) return false;
   // Missing/expired/quota-exhausted WeChat context is a user-refreshable
   // delivery prerequisite, not evidence that the chat itself is dead.
   if (!imSendFailurePolicy(sendFailure.error).countsTowardChannelRemoval) {
@@ -2998,7 +3213,9 @@ async function sendImWithRetry(
 const CHANNEL_MANUAL_RECONCILIATION_NOTICE =
   '刚才的回复可能没有完整送达。为避免重复消息，系统未自动重发；如内容不完整，重新发送问题即可。';
 const CHANNEL_DEFINITIVE_REJECTION_NOTICE =
-  '刚才的回复未能送达飞书，完整内容已保存在 HappyClaw Web。你可以前往 Web 查看，或稍后重新发送问题。';
+  '刚才的回复未能送达当前渠道，完整内容已保存在 HappyClaw Web。你可以前往 Web 查看，或稍后重新发送问题。';
+const CHANNEL_PARTIAL_REJECTION_NOTICE =
+  '刚才的回复仅部分送达当前渠道，完整内容已保存在 HappyClaw Web。为避免重复消息，系统未自动重发。';
 
 /**
  * Surface a crash-after-delivery fence to the exact native route. The notice
@@ -3043,6 +3260,43 @@ async function deliverChannelManualReconciliationNotice(input: {
     'delivery_uncertain',
     CHANNEL_MANUAL_RECONCILIATION_NOTICE,
   );
+  return true;
+}
+
+async function deliverChannelDefinitiveFailureNotice(input: {
+  logicalChatJid: string;
+  scopeKey: string;
+  targetJid: string;
+  runtime: ChannelTurnRuntime;
+  agentId?: string | null;
+  presentation?: 'default' | 'native';
+  partial?: boolean;
+  route: {
+    provider: string;
+    accountId: string;
+    sourceJid: string;
+    chatId: string;
+    rootId?: string | null;
+    threadId?: string | null;
+  };
+}): Promise<boolean> {
+  const noticeText = input.partial
+    ? CHANNEL_PARTIAL_REJECTION_NOTICE
+    : CHANNEL_DEFINITIVE_REJECTION_NOTICE;
+  const delivered = await deliverIndependentChannelSystemNotice({
+    logicalChatJid: input.logicalChatJid,
+    scopeKey: input.scopeKey,
+    targetJid: input.targetJid,
+    route: input.route,
+    agentId: input.agentId,
+    originalInputTurnId: input.runtime.inputTurnId,
+    originalRunId: input.runtime.runId,
+    noticeKey: 'definitive-delivery-failure',
+    text: noticeText,
+    presentation: input.presentation,
+  });
+  if (delivered) return true;
+  sendSystemMessage(input.logicalChatJid, 'delivery_rejected', noticeText);
   return true;
 }
 
@@ -3261,25 +3515,102 @@ async function sendTaskImageWithRetry(
   caption?: string,
   fileName?: string,
   outbox?: ChannelOutboxDeliveryRef,
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
-  const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
+  const channelType = getChannelType(targetJid);
+  const separatesImageCaption =
+    channelType === 'wechat' ||
+    channelType === 'dingtalk' ||
+    channelType === 'wecom';
+  let effectiveOutbox = outbox;
+  let effectiveCaption = caption;
+  let captionChunkCount = 0;
+
+  if (separatesImageCaption && outbox && caption) {
+    const captionChunks =
+      channelType === 'wechat' ? prepareWeChatTextChunks(caption) : [caption];
+    captionChunkCount = captionChunks.length;
+    let acknowledgedCaptions = 0;
+    for (let index = 0; index < captionChunks.length; index++) {
+      const chunk = captionChunks[index]!;
+      const delivered = await deliverScopedChannelOutput(
+        targetJid,
+        childChannelOutboxRef(outbox, `caption:${index}`),
+        {
+          kind: 'text',
+          payload: { text: chunk, role: 'image_caption' },
+          send: (item) =>
+            imManager.sendMessage(targetJid, chunk, [], {
+              deliveryId: item.id,
+              chunkIndex: index,
+              physicalOutput: true,
+            }),
+        },
+      );
+      if (delivered !== true) {
+        if (acknowledgedCaptions > 0) {
+          logger.warn(
+            {
+              targetJid,
+              acknowledgedOutputs: acknowledgedCaptions,
+              totalOutputs: captionChunks.length + 1,
+            },
+            'Image delivery is partial after caption chunk failure',
+          );
+        }
+        return false;
+      }
+      acknowledgedCaptions += 1;
+    }
+    effectiveCaption = undefined;
+    effectiveOutbox = childChannelOutboxRef(outbox, 'image');
+  }
+
+  const scoped = await deliverScopedChannelOutput(targetJid, effectiveOutbox, {
     kind: 'image',
     payload: {
       mimeType,
-      caption: caption ?? null,
+      caption: effectiveCaption ?? null,
       fileName: fileName ?? null,
       contentHash: crypto
         .createHash('sha256')
         .update(imageBuffer)
         .digest('hex'),
     },
-    send: () =>
-      imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+    send: (item) =>
+      imManager.sendImage(
+        targetJid,
+        imageBuffer,
+        mimeType,
+        effectiveCaption,
+        fileName,
+        {
+          deliveryId: item.id,
+          chunkIndex: captionChunkCount,
+          physicalOutput: separatesImageCaption,
+        },
+      ),
   });
-  if (scoped !== null) return scoped;
-  return retryImOperation('send_task_image', targetJid, () =>
-    imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+  if (scoped !== null) {
+    if (!scoped && captionChunkCount > 0) {
+      logger.warn(
+        {
+          targetJid,
+          acknowledgedOutputs: captionChunkCount,
+          totalOutputs: captionChunkCount + 1,
+        },
+        'Image delivery is partial after image send failure',
+      );
+    }
+    return scoped;
+  }
+  return retryImOperation(
+    'send_task_image',
+    targetJid,
+    () =>
+      imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+    failure,
   );
 }
 
@@ -3288,6 +3619,7 @@ async function sendTaskFileWithRetry(
   filePath: string,
   fileName: string,
   outbox?: ChannelOutboxDeliveryRef,
+  failure?: ImSendFailureRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
   const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
@@ -3299,11 +3631,19 @@ async function sendTaskFileWithRetry(
         .update(fs.readFileSync(filePath))
         .digest('hex'),
     },
-    send: () => imManager.sendFile(targetJid, filePath, fileName),
+    send: (item) =>
+      imManager.sendFile(targetJid, filePath, fileName, {
+        deliveryId: item.id,
+        chunkIndex: 0,
+        physicalOutput: getChannelType(targetJid) === 'wechat',
+      }),
   });
   if (scoped !== null) return scoped;
-  return retryImOperation('send_task_file', targetJid, () =>
-    imManager.sendFile(targetJid, filePath, fileName),
+  return retryImOperation(
+    'send_task_file',
+    targetJid,
+    () => imManager.sendFile(targetJid, filePath, fileName),
+    failure,
   );
 }
 
@@ -6349,6 +6689,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         })
       : undefined;
   const channelTurnRuntimes = new Map<string, ChannelTurnRuntime>();
+  let channelDefinitiveFailureSettled = false;
   if (channelTurnRuntime) {
     channelTurnRuntimes.set(lastProcessed.id, channelTurnRuntime);
   }
@@ -6386,6 +6727,39 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             })
           : false;
         if (interrupted && notified) {
+          await clearProcessingIndicatorForInput(inputId);
+          runtime.dispose();
+          channelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
+        continue;
+      }
+      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+      if (failedDelivery) {
+        const partialFailure = Boolean(
+          getDeliveredChannelOutboxForTurn(runtime.runId),
+        );
+        const failed = runtime.fail(
+          partialFailure
+            ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+            : `Channel delivery ${failedDelivery.id} was definitively rejected`,
+        );
+        const exactScope = channelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelDefinitiveFailureNotice({
+              logicalChatJid: chatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              partial: partialFailure,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : true;
+        if (failed && notified) {
+          channelDefinitiveFailureSettled = true;
           await clearProcessingIndicatorForInput(inputId);
           runtime.dispose();
           channelTurnRuntimes.delete(inputId);
@@ -8556,6 +8930,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // prevents a completed card from claiming success while one of
               // its files is still missing.
               let pendingStreamingCardCompleted = false;
+              let streamingCardDeliveryUncertain = false;
+              let cardFinalizationAllowsStaticFallback = false;
+              let postFinalizationStaticRequired = false;
+              let postFinalizationStaticDelivered = false;
               if (pendingStreamingCardCompletion) {
                 if (localImagePaths.length > 0 && outputReplySourceJid) {
                   for (
@@ -8609,13 +8987,48 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     : '附件投递未确认，系统将重试',
                 );
                 pendingStreamingCardCompleted = cardFinalization.acknowledged;
+                const acknowledgedProviderOutputs = Math.max(
+                  0,
+                  pendingStreamingCardCompletion.getAcknowledgedProviderOutputCount?.() ??
+                    0,
+                );
+                cardFinalizationAllowsStaticFallback =
+                  !pendingStreamingCardCompleted &&
+                  acknowledgedProviderOutputs === 0 &&
+                  (!cardFinalization.error ||
+                    classifyImSendFailure(cardFinalization.error) !==
+                      'uncertain');
                 if (pendingStreamingCardCompleted) {
                   heldUsagePatchTarget = pendingStreamingCardCompletion;
                   heldCardParts = [];
                 } else if (cardFinalization.error) {
+                  streamingCardDeliveryUncertain =
+                    classifyImSendFailure(cardFinalization.error) ===
+                    'uncertain';
+                  const fenced = outputChannelScope.scope
+                    ? await persistUncertainStreamingDelivery({
+                        scope: outputChannelScope.scope,
+                        operationKey: `streaming-card-final:${outputChannelScope.inputId}:${durableOutputIdentity}`,
+                        payload: {
+                          role: 'primary_stream_final',
+                          contentHash: crypto
+                            .createHash('sha256')
+                            .update(dbText)
+                            .digest('hex'),
+                        },
+                        error: cardFinalization.error,
+                      })
+                    : null;
                   logger.warn(
-                    { cardError: cardFinalization.error, chatJid },
-                    'Streaming card final ACK failed; keeping the channel turn retryable',
+                    {
+                      cardError: cardFinalization.error,
+                      chatJid,
+                      streamingCardDeliveryUncertain,
+                      uncertaintyPersisted: fenced?.status === 'uncertain',
+                    },
+                    streamingCardDeliveryUncertain
+                      ? 'Streaming card final ACK is uncertain; fenced for manual reconciliation'
+                      : 'Streaming card final ACK was rejected before acceptance; using exact static fallback',
                   );
                 } else {
                   logger.error(
@@ -8626,7 +9039,41 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
                 // A provisional active card is not a delivery ACK.  Failed
                 // attachment/card completion must flow into the retry path.
-                streamingCardHandledIM = pendingStreamingCardCompleted;
+                // An uncertain stream may already be visible. Treat it as the
+                // sole native presentation so no static fallback can duplicate
+                // it; it is deliberately not a delivery acknowledgement.
+                streamingCardHandledIM =
+                  pendingStreamingCardCompleted ||
+                  streamingCardDeliveryUncertain;
+                if (
+                  !streamingCardHandledIM &&
+                  cardFinalizationAllowsStaticFallback &&
+                  (scheduledGroupRuns.length === 0 ||
+                    scheduledGroupDeliveryContract.frameworkDeliversFinalText) &&
+                  directImReply &&
+                  !routeSwitchedAway &&
+                  !routeCleared
+                ) {
+                  postFinalizationStaticRequired = true;
+                  // Main persists its DB/Web projection before terminalizing
+                  // the provider card. If that first provider mutation is
+                  // authoritatively rejected, the original static-send window
+                  // has already passed; deliver the exact same Outbox text row
+                  // now. Card attachments were handled above and must not be
+                  // replayed with the text fallback.
+                  postFinalizationStaticDelivered = await sendImWithRetry(
+                    chatJid,
+                    text,
+                    [],
+                    outputChannelScope.scope
+                      ? {
+                          scopeKey: channelTurnScope(effectiveGroup.folder),
+                          scopeToken: outputChannelScope.scope.token,
+                          operationKey: `main:${lastProcessed.id}:${effectiveTurnId}:${durableOutputIdentity}`,
+                        }
+                      : undefined,
+                  );
+                }
                 if (pendingStreamingCardCompleted) {
                   channelStreamingSessionsByInput.delete(
                     outputChannelScope.inputId,
@@ -8646,9 +9093,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // card. Any separately emitted local image is part of the same
               // logical reply and must also be durably ACKed before the turn can
               // advance its cursor.
-              let replyDeliveryAcknowledged = streamingCardHandledIM
-                ? streamingCardAttachmentsDelivered
-                : replySendOutcome.targetDelivered;
+              let replyDeliveryAcknowledged =
+                resolveStreamingCardReplyAcknowledgement({
+                  streamingDeliveryUncertain: streamingCardDeliveryUncertain,
+                  streamingCardHandled: streamingCardHandledIM,
+                  attachmentsDelivered: streamingCardAttachmentsDelivered,
+                  postFinalizationStaticRequired,
+                  postFinalizationStaticDelivered,
+                  projectedTargetDelivered: replySendOutcome.targetDelivered,
+                });
               // A Web-only group-mode task must not replay Agent work after
               // its canonical projection failure has been persisted for
               // idempotent notification-worker repair.
@@ -8670,10 +9123,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // Streaming card already handles IM delivery for the first reply.
               if (outputReplySourceJid && outputReplySourceJid !== chatJid) {
                 if (!streamingCardHandledIM && !outputAlreadySent) {
-                  replyDeliveryAcknowledged = await sendImWithRetry(
+                  const routedFallbackDelivered = await sendImWithRetry(
                     outputReplySourceJid,
                     text,
-                    localImagePaths,
+                    pendingStreamingCardCompletion ? [] : localImagePaths,
                     outputChannelScope.scope
                       ? {
                           scopeKey: channelTurnScope(effectiveGroup.folder),
@@ -8682,6 +9135,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                         }
                       : undefined,
                   );
+                  replyDeliveryAcknowledged =
+                    routedFallbackDelivered &&
+                    streamingCardAttachmentsDelivered;
                 }
               }
 
@@ -8803,7 +9259,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
               if (
                 result.inputTurnCompleted &&
-                replyDeliveryAcknowledged &&
+                (replyDeliveryAcknowledged ||
+                  Boolean(
+                    outputChannelScope.scope &&
+                    getFailedChannelOutboxForTurn(
+                      outputChannelScope.scope.turnRunId,
+                    ),
+                  )) &&
                 (await completeChannelRuntimesForOutput(result))
               ) {
                 commitCursor(outputChannelScope.inputId);
@@ -8894,7 +9356,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           await streamingSession.abort(heldNote).catch(() => {});
         } else if (providerFailoverPending) {
           await streamingSession
-            .abort('模型服务切换中，正在重试')
+            .abort('模型服务暂时异常，正在重试')
             .catch(() => {});
         } else if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
@@ -8964,7 +9426,34 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
         );
-        if (uncertainDelivery) {
+        const failedDelivery = uncertainDelivery
+          ? undefined
+          : getFailedChannelOutboxForTurn(runtime.runId);
+        if (failedDelivery) {
+          const partialFailure = Boolean(
+            getDeliveredChannelOutboxForTurn(runtime.runId),
+          );
+          settled = runtime.fail(
+            partialFailure
+              ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+              : `Channel delivery ${failedDelivery.id} was definitively rejected`,
+          );
+          const exactScope = channelOutboxScopesByInput.get(inputTurnId);
+          await (exactScope?.chatId
+            ? deliverChannelDefinitiveFailureNotice({
+                logicalChatJid: chatJid,
+                scopeKey: channelTurnScope(effectiveGroup.folder),
+                targetJid: exactScope.sourceJid,
+                runtime,
+                partial: partialFailure,
+                presentation:
+                  interactionMode === 'proactive' ? 'native' : 'default',
+                route: { ...exactScope, chatId: exactScope.chatId },
+              })
+            : Promise.resolve(true));
+          terminal = settled;
+          channelDefinitiveFailureSettled ||= settled;
+        } else if (uncertainDelivery) {
           channelDeliveryNeedsManualReconciliation = true;
           settled = runtime.interrupt(
             `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
@@ -9051,6 +9540,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (channelDeliveryNeedsManualReconciliation) {
         if (channelManualNoticesAcknowledged) commitCursor();
       }
+      if (channelDefinitiveFailureSettled) commitCursor();
     }
 
     // ── 保存中断内容到数据库 + 广播到 Web ──
@@ -9839,7 +10329,10 @@ async function runAgent(
       output.queryIdle === true ||
       (isInterruptStatus && output.queryIdle !== false)
     ) {
-      queue.markRunnerQueryIdle(chatJid);
+      const preserveIpcDebt =
+        output.sourceKind === 'truncation_continue' ||
+        output.sourceKind === 'auto_continue';
+      queue.markRunnerQueryIdle(chatJid, { preserveIpcDebt });
     }
     // 仅从成功的输出中更新 session ID；
     // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
@@ -10052,6 +10545,9 @@ interface SendMessageOutcome {
    * IM JID this requires connector success; for a Web/virtual JID it requires
    * successful persistence+broadcast. */
   targetDelivered: boolean;
+  /** Exact physical delivery evidence retained even when Web projection
+   * succeeds independently. */
+  failure?: ImSendFailureRef;
 }
 
 async function sendMessageWithOutcome(
@@ -10063,6 +10559,7 @@ async function sendMessageWithOutcome(
   const sendToIM = options.sendToIM ?? isIMChannel;
   let targetDelivered = false;
   let webProjected = false;
+  const failure: ImSendFailureRef = {};
   try {
     if (sendToIM && isIMChannel) {
       try {
@@ -10075,8 +10572,13 @@ async function sendMessageWithOutcome(
           imText,
           localImagePaths,
           options.channelOutbox,
+          undefined,
+          undefined,
+          failure,
         );
       } catch (err) {
+        failure.error = err;
+        failure.outcome = classifyImSendFailure(err);
         logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
     }
@@ -10141,10 +10643,23 @@ async function sendMessageWithOutcome(
     if (!options.source) {
       broadcastToWebClients(jid, text);
     }
-    return { messageId: persistedMsgId, targetDelivered, webProjected };
+    return {
+      messageId: persistedMsgId,
+      targetDelivered,
+      webProjected,
+      ...(failure.error !== undefined || failure.outcome !== undefined
+        ? { failure }
+        : {}),
+    };
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
-    return { targetDelivered, webProjected };
+    return {
+      targetDelivered,
+      webProjected,
+      ...(failure.error !== undefined || failure.outcome !== undefined
+        ? { failure }
+        : {}),
+    };
   }
 }
 
@@ -10791,6 +11306,11 @@ function startIpcWatcher(): void {
                           messageDeliveryFailure,
                         );
                         nativeDeliveryAcknowledged = messageDelivered;
+                        const partialFailure =
+                          messageDeliveryFailure.error instanceof
+                          ScopedChannelPartialDeliveryError
+                            ? messageDeliveryFailure.error
+                            : undefined;
                         if (
                           !messageDelivered &&
                           messageScope &&
@@ -10799,8 +11319,9 @@ function startIpcWatcher(): void {
                           )
                         ) {
                           messageDeliveryUncertain = true;
-                          messageDeliveryError =
-                            'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
+                          messageDeliveryError = partialFailure
+                            ? `Message delivery is partial: ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs were acknowledged and the next outcome is uncertain. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.`
+                            : 'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
                         } else if (
                           !messageDelivered &&
                           messageDeliveryFailure.error instanceof
@@ -10817,8 +11338,13 @@ function startIpcWatcher(): void {
                               }
                             : undefined;
                           messageDeliveryError =
-                            `The native channel definitively did not accept this message: ${messageDeliveryFailure.error.message}. ` +
+                            (partialFailure
+                              ? `The native channel accepted ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs before definitively rejecting the tail: ${messageDeliveryFailure.error.message}. `
+                              : `The native channel definitively did not accept this message: ${messageDeliveryFailure.error.message}. `) +
                             'The complete answer will remain available in HappyClaw Web; do not retry or rewrite it solely for this channel failure.';
+                        } else if (!messageDelivered && partialFailure) {
+                          messageDeliveryUncertain = true;
+                          messageDeliveryError = `Message delivery is partial: ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs were acknowledged before the tail was fenced as ${partialFailure.status}. Do not retry; the complete answer remains available in HappyClaw Web.`;
                         }
                       }
                     }
@@ -10870,8 +11396,10 @@ function startIpcWatcher(): void {
                     const attempts: TaskNotificationDeliveryAttempt[] = [];
                     const addTargetAttempts = (targetJid: string): void => {
                       const channel = getChannelType(targetJid) ?? targetJid;
+                      const textFailure: ImSendFailureRef = {};
                       attempts.push({
                         channel,
+                        failure: textFailure,
                         payload: {
                           kind: 'im_message',
                           targetJid,
@@ -10879,14 +11407,24 @@ function startIpcWatcher(): void {
                           localImagePaths: [],
                         },
                         deliver: () =>
-                          sendImWithRetry(targetJid, data.text, []),
+                          sendImWithRetry(
+                            targetJid,
+                            data.text,
+                            [],
+                            undefined,
+                            undefined,
+                            undefined,
+                            textFailure,
+                          ),
                       });
                       for (const imagePath of taskLocalImages) {
                         const imageBuffer = fs.readFileSync(imagePath);
                         const mimeType = detectImageMimeType(imageBuffer);
                         const fileName = path.basename(imagePath);
+                        const imageFailure: ImSendFailureRef = {};
                         attempts.push({
                           channel,
+                          failure: imageFailure,
                           payload: {
                             kind: 'im_image',
                             targetJid,
@@ -10905,6 +11443,8 @@ function startIpcWatcher(): void {
                               mimeType,
                               undefined,
                               fileName,
+                              undefined,
+                              imageFailure,
                             ),
                         });
                       }
@@ -10922,8 +11462,12 @@ function startIpcWatcher(): void {
                         addTargetAttempts(targetJid);
                       }
                       for (const channel of targetPlan.unavailableChannels) {
+                        const failure = taskNotificationPreAcceptFailure(
+                          `No connected ${channel} binding exists for this workspace`,
+                        );
                         attempts.push({
                           channel,
+                          failure,
                           payload: {
                             kind: 'im_channel_message',
                             targetChannel: channel,
@@ -10935,8 +11479,12 @@ function startIpcWatcher(): void {
                         });
                         for (const imagePath of taskLocalImages) {
                           const imageBuffer = fs.readFileSync(imagePath);
+                          const imageFailure = taskNotificationPreAcceptFailure(
+                            `No connected ${channel} binding exists for this workspace`,
+                          );
                           attempts.push({
                             channel,
+                            failure: imageFailure,
                             payload: {
                               kind: 'im_channel_image',
                               targetChannel: channel,
@@ -11403,32 +11951,42 @@ function startIpcWatcher(): void {
                       typeof data.filePath === 'string' ? data.filePath : '';
                     const imageAttempt = (
                       targetJid: string,
-                    ): TaskNotificationDeliveryAttempt => ({
-                      channel: getChannelType(targetJid) ?? targetJid,
-                      payload: {
-                        kind: 'im_image',
-                        targetJid,
-                        workspaceFolder: sourceGroup,
-                        filePath: relativeImagePath,
-                        mimeType,
-                        caption,
-                        fileName,
-                      },
-                      deliver: () =>
-                        sendTaskImageWithRetry(
+                    ): TaskNotificationDeliveryAttempt => {
+                      const failure: ImSendFailureRef = {};
+                      return {
+                        channel: getChannelType(targetJid) ?? targetJid,
+                        failure,
+                        payload: {
+                          kind: 'im_image',
                           targetJid,
-                          imageBuffer,
+                          workspaceFolder: sourceGroup,
+                          filePath: relativeImagePath,
                           mimeType,
                           caption,
                           fileName,
-                        ),
-                    });
+                        },
+                        deliver: () =>
+                          sendTaskImageWithRetry(
+                            targetJid,
+                            imageBuffer,
+                            mimeType,
+                            caption,
+                            fileName,
+                            undefined,
+                            failure,
+                          ),
+                      };
+                    };
                     for (const targetJid of taskImageTargetJids) {
                       attempts.push(imageAttempt(targetJid));
                     }
                     for (const channel of taskImageUnavailableChannels) {
+                      const failure = taskNotificationPreAcceptFailure(
+                        `No connected ${channel} binding exists for this workspace`,
+                      );
                       attempts.push({
                         channel,
+                        failure,
                         payload: {
                           kind: 'im_channel_image',
                           targetChannel: channel,
@@ -14134,21 +14692,35 @@ async function processTaskIpc(
                 fileRoutingDecision,
               );
               const attempts: TaskNotificationDeliveryAttempt[] =
-                targetPlan.targetJids.map((targetJid) => ({
-                  channel: getChannelType(targetJid) ?? targetJid,
-                  payload: {
-                    kind: 'im_file' as const,
-                    targetJid,
-                    workspaceFolder: sourceGroup,
-                    filePath: data.filePath!,
-                    fileName: imFileName,
-                  },
-                  deliver: () =>
-                    sendTaskFileWithRetry(targetJid, resolvedPath, imFileName),
-                }));
+                targetPlan.targetJids.map((targetJid) => {
+                  const failure: ImSendFailureRef = {};
+                  return {
+                    channel: getChannelType(targetJid) ?? targetJid,
+                    failure,
+                    payload: {
+                      kind: 'im_file' as const,
+                      targetJid,
+                      workspaceFolder: sourceGroup,
+                      filePath: data.filePath!,
+                      fileName: imFileName,
+                    },
+                    deliver: () =>
+                      sendTaskFileWithRetry(
+                        targetJid,
+                        resolvedPath,
+                        imFileName,
+                        undefined,
+                        failure,
+                      ),
+                  };
+                });
               for (const channel of targetPlan.unavailableChannels) {
+                const failure = taskNotificationPreAcceptFailure(
+                  `No connected ${channel} binding exists for this workspace`,
+                );
                 attempts.push({
                   channel,
+                  failure,
                   payload: {
                     kind: 'im_channel_file',
                     targetChannel: channel,
@@ -14865,6 +15437,7 @@ async function processAgentConversation(
         })
       : undefined;
   const agentChannelTurnRuntimes = new Map<string, ChannelTurnRuntime>();
+  let agentDefinitiveFailureSettled = false;
   if (agentChannelTurnRuntime) {
     agentChannelTurnRuntimes.set(lastProcessed.id, agentChannelTurnRuntime);
   }
@@ -14903,6 +15476,40 @@ async function processAgentConversation(
             })
           : false;
         if (interrupted && notified) {
+          await clearAgentProcessingIndicatorForInput(inputId);
+          runtime.dispose();
+          agentChannelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
+        continue;
+      }
+      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+      if (failedDelivery) {
+        const partialFailure = Boolean(
+          getDeliveredChannelOutboxForTurn(runtime.runId),
+        );
+        const failed = runtime.fail(
+          partialFailure
+            ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+            : `Channel delivery ${failedDelivery.id} was definitively rejected`,
+        );
+        const exactScope = agentChannelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelDefinitiveFailureNotice({
+              logicalChatJid: virtualChatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              agentId,
+              partial: partialFailure,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : true;
+        if (failed && notified) {
+          agentDefinitiveFailureSettled = true;
           await clearAgentProcessingIndicatorForInput(inputId);
           runtime.dispose();
           agentChannelTurnRuntimes.delete(inputId);
@@ -15731,12 +16338,27 @@ async function processAgentConversation(
         output.streamEvent.statusText === 'interrupted' &&
         output.queryIdle !== false)
     ) {
-      queue.markRunnerQueryIdle(virtualJid);
+      const preserveIpcDebt =
+        output.sourceKind === 'truncation_continue' ||
+        output.sourceKind === 'auto_continue';
+      queue.markRunnerQueryIdle(virtualJid, { preserveIpcDebt });
     }
 
     // #549: a provider switch surfaced as a failure clears the agent session so
     // the next turn starts fresh on the newly-selected provider.
-    if (output.providerFailure) {
+    //
+    // Only when a switch can actually happen. Transient and config failures
+    // judged no account at all, and a single-provider pool has nothing to switch
+    // to — clearing the session there just destroys the conversation for nothing.
+    if (
+      output.providerFailure &&
+      resolveProviderFailureClass(output) === 'account' &&
+      willClearSessionOnProviderSwitch(
+        effectiveGroup.folder,
+        agentId,
+        agentProfile?.model_config_id,
+      )
+    ) {
       try {
         deleteSession(effectiveGroup.folder, agentId);
         currentAgentSessionId = undefined;
@@ -16387,6 +17009,7 @@ async function processAgentConversation(
         let streamingCardHandledIM = false;
         let agentCardAttachmentsDelivered = true;
         let agentStaticImDelivered = false;
+        let agentStreamingCardDeliveryUncertain = false;
         let pendingAgentCardCompletion:
           | NonNullable<typeof outputAgentStreamingSession>
           | undefined;
@@ -16495,9 +17118,33 @@ async function processAgentConversation(
             heldAgentUsagePatchPending = true;
             heldAgentParts = [];
           } else if (cardFinalization.error) {
+            agentStreamingCardDeliveryUncertain =
+              classifyImSendFailure(cardFinalization.error) === 'uncertain';
+            const fenced = outputAgentScope.scope
+              ? await persistUncertainStreamingDelivery({
+                  scope: outputAgentScope.scope,
+                  operationKey: `agent-streaming-card-final:${agentId}:${outputAgentScope.inputId}`,
+                  payload: {
+                    role: 'agent_primary_stream_final',
+                    contentHash: crypto
+                      .createHash('sha256')
+                      .update(dbText)
+                      .digest('hex'),
+                  },
+                  error: cardFinalization.error,
+                })
+              : null;
             logger.warn(
-              { err: cardFinalization.error, chatJid, agentId },
-              'Agent streaming card final ACK failed, falling back to exact static delivery',
+              {
+                err: cardFinalization.error,
+                chatJid,
+                agentId,
+                agentStreamingCardDeliveryUncertain,
+                uncertaintyPersisted: fenced?.status === 'uncertain',
+              },
+              agentStreamingCardDeliveryUncertain
+                ? 'Agent streaming card final ACK is uncertain; fenced for manual reconciliation'
+                : 'Agent streaming card final ACK was rejected; falling back to exact static delivery',
             );
             heldAgentParts = [];
             heldAgentUsage = null;
@@ -16507,7 +17154,8 @@ async function processAgentConversation(
               'Agent streaming card remains unfinished because an attachment was not physically ACKed',
             );
           }
-          streamingCardHandledIM = cardCompleted;
+          streamingCardHandledIM =
+            cardCompleted || agentStreamingCardDeliveryUncertain;
           if (cardCompleted) {
             agentStreamingSessionsByInput.delete(outputAgentScope.inputId);
             if (outputAgentStreamingSession === agentStreamingSession) {
@@ -16527,10 +17175,12 @@ async function processAgentConversation(
         ) {
           // Only send the FIRST substantive reply to IM. Subsequent results
           // (SDK Task completions) are stored in DB but not spammed to IM.
-          agentStaticImDelivered = await sendImWithRetry(
+          // A pending provider card already delivered every local attachment
+          // above. Its safe text fallback must not replay that ACKed prefix.
+          const agentStaticTextDelivered = await sendImWithRetry(
             outputAgentReplySourceJid,
             text,
-            localImagePaths,
+            pendingAgentCardCompletion ? [] : localImagePaths,
             outputAgentScope.scope
               ? {
                   scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
@@ -16539,6 +17189,8 @@ async function processAgentConversation(
                 }
               : undefined,
           );
+          agentStaticImDelivered =
+            agentStaticTextDelivered && agentCardAttachmentsDelivered;
           if (agentStaticImDelivered) {
             logger.info(
               {
@@ -16557,6 +17209,8 @@ async function processAgentConversation(
                 agentId,
                 replySourceImJid,
                 sourceKind: output.sourceKind,
+                agentStaticTextDelivered,
+                agentCardAttachmentsDelivered,
               },
               'Agent conversation: IM send failed after all retries, message lost',
             );
@@ -16629,6 +17283,7 @@ async function processAgentConversation(
             agentPhysicalDeliveryAckByInput.get(outputAgentScope.inputId) ===
               true ||
             (streamingCardHandledIM &&
+              !agentStreamingCardDeliveryUncertain &&
               !holdReason &&
               agentCardAttachmentsDelivered) ||
             agentStaticImDelivered) &&
@@ -17070,7 +17725,7 @@ async function processAgentConversation(
           await agentStreamingSession.abort(heldNote).catch(() => {});
         } else if (agentProviderFailoverPending) {
           await agentStreamingSession
-            .abort('模型服务切换中，正在重试')
+            .abort('模型服务暂时异常，正在重试')
             .catch(() => {});
         } else if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
@@ -17140,9 +17795,37 @@ async function processAgentConversation(
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
         );
+        const failedDelivery = uncertainDelivery
+          ? undefined
+          : getFailedChannelOutboxForTurn(runtime.runId);
         let settled: boolean;
         let terminal = false;
-        if (uncertainDelivery) {
+        if (failedDelivery) {
+          const partialFailure = Boolean(
+            getDeliveredChannelOutboxForTurn(runtime.runId),
+          );
+          settled = runtime.fail(
+            partialFailure
+              ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+              : `Channel delivery ${failedDelivery.id} was definitively rejected`,
+          );
+          const exactScope = agentChannelOutboxScopesByInput.get(inputTurnId);
+          await (exactScope?.chatId
+            ? deliverChannelDefinitiveFailureNotice({
+                logicalChatJid: virtualChatJid,
+                scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+                targetJid: exactScope.sourceJid,
+                runtime,
+                agentId,
+                partial: partialFailure,
+                presentation:
+                  interactionMode === 'proactive' ? 'native' : 'default',
+                route: { ...exactScope, chatId: exactScope.chatId },
+              })
+            : Promise.resolve(true));
+          terminal = settled;
+          agentDefinitiveFailureSettled ||= settled;
+        } else if (uncertainDelivery) {
           agentDeliveryNeedsManualReconciliation = true;
           settled = runtime.interrupt(
             `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
@@ -17234,6 +17917,10 @@ async function processAgentConversation(
         } else {
           retryUnfinishedTurn = true;
         }
+      }
+      if (agentDefinitiveFailureSettled) {
+        commitCursor();
+        retryUnfinishedTurn = false;
       }
     }
 
@@ -19549,7 +20236,7 @@ function handleIncomingFollowUp(input: {
       input.targetJid,
       input.coalesceBundleId!,
     );
-  const mode = resolveFeishuFollowUpMode(
+  const mode = resolveFollowUpMode(
     input.requestedMode ?? (coalesceActiveRoot ? 'steer' : undefined),
   );
   setMessageFollowUp(input.targetJid, input.messageId, {
@@ -19646,7 +20333,7 @@ function handleCardInterrupt(
  * everything that was already durably queued, then interrupt the exact active
  * query. Messages admitted after this synchronous cutoff remain runnable.
  */
-async function handleFeishuSessionBreak(input: {
+async function handleSessionBreak(input: {
   sourceJid: string;
   targetJid?: string;
   senderImId: string;
@@ -19714,7 +20401,7 @@ async function handleFeishuSessionBreak(input: {
       interrupted,
       cancelledMessageIds: cancelled.map((item) => item.id),
     },
-    'Feishu session break processed',
+    'Session break processed',
   );
   return interrupted || cancelled.length > 0
     ? 'Current task stopped.'
@@ -19900,7 +20587,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
               () => secret.ownerOpenId || undefined,
             ),
           onFollowUpMessage: handleIncomingFollowUp,
-          onSessionBreak: handleFeishuSessionBreak,
+          onSessionBreak: handleSessionBreak,
           onSessionClear: handleFeishuSessionClear,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
@@ -19965,7 +20652,14 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           workspace.jid,
           account.is_legacy_default,
         ),
-        common,
+        // Not added to `common`: the remaining channels do not forward the
+        // callback to their connector, so enabling it there would only look
+        // like queue support without providing it.
+        {
+          ...common,
+          onFollowUpMessage: handleIncomingFollowUp,
+          onSessionBreak: handleSessionBreak,
+        },
       );
     } else if (account.provider === 'wechat') {
       const bypassProxy = secret.bypassProxy !== 'false';
@@ -20825,7 +21519,7 @@ async function main(): Promise<void> {
             isSenderAllowedInGroup: (jid: string, sender?: string) =>
               isSenderAllowedInGroup(jid, sender, getReloadOwnerOpenId),
             onFollowUpMessage: handleIncomingFollowUp,
-            onSessionBreak: handleFeishuSessionBreak,
+            onSessionBreak: handleSessionBreak,
             onSessionClear: handleFeishuSessionClear,
             onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
@@ -20892,6 +21586,9 @@ async function main(): Promise<void> {
           buildOnPairAttempt(userId),
           {
             onMessagePersisted: broadcastNewMessage,
+            onFollowUpsChanged: broadcastFollowUpUpdate,
+            onFollowUpMessage: handleIncomingFollowUp,
+            onSessionBreak: handleSessionBreak,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
@@ -21605,7 +22302,16 @@ async function main(): Promise<void> {
     sendMessage: async (jid, text, options) => {
       const outcome = await sendMessageWithOutcome(jid, text, options);
       if (!outcome.targetDelivered) {
-        throw new Error(`Scheduled-task target did not acknowledge: ${jid}`);
+        const failure =
+          outcome.failure ??
+          taskNotificationPreAcceptFailure(
+            `Scheduled-task target did not acknowledge: ${jid}`,
+          );
+        throw new ImDeliveryPhaseError(
+          failure.outcome ?? 'pre_accept',
+          `Scheduled-task target did not acknowledge: ${jid}`,
+          { cause: failure.error },
+        );
       }
       return outcome.messageId;
     },
@@ -21716,7 +22422,7 @@ async function main(): Promise<void> {
       const deliveries: Array<{
         channel: string;
         result: Promise<boolean>;
-        failure?: { error?: unknown };
+        failure?: ImSendFailureRef;
       }> = [];
       // A task records the exact place it was scheduled from. Deliver there
       // first: the previous behaviour resolved the target by scanning the
@@ -21729,7 +22435,7 @@ async function main(): Promise<void> {
         !alreadySent.has(boundRoute)
       ) {
         alreadySent.add(boundRoute);
-        const failure: { error?: unknown } = {};
+        const failure: ImSendFailureRef = {};
         deliveries.push({
           channel: getChannelType(boundRoute) ?? boundRoute,
           result: sendImWithRetry(
@@ -21754,7 +22460,7 @@ async function main(): Promise<void> {
           broadcastFolder,
           alreadySent,
           (jid) => {
-            const failure: { error?: unknown } = {};
+            const failure: ImSendFailureRef = {};
             deliveries.push({
               // Notification retries filter on channel type, not the concrete
               // binding jid. Keep the concrete jid only as a defensive fallback.
@@ -21774,14 +22480,13 @@ async function main(): Promise<void> {
           options.notifyChannels,
         );
         for (const channel of unavailableChannels) {
+          const failure = taskNotificationPreAcceptFailure(
+            `未找到已连接且绑定到当前工作区的 ${channel} 渠道`,
+          );
           deliveries.push({
             channel,
             result: Promise.resolve(false),
-            failure: {
-              error: new Error(
-                `未找到已连接且绑定到当前工作区的 ${channel} 渠道`,
-              ),
-            },
+            failure,
           });
         }
       }
@@ -21802,24 +22507,42 @@ async function main(): Promise<void> {
           channel: delivery.channel,
           success: await delivery.result,
           error: delivery.failure?.error,
+          outcome: delivery.failure?.outcome,
         })),
       );
+      const uncertainChannels = outcomes
+        .filter(
+          (outcome) =>
+            !outcome.success &&
+            (outcome.outcome === 'uncertain' ||
+              (outcome.error !== undefined &&
+                classifyImSendFailure(outcome.error) === 'uncertain')),
+        )
+        .map((outcome) => outcome.channel);
       const failedChannels = outcomes
         .filter((outcome) => !outcome.success)
         .map((outcome) => outcome.channel);
       const succeeded = outcomes.length - failedChannels.length;
       return {
         status:
-          failedChannels.length === 0
-            ? 'success'
-            : succeeded > 0
-              ? 'partial_failed'
-              : 'failed',
+          uncertainChannels.length > 0
+            ? 'uncertain'
+            : failedChannels.length === 0
+              ? 'success'
+              : succeeded > 0
+                ? 'partial_failed'
+                : 'failed',
         summary: {
           attempted: outcomes.length,
           succeeded,
           failed: failedChannels.length,
           failed_channels: failedChannels,
+          ...(uncertainChannels.length > 0
+            ? {
+                uncertain: uncertainChannels.length,
+                uncertain_channels: [...new Set(uncertainChannels)],
+              }
+            : {}),
         },
         error:
           failedChannels.length > 0
@@ -21853,6 +22576,7 @@ async function main(): Promise<void> {
             : 'notification';
       let success = false;
       let error: string | null = null;
+      const failure: ImSendFailureRef = {};
       try {
         if ('targetChannel' in payload) {
           broadcastToOwnerIMChannels(
@@ -21865,7 +22589,7 @@ async function main(): Promise<void> {
             [payload.targetChannel],
           );
           if (!targetJid) {
-            throw new Error(
+            throw preAcceptImDeliveryError(
               `No connected ${payload.targetChannel} binding exists for this workspace`,
             );
           }
@@ -21875,9 +22599,21 @@ async function main(): Promise<void> {
             payload.targetJid,
             payload.text,
             payload.localImagePaths,
+            undefined,
+            undefined,
+            undefined,
+            failure,
           );
         } else if (payload.kind === 'im_channel_message') {
-          success = await sendImWithRetry(targetJid!, payload.text, []);
+          success = await sendImWithRetry(
+            targetJid!,
+            payload.text,
+            [],
+            undefined,
+            undefined,
+            undefined,
+            failure,
+          );
         } else if (
           payload.kind === 'im_image' ||
           payload.kind === 'im_file' ||
@@ -21893,10 +22629,14 @@ async function main(): Promise<void> {
             resolvedPath !== workspaceRoot &&
             !resolvedPath.startsWith(`${workspaceRoot}${path.sep}`)
           ) {
-            throw new Error('Persisted notification path left its workspace');
+            throw preAcceptImDeliveryError(
+              'Persisted notification path left its workspace',
+            );
           }
           if (!isRealpathInside(resolvedPath, workspaceRoot)) {
-            throw new Error('Persisted notification file is unavailable');
+            throw preAcceptImDeliveryError(
+              'Persisted notification file is unavailable',
+            );
           }
           if (
             payload.kind === 'im_image' ||
@@ -21908,31 +22648,43 @@ async function main(): Promise<void> {
               payload.mimeType,
               payload.caption,
               payload.fileName,
+              undefined,
+              failure,
             );
           } else {
             success = await sendTaskFileWithRetry(
               targetJid!,
               resolvedPath,
               payload.fileName,
+              undefined,
+              failure,
             );
           }
         } else {
-          throw new Error(
+          throw preAcceptImDeliveryError(
             `Unsupported direct notification kind: ${payload.kind}`,
           );
         }
       } catch (err) {
+        failure.error = err;
+        failure.outcome = classifyImSendFailure(err);
         error = err instanceof Error ? err.message : String(err);
       }
       if (!success && !error)
         error = `Notification delivery failed: ${channel}`;
+      const uncertain =
+        !success &&
+        (failure.outcome === 'uncertain' ||
+          (failure.error !== undefined &&
+            classifyImSendFailure(failure.error) === 'uncertain'));
       return {
-        status: success ? 'success' : 'failed',
+        status: success ? 'success' : uncertain ? 'uncertain' : 'failed',
         summary: {
           attempted: 1,
           succeeded: success ? 1 : 0,
           failed: success ? 0 : 1,
           failed_channels: success ? [] : [channel],
+          ...(uncertain ? { uncertain: 1, uncertain_channels: [channel] } : {}),
         },
         error,
       };

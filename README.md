@@ -152,17 +152,17 @@ HappyClaw 区分不同层级的能力来源：
 私聊或原生话题覆盖绑定目标。账号身份会写入渠道地址和 mount，发送时不会借用其他
 Bot 的凭据。
 
-| 渠道         | 接入方式                          | 主要能力                                              |
-| ------------ | --------------------------------- | ----------------------------------------------------- |
-| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射 |
-| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置       |
-| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                 |
-| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制             |
-| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                |
-| **企业微信** | Bot ID / Secret，WebSocket        | Markdown 流式回复、群聊 @ 控制、配对码绑定            |
-| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询        |
-| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复          |
-| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA              |
+| 渠道         | 接入方式                          | 主要能力                                               |
+| ------------ | --------------------------------- | ------------------------------------------------------ |
+| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射  |
+| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置        |
+| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                  |
+| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制              |
+| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                 |
+| **企业微信** | Bot ID / Secret，WebSocket        | Markdown 流式回复、图片与文件、群聊 @ 控制、配对码绑定 |
+| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询         |
+| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复           |
+| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA               |
 
 渠道账号的凭据和扫码会话按用户、账号隔离。当前绑定边界为：
 
@@ -310,22 +310,23 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 
 ### 可选环境变量
 
-| 变量                         | 默认值                            | 说明                                                                               |
-| ---------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
-| `WEB_PORT`                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
-| `WEB_SESSION_SECRET`         | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
-| `CONTAINER_IMAGE`            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
-| `CONTAINER_IMAGE_HEADROOM`   | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
-| `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                   |
-| `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
-| `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
-| `MAX_CONCURRENT_CONTAINERS`  | `20`                              | 最大并发容器数                                                                     |
-| `MAX_FILE_SIZE_MB`           | `50`                              | Web 和 IM 入站文件大小上限                                                         |
-| `CORS_ALLOWED_ORIGINS`       | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
-| `TRUST_PROXY`                | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
-| `TZ`                         | 系统时区                          | 日志与定时任务时区                                                                 |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
-| `NO_PROXY`                   | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
+| 变量                                 | 默认值                            | 说明                                                                               |
+| ------------------------------------ | --------------------------------- | ---------------------------------------------------------------------------------- |
+| `WEB_PORT`                           | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
+| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
+| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
+| `CONTAINER_IMAGE_HEADROOM`           | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
+| `CONTAINER_TIMEOUT`                  | `1800000`                         | 容器硬超时，毫秒                                                                   |
+| `IDLE_TIMEOUT`                       | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（整数分钟，范围 4–120；非法值回退默认）                       |
+| `ADMIN_HOST_ONLY_MODE`               | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
+| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | 最大并发容器数                                                                     |
+| `MAX_FILE_SIZE_MB`                   | `50`                              | Web 和 IM 入站文件大小上限                                                         |
+| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
+| `TRUST_PROXY`                        | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
+| `TZ`                                 | 系统时区                          | 日志与定时任务时区                                                                 |
+| `HTTPS_PROXY` / `HTTP_PROXY`         | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
+| `NO_PROXY`                           | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
 
 Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-GCM 加密存储，相关 API 只返回是否已配置，不返回密钥明文。
 

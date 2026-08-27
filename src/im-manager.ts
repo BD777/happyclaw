@@ -65,6 +65,26 @@ import {
   scopeChannelJid,
 } from './channel-address.js';
 import { ChannelRouteRejectedError } from './channel-admission.js';
+import {
+  classifyImSendFailure,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
+
+async function withTypedImSendPhase(
+  operation: () => Promise<void>,
+): Promise<void> {
+  try {
+    await operation();
+  } catch (error) {
+    if (classifyImSendFailure(error) === 'pre_accept') {
+      throw preAcceptImDeliveryError(
+        error instanceof Error ? error.message : String(error),
+        error,
+      );
+    }
+    throw error;
+  }
+}
 
 export interface UserIMConnection {
   userId: string;
@@ -818,19 +838,25 @@ export class IMConnectionManager {
     const channelType = getChannelType(jid);
     if (!channelType) {
       logger.debug({ jid }, 'Unknown channel type for JID, skip sending');
-      throw new Error(`Unknown channel type for JID: ${jid}`);
+      throw preAcceptImDeliveryError(`Unknown channel type for JID: ${jid}`);
     }
 
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (!channel) {
-      throw new Error(`No IM channel available for ${jid} (${channelType})`);
+      throw preAcceptImDeliveryError(
+        `No IM channel available for ${jid} (${channelType})`,
+      );
     }
     if (options) {
-      await channel.sendMessage(chatId, text, localImagePaths, options);
+      await withTypedImSendPhase(() =>
+        channel.sendMessage(chatId, text, localImagePaths, options),
+      );
     } else {
       // Preserve the historical three-argument connector call shape.
-      await channel.sendMessage(chatId, text, localImagePaths);
+      await withTypedImSendPhase(() =>
+        channel.sendMessage(chatId, text, localImagePaths),
+      );
     }
   }
 
@@ -843,28 +869,56 @@ export class IMConnectionManager {
     mimeType: string,
     caption?: string,
     fileName?: string,
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
       logger.debug({ jid }, 'Unknown channel type for JID, skip sending image');
-      throw new Error(`Unknown channel type for image JID: ${jid}`);
+      throw preAcceptImDeliveryError(
+        `Unknown channel type for image JID: ${jid}`,
+      );
     }
 
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.sendImage) {
-      await channel.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+      if (options) {
+        await withTypedImSendPhase(() =>
+          channel.sendImage!(
+            chatId,
+            imageBuffer,
+            mimeType,
+            caption,
+            fileName,
+            options,
+          ),
+        );
+      } else {
+        await withTypedImSendPhase(() =>
+          channel.sendImage!(chatId, imageBuffer, mimeType, caption, fileName),
+        );
+      }
       return;
     }
 
     // Fallback: if channel doesn't support sendImage, send caption as text
     if (caption && channel) {
-      await channel.sendMessage(chatId, `📷 ${caption}`);
+      if (options) {
+        await withTypedImSendPhase(() =>
+          channel.sendMessage(chatId, `📷 ${caption}`, undefined, options),
+        );
+      } else {
+        await withTypedImSendPhase(() =>
+          channel.sendMessage(chatId, `📷 ${caption}`),
+        );
+      }
       return;
     }
 
     logger.warn({ jid, channelType }, 'No IM channel available to send image');
-    throw new Error(`No IM channel available for ${jid} (${channelType})`);
+    throw preAcceptImDeliveryError(
+      `No IM channel available for ${jid} (${channelType})`,
+    );
   }
 
   /**
@@ -875,18 +929,27 @@ export class IMConnectionManager {
     jid: string,
     filePath: string,
     fileName: string,
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
-      throw new Error(`无法识别 JID 的通道类型: ${jid}`);
+      throw preAcceptImDeliveryError(`无法识别 JID 的通道类型: ${jid}`);
     }
 
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.sendFile) {
-      await channel.sendFile(chatId, filePath, fileName);
+      if (options) {
+        await withTypedImSendPhase(() =>
+          channel.sendFile!(chatId, filePath, fileName, options),
+        );
+      } else {
+        await withTypedImSendPhase(() =>
+          channel.sendFile!(chatId, filePath, fileName),
+        );
+      }
     } else {
-      throw new Error(`通道 ${channelType} 不支持发送文件`);
+      throw preAcceptImDeliveryError(`通道 ${channelType} 不支持发送文件`);
     }
   }
 
@@ -1397,6 +1460,9 @@ export class IMConnectionManager {
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
       onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
+      onFollowUpMessage?: IMChannelConnectOpts['onFollowUpMessage'];
+      onFollowUpsChanged?: IMChannelConnectOpts['onFollowUpsChanged'];
+      onSessionBreak?: IMChannelConnectOpts['onSessionBreak'];
     },
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
@@ -1425,6 +1491,9 @@ export class IMConnectionManager {
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
       },
       options?.accountId,
       options?.scopeIncomingJids,

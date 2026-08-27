@@ -1155,9 +1155,27 @@ export class GroupQueue {
     return committed;
   }
 
-  markRunnerQueryIdle(groupJid: string): void {
+  markRunnerQueryIdle(
+    groupJid: string,
+    options?: { preserveIpcDebt?: boolean },
+  ): void {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active || !state.queryInFlight) return;
+    // Truncation/compaction continues report queryIdle even though they
+    // refused later user IPC (acceptIpc=false). Wiping the #618/#622 debt
+    // clock here hides a leftover IPC file from stuck recovery.
+    if (options?.preserveIpcDebt) {
+      const hasPendingReceipts = state.pendingIpcDeliveries?.size > 0;
+      const hasPendingFiles = Boolean(
+        state.groupFolder &&
+        this.hasRemainingIpcMessages(
+          state.groupFolder,
+          state.agentId,
+          state.taskRunId,
+        ),
+      );
+      if (hasPendingReceipts || hasPendingFiles) return;
+    }
     const completedQueryId = state.queryId;
     state.queryInFlight = false;
     state.ipcOwedSinceAt = null;

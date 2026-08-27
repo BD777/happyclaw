@@ -112,10 +112,11 @@ import {
 } from './provider-runtime.js';
 import { resolveAgentSdkEffort } from './agent-effort.js';
 import {
+  classifyProviderAssistantError,
   decideProviderLimitAction,
-  isAccountProviderAssistantError,
   ProviderFallbackModelState,
   ProviderFallbackTurnLedger,
+  type ProviderFailureClass,
   type ProviderFallbackRetryTurn,
 } from './provider-fallback.js';
 import {
@@ -1791,12 +1792,31 @@ async function runQueryAttempt(
     if (emitOutput) writeOutput(output);
   };
   let providerFailurePublished = false;
-  const publishProviderAccountFailure = (
-    error: SDKAssistantMessageError,
-    rateLimitResetsAt?: number,
-    failureNotice?: string,
-    rateLimitScope: 'account' | 'model' = 'account',
-  ): void => {
+  /**
+   * Publish one provider failure control signal.
+   *
+   * `failureClass` — not the SDK error name — is what the host reads to decide
+   * whether the account is quarantined, whether the input is replayed, and
+   * which notice the user eventually sees. It is required so that no future
+   * call site can silently inherit the account-verdict disposition the way the
+   * liveness watchdog once did by borrowing the `server_error` label.
+   */
+  const publishProviderFailure = (options: {
+    error: SDKAssistantMessageError;
+    failureClass: ProviderFailureClass;
+    rateLimitResetsAt?: number;
+    failureNotice?: string;
+    rateLimitScope?: 'account' | 'model';
+    livenessTimeout?: boolean;
+  }): void => {
+    const {
+      error,
+      failureClass,
+      rateLimitResetsAt,
+      failureNotice,
+      rateLimitScope = 'account',
+      livenessTimeout = false,
+    } = options;
     if (providerFailurePublished) return;
     providerFailurePublished = true;
     // Produce the exact receipt candidates for a terminal host projection.
@@ -1808,6 +1828,7 @@ async function runQueryAttempt(
       result: null,
       newSessionId,
       providerFailure: true,
+      providerFailureClass: failureClass,
       ...(typeof rateLimitResetsAt === 'number' &&
       Number.isFinite(rateLimitResetsAt)
         ? { providerRateLimitResetsAt: rateLimitResetsAt }
@@ -1819,16 +1840,45 @@ async function runQueryAttempt(
         PROVIDER_FALLBACK_MODELS.activeModelOverride,
       ),
       ...(!emitOutput ? { providerFailureMaintenance: true } : {}),
+      ...(livenessTimeout ? { providerLivenessTimeout: true } : {}),
       finalizationReason: 'error',
       ...(emitOutput && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
       ...(sourceKindOverride ? { sourceKind: sourceKindOverride } : {}),
     };
-    log(`Publishing provider failure control signal (${error})`);
+    log(
+      `Publishing provider failure control signal (${error}, class=${failureClass})`,
+    );
     if (emitOutput) {
       emit(output);
     } else {
       writeOutput(outputCorrelation.correlate(output));
     }
+  };
+  /**
+   * Tell the user, once, that the answer they are about to read came from the
+   * fallback model rather than the one they configured.
+   *
+   * Without this the downgrade is invisible: the turn is silently re-run on a
+   * weaker tier and the reply is indistinguishable from a primary-model reply,
+   * so a user reading it has no way to know the quality bar moved or that their
+   * primary model needs attention. It is a standalone out-of-band notice, never
+   * the answer — `provider_fallback_notice` keeps it out of the primary reply
+   * slot so it cannot be mistaken for a delivered result.
+   *
+   * `ProviderFallbackModelState` latches on activation, so this fires at most
+   * once per runner process even across warm IPC turns.
+   */
+  const emitModelFallbackNotice = (): void => {
+    if (!emitOutput) return;
+    emit({
+      status: 'success',
+      result:
+        `⚠️ 主模型 ${PROVIDER_FALLBACK_MODELS.primaryModel} 已达用量上限，` +
+        `本轮起改用备用模型 ${PROVIDER_FALLBACK_MODELS.fallbackModel} 回复。` +
+        `回答质量可能与平时不同；如需恢复，请等待用量重置或在「模型配置」中调整。`,
+      newSessionId: undefined,
+      sourceKind: 'provider_fallback_notice',
+    });
   };
   let firstResponseWatchdog: SdkFirstResponseWatchdog | undefined;
 
@@ -2629,10 +2679,16 @@ async function runQueryAttempt(
     firstResponseWatchdog = new SdkFirstResponseWatchdog(
       SDK_FIRST_RESPONSE_TIMEOUT_MS,
       (phase, timeoutMs) => {
-        log(
-          `No model response event within ${timeoutMs}ms (${phase}); marking provider unhealthy`,
+        // WARN, not info: the host only forwards warn-and-above from the runner,
+        // and this line is the sole diagnostic for a liveness stall.
+        logWarn(
+          `No model response event within ${timeoutMs}ms (${phase}); reporting a transient liveness timeout (account health untouched)`,
         );
-        publishProviderAccountFailure('server_error');
+        publishProviderFailure({
+          error: 'server_error',
+          failureClass: 'transient',
+          livenessTimeout: true,
+        });
         processor.discardPendingTextOutput();
         processor.cleanup();
         stream.end();
@@ -2707,7 +2763,11 @@ async function runQueryAttempt(
                 info.resetsAt ?? 'none'
               }); marking provider unhealthy immediately`,
             );
-            publishProviderAccountFailure('rate_limit', info.resetsAt);
+            publishProviderFailure({
+              error: 'rate_limit',
+              failureClass: 'account',
+              rateLimitResetsAt: info.resetsAt,
+            });
             processor.discardPendingTextOutput();
             processor.cleanup();
             assistantTextTracker.reset();
@@ -2739,6 +2799,7 @@ async function runQueryAttempt(
             log(
               `Model-specific rate limit rejected; retrying current turn with fallback model ${PROVIDER_FALLBACK_MODELS.fallbackModel}`,
             );
+            emitModelFallbackNotice();
             writeOutput({
               status: 'stream',
               result: null,
@@ -2778,12 +2839,13 @@ async function runQueryAttempt(
               info.resetsAt ?? 'none'
             }); quarantining profile for failover`,
           );
-          publishProviderAccountFailure(
-            'rate_limit',
-            info.resetsAt,
-            MODEL_LIMIT_EXHAUSTED_NOTICE,
-            'model',
-          );
+          publishProviderFailure({
+            error: 'rate_limit',
+            failureClass: 'account',
+            rateLimitResetsAt: info.resetsAt,
+            failureNotice: MODEL_LIMIT_EXHAUSTED_NOTICE,
+            rateLimitScope: 'model',
+          });
           processor.discardPendingTextOutput();
           processor.cleanup();
           assistantTextTracker.reset();
@@ -2999,11 +3061,16 @@ async function runQueryAttempt(
       if (message.type === 'assistant' && 'uuid' in message) {
         const assistantError = (message as { error?: SDKAssistantMessageError })
           .error;
-        if (isAccountProviderAssistantError(assistantError)) {
+        const assistantErrorClass =
+          classifyProviderAssistantError(assistantError);
+        if (assistantError && assistantErrorClass) {
           log(
-            `Assistant provider error (${assistantError}); marking provider unhealthy`,
+            `Assistant provider error (${assistantError}); classified as ${assistantErrorClass}`,
           );
-          publishProviderAccountFailure(assistantError);
+          publishProviderFailure({
+            error: assistantError,
+            failureClass: assistantErrorClass,
+          });
           processor.discardPendingTextOutput();
           processor.cleanup();
           assistantTextTracker.reset();
@@ -3190,7 +3257,10 @@ async function runQueryAttempt(
           log(
             'Account rate limit recognized from compatibility text; marking provider unhealthy',
           );
-          publishProviderAccountFailure('rate_limit');
+          publishProviderFailure({
+            error: 'rate_limit',
+            failureClass: 'account',
+          });
           emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           assistantBatchFlushedSinceLastResult = false;
           processor.discardPendingTextOutput();
@@ -3226,6 +3296,7 @@ async function runQueryAttempt(
           log(
             `Primary model hit a model-specific limit; retrying current turn with fallback model ${PROVIDER_FALLBACK_MODELS.fallbackModel}`,
           );
+          emitModelFallbackNotice();
           writeOutput({
             status: 'stream',
             result: null,
@@ -3253,12 +3324,12 @@ async function runQueryAttempt(
           log(
             'Model tiers exhausted on this account; quarantining profile for failover',
           );
-          publishProviderAccountFailure(
-            'rate_limit',
-            undefined,
-            textResult?.trim() || MODEL_LIMIT_EXHAUSTED_NOTICE,
-            'model',
-          );
+          publishProviderFailure({
+            error: 'rate_limit',
+            failureClass: 'account',
+            failureNotice: textResult?.trim() || MODEL_LIMIT_EXHAUSTED_NOTICE,
+            rateLimitScope: 'model',
+          });
           emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           assistantBatchFlushedSinceLastResult = false;
           processor.discardPendingTextOutput();
@@ -4070,7 +4141,7 @@ async function main(): Promise<void> {
         resumeAt = queryResult.lastAssistantUuid;
       }
       if (queryResult.providerAccountFailure) {
-        log('Account provider failure emitted; exiting runner');
+        log('Provider failure control signal emitted; exiting runner');
         forceExitWithSafetyNet(0);
         return;
       }
@@ -4398,12 +4469,41 @@ async function main(): Promise<void> {
             } catch {
               /* ignore */
             }
+            clearInterruptRequested();
+            if (autoContResult.pipedMessagesDuringQuery.length > 0) {
+              requeueIpcInputMessages(
+                IPC_INPUT_DIR,
+                autoContResult.pipedMessagesDuringQuery,
+              );
+            }
+            writeOutput({
+              status: 'stream',
+              result: null,
+              sourceKind: 'auto_continue',
+              streamEvent: {
+                eventType: 'status',
+                statusText: 'interrupted',
+                queryRunId: containerInput.queryRunId,
+                turnId: containerInput.turnId,
+                sessionId,
+              },
+              newSessionId: sessionId,
+              turnId: containerInput.turnId,
+              sessionId,
+              ...(autoContResult.cancelledIpcReceipts?.length
+                ? { ipcReceipts: autoContResult.cancelledIpcReceipts }
+                : {}),
+              queryIdle: autoContResult.pipedMessagesDuringQuery.length === 0,
+            });
           }
           // Auto-continue can consume user IPC while it is running. A query
           // that ends without a healthy result leaves those messages in the
           // delivery tracker; requeue them now so they become the next turn
           // instead of remaining invisible until host-side exit recovery.
-          if (autoContResult.pipedMessagesDuringQuery.length > 0) {
+          if (
+            !autoContResult.interruptedDuringQuery &&
+            autoContResult.pipedMessagesDuringQuery.length > 0
+          ) {
             const pending = autoContResult.pipedMessagesDuringQuery;
             log(
               `Auto-continue ended with ${pending.length} unacknowledged IPC message(s); re-enqueueing`,
@@ -4539,6 +4639,32 @@ async function main(): Promise<void> {
           } catch {
             /* ignore */
           }
+          clearInterruptRequested();
+          if (contResult.pipedMessagesDuringQuery.length > 0) {
+            requeueIpcInputMessages(
+              IPC_INPUT_DIR,
+              contResult.pipedMessagesDuringQuery,
+            );
+          }
+          writeOutput({
+            status: 'stream',
+            result: null,
+            sourceKind: 'truncation_continue',
+            streamEvent: {
+              eventType: 'status',
+              statusText: 'interrupted',
+              queryRunId: containerInput.queryRunId,
+              turnId: containerInput.turnId,
+              sessionId,
+            },
+            newSessionId: sessionId,
+            turnId: containerInput.turnId,
+            sessionId,
+            ...(contResult.cancelledIpcReceipts?.length
+              ? { ipcReceipts: contResult.cancelledIpcReceipts }
+              : {}),
+            queryIdle: contResult.pipedMessagesDuringQuery.length === 0,
+          });
           break;
         }
         // 续写本身又被截断 → 带新结尾再续，直到写完或触顶

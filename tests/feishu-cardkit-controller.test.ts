@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { CARD_ELEMENT_IDS } from '../src/feishu-cards/sections.js';
 import { StreamingCardController } from '../src/feishu-streaming-card.js';
+import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
 
 function makeClient() {
   let cardNumber = 0;
@@ -349,7 +350,7 @@ describe('Feishu CardKit streaming controller', () => {
     async (mode) => {
       let createCount = 0;
       const cardUpdate = vi.fn().mockResolvedValue({ code: 0 });
-      const messagePatch = vi.fn().mockResolvedValue({});
+      const messagePatch = vi.fn().mockResolvedValue({ code: 0 });
       const cardCreate = vi.fn().mockImplementation(async () => {
         createCount++;
         if (createCount === 1 || mode === 'legacy') {
@@ -396,6 +397,296 @@ describe('Feishu CardKit streaming controller', () => {
         findElementContent(cardJson, CARD_ELEMENT_IDS.MAIN_CONTENT),
       ).toContain('正在分析请求');
       expect((controller as any).accumulatedText).toBe('');
+      controller.dispose();
+    },
+  );
+
+  test('accepted streaming message timeout is sticky and never creates a fallback card', async () => {
+    const mock = makeClient();
+    let visibleMutations = 0;
+    const acceptedTimeout = Object.assign(
+      new Error('message.create ACK timed out after acceptance'),
+      { code: 'ETIMEDOUT' },
+    );
+    const messageCreate = vi.fn(async () => {
+      visibleMutations += 1;
+      throw acceptedTimeout;
+    });
+    mock.client.im.v1.message.create = messageCreate;
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_uncertain_create',
+    });
+
+    controller.append('answer');
+    await vi.waitFor(() => expect(controller.currentState).toBe('error'));
+
+    expect(mock.cardCreate).toHaveBeenCalledOnce();
+    expect(messageCreate).toHaveBeenCalledOnce();
+    expect(visibleMutations).toBe(1);
+    expect(controller.isActive()).toBe(true);
+    await expect(controller.complete('answer')).rejects.toMatchObject({
+      deliveryPhase: 'uncertain',
+      cause: acceptedTimeout,
+    });
+    await expect(controller.complete('answer')).rejects.toMatchObject({
+      deliveryPhase: 'uncertain',
+    });
+    expect(messageCreate).toHaveBeenCalledOnce();
+    expect(visibleMutations).toBe(1);
+    const aborted = await finalizeChannelCardAfterDelivery(
+      controller,
+      'answer',
+      false,
+      'attachment prerequisite failed',
+    );
+    expect(aborted).toMatchObject({
+      acknowledged: false,
+      error: { deliveryPhase: 'uncertain' },
+    });
+    expect(controller.currentState).toBe('aborted');
+    expect(messageCreate).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
+  test.each([
+    [408, 408],
+    [503, 9999],
+  ])(
+    'HTTP %s with numeric body code %s remains uncertain and never switches backend',
+    async (status, code) => {
+      const mock = makeClient();
+      let visibleMutations = 0;
+      const messageCreate = vi.fn(async () => {
+        visibleMutations += 1;
+        throw Object.assign(new Error(`HTTP ${status} after mutation`), {
+          response: { status, data: { code, msg: 'ambiguous response' } },
+        });
+      });
+      mock.client.im.v1.message.create = messageCreate;
+      const controller = new StreamingCardController({
+        client: mock.client as any,
+        chatId: `oc_http_${status}`,
+      });
+
+      controller.append('answer');
+      await vi.waitFor(() => expect(controller.currentState).toBe('error'));
+
+      expect(mock.cardCreate).toHaveBeenCalledOnce();
+      expect(messageCreate).toHaveBeenCalledOnce();
+      expect(visibleMutations).toBe(1);
+      await expect(controller.complete('answer')).rejects.toMatchObject({
+        deliveryPhase: 'uncertain',
+      });
+      controller.dispose();
+    },
+  );
+
+  test('a successfully aborted visible card still fences static prerequisite fallback', async () => {
+    const mock = makeClient();
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_visible_abort_fence',
+    });
+    controller.append('visible preview');
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+
+    const result = await finalizeChannelCardAfterDelivery(
+      controller,
+      'final answer',
+      false,
+      'attachment prerequisite failed',
+    );
+
+    expect(result).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+      },
+    });
+    expect(controller.currentState).toBe('aborted');
+    expect(mock.client.im.v1.message.create).toHaveBeenCalledOnce();
+    expect(mock.cardUpdate).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
+  test('an explicit streaming-message rejection still permits CardKit v1 fallback', async () => {
+    const mock = makeClient();
+    const messageCreate = vi
+      .fn()
+      .mockResolvedValueOnce({ code: 230001, msg: 'streaming unsupported' })
+      .mockResolvedValueOnce({
+        code: 0,
+        data: { message_id: 'om_v1_fallback' },
+      });
+    mock.client.im.v1.message.create = messageCreate;
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_rejected_create',
+    });
+
+    controller.append('answer');
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+
+    expect(mock.cardCreate).toHaveBeenCalledTimes(2);
+    expect(messageCreate).toHaveBeenCalledTimes(2);
+    expect(controller.currentMessageId).toBe('om_v1_fallback');
+    expect((controller as any).backendMode).toBe('v1');
+    controller.dispose();
+  });
+
+  test('a proven pre-accept streaming-message failure permits CardKit v1 fallback', async () => {
+    const mock = makeClient();
+    const messageCreate = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('getaddrinfo ENOTFOUND open.feishu.cn'), {
+          code: 'ENOTFOUND',
+        }),
+      )
+      .mockResolvedValueOnce({
+        code: 0,
+        data: { message_id: 'om_v1_after_preaccept' },
+      });
+    mock.client.im.v1.message.create = messageCreate;
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_preaccept_create',
+    });
+
+    controller.append('answer');
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+
+    expect(mock.cardCreate).toHaveBeenCalledTimes(2);
+    expect(messageCreate).toHaveBeenCalledTimes(2);
+    expect(controller.currentMessageId).toBe('om_v1_after_preaccept');
+    expect((controller as any).backendMode).toBe('v1');
+    controller.dispose();
+  });
+
+  test('accepted CardKit v1 message timeout never falls through to legacy create', async () => {
+    const mock = makeClient();
+    mock.cardCreate
+      .mockRejectedValueOnce(new Error('streaming resource unavailable'))
+      .mockResolvedValueOnce({ code: 0, data: { card_id: 'card_v1' } });
+    let visibleMutations = 0;
+    const messageCreate = vi.fn(async () => {
+      visibleMutations += 1;
+      throw Object.assign(new Error('v1 message ACK timed out'), {
+        code: 'ETIMEDOUT',
+      });
+    });
+    mock.client.im.v1.message.create = messageCreate;
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_uncertain_v1',
+    });
+
+    controller.append('answer');
+    await vi.waitFor(() => expect(controller.currentState).toBe('error'));
+
+    expect(mock.cardCreate).toHaveBeenCalledTimes(2);
+    expect(messageCreate).toHaveBeenCalledOnce();
+    expect(visibleMutations).toBe(1);
+    expect(controller.isActive()).toBe(true);
+    await expect(controller.complete('answer')).rejects.toMatchObject({
+      deliveryPhase: 'uncertain',
+    });
+    expect(messageCreate).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
+  test('unknown final update ACK is sticky and never tries a truncated second mutation', async () => {
+    const mock = makeClient();
+    const acceptedTimeout = Object.assign(
+      new Error('card.update ACK timed out after acceptance'),
+      { code: 'ETIMEDOUT' },
+    );
+    mock.cardUpdate.mockRejectedValue(acceptedTimeout);
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_uncertain_finalize',
+    });
+    controller.append('final answer');
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+
+    await expect(controller.complete('final answer')).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      cause: acceptedTimeout,
+    });
+
+    expect(mock.cardUpdate).toHaveBeenCalledOnce();
+    expect(controller.currentState).toBe('error');
+    await expect(controller.complete('final answer')).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+    });
+    expect(mock.cardUpdate).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
+  test.each(['v1', 'legacy'] as const)(
+    '%s unknown active-update ACK becomes sticky without a new message',
+    async (mode) => {
+      let cardCreates = 0;
+      const cardCreate = vi.fn(async () => {
+        cardCreates += 1;
+        if (cardCreates === 1 || mode === 'legacy') {
+          throw new Error('backend resource unavailable');
+        }
+        return { code: 0, data: { card_id: 'card_v1' } };
+      });
+      const acceptedTimeout = Object.assign(
+        new Error(`${mode} update ACK timed out after acceptance`),
+        { code: 'ETIMEDOUT' },
+      );
+      const cardUpdate = vi.fn(async () => {
+        throw acceptedTimeout;
+      });
+      const messagePatch = vi.fn(async () => {
+        throw acceptedTimeout;
+      });
+      const messageCreate = vi
+        .fn()
+        .mockResolvedValue({ code: 0, data: { message_id: `om_${mode}` } });
+      const client = {
+        cardkit: {
+          v1: {
+            card: {
+              create: cardCreate,
+              update: cardUpdate,
+            },
+            cardElement: {},
+          },
+        },
+        im: {
+          message: {},
+          v1: { message: { create: messageCreate, patch: messagePatch } },
+        },
+      };
+      const controller = new StreamingCardController({
+        client: client as any,
+        chatId: `oc_${mode}_sticky_update`,
+      });
+      controller.append('body');
+      await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+      (controller as any).accumulatedText = 'body changed';
+
+      await expect(
+        (controller as any).patchCard('streaming'),
+      ).rejects.toMatchObject({
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        cause: acceptedTimeout,
+      });
+
+      expect(controller.currentState).toBe('error');
+      expect(messageCreate).toHaveBeenCalledOnce();
+      expect(mode === 'v1' ? cardUpdate : messagePatch).toHaveBeenCalledOnce();
+      await expect(controller.complete('body')).rejects.toMatchObject({
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+      });
+      expect(messageCreate).toHaveBeenCalledOnce();
       controller.dispose();
     },
   );

@@ -149,26 +149,70 @@ export function isProviderLimitNotice(result: string | null): boolean {
   return classifyProviderLimitNotice(result) !== null;
 }
 
+/**
+ * What a provider failure actually says about the account, which is what
+ * decides the disposition.
+ *
+ * - `account`: a verdict on this OAuth profile. Quarantine it and let the pool
+ *   decide whether another account can replay the input.
+ * - `transient`: the upstream or the transport misbehaved. The account was
+ *   never judged, so its health must not change and the input stays replayable
+ *   on the same provider within a bounded budget.
+ * - `config`: the request itself is unserviceable as configured. No account can
+ *   satisfy it, so failing over or retrying only burns turns; end visibly and
+ *   point at the configuration.
+ */
+export type ProviderFailureClass = 'account' | 'transient' | 'config';
+
+/** A verdict on the profile: quarantine and fail over. */
 const ACCOUNT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
   'authentication_failed',
   'oauth_org_not_allowed',
   'billing_error',
+  // A bare `rate_limit` assistant error carries no rateLimitType, so its blast
+  // radius is unknown. classifyProviderRateLimitType() already fails safe as
+  // account-wide for an unknown type; stay consistent with it here.
   'rate_limit',
+]);
+
+/**
+ * Upstream/transport noise. `overloaded` is a 529 from Anthropic's own edge and
+ * `server_error` is a 5xx — neither is evidence that this account is out of
+ * quota, yet both used to quarantine it and retire the user's input.
+ */
+const TRANSIENT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
   'overloaded',
-  'model_not_found',
   'server_error',
+]);
+
+/**
+ * `model_not_found` means the configured model name is not servable by this
+ * endpoint. Every account in the pool would be asked for the same model, so
+ * failover is guaranteed to fail the same way — and quarantining accounts for
+ * it would empty the pool over a typo.
+ */
+const CONFIG_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
+  'model_not_found',
 ]);
 
 /**
  * Third-party Anthropic-compatible endpoints can emit an AssistantMessage
  * carrying `error` without ever following it with rate_limit_event/result.
- * Treat provider/account failures as terminal control-plane signals instead of
- * waiting indefinitely for a Result that may never arrive.
+ * Every recognized error therefore has to terminate the SDK attempt rather than
+ * wait indefinitely for a Result that may never arrive — but only the returned
+ * class decides what happens to the account and to the user's input.
+ *
+ * @returns the failure class, or undefined when the error is not a provider
+ * failure at all and normal processing should continue.
  */
-export function isAccountProviderAssistantError(
+export function classifyProviderAssistantError(
   error: SDKAssistantMessageError | undefined,
-): error is SDKAssistantMessageError {
-  return !!error && ACCOUNT_PROVIDER_ASSISTANT_ERRORS.has(error);
+): ProviderFailureClass | undefined {
+  if (!error) return undefined;
+  if (ACCOUNT_PROVIDER_ASSISTANT_ERRORS.has(error)) return 'account';
+  if (TRANSIENT_PROVIDER_ASSISTANT_ERRORS.has(error)) return 'transient';
+  if (CONFIG_PROVIDER_ASSISTANT_ERRORS.has(error)) return 'config';
+  return undefined;
 }
 
 /**
