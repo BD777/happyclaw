@@ -1282,10 +1282,24 @@ const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 3 * 60 * 1000;
-// Recovery grace is bounded at 10 minutes. IPC-injected work measures this
+// Recovery grace ceiling, default 10 minutes. IPC-injected work measures this
 // against its dedicated debt clock so ordinary runner output cannot postpone
 // the ceiling; other candidates use their uninterrupted idle age (#618).
-const STUCK_RUNNER_FORCE_RESTART_MS = 10 * 60 * 1000;
+// Configurable because the right value depends on workload: hosts running
+// long interactive turns (multi-file edits plus test suites, deep research)
+// can legitimately exceed 10 minutes of continuous activity and get
+// force-restarted mid-work. Operators should keep it below CONTAINER_TIMEOUT
+// so graceful replay still precedes the hard run timeout; genuinely dead
+// runners are caught by the 3-minute idle path regardless.
+const stuckRunnerMinutesRaw = Number(
+  process.env.STUCK_RUNNER_FORCE_RESTART_MINUTES,
+);
+const STUCK_RUNNER_FORCE_RESTART_MS =
+  (Number.isFinite(stuckRunnerMinutesRaw) && stuckRunnerMinutesRaw > 0
+    ? stuckRunnerMinutesRaw
+    : 10) *
+  60 *
+  1000;
 let stuckRunnerCheckCounter = 0;
 
 // OOM auto-recovery: track consecutive OOM (exit code 137) exits per folder.
@@ -7336,8 +7350,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   let output:
-    | { status: 'success' | 'error' | 'closed'; error?: string }
-    | undefined;
+    { status: 'success' | 'error' | 'closed'; error?: string } | undefined;
   let activeSessionId = getSession(effectiveGroup.folder) || undefined;
   // currentSourceJid: tells the agent-runner which IM chat the latest user
   // message came from, so per-channel MCP tools (discord_*, etc.) can detect
@@ -7646,9 +7659,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   : se.usage;
                 heldCardUsage = null;
                 void target.patchUsageNote(merged);
-              } else if (
-                !(se.eventType === 'text_delta' && !se.parentToolUseId)
-              ) {
+              } else if (!(
+                se.eventType === 'text_delta' && !se.parentToolUseId
+              )) {
                 feedStreamEventToCard(
                   streamingSession,
                   se,
@@ -8309,8 +8322,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               let streamingCardAttachmentsDelivered = true;
               let cardHeldThisResult = false;
               let pendingStreamingCardCompletion:
-                | NonNullable<typeof outputStreamingSession>
-                | undefined;
+                NonNullable<typeof outputStreamingSession> | undefined;
               if (holdReason) {
                 heldCardParts.push(heldPartText);
                 cardHeldThisResult = true;
@@ -10610,9 +10622,7 @@ function startIpcWatcher(): void {
                 | undefined;
               let nativeDeliveryAcknowledged = false;
               let stagedDisposition:
-                | 'staged_progress'
-                | 'staged_final'
-                | undefined;
+                'staged_progress' | 'staged_final' | undefined;
               const isTaskIpcMessage = Boolean(durableTaskRun);
               const frozenIpcMode = resolveFrozenIpcInteractionMode(
                 data.interactionMode,
@@ -12464,11 +12474,7 @@ async function processTaskIpc(
               ...base,
               query: data.query,
               kind: data.kind as
-                | 'fact'
-                | 'decision'
-                | 'lesson'
-                | 'open_loop'
-                | undefined,
+                'fact' | 'decision' | 'lesson' | 'open_loop' | undefined,
               limit: data.limit,
               maxChars: data.maxChars,
             });
@@ -12489,11 +12495,7 @@ async function processTaskIpc(
               ...base,
               query: data.query ?? '',
               kind: data.kind as
-                | 'fact'
-                | 'decision'
-                | 'lesson'
-                | 'open_loop'
-                | undefined,
+                'fact' | 'decision' | 'lesson' | 'open_loop' | undefined,
               limit: data.limit,
             });
             break;
@@ -13275,9 +13277,7 @@ async function processTaskIpc(
         data.schedule_value !== undefined
       ) {
         const newType = (data.schedule_type ?? task.schedule_type) as
-          | 'cron'
-          | 'interval'
-          | 'once';
+          'cron' | 'interval' | 'once';
         const newValue = data.schedule_value ?? task.schedule_value;
         try {
           updatedNextRun = computeNextRunForSchedule(newType, newValue);
@@ -16432,8 +16432,7 @@ async function processAgentConversation(
         let agentCardAttachmentsDelivered = true;
         let agentStaticImDelivered = false;
         let pendingAgentCardCompletion:
-          | NonNullable<typeof outputAgentStreamingSession>
-          | undefined;
+          NonNullable<typeof outputAgentStreamingSession> | undefined;
         if (holdReason) {
           // 挂起：不定稿，正文进 heldAgentParts，有卡片则状态行提示，后续
           // turn 的流式增量继续追加到同一张卡（Sub 路径 session 本就不轮换）。
