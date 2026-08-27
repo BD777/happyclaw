@@ -1,8 +1,12 @@
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import { afterEach, describe, expect, test } from 'vitest';
 
-import { downloadHttpsBuffer } from '../src/im-media-download.js';
+import {
+  downloadHttpsBuffer,
+  imMediaAgentForHop,
+} from '../src/im-media-download.js';
 
 function trackClose(server: net.Server): () => Promise<void> {
   const sockets = new Set<net.Socket>();
@@ -164,5 +168,85 @@ describe('Inbound IM media download timeout against a blackhole peer', () => {
       }),
     ).rejects.toThrow(/timed out/i);
     expect(Date.now() - started).toBeLessThan(300);
+  });
+
+  test('does not reuse a configured Agent after a protocol-changing redirect', () => {
+    const agent = new http.Agent();
+    expect(imMediaAgentForHop(agent, true)).toBe(agent);
+    expect(imMediaAgentForHop(agent, false)).toBeUndefined();
+    agent.destroy();
+  });
+
+  test('cross-protocol redirect reaches the new transport without the old Agent', async () => {
+    const server = http.createServer((_req, res) => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') throw new Error('missing port');
+      res.writeHead(302, {
+        location: `https://127.0.0.1:${addr.port}/tls-target`,
+      });
+      res.end();
+    });
+    server.on('clientError', (_error, socket) => socket.destroy());
+    closers.push(trackClose(server));
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('missing HTTP port');
+    const oldAgent = new http.Agent();
+    try {
+      const error = await downloadHttpsBuffer(
+        `http://127.0.0.1:${addr.port}/redirect`,
+        { agent: oldAgent, followRedirects: true, timeoutMs: 1000 },
+      ).catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as NodeJS.ErrnoException).code).not.toBe(
+        'ERR_INVALID_PROTOCOL',
+      );
+    } finally {
+      oldAgent.destroy();
+    }
+  });
+
+  test('turns a synchronous transport.get setup throw into Promise rejection', async () => {
+    const wrongProtocolAgent = new https.Agent();
+    try {
+      await expect(
+        downloadHttpsBuffer('http://127.0.0.1:1/file', {
+          agent: wrongProtocolAgent,
+        }),
+      ).rejects.toThrow(/protocol/i);
+    } finally {
+      wrongProtocolAgent.destroy();
+    }
+  });
+
+  test('keeps a redirect response tracked until its body ends', async () => {
+    let targetRequests = 0;
+    const server = http.createServer((req, res) => {
+      if (req.url === '/redirect') {
+        res.writeHead(302, { location: '/target' });
+        res.write('body-that-never-finishes');
+        return;
+      }
+      targetRequests += 1;
+      res.end('unexpected');
+    });
+    closers.push(trackClose(server));
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('missing HTTP port');
+
+    await expect(
+      downloadHttpsBuffer(`http://127.0.0.1:${addr.port}/redirect`, {
+        timeoutMs: 120,
+        followRedirects: true,
+      }),
+    ).rejects.toThrow(/timed out/i);
+    expect(targetRequests).toBe(0);
   });
 });

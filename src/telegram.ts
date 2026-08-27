@@ -239,6 +239,20 @@ export function telegramMediaMessageText(
   return normalizedCaption ? `${fileText}\n${normalizedCaption}` : fileText;
 }
 
+/**
+ * Bot API animation updates also carry a compatibility `document` object.
+ * grammY middleware stops unless `next()` is called, so the document handler
+ * must explicitly yield or the later `message:animation` handler is unreachable.
+ */
+export async function yieldTelegramAnimationDocument(
+  message: { animation?: unknown },
+  next: () => Promise<unknown>,
+): Promise<boolean> {
+  if (!message.animation) return false;
+  await next();
+  return true;
+}
+
 export type TelegramOutboundFileKind = 'video' | 'audio' | 'voice' | 'document';
 
 /** Telegram's native APIs accept a narrower set than generic MIME viewers. */
@@ -1303,12 +1317,12 @@ export function createTelegramConnection(
       });
 
       // ── message:document 处理器 ──
-      bot.on('message:document', async (ctx) => {
+      bot.on('message:document', async (ctx, next) => {
         try {
           // Telegram exposes animations through both `animation` and the
           // backwards-compatible `document` field. Let the native animation
           // handler own it so one update cannot race two persistence paths.
-          if ('animation' in ctx.message && ctx.message.animation) return;
+          if (await yieldTelegramAnimationDocument(ctx.message, next)) return;
           const msgId =
             String(ctx.message.message_id) + ':' + String(ctx.chat.id);
           if (isGloballyStale(ctx.message.date * 1000)) return;

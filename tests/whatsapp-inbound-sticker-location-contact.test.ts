@@ -261,4 +261,18 @@ describe('detectMedia / extractMessageText helpers', () => {
       } as proto.IMessage),
     ).toBe('[联系人: Jane Doe]\n电话: +1-555-0100\n邮箱: jane@example.com');
   });
+
+  test('contact arrays cap both item count and total durable text length', () => {
+    const contacts = Array.from({ length: 100 }, (_, index) => ({
+      displayName: `contact-${index}-${'x'.repeat(500)}`,
+      vcard: `BEGIN:VCARD\nTEL:+1555${String(index).padStart(4, '0')}\nEMAIL:user-${index}@example.com\nEND:VCARD`,
+    }));
+    const text = extractMessageText({
+      contactsArrayMessage: { contacts },
+    } as proto.IMessage)!;
+    expect(text.length).toBeLessThanOrEqual(8192);
+    expect(text).toContain('contact-0-');
+    expect(text).not.toContain('contact-20-');
+    expect(text).toMatch(/另有 \d+ 个联系人未显示/);
+  });
 });

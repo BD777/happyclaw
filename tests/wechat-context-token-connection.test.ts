@@ -30,6 +30,7 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const { createWeChatConnection } = await import('../src/wechat.js');
+const { weChatClientIdForChunk } = await import('../src/wechat-outbound.js');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -181,7 +182,10 @@ describe('WeChat connection durable context_token integration', () => {
         'image/png',
         'caption',
       ),
-    ).rejects.toBe(uploadFailure);
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_REJECTED',
+      cause: uploadFailure,
+    });
     expect(store.record?.sendCount).toBe(0);
     const filePath = path.join(
       fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-wechat-upload-')),
@@ -191,7 +195,10 @@ describe('WeChat connection durable context_token integration', () => {
     try {
       await expect(
         connection.sendFile('peer', filePath, 'report.txt'),
-      ).rejects.toBe(uploadFailure);
+      ).rejects.toMatchObject({
+        code: 'CHANNEL_DELIVERY_REJECTED',
+        cause: uploadFailure,
+      });
       expect(store.record?.sendCount).toBe(0);
       expect(uploadMedia).toHaveBeenCalledTimes(2);
     } finally {
@@ -259,9 +266,15 @@ describe('WeChat connection durable context_token integration', () => {
         deliveryId: 'delivery-mid-batch',
       }),
     ).rejects.toMatchObject({
-      code: 'CHANNEL_DELIVERY_UNCERTAIN',
-      deliveryId: 'delivery-mid-batch',
-      chunkIndex: 1,
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredChunks: 1,
+      totalChunks: 2,
+      uncertainTail: true,
+      cause: {
+        code: 'CHANNEL_DELIVERY_UNCERTAIN',
+        deliveryId: 'delivery-mid-batch',
+        chunkIndex: 1,
+      },
     });
 
     expect(attemptedTexts).toHaveLength(2);
@@ -389,6 +402,185 @@ describe('WeChat connection durable context_token integration', () => {
     expect(store.record?.sendCount).toBe(1);
     expect(acceptedClientIds).toHaveLength(1);
     await connection.disconnect();
+  });
+
+  test('a durable physical row uses its actual item id and chunk index for client_id', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-1',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    let clientId = '';
+    const fetchMock = vi.fn(
+      async (
+        url: string,
+        init?: { body?: unknown; signal?: AbortSignal | null },
+      ) => {
+        if (url.includes('sendmessage')) {
+          clientId = String(JSON.parse(String(init?.body)).msg.client_id);
+          return Response.json({ ret: 0 });
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+
+    await connection.sendMessage('peer', 'one physical chunk', [], {
+      deliveryId: 'actual-channel-outbox-item-id',
+      chunkIndex: 7,
+      physicalOutput: true,
+    });
+    expect(clientId).toBe(
+      weChatClientIdForChunk('actual-channel-outbox-item-id', 7),
+    );
+    expect(store.record?.sendCount).toBe(1);
+    await connection.disconnect();
+  });
+
+  test('physical-row preflight failures are definitive and make no provider request', async () => {
+    const store = new SharedStore();
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const fetchMock = vi.fn(
+      async (_url: string, init?: { signal?: AbortSignal | null }) =>
+        waitUntilAborted(init?.signal),
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+
+    await expect(
+      connection.sendMessage('peer', 'missing context', [], {
+        deliveryId: 'outbox-missing-context',
+        physicalOutput: true,
+      }),
+    ).rejects.toMatchObject({ code: 'CHANNEL_DELIVERY_REJECTED' });
+    await expect(
+      connection.sendMessage('peer', 'A'.repeat(2500), [], {
+        deliveryId: 'outbox-not-pre-split',
+        physicalOutput: true,
+      }),
+    ).rejects.toMatchObject({ code: 'CHANNEL_DELIVERY_REJECTED' });
+    await expect(
+      connection.sendImage(
+        'peer',
+        Buffer.from('image'),
+        'image/png',
+        'caption must be a separate row',
+        'image.png',
+        {
+          deliveryId: 'outbox-image-with-caption',
+          physicalOutput: true,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'CHANNEL_DELIVERY_REJECTED' });
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes('sendmessage'),
+      ),
+    ).toHaveLength(0);
+    await connection.disconnect();
+  });
+
+  test('explicit nonzero ACK is definitive while 5xx and invalid 2xx ACK are uncertain', async () => {
+    const cases = [
+      {
+        name: 'nonzero-ack',
+        response: () => Response.json({ ret: 4001, errmsg: 'rejected' }),
+        code: 'CHANNEL_DELIVERY_REJECTED',
+      },
+      {
+        name: 'http-503',
+        response: () => new Response('unavailable', { status: 503 }),
+        code: 'CHANNEL_DELIVERY_UNCERTAIN',
+      },
+      {
+        name: 'invalid-2xx',
+        response: () => new Response('not-json', { status: 200 }),
+        code: 'CHANNEL_DELIVERY_UNCERTAIN',
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const store = new SharedStore();
+      store.record = {
+        accountId: 'account',
+        userId: 'peer',
+        token: 'durable-secret',
+        refreshedAtMs: Date.now(),
+        sourceMessageId: `inbound-${testCase.name}`,
+        sourceSequence: 1,
+        sendCount: 0,
+        lastSentAtMs: null,
+      };
+      const dispatcher = {
+        close: vi.fn(async () => undefined),
+      } as unknown as Dispatcher;
+      let sends = 0;
+      const fetchMock = vi.fn(
+        async (url: string, init?: { signal?: AbortSignal | null }) => {
+          if (url.includes('sendmessage')) {
+            sends += 1;
+            return testCase.response();
+          }
+          return waitUntilAborted(init?.signal);
+        },
+      );
+      const connection = createWeChatConnection(
+        {
+          botToken: 'bot-token',
+          ilinkBotId: 'bot-id',
+          logContext: { accountId: 'account' },
+        },
+        {
+          fetch: fetchMock as typeof fetch,
+          createDispatcher: () => dispatcher,
+          contextTokenStore: store,
+        },
+      );
+      await connection.connect({ onNewChat: vi.fn() });
+      await expect(
+        connection.sendMessage('peer', testCase.name, [], {
+          deliveryId: `outbox-${testCase.name}`,
+          physicalOutput: true,
+        }),
+      ).rejects.toMatchObject({ code: testCase.code });
+      expect(sends).toBe(1);
+      expect(store.record?.sendCount).toBe(1);
+      await connection.disconnect();
+    }
   });
 
   test('persists inbound token, restores after restart, and invalidates ret=-2 without tokenless retry', async () => {

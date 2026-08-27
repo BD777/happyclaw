@@ -843,6 +843,7 @@ export class IMConnectionManager {
     mimeType: string,
     caption?: string,
     fileName?: string,
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
@@ -853,13 +854,20 @@ export class IMConnectionManager {
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.sendImage) {
-      await channel.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+      await channel.sendImage(
+        chatId,
+        imageBuffer,
+        mimeType,
+        caption,
+        fileName,
+        options,
+      );
       return;
     }
 
     // Fallback: if channel doesn't support sendImage, send caption as text
     if (caption && channel) {
-      await channel.sendMessage(chatId, `📷 ${caption}`);
+      await channel.sendMessage(chatId, `📷 ${caption}`, undefined, options);
       return;
     }
 
@@ -875,6 +883,7 @@ export class IMConnectionManager {
     jid: string,
     filePath: string,
     fileName: string,
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void> {
     const channelType = getChannelType(jid);
     if (!channelType) {
@@ -884,7 +893,7 @@ export class IMConnectionManager {
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.sendFile) {
-      await channel.sendFile(chatId, filePath, fileName);
+      await channel.sendFile(chatId, filePath, fileName, options);
     } else {
       throw new Error(`通道 ${channelType} 不支持发送文件`);
     }

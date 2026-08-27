@@ -46,6 +46,16 @@ describe('imSendFailurePolicy', () => {
     );
   });
 
+  test('does not retry or remove a channel after a partial physical delivery', () => {
+    const error = Object.assign(new Error('1/2 outputs delivered'), {
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+    });
+    expect(imSendFailurePolicy(error)).toEqual({
+      retryable: false,
+      countsTowardChannelRemoval: false,
+    });
+  });
+
   test('does not retry or remove a healthy channel after an explicit provider rejection', () => {
     expect(
       imSendFailurePolicy(

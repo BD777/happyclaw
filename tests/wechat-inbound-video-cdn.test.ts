@@ -183,10 +183,18 @@ describe('WeChat inbound video CDN persist', () => {
     expect(detectWeChatVoiceExtension(Buffer.from('#!SILK_V3bytes'))).toBe(
       '.silk',
     );
+    expect(
+      detectWeChatVoiceExtension(
+        Buffer.concat([Buffer.from([0x02]), Buffer.from('#!SILK_V3bytes')]),
+      ),
+    ).toBe('.silk');
     expect(detectWeChatVoiceExtension(Buffer.from('#!AMR\nbytes'))).toBe(
       '.amr',
     );
     expect(detectWeChatVoiceExtension(Buffer.from('OggSbytes'))).toBe('.ogg');
+    expect(detectWeChatVoiceExtension(Buffer.from([0xff, 0xf1, 0x50]))).toBe(
+      '.aac',
+    );
     expect(
       detectWeChatVoiceExtension(Buffer.from('unknown-voice-container')),
     ).toBe('.bin');

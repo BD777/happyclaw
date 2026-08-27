@@ -5,6 +5,8 @@ import type { WeChatConnectOpts } from '../src/wechat.js';
 const capture = vi.hoisted(() => ({
   connectOpts: null as WeChatConnectOpts | null,
   sendMessage: vi.fn(),
+  sendImage: vi.fn(),
+  sendFile: vi.fn(),
 }));
 
 vi.mock('../src/wechat.js', () => ({
@@ -14,8 +16,8 @@ vi.mock('../src/wechat.js', () => ({
     },
     async disconnect() {},
     sendMessage: capture.sendMessage,
-    async sendImage() {},
-    async sendFile() {},
+    sendImage: capture.sendImage,
+    sendFile: capture.sendFile,
     async sendTyping() {},
     isRunning: () => true,
     isConnected: () => true,
@@ -30,6 +32,8 @@ describe('WeChat admission and lifecycle wiring', () => {
   beforeEach(() => {
     capture.connectOpts = null;
     capture.sendMessage.mockReset();
+    capture.sendImage.mockReset();
+    capture.sendFile.mockReset();
   });
 
   test('adapter forwards authorization, pairing, and connection state callbacks', async () => {
@@ -82,10 +86,41 @@ describe('WeChat admission and lifecycle wiring', () => {
     await channel.connect({ onNewChat: vi.fn() });
     await channel.sendMessage('peer', 'hello', [], {
       deliveryId: 'turn-1:reply-0',
+      chunkIndex: 3,
+      physicalOutput: true,
     });
     expect(capture.sendMessage).toHaveBeenCalledWith('peer', 'hello', [], {
       deliveryId: 'turn-1:reply-0',
+      chunkIndex: 3,
+      physicalOutput: true,
     });
+    await channel.sendImage?.(
+      'peer',
+      Buffer.from('image'),
+      'image/png',
+      undefined,
+      'image.png',
+      { deliveryId: 'image-row', chunkIndex: 0, physicalOutput: true },
+    );
+    expect(capture.sendImage).toHaveBeenCalledWith(
+      'peer',
+      Buffer.from('image'),
+      'image/png',
+      undefined,
+      'image.png',
+      { deliveryId: 'image-row', chunkIndex: 0, physicalOutput: true },
+    );
+    await channel.sendFile?.('peer', '/tmp/report', 'report.txt', {
+      deliveryId: 'file-row',
+      chunkIndex: 0,
+      physicalOutput: true,
+    });
+    expect(capture.sendFile).toHaveBeenCalledWith(
+      'peer',
+      '/tmp/report',
+      'report.txt',
+      { deliveryId: 'file-row', chunkIndex: 0, physicalOutput: true },
+    );
   });
 
   test('manager account-scopes WeChat admission callbacks and forwards expiry', async () => {

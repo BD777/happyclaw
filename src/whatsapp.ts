@@ -1166,8 +1166,7 @@ export function extractMessageText(content: proto.IMessage): string | null {
   }
   if (content.contactsArrayMessage) {
     const contacts = content.contactsArrayMessage.contacts ?? [];
-    if (contacts.length === 0) return '[联系人]';
-    return contacts.map((entry) => formatWhatsAppContact(entry)).join('\n');
+    return formatWhatsAppContacts(contacts);
   }
   return null;
 }
@@ -1279,6 +1278,40 @@ export function formatWhatsAppContact(contact: {
     lines.push(`组织: ${vcard.organizations.join(', ')}`);
   }
   return lines.join('\n').slice(0, 4096);
+}
+
+export const WHATSAPP_MAX_CONTACTS_PER_MESSAGE = 20;
+export const WHATSAPP_MAX_CONTACT_TEXT_LENGTH = 8192;
+
+export function formatWhatsAppContacts(
+  contacts: Array<{ displayName?: string | null; vcard?: string | null }>,
+): string {
+  if (contacts.length === 0) return '[联系人]';
+  const rendered: string[] = [];
+  const scanCount = Math.min(
+    contacts.length,
+    WHATSAPP_MAX_CONTACTS_PER_MESSAGE,
+  );
+  // Reserve enough room for the omission marker so the bound never truncates
+  // into a phone number or email address.
+  const markerReserve = 96;
+  let length = 0;
+  for (let index = 0; index < scanCount; index++) {
+    const entry = formatWhatsAppContact(contacts[index]!);
+    const separatorLength = rendered.length > 0 ? 1 : 0;
+    if (
+      length + separatorLength + entry.length >
+      WHATSAPP_MAX_CONTACT_TEXT_LENGTH - markerReserve
+    ) {
+      break;
+    }
+    rendered.push(entry);
+    length += separatorLength + entry.length;
+  }
+
+  const omitted = contacts.length - rendered.length;
+  if (omitted > 0) rendered.push(`[另有 ${omitted} 个联系人未显示]`);
+  return rendered.join('\n').slice(0, WHATSAPP_MAX_CONTACT_TEXT_LENGTH);
 }
 
 /**

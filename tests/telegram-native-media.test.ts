@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const inbound = vi.hoisted(() => ({
-  handlers: new Map<string, (ctx: any) => Promise<void>>(),
+  handlers: new Map<
+    string,
+    (ctx: any, next?: () => Promise<unknown>) => Promise<void>
+  >(),
   storeMessageDirect: vi.fn(),
   notifyNewImMessage: vi.fn(),
   stop: null as (() => void) | null,
@@ -16,7 +19,10 @@ vi.mock('grammy', () => ({
       getChat: vi.fn(async () => ({ is_forum: false })),
       setMessageReaction: vi.fn(async () => {}),
     };
-    on(filter: string, fn: (ctx: any) => Promise<void>) {
+    on(
+      filter: string,
+      fn: (ctx: any, next?: () => Promise<unknown>) => Promise<void>,
+    ) {
       inbound.handlers.set(filter, fn);
       return this;
     }
@@ -191,8 +197,9 @@ describe('Telegram native media inbound listeners', () => {
       react: vi.fn(async () => {}),
       reply: vi.fn(async () => {}),
     };
-    await inbound.handlers.get('message:document')!(ctx);
-    await inbound.handlers.get('message:animation')!(ctx);
+    await inbound.handlers.get('message:document')!(ctx, () =>
+      inbound.handlers.get('message:animation')!(ctx),
+    );
     expect(inbound.storeMessageDirect).toHaveBeenCalledOnce();
   });
 });

@@ -274,7 +274,9 @@ import {
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
   CHANNEL_RELIABILITY_TERMINAL_STATUSES,
+  type ChannelOutboxItem,
 } from './channel-reliability-store.js';
+import { prepareWeChatTextChunks } from './wechat-outbound.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp-auth.js';
@@ -2654,13 +2656,45 @@ interface ChannelOutboxDeliveryRef {
   ordinalSlot?: string;
 }
 
+function childChannelOutboxRef(
+  ref: ChannelOutboxDeliveryRef,
+  suffix: string,
+): ChannelOutboxDeliveryRef {
+  return {
+    ...ref,
+    operationKey: `${ref.operationKey}:${suffix}`,
+    ordinalSlot: `${ref.ordinalSlot ?? 'message'}:${suffix}`,
+  };
+}
+
 class ScopedChannelDeliveryError extends Error {
   constructor(
     readonly status: Exclude<ChannelOutboxDeliveryOutcome, 'delivered'>,
     message: string,
+    options: { cause?: unknown } = {},
   ) {
-    super(message);
+    super(
+      message,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
     this.name = 'ScopedChannelDeliveryError';
+  }
+}
+
+class ScopedChannelPartialDeliveryError extends ScopedChannelDeliveryError {
+  readonly code = 'CHANNEL_DELIVERY_PARTIAL';
+
+  constructor(
+    readonly deliveredOutputs: number,
+    readonly totalOutputs: number,
+    tail: ScopedChannelDeliveryError,
+  ) {
+    super(
+      tail.status,
+      `Channel delivery is partial: ${deliveredOutputs}/${totalOutputs} physical outputs were acknowledged; ${tail.message}`,
+      { cause: tail },
+    );
+    this.name = 'ScopedChannelPartialDeliveryError';
   }
 }
 
@@ -2726,7 +2760,7 @@ async function deliverScopedChannelOutput(
   input: {
     kind: 'text' | 'card' | 'image' | 'file';
     payload: unknown;
-    send: () => Promise<void>;
+    send: (item: ChannelOutboxItem) => Promise<void>;
     failure?: { error?: unknown };
   },
 ): Promise<boolean | null> {
@@ -2749,6 +2783,12 @@ async function deliverScopedChannelOutput(
       },
       'Suppressed channel side effect because its exact outbox scope is unavailable',
     );
+    if (input.failure) {
+      input.failure.error = new ScopedChannelDeliveryError(
+        'failed',
+        'Exact outbox scope is unavailable',
+      );
+    }
     return false;
   }
   // The scope projection deliberately outlives a single input turn so a late
@@ -2773,6 +2813,12 @@ async function deliverScopedChannelOutput(
       },
       'Suppressed channel side effect because its turn already closed its output window',
     );
+    if (input.failure) {
+      input.failure.error = new ScopedChannelDeliveryError(
+        'cancelled',
+        'Channel turn already closed its output window',
+      );
+    }
     return false;
   }
   const uncertainSibling = getUncertainChannelOutboxForTurn(scope.turnRunId);
@@ -2786,6 +2832,13 @@ async function deliverScopedChannelOutput(
       },
       'Blocked channel side effect until uncertain turn is manually reconciled',
     );
+    if (input.failure) {
+      input.failure.error = new ScopedChannelDeliveryError(
+        'uncertain',
+        uncertainSibling.error ??
+          'Earlier physical channel output is uncertain; automatic replay is blocked',
+      );
+    }
     return false;
   }
   const semanticIdentity = semanticChannelOutboxIdentity({
@@ -2812,7 +2865,7 @@ async function deliverScopedChannelOutput(
       mode: 'single',
       send: async ({ item }) => {
         // deliverChannelOutboxItem persists `sending` before entering here.
-        await input.send();
+        await input.send(item);
         return {
           providerMessageId: syntheticChannelProviderAck({
             turnRunId: scope.turnRunId,
@@ -2899,53 +2952,95 @@ async function sendImWithRetry(
   let ok: boolean;
   const sendFailure = failure ?? {};
   const durableScoped = outbox !== undefined;
-  const connectorDeliveryOptions: ChannelMessageDeliveryOptions = {
-    ...deliveryOptions,
-    deliveryId:
-      deliveryOptions?.deliveryId ??
-      (outbox
-        ? `${outbox.scopeKey}:${outbox.operationKey}:${outbox.ordinalSlot ?? 'message'}:text`
-        : crypto.randomUUID()),
-  };
   if (durableScoped) {
     ok = true;
-    if (text) {
+    const weChat = getChannelType(imJid) === 'wechat';
+    const textChunks = text
+      ? weChat
+        ? prepareWeChatTextChunks(text)
+        : [text]
+      : [];
+    const totalPhysicalOutputs = textChunks.length + localImagePaths.length;
+    let deliveredOutputs = 0;
+
+    const recordTailFailure = (tail: unknown): void => {
+      const scopedTail =
+        tail instanceof ScopedChannelDeliveryError
+          ? tail
+          : new ScopedChannelDeliveryError(
+              'busy',
+              tail instanceof Error
+                ? tail.message
+                : 'Physical channel output did not complete',
+              { cause: tail },
+            );
+      sendFailure.error =
+        deliveredOutputs > 0
+          ? new ScopedChannelPartialDeliveryError(
+              deliveredOutputs,
+              totalPhysicalOutputs,
+              scopedTail,
+            )
+          : scopedTail;
+    };
+
+    for (let index = 0; index < textChunks.length; index++) {
+      const chunk = textChunks[index]!;
+      const chunkFailure: { error?: unknown } = {};
       const delivered = await deliverScopedChannelOutput(
         imJid,
-        {
-          ...outbox!,
-          operationKey: `${outbox!.operationKey}:text`,
-          ordinalSlot: `${outbox!.ordinalSlot ?? 'message'}:text`,
-        },
+        childChannelOutboxRef(outbox!, weChat ? `text:${index}` : 'text'),
         {
           kind: 'text',
           payload: buildInteractionTextOutboxPayload(
-            text,
+            chunk,
             deliveryOptions?.presentation,
             outboxMetadata,
           ),
-          send: () =>
-            imManager.sendMessage(imJid, text, [], connectorDeliveryOptions),
-          failure: sendFailure,
+          send: (item) =>
+            imManager.sendMessage(imJid, chunk, [], {
+              ...deliveryOptions,
+              deliveryId: item.id,
+              chunkIndex: index,
+              physicalOutput: weChat,
+            }),
+          failure: chunkFailure,
         },
       );
-      ok = delivered === true;
+      if (delivered !== true) {
+        ok = false;
+        recordTailFailure(chunkFailure.error);
+        break;
+      }
+      deliveredOutputs += 1;
     }
-    for (let index = 0; index < localImagePaths.length; index++) {
+
+    for (let index = 0; ok && index < localImagePaths.length; index++) {
       const imagePath = localImagePaths[index];
-      const imageBuffer = fs.readFileSync(imagePath);
-      const contentHash = crypto
-        .createHash('sha256')
-        .update(imageBuffer)
-        .digest('hex');
-      const mimeType = detectImageMimeType(imageBuffer);
+      let imageBuffer: Buffer;
+      let contentHash: string;
+      let mimeType: string;
+      try {
+        imageBuffer = fs.readFileSync(imagePath);
+        contentHash = crypto
+          .createHash('sha256')
+          .update(imageBuffer)
+          .digest('hex');
+        mimeType = detectImageMimeType(imageBuffer);
+      } catch (error) {
+        ok = false;
+        recordTailFailure(
+          new ScopedChannelDeliveryError(
+            'failed',
+            `Image attachment preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          ),
+        );
+        break;
+      }
       const delivered = await deliverScopedChannelOutput(
         imJid,
-        {
-          ...outbox!,
-          operationKey: `${outbox!.operationKey}:image:${index}`,
-          ordinalSlot: `${outbox!.ordinalSlot ?? 'message'}:image:${index}`,
-        },
+        childChannelOutboxRef(outbox!, `image:${index}`),
         {
           kind: 'image',
           payload: {
@@ -2954,20 +3049,35 @@ async function sendImWithRetry(
           },
           // One physical attachment per outbox row. A later attachment failure
           // therefore cannot cause the already delivered body to be resent.
-          send: () =>
+          send: (item) =>
             imManager.sendImage(
               imJid,
               imageBuffer,
               mimeType,
               undefined,
               path.basename(imagePath),
+              {
+                deliveryId: item.id,
+                chunkIndex: textChunks.length + index,
+                physicalOutput: weChat,
+              },
             ),
           failure: sendFailure,
         },
       );
-      if (delivered !== true) ok = false;
+      if (delivered !== true) {
+        ok = false;
+        recordTailFailure(sendFailure.error);
+        break;
+      }
+      deliveredOutputs += 1;
     }
   } else {
+    const connectorDeliveryOptions: ChannelMessageDeliveryOptions = {
+      ...deliveryOptions,
+      deliveryId: deliveryOptions?.deliveryId ?? crypto.randomUUID(),
+      chunkIndex: deliveryOptions?.chunkIndex ?? 0,
+    };
     ok = await retryImOperation(
       'send_message',
       imJid,
@@ -3277,21 +3387,88 @@ async function sendTaskImageWithRetry(
   outbox?: ChannelOutboxDeliveryRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
-  const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
+  const weChat = getChannelType(targetJid) === 'wechat';
+  let effectiveOutbox = outbox;
+  let effectiveCaption = caption;
+  let captionChunkCount = 0;
+
+  if (weChat && outbox && caption) {
+    const captionChunks = prepareWeChatTextChunks(caption);
+    captionChunkCount = captionChunks.length;
+    let acknowledgedCaptions = 0;
+    for (let index = 0; index < captionChunks.length; index++) {
+      const chunk = captionChunks[index]!;
+      const delivered = await deliverScopedChannelOutput(
+        targetJid,
+        childChannelOutboxRef(outbox, `caption:${index}`),
+        {
+          kind: 'text',
+          payload: { text: chunk, role: 'image_caption' },
+          send: (item) =>
+            imManager.sendMessage(targetJid, chunk, [], {
+              deliveryId: item.id,
+              chunkIndex: index,
+              physicalOutput: true,
+            }),
+        },
+      );
+      if (delivered !== true) {
+        if (acknowledgedCaptions > 0) {
+          logger.warn(
+            {
+              targetJid,
+              acknowledgedOutputs: acknowledgedCaptions,
+              totalOutputs: captionChunks.length + 1,
+            },
+            'WeChat image delivery is partial after caption chunk failure',
+          );
+        }
+        return false;
+      }
+      acknowledgedCaptions += 1;
+    }
+    effectiveCaption = undefined;
+    effectiveOutbox = childChannelOutboxRef(outbox, 'image');
+  }
+
+  const scoped = await deliverScopedChannelOutput(targetJid, effectiveOutbox, {
     kind: 'image',
     payload: {
       mimeType,
-      caption: caption ?? null,
+      caption: effectiveCaption ?? null,
       fileName: fileName ?? null,
       contentHash: crypto
         .createHash('sha256')
         .update(imageBuffer)
         .digest('hex'),
     },
-    send: () =>
-      imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+    send: (item) =>
+      imManager.sendImage(
+        targetJid,
+        imageBuffer,
+        mimeType,
+        effectiveCaption,
+        fileName,
+        {
+          deliveryId: item.id,
+          chunkIndex: captionChunkCount,
+          physicalOutput: weChat,
+        },
+      ),
   });
-  if (scoped !== null) return scoped;
+  if (scoped !== null) {
+    if (!scoped && captionChunkCount > 0) {
+      logger.warn(
+        {
+          targetJid,
+          acknowledgedOutputs: captionChunkCount,
+          totalOutputs: captionChunkCount + 1,
+        },
+        'WeChat image delivery is partial after image send failure',
+      );
+    }
+    return scoped;
+  }
   return retryImOperation('send_task_image', targetJid, () =>
     imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
   );
@@ -3313,7 +3490,12 @@ async function sendTaskFileWithRetry(
         .update(fs.readFileSync(filePath))
         .digest('hex'),
     },
-    send: () => imManager.sendFile(targetJid, filePath, fileName),
+    send: (item) =>
+      imManager.sendFile(targetJid, filePath, fileName, {
+        deliveryId: item.id,
+        chunkIndex: 0,
+        physicalOutput: getChannelType(targetJid) === 'wechat',
+      }),
   });
   if (scoped !== null) return scoped;
   return retryImOperation('send_task_file', targetJid, () =>
@@ -10805,6 +10987,11 @@ function startIpcWatcher(): void {
                           messageDeliveryFailure,
                         );
                         nativeDeliveryAcknowledged = messageDelivered;
+                        const partialFailure =
+                          messageDeliveryFailure.error instanceof
+                          ScopedChannelPartialDeliveryError
+                            ? messageDeliveryFailure.error
+                            : undefined;
                         if (
                           !messageDelivered &&
                           messageScope &&
@@ -10813,8 +11000,9 @@ function startIpcWatcher(): void {
                           )
                         ) {
                           messageDeliveryUncertain = true;
-                          messageDeliveryError =
-                            'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
+                          messageDeliveryError = partialFailure
+                            ? `Message delivery is partial: ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs were acknowledged and the next outcome is uncertain. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.`
+                            : 'Message delivery is uncertain or fenced by an earlier uncertain channel mutation. Do not retry, sleep, switch to a card, or call a raw channel API; the framework will notify the user.';
                         } else if (
                           !messageDelivered &&
                           messageDeliveryFailure.error instanceof
@@ -10831,8 +11019,13 @@ function startIpcWatcher(): void {
                               }
                             : undefined;
                           messageDeliveryError =
-                            `The native channel definitively did not accept this message: ${messageDeliveryFailure.error.message}. ` +
+                            (partialFailure
+                              ? `The native channel accepted ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs before definitively rejecting the tail: ${messageDeliveryFailure.error.message}. `
+                              : `The native channel definitively did not accept this message: ${messageDeliveryFailure.error.message}. `) +
                             'The complete answer will remain available in HappyClaw Web; do not retry or rewrite it solely for this channel failure.';
+                        } else if (!messageDelivered && partialFailure) {
+                          messageDeliveryUncertain = true;
+                          messageDeliveryError = `Message delivery is partial: ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs were acknowledged before the tail was fenced as ${partialFailure.status}. Do not retry; the complete answer remains available in HappyClaw Web.`;
                         }
                       }
                     }

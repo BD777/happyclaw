@@ -221,13 +221,19 @@ export interface IMChannel {
     options?: ChannelMessageDeliveryOptions,
   ): Promise<void>;
   /** Send file to chat (if supported) */
-  sendFile?(chatId: string, filePath: string, fileName: string): Promise<void>;
+  sendFile?(
+    chatId: string,
+    filePath: string,
+    fileName: string,
+    options?: ChannelMessageDeliveryOptions,
+  ): Promise<void>;
   sendImage?(
     chatId: string,
     imageBuffer: Buffer,
     mimeType: string,
     caption?: string,
     fileName?: string,
+    options?: ChannelMessageDeliveryOptions,
   ): Promise<void>;
   setTyping(chatId: string, isTyping: boolean, leaseId?: string): Promise<void>;
   /** Add an ack reaction for the one exact input that owns an active batch. */
@@ -265,8 +271,12 @@ export interface IMChannel {
 export interface ChannelMessageDeliveryOptions {
   /** `native` avoids bot/card presentation for Proactive-mode workspace Agents. */
   presentation?: 'default' | 'native';
-  /** Stable durable identity reused across transport retries. */
+  /** Actual ChannelOutboxItem.id, or a call-scoped UUID outside the outbox. */
   deliveryId?: string;
+  /** Physical chunk ordinal used to derive a stable provider idempotency key. */
+  chunkIndex?: number;
+  /** Enforce the one-outbox-row/one-provider-request invariant. */
+  physicalOutput?: boolean;
 }
 
 /**
@@ -887,6 +897,8 @@ export function createWeChatChannel(
       }
       await inner.sendMessage(chatId, text, localImagePaths, {
         deliveryId: options?.deliveryId,
+        chunkIndex: options?.chunkIndex,
+        physicalOutput: options?.physicalOutput,
       });
     },
 
@@ -896,26 +908,35 @@ export function createWeChatChannel(
       mimeType: string,
       caption?: string,
       fileName?: string,
+      options?: ChannelMessageDeliveryOptions,
     ): Promise<void> {
       if (!inner) {
         throw new Error(
           `WeChat channel is not connected; image to ${chatId} was not sent`,
         );
       }
-      await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+      await inner.sendImage(
+        chatId,
+        imageBuffer,
+        mimeType,
+        caption,
+        fileName,
+        options,
+      );
     },
 
     async sendFile(
       chatId: string,
       filePath: string,
       fileName: string,
+      options?: ChannelMessageDeliveryOptions,
     ): Promise<void> {
       if (!inner) {
         throw new Error(
           `WeChat channel is not connected; file to ${chatId} was not sent`,
         );
       }
-      await inner.sendFile(chatId, filePath, fileName);
+      await inner.sendFile(chatId, filePath, fileName, options);
     },
 
     async setTyping(
