@@ -378,40 +378,6 @@ describe('channel outbox physical delivery transaction', () => {
     expect(providerAccepted).toBe(1);
   });
 
-  test('persists an explicit Retry-After rejection as retry_wait', async () => {
-    const now = '2026-07-23T04:01:30.000Z';
-    const retryAt = '2026-07-23T04:02:00.000Z';
-    const run = createRun('retry-after', now);
-    let sends = 0;
-    const input = {
-      ...route,
-      turnRunId: run.id,
-      ordinal: 0,
-      kind: 'text' as const,
-      payload: { text: 'rate limited' },
-      owner: 'sender-retry-after',
-      now: () => now,
-      delivery: {
-        mode: 'single' as const,
-        send: async (): Promise<{ providerMessageId: string }> => {
-          sends += 1;
-          throw new delivery.DefinitiveChannelDeliveryError('HTTP 429', {
-            retryAt,
-          });
-        },
-      },
-    };
-    const first = await delivery.deliverChannelOutboxItem(input);
-    expect(first).toMatchObject({ status: 'retry_wait', reused: false });
-    expect(store.getChannelOutboxItem(first.itemId)).toMatchObject({
-      status: 'retry_wait',
-      availableAt: retryAt,
-    });
-    const earlyReplay = await delivery.deliverChannelOutboxItem(input);
-    expect(earlyReplay.status).toBe('retry_wait');
-    expect(sends).toBe(1);
-  });
-
   test('reuses a persisted upload after process death before send', async () => {
     let now = '2026-07-23T04:02:00.000Z';
     const run = createRun('upload-crash', now);

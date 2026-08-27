@@ -569,7 +569,7 @@ describe('WeChat connection durable context_token integration', () => {
     await connection.disconnect();
   });
 
-  test('strictly classifies HTTP/ACK outcomes and preserves 429 retry-wait', async () => {
+  test('strictly classifies HTTP/ACK outcomes without creating dead retry-wait', async () => {
     const cases = [
       {
         name: 'nonzero-ack',
@@ -599,7 +599,7 @@ describe('WeChat connection durable context_token integration', () => {
             headers: { 'retry-after': '2' },
           }),
         code: 'CHANNEL_DELIVERY_REJECTED',
-        retryWait: true,
+        manualRetry: true,
         expectedRetryMs: 2000,
       },
       {
@@ -610,7 +610,7 @@ describe('WeChat connection durable context_token integration', () => {
             headers: { 'retry-after': '7' },
           }),
         code: 'CHANNEL_DELIVERY_REJECTED',
-        retryWait: true,
+        manualRetry: true,
         expectedRetryMs: 7000,
       },
       {
@@ -676,10 +676,15 @@ describe('WeChat connection durable context_token integration', () => {
         })
         .catch((cause: unknown) => cause);
       expect(error).toMatchObject({ code: testCase.code });
-      if ('retryWait' in testCase && testCase.retryWait) {
-        const retryAt = Date.parse(
-          String((error as { retryAt?: string }).retryAt),
+      if ('manualRetry' in testCase && testCase.manualRetry) {
+        expect((error as { retryAt?: string }).retryAt).toBeUndefined();
+        expect(String((error as Error).message)).toContain(
+          'manual_retry_after=',
         );
+        const cause = (error as Error & { cause?: unknown }).cause as {
+          manualRetryAfter?: string;
+        };
+        const retryAt = Date.parse(String(cause.manualRetryAfter));
         expect(retryAt - startedAt).toBeGreaterThanOrEqual(
           testCase.expectedRetryMs - 1000,
         );

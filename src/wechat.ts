@@ -255,10 +255,10 @@ export class WeChatHttpError extends Error {
     readonly endpoint: string,
     readonly status: number,
     readonly responseBody: string,
-    readonly retryAt?: string,
+    readonly manualRetryAfter?: string,
   ) {
     super(
-      `WeChat API ${endpoint} HTTP ${status}: ${responseBody.slice(0, 200)}`,
+      `WeChat API ${endpoint} HTTP ${status}: ${responseBody.slice(0, 200)}${manualRetryAfter ? `; manual_retry_after=${manualRetryAfter}` : ''}`,
     );
     this.name = 'WeChatHttpError';
   }
@@ -267,9 +267,9 @@ export class WeChatHttpError extends Error {
 const WECHAT_DEFINITIVE_HTTP_STATUSES = new Set([
   400, 401, 403, 404, 405, 413, 415, 422,
 ]);
-const WECHAT_RETRYABLE_REJECTION_STATUSES = new Set([425, 429]);
+const WECHAT_MANUAL_RETRY_HTTP_STATUSES = new Set([425, 429]);
 
-export function weChatRetryAtFromHeader(
+export function weChatManualRetryAfterFromHeader(
   retryAfter: string | null,
   fallbackMs: number,
   nowMs = Date.now(),
@@ -335,7 +335,6 @@ export class WeChatPartialDeliveryError extends Error {
 function definitiveWeChatDeliveryError(
   operation: string,
   cause: unknown,
-  options: { retryAt?: string } = {},
 ): DefinitiveChannelDeliveryError {
   if (cause instanceof DefinitiveChannelDeliveryError) return cause;
   const message = cause instanceof Error ? cause.message : String(cause);
@@ -345,7 +344,7 @@ function definitiveWeChatDeliveryError(
       : operation;
   return new DefinitiveChannelDeliveryError(
     `WeChat ${reason} definitively produced no provider message: ${message}`,
-    { cause, retryAt: options.retryAt },
+    { cause },
   );
 }
 
@@ -366,12 +365,11 @@ function classifyWeChatSendAttemptError(
     return definitiveWeChatDeliveryError(operation, cause);
   }
   if (cause instanceof WeChatHttpError) {
-    if (WECHAT_RETRYABLE_REJECTION_STATUSES.has(cause.status)) {
-      return definitiveWeChatDeliveryError(operation, cause, {
-        retryAt:
-          cause.retryAt ??
-          weChatRetryAtFromHeader(null, cause.status === 425 ? 1000 : 30_000),
-      });
+    if (WECHAT_MANUAL_RETRY_HTTP_STATUSES.has(cause.status)) {
+      // No due-row worker exists in production. Persist this as a terminal
+      // explicit rejection instead of creating a retry_wait row that can never
+      // be reclaimed. The cause message retains manual_retry_after for Web.
+      return definitiveWeChatDeliveryError(operation, cause);
     }
     if (WECHAT_DEFINITIVE_HTTP_STATUSES.has(cause.status)) {
       return definitiveWeChatDeliveryError(operation, cause);
@@ -438,13 +436,20 @@ export async function parseWeChatApiResponse<T>(
 ): Promise<T> {
   const text = await response.text();
   if (!response.ok) {
-    const retryAt = WECHAT_RETRYABLE_REJECTION_STATUSES.has(response.status)
-      ? weChatRetryAtFromHeader(
+    const manualRetryAfter = WECHAT_MANUAL_RETRY_HTTP_STATUSES.has(
+      response.status,
+    )
+      ? weChatManualRetryAfterFromHeader(
           response.headers.get('retry-after'),
           response.status === 425 ? 1000 : 30_000,
         )
       : undefined;
-    throw new WeChatHttpError(endpoint, response.status, text, retryAt);
+    throw new WeChatHttpError(
+      endpoint,
+      response.status,
+      text,
+      manualRetryAfter,
+    );
   }
   try {
     return JSON.parse(text) as T;
