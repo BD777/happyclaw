@@ -32,7 +32,10 @@
 
 import { logger } from './logger.js';
 import { PartialChannelDeliveryError } from './im-delivery-progress.js';
-import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
+import {
+  classifyImSendFailure,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -136,7 +139,12 @@ export class WeComStreamingController {
   // ─── StreamingSession interface ─────────────────────────────
 
   isActive(): boolean {
-    return this.state === 'idle' || this.state === 'streaming';
+    return (
+      this.acceptsStreamingUpdates() ||
+      (this.state === 'aborted' &&
+        this.terminalDeliveryError !== undefined &&
+        classifyImSendFailure(this.terminalDeliveryError) === 'uncertain')
+    );
   }
 
   getAcknowledgedProviderOutputCount(): number {
@@ -144,7 +152,10 @@ export class WeComStreamingController {
   }
 
   append(text: string): void {
-    if (!this.isActive()) return;
+    // `isActive()` also exposes a sticky uncertain failure so the host can
+    // hand it to the durable finalizer. That evidence must never reopen the
+    // provider stream or accept a late delta.
+    if (!this.acceptsStreamingUpdates()) return;
     const isFirst = this.accumulatedText.length === 0;
     this.accumulatedText = text;
     // Real text has arrived — the thinking indicator is no longer relevant.
@@ -160,7 +171,7 @@ export class WeComStreamingController {
   }
 
   async complete(finalText: string): Promise<void> {
-    if (this.state === 'aborted' && this.terminalDeliveryError) {
+    if (this.state === 'aborted' && this.terminalDeliveryError !== undefined) {
       throw this.terminalDeliveryError;
     }
     if (
@@ -176,7 +187,7 @@ export class WeComStreamingController {
     this.clearTimers();
     if (this.currentFlushPromise)
       await this.currentFlushPromise.catch(() => {});
-    if (this.terminalDeliveryError) {
+    if (this.terminalDeliveryError !== undefined) {
       this.state = 'aborted';
       throw this.terminalDeliveryError;
     }
@@ -276,7 +287,7 @@ export class WeComStreamingController {
   }
 
   async abort(reason?: string): Promise<void> {
-    if (this.state === 'aborted' && this.terminalDeliveryError) {
+    if (this.state === 'aborted' && this.terminalDeliveryError !== undefined) {
       throw this.terminalDeliveryError;
     }
     if (
@@ -291,7 +302,7 @@ export class WeComStreamingController {
     this.clearTimers();
     if (this.currentFlushPromise)
       await this.currentFlushPromise.catch(() => {});
-    if (this.terminalDeliveryError) {
+    if (this.terminalDeliveryError !== undefined) {
       this.state = 'aborted';
       throw this.terminalDeliveryError;
     }
@@ -454,7 +465,7 @@ export class WeComStreamingController {
                   err,
                 )
               : err;
-          this.terminalDeliveryError = terminalError;
+          this.terminalDeliveryError ??= terminalError;
           this.state = 'aborted';
           logger.debug(
             { err: err?.message, chatId: this.chatId },
@@ -463,13 +474,14 @@ export class WeComStreamingController {
         })
         .finally(() => {
           this.currentFlushPromise = null;
-          if (this.flushPending && this.isActive()) this.scheduleFlush();
+          if (this.flushPending && this.acceptsStreamingUpdates())
+            this.scheduleFlush();
         });
     }, delay);
   }
 
   private async doFlush(): Promise<void> {
-    if (!this.isActive()) return;
+    if (!this.acceptsStreamingUpdates()) return;
     const content = this.renderStreaming();
     if (!content.trim()) return;
     await this.sendStream(truncateWeComUtf8(content), false); // GENERATING
@@ -483,5 +495,9 @@ export class WeComStreamingController {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+  }
+
+  private acceptsStreamingUpdates(): boolean {
+    return this.state === 'idle' || this.state === 'streaming';
   }
 }
