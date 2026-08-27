@@ -1157,6 +1157,29 @@ export function extractMessageText(content: proto.IMessage): string | null {
   if (content.imageMessage?.caption) return content.imageMessage.caption;
   if (content.videoMessage?.caption) return content.videoMessage.caption;
   if (content.documentMessage?.caption) return content.documentMessage.caption;
+  const eventMessage = (
+    content as proto.IMessage & {
+      eventMessage?: { name?: string | null; description?: string | null };
+    }
+  ).eventMessage;
+  if (eventMessage) {
+    const name = eventMessage.name?.trim();
+    return name ? `[活动: ${name}]` : '[活动]';
+  }
+  const groupInviteMessage = (
+    content as proto.IMessage & {
+      groupInviteMessage?: {
+        groupName?: string | null;
+        caption?: string | null;
+      };
+    }
+  ).groupInviteMessage;
+  if (groupInviteMessage) {
+    const name =
+      groupInviteMessage.groupName?.trim() ||
+      groupInviteMessage.caption?.trim();
+    return name ? `[群邀请: ${name}]` : '[群邀请]';
+  }
   return null;
 }
 
