@@ -576,8 +576,11 @@ export function createWhatsAppConnection(
 
     let buffer: Buffer;
     try {
+      // Baileys downloadMediaMessage reads msg.message and does not peel
+      // lottieStickerMessage (proto 74 / #2776 unmerged). Reconstruct so the
+      // unwrapped inner sticker is what the downloader sees.
       buffer = await downloadMediaMessage(
-        msg,
+        { ...msg, message: content },
         'buffer',
         {},
         {
@@ -1121,13 +1124,19 @@ export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
     // wrap too. Missing any of these drops the message — e.g. a PDF WITH a
     // caption (documentWithCaptionMessage) would extract no text and detect no
     // media, while the same PDF without a caption (bare documentMessage) works.
+    const lottieSticker = (
+      inner as proto.IMessage & {
+        lottieStickerMessage?: { message?: proto.IMessage | null } | null;
+      }
+    ).lottieStickerMessage?.message;
     const next =
       inner.ephemeralMessage?.message ||
       inner.viewOnceMessage?.message ||
       inner.viewOnceMessageV2?.message ||
       inner.viewOnceMessageV2Extension?.message ||
       inner.documentWithCaptionMessage?.message ||
-      inner.editedMessage?.message;
+      inner.editedMessage?.message ||
+      lottieSticker;
     if (!next) break;
     inner = next;
   }
@@ -1177,7 +1186,7 @@ export function normalizeTimestamp(
 }
 
 interface DetectedMedia {
-  kind: 'image' | 'video' | 'audio' | 'document';
+  kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
   label: string;
   defaultExt: string;
   node: {
@@ -1219,6 +1228,14 @@ function detectMedia(content: proto.IMessage): DetectedMedia | null {
       label: '文档',
       defaultExt: '',
       node: content.documentMessage as DetectedMedia['node'],
+    };
+  }
+  if (content.stickerMessage) {
+    return {
+      kind: 'sticker',
+      label: '贴纸',
+      defaultExt: '.webp',
+      node: content.stickerMessage as DetectedMedia['node'],
     };
   }
   return null;
