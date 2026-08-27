@@ -67,6 +67,12 @@ import type {
   OnChannelFollowUpsChanged,
   OnChannelMessagePersisted,
 } from './channel-contracts.js';
+import {
+  deliverTextAndLocalImages,
+  prepareLocalImages,
+} from './im-local-attachments.js';
+import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
+import { prepareWeChatTextChunks } from './wechat-outbound.js';
 
 /** Union type for any streaming card controller (Feishu, DingTalk, Discord, QQ, or WeCom) */
 export type StreamingSession =
@@ -974,10 +980,32 @@ export function createWeChatChannel(
           `WeChat channel is not connected; message to ${chatId} was not sent`,
         );
       }
-      await inner.sendMessage(chatId, text, localImagePaths, {
-        deliveryId: options?.deliveryId,
-        chunkIndex: options?.chunkIndex,
-        physicalOutput: options?.physicalOutput,
+      const firstImageChunk =
+        (options?.chunkIndex ?? 0) +
+        (text.length > 0 ? prepareWeChatTextChunks(text).length : 0);
+      const images = prepareLocalImages(localImagePaths ?? []);
+      await deliverTextAndLocalImages({
+        text,
+        images,
+        sendText: () =>
+          inner!.sendMessage(chatId, text, [], {
+            deliveryId: options?.deliveryId,
+            chunkIndex: options?.chunkIndex,
+            physicalOutput: options?.physicalOutput,
+          }),
+        sendImage: (image, index) =>
+          inner!.sendImage(
+            chatId,
+            image.buffer,
+            image.mimeType,
+            undefined,
+            image.fileName,
+            {
+              deliveryId: options?.deliveryId,
+              chunkIndex: firstImageChunk + index,
+              physicalOutput: options?.physicalOutput,
+            },
+          ),
       });
     },
 
@@ -1097,11 +1125,63 @@ export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
       }
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+      options?: ChannelMessageDeliveryOptions,
+    ): Promise<void> {
       if (!inner) {
         throw new Error('WeCom channel is not connected');
       }
-      await inner.sendMessage(chatId, text);
+      if (
+        options?.physicalOutput &&
+        (localImagePaths?.length || Buffer.byteLength(text, 'utf8') > 20_480)
+      ) {
+        throw preAcceptImDeliveryError(
+          'Durable WeCom text row must map to exactly one provider output',
+        );
+      }
+      const images = prepareLocalImages(localImagePaths ?? []);
+      await deliverTextAndLocalImages({
+        text,
+        images,
+        sendText: () => inner!.sendMessage(chatId, text, []),
+        sendImage: (image) =>
+          inner!.sendImage(
+            chatId,
+            image.buffer,
+            image.mimeType,
+            undefined,
+            image.fileName,
+          ),
+      });
+    },
+
+    async sendImage(
+      chatId: string,
+      imageBuffer: Buffer,
+      mimeType: string,
+      caption?: string,
+      fileName?: string,
+      options?: ChannelMessageDeliveryOptions,
+    ): Promise<void> {
+      if (!inner) throw new Error('WeCom channel is not connected');
+      if (options?.physicalOutput && caption) {
+        throw preAcceptImDeliveryError(
+          'Durable WeCom image row cannot include a separate caption output',
+        );
+      }
+      await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+    },
+
+    async sendFile(
+      chatId: string,
+      filePath: string,
+      fileName: string,
+    ): Promise<void> {
+      if (!inner) throw new Error('WeCom channel is not connected');
+      await inner.sendFile(chatId, filePath, fileName);
     },
 
     // 企微智能机器人无「正在输入」态，setTyping 为 no-op。
@@ -1174,13 +1254,39 @@ export function createDingTalkChannel(
       }
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+      options?: ChannelMessageDeliveryOptions,
+    ): Promise<void> {
       if (!inner) {
         throw new Error(
           `DingTalk channel is not connected; message to ${chatId} was not sent`,
         );
       }
-      await inner.sendMessage(chatId, text);
+      if (
+        options?.physicalOutput &&
+        (localImagePaths?.length || text.length > 4_000)
+      ) {
+        throw preAcceptImDeliveryError(
+          'Durable DingTalk text row must map to exactly one provider output',
+        );
+      }
+      const images = prepareLocalImages(localImagePaths ?? []);
+      await deliverTextAndLocalImages({
+        text,
+        images,
+        sendText: () => inner!.sendMessage(chatId, text, []),
+        sendImage: (image) =>
+          inner!.sendImage(
+            chatId,
+            image.buffer,
+            image.mimeType,
+            undefined,
+            image.fileName,
+          ),
+      });
     },
 
     async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
@@ -1193,10 +1299,16 @@ export function createDingTalkChannel(
       mimeType: string,
       caption?: string,
       fileName?: string,
+      options?: ChannelMessageDeliveryOptions,
     ): Promise<void> {
       if (!inner) {
         throw new Error(
           `DingTalk channel is not connected; image to ${chatId} was not sent`,
+        );
+      }
+      if (options?.physicalOutput && caption) {
+        throw preAcceptImDeliveryError(
+          'Durable DingTalk image row cannot include a separate caption output',
         );
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);

@@ -152,17 +152,17 @@ HappyClaw 区分不同层级的能力来源：
 私聊或原生话题覆盖绑定目标。账号身份会写入渠道地址和 mount，发送时不会借用其他
 Bot 的凭据。
 
-| 渠道         | 接入方式                          | 主要能力                                              |
-| ------------ | --------------------------------- | ----------------------------------------------------- |
-| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射 |
-| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置       |
-| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                 |
-| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制             |
-| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                |
-| **企业微信** | Bot ID / Secret，WebSocket        | Markdown 流式回复、群聊 @ 控制、配对码绑定            |
-| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询        |
-| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复          |
-| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA              |
+| 渠道         | 接入方式                          | 主要能力                                               |
+| ------------ | --------------------------------- | ------------------------------------------------------ |
+| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射  |
+| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置        |
+| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                  |
+| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制              |
+| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                 |
+| **企业微信** | Bot ID / Secret，WebSocket        | Markdown 流式回复、图片与文件、群聊 @ 控制、配对码绑定 |
+| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询         |
+| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复           |
+| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA               |
 
 渠道账号的凭据和扫码会话按用户、账号隔离。当前绑定边界为：
 

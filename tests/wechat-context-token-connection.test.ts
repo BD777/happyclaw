@@ -284,6 +284,161 @@ describe('WeChat connection durable context_token integration', () => {
     await connection.disconnect();
   });
 
+  test('sendMessage delivers its body and every local image with stable chunk indexes', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-local-images',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const uploadMedia = vi.fn(async (input: { buf: Buffer }) => ({
+      filekey: 'fk',
+      downloadEncryptedQueryParam: 'q-enc',
+      aeskey: 'aes-key',
+      fileSize: input.buf.length,
+      fileSizeCiphertext: input.buf.length + 16,
+    }));
+    const sendBodies: any[] = [];
+    const fetchMock = vi.fn(
+      async (
+        url: string,
+        init?: { body?: unknown; signal?: AbortSignal | null },
+      ) => {
+        if (url.includes('sendmessage')) {
+          sendBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ ret: 0 });
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+        uploadMediaBuffer: uploadMedia,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-local-images-'));
+    const first = path.join(dir, 'first.png');
+    const second = path.join(dir, 'second.png');
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    fs.writeFileSync(first, png);
+    fs.writeFileSync(second, png);
+    try {
+      await connection.sendMessage('peer', 'body', [first, second], {
+        deliveryId: 'wechat-local-images',
+      });
+      expect(sendBodies.map((body) => body.msg.item_list[0].type)).toEqual([
+        1, 2, 2,
+      ]);
+      expect(sendBodies.map((body) => body.msg.client_id)).toEqual([
+        expect.any(String),
+        expect.any(String),
+        expect.any(String),
+      ]);
+      expect(new Set(sendBodies.map((body) => body.msg.client_id)).size).toBe(
+        3,
+      );
+      expect(uploadMedia).toHaveBeenCalledTimes(2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await connection.disconnect();
+    }
+  });
+
+  test('ACKed body and first image fence a second-image transport failure', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-local-tail',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const uploadMedia = vi.fn(async (input: { buf: Buffer }) => ({
+      filekey: 'fk',
+      downloadEncryptedQueryParam: 'q-enc',
+      aeskey: 'aes-key',
+      fileSize: input.buf.length,
+      fileSizeCiphertext: input.buf.length + 16,
+    }));
+    let sends = 0;
+    const fetchMock = vi.fn(
+      async (url: string, init?: { signal?: AbortSignal | null }) => {
+        if (url.includes('sendmessage')) {
+          sends += 1;
+          if (sends === 3) {
+            return new Response('bad gateway', { status: 502 });
+          }
+          return Response.json({ ret: 0 });
+        }
+        return waitUntilAborted(init?.signal);
+      },
+    );
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: fetchMock as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+        uploadMediaBuffer: uploadMedia,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-local-tail-'));
+    const first = path.join(dir, 'first.png');
+    const second = path.join(dir, 'second.png');
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    fs.writeFileSync(first, png);
+    fs.writeFileSync(second, png);
+    try {
+      await expect(
+        connection.sendMessage('peer', 'body', [first, second], {
+          deliveryId: 'wechat-local-tail',
+        }),
+      ).rejects.toMatchObject({
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 2,
+        totalOutputs: 3,
+      });
+      expect(sends).toBe(3);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await connection.disconnect();
+    }
+  });
+
   test('two concurrent identical texts remain distinct durable deliveries', async () => {
     const store = new SharedStore();
     store.record = {

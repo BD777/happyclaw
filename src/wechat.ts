@@ -13,12 +13,16 @@
  */
 import crypto from 'crypto';
 import fs from 'fs';
+import path from 'node:path';
 import { fetch as undiciFetch, type Dispatcher } from 'undici';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
-import { detectImageMimeType } from './image-detector.js';
+import {
+  detectImageMimeType,
+  detectImageMimeTypeStrict,
+} from './image-detector.js';
 import { downloadAndDecryptMedia, uploadMediaBuffer } from './wechat-crypto.js';
 import { createDedupCache } from './im-utils.js';
 import { weChatIlinkHeaders } from './wechat-onboarding.js';
@@ -36,6 +40,7 @@ import {
   prepareWeChatTextChunks,
   weChatClientIdForChunk,
 } from './wechat-outbound.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -1769,13 +1774,86 @@ export function createWeChatConnection(
     async sendMessage(
       chatId: string,
       text: string,
-      _localImagePaths?: string[],
+      localImagePaths?: string[],
       options?: WeChatPhysicalDeliveryOptions,
     ): Promise<void> {
       // chatId is the raw WeChat user ID (prefix already stripped by IM manager)
       const userId = chatId;
 
       try {
+        if (localImagePaths?.length) {
+          if (options?.physicalOutput) {
+            throw definitiveWeChatDeliveryError(
+              'attachment preflight',
+              new Error(
+                'One durable WeChat outbox item cannot contain text and local images',
+              ),
+            );
+          }
+          const images = await Promise.all(
+            localImagePaths.map(async (imagePath) => {
+              let buffer: Buffer;
+              try {
+                buffer = await fs.promises.readFile(imagePath);
+              } catch (error) {
+                throw definitiveWeChatDeliveryError(
+                  'attachment preflight',
+                  error,
+                );
+              }
+              if (buffer.length === 0 || buffer.length > MAX_FILE_SIZE) {
+                throw definitiveWeChatDeliveryError(
+                  'attachment preflight',
+                  new Error(
+                    `Image attachment has invalid size ${buffer.length}: ${imagePath}`,
+                  ),
+                );
+              }
+              const mimeType = detectImageMimeTypeStrict(buffer);
+              if (!mimeType) {
+                throw definitiveWeChatDeliveryError(
+                  'attachment preflight',
+                  new Error(`Attachment is not an image: ${imagePath}`),
+                );
+              }
+              return {
+                buffer,
+                mimeType,
+                fileName: path.basename(imagePath),
+              };
+            }),
+          );
+          const textChunks =
+            text.length > 0 ? prepareWeChatTextChunks(text) : [];
+          const tracker = new PhysicalDeliveryTracker(
+            (text.length > 0 ? 1 : 0) + images.length,
+          );
+          if (text.length > 0) {
+            await tracker.send(() => sendManagedText(userId, text, options));
+          }
+          for (let index = 0; index < images.length; index += 1) {
+            const image = images[index]!;
+            await tracker.send(() =>
+              connection.sendImage(
+                chatId,
+                image.buffer,
+                image.mimeType,
+                undefined,
+                image.fileName,
+                {
+                  ...options,
+                  chunkIndex:
+                    (options?.chunkIndex ?? 0) + textChunks.length + index,
+                },
+              ),
+            );
+          }
+          logger.info(
+            { chatId, images: images.length },
+            'WeChat message and local images sent',
+          );
+          return;
+        }
         await sendManagedText(userId, text, options);
         logger.info({ chatId }, 'WeChat message sent');
       } catch (err) {

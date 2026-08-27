@@ -25,9 +25,16 @@ import { storeChatMetadata, storeMessageDirect } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
 import { GROUPS_DIR } from './config.js';
-import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
+import {
+  saveDownloadedFile,
+  MAX_FILE_SIZE,
+  sanitizeImFilename,
+} from './im-downloader.js';
 import { extractFileText } from './file-text-extractor.js';
-import { detectImageMimeType } from './image-detector.js';
+import {
+  detectImageMimeType,
+  detectImageMimeTypeStrict,
+} from './image-detector.js';
 import {
   markdownToPlainText,
   splitTextChunks,
@@ -44,6 +51,8 @@ import {
   ExactAsyncIndicatorRegistry,
   processingIndicatorKey,
 } from './processing-indicator.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
+import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -55,6 +64,40 @@ const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
 const MIN_IMAGE_SIZE = 500;
 /** Match QQ's outbound API request budget so a blackhole peer cannot hang a send. */
 export const DINGTALK_HTTPS_REQUEST_TIMEOUT_MS = 30_000;
+
+async function prepareDingTalkLocalImages(
+  localImagePaths: readonly string[],
+): Promise<Array<{ buffer: Buffer; mimeType: string; fileName: string }>> {
+  return Promise.all(
+    localImagePaths.map(async (imagePath) => {
+      let buffer: Buffer;
+      try {
+        buffer = await fs.readFile(imagePath);
+      } catch (error) {
+        throw preAcceptImDeliveryError(
+          `DingTalk local image is unavailable: ${imagePath}`,
+          error,
+        );
+      }
+      if (buffer.length === 0 || buffer.length > MAX_FILE_SIZE) {
+        throw preAcceptImDeliveryError(
+          `DingTalk local image has invalid size ${buffer.length}: ${imagePath}`,
+        );
+      }
+      const mimeType = detectImageMimeTypeStrict(buffer);
+      if (!mimeType) {
+        throw preAcceptImDeliveryError(
+          `DingTalk local attachment is not an image: ${imagePath}`,
+        );
+      }
+      return {
+        buffer,
+        mimeType,
+        fileName: sanitizeImFilename(path.basename(imagePath)),
+      };
+    }),
+  );
+}
 
 export interface DingTalkHttpsRequestOverrides {
   hostname?: string;
@@ -2917,8 +2960,30 @@ export function createDingTalkConnection(
     async sendMessage(
       chatId: string,
       text: string,
-      _localImagePaths?: string[],
+      localImagePaths?: string[],
     ): Promise<void> {
+      if (localImagePaths?.length) {
+        const images = await prepareDingTalkLocalImages(localImagePaths);
+        const sendsText = text.length > 0;
+        const tracker = new PhysicalDeliveryTracker(
+          (sendsText ? 1 : 0) + images.length,
+        );
+        if (sendsText) {
+          await tracker.send(() => connection.sendMessage(chatId, text, []));
+        }
+        for (const image of images) {
+          await tracker.send(() =>
+            connection.sendImage(
+              chatId,
+              image.buffer,
+              image.mimeType,
+              undefined,
+              image.fileName,
+            ),
+          );
+        }
+        return;
+      }
       const parsed = parseDingTalkChatId(chatId);
       if (!parsed) {
         logger.error({ chatId }, 'Invalid DingTalk chat ID format');
@@ -3059,6 +3124,29 @@ export function createDingTalkConnection(
       caption?: string,
       fileName?: string,
     ): Promise<void> {
+      if (
+        imageBuffer.length === 0 ||
+        imageBuffer.length > MAX_FILE_SIZE ||
+        !detectImageMimeTypeStrict(imageBuffer)
+      ) {
+        throw preAcceptImDeliveryError(
+          `DingTalk image preflight failed for ${fileName ?? 'image'}`,
+        );
+      }
+      if (caption) {
+        const tracker = new PhysicalDeliveryTracker(2);
+        await tracker.send(() => connection.sendMessage(chatId, caption, []));
+        await tracker.send(() =>
+          connection.sendImage(
+            chatId,
+            imageBuffer,
+            mimeType,
+            undefined,
+            fileName,
+          ),
+        );
+        return;
+      }
       // Look up sender info from the chat jid
       const parsed = parseDingTalkChatId(chatId);
       const jidKey = parsed
@@ -3073,15 +3161,29 @@ export function createDingTalkConnection(
           { chatId, jidKey },
           'DingTalk sendImage: no senderId found',
         );
-        throw new Error(`DingTalk sendImage: unknown chat ${chatId}`);
+        throw preAcceptImDeliveryError(
+          `DingTalk sendImage: unknown chat ${chatId}`,
+        );
       }
 
-      const fname = fileName || `image.${mimeType.split('/')[1] || 'png'}`;
+      const fname = sanitizeImFilename(
+        path.basename(fileName || `image.${mimeType.split('/')[1] || 'png'}`),
+      );
 
       // Upload image to DingTalk media API
-      const mediaId = await uploadDingTalkMedia(imageBuffer, fname, 'image');
+      let mediaId: string | null;
+      try {
+        mediaId = await uploadDingTalkMedia(imageBuffer, fname, 'image');
+      } catch (error) {
+        throw preAcceptImDeliveryError(
+          'DingTalk image upload failed before visible send',
+          error,
+        );
+      }
       if (!mediaId) {
-        throw new Error('DingTalk sendImage: media upload failed');
+        throw preAcceptImDeliveryError(
+          'DingTalk sendImage: media upload returned no media id',
+        );
       }
 
       // For group chats: use persistent groupMessages API.

@@ -1,5 +1,8 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import https from 'node:https';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const sdk = vi.hoisted(() => {
@@ -47,18 +50,26 @@ import {
   createDingTalkConnection,
   DingTalkPartialDeliveryError,
 } from '../src/dingtalk.js';
+import { classifyImSendFailure } from '../src/im-send-retry-policy.js';
+
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
 
 describe('DingTalk multi-chunk physical delivery', () => {
   let groupSendCount = 0;
   let failGroupSendAt = 0;
   let c2cSendCount = 0;
   let failC2cSendAt = 0;
+  let uploadCount = 0;
 
   beforeEach(() => {
     groupSendCount = 0;
     failGroupSendAt = 0;
     c2cSendCount = 0;
     failC2cSendAt = 0;
+    uploadCount = 0;
     sdk.MockDWClient.instances.length = 0;
     vi.spyOn(https, 'request').mockImplementation(
       (options: any, callback?: any) => {
@@ -107,6 +118,9 @@ describe('DingTalk multi-chunk physical delivery', () => {
                 flowControlledStaffIdList: [],
               };
             }
+          } else if (requestPath.includes('/media/upload')) {
+            uploadCount += 1;
+            body = { errcode: 0, media_id: `media-${uploadCount}` };
           } else {
             throw new Error(`unexpected DingTalk request: ${requestPath}`);
           }
@@ -142,6 +156,26 @@ describe('DingTalk multi-chunk physical delivery', () => {
         isChatAuthorized: () => true,
       }),
     ).resolves.toBe(true);
+    return connection;
+  }
+
+  async function establishGroupRoute(
+    connection: Awaited<ReturnType<typeof connected>>,
+  ) {
+    const client = sdk.MockDWClient.instances.at(-1)!;
+    await client.listener?.({
+      headers: { messageId: 'group-route-stream' },
+      data: JSON.stringify({
+        conversationId: 'cid-1',
+        conversationType: '2',
+        msgId: 'group-route-message',
+        senderId: 'group-sender',
+        senderStaffId: 'group-staff',
+        senderNick: 'Ada',
+        createAt: Date.now(),
+        msgtype: 'unsupported-for-route-setup',
+      }),
+    });
     return connection;
   }
 
@@ -208,6 +242,69 @@ describe('DingTalk multi-chunk physical delivery', () => {
       totalChunks: 2,
     });
     expect(c2cSendCount).toBe(2);
+    await connection.disconnect();
+  });
+
+  test('adapter payload body plus every local image reaches the provider', async () => {
+    const connection = await establishGroupRoute(await connected());
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dingtalk-local-'));
+    const first = path.join(dir, 'first.png');
+    const second = path.join(dir, 'second.png');
+    fs.writeFileSync(first, PNG_1X1);
+    fs.writeFileSync(second, PNG_1X1);
+    try {
+      await connection.sendMessage('dingtalk:group:cid-1', 'body', [
+        first,
+        second,
+      ]);
+      expect(groupSendCount).toBe(3);
+      expect(uploadCount).toBe(2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await connection.disconnect();
+    }
+  });
+
+  test('body and first image ACK make a second-image rejection partial', async () => {
+    failGroupSendAt = 3;
+    const connection = await establishGroupRoute(await connected());
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dingtalk-tail-'));
+    const first = path.join(dir, 'first.png');
+    const second = path.join(dir, 'second.png');
+    fs.writeFileSync(first, PNG_1X1);
+    fs.writeFileSync(second, PNG_1X1);
+    let failure: unknown;
+    try {
+      await connection.sendMessage('dingtalk:group:cid-1', 'body', [
+        first,
+        second,
+      ]);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await connection.disconnect();
+    }
+    expect(failure).toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredOutputs: 2,
+      totalOutputs: 3,
+    });
+    expect(classifyImSendFailure(failure)).toBe('uncertain');
+    expect(groupSendCount).toBe(3);
+  });
+
+  test('image caption is sent as text plus image instead of being discarded', async () => {
+    const connection = await establishGroupRoute(await connected());
+    await connection.sendImage(
+      'dingtalk:group:cid-1',
+      PNG_1X1,
+      'image/png',
+      'caption',
+      'photo.png',
+    );
+    expect(groupSendCount).toBe(2);
+    expect(uploadCount).toBe(1);
     await connection.disconnect();
   });
 });
