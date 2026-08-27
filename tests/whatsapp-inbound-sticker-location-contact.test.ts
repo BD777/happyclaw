@@ -216,6 +216,82 @@ describe('WhatsApp inbound sticker / location / contact (live upsert)', () => {
     expect(db.storeMessageDirect).not.toHaveBeenCalled();
     expect(notify.notifyNewImMessage).not.toHaveBeenCalled();
   });
+
+  test('disconnect fences held media and a new connection stores redelivery once', async () => {
+    let releaseDownload!: (value: Buffer) => void;
+    let admittedSignal: AbortSignal | undefined;
+    downloadMediaMessage.mockImplementation(
+      async (_message, _type, options) =>
+        new Promise<Buffer>((resolve) => {
+          admittedSignal = options?.options?.signal ?? undefined;
+          releaseDownload = resolve;
+        }),
+    );
+
+    const first = await connect(true);
+    const inbound = upsertMessage(
+      '15559876543@s.whatsapp.net',
+      'disconnect-sticker-1',
+      { stickerMessage: { mimetype: 'image/webp' } },
+    );
+    const oldAttempt = first.socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [inbound],
+    });
+    await vi.waitFor(() => expect(downloadMediaMessage).toHaveBeenCalledOnce());
+
+    const disconnect = first.connection.disconnect();
+    await vi.waitFor(() => expect(admittedSignal?.aborted).toBe(true));
+    releaseDownload(Buffer.from('late-sticker'));
+    await Promise.all([oldAttempt, disconnect]);
+    expect(db.storeMessageDirect).not.toHaveBeenCalled();
+    expect(notify.notifyNewImMessage).not.toHaveBeenCalled();
+
+    downloadMediaMessage.mockResolvedValue(Buffer.from('fresh-sticker'));
+    const second = await connect(true);
+    await second.socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [inbound],
+    });
+    await second.socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [inbound],
+    });
+    expect(db.storeMessageDirect).toHaveBeenCalledTimes(1);
+    expect(notify.notifyNewImMessage).toHaveBeenCalledTimes(1);
+    await second.connection.disconnect();
+  });
+
+  test('public send waits for a Meta server ACK instead of socket-write success', async () => {
+    const { connection, socket } = await connect(true);
+    socket.sendMessage.mockResolvedValue({
+      key: {
+        id: 'outbound-ack-1',
+        remoteJid: '15559876543@s.whatsapp.net',
+        fromMe: true,
+      },
+    });
+    await socket.emit('connection.update', { connection: 'open' });
+
+    let settled = false;
+    const send = connection
+      .sendMessage('whatsapp:15559876543@s.whatsapp.net', 'hello')
+      .then(() => {
+        settled = true;
+      });
+    await vi.waitFor(() => expect(socket.sendMessage).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+
+    await socket.emit('messages.update', [
+      {
+        key: { id: 'outbound-ack-1' },
+        update: { status: 2 },
+      },
+    ]);
+    await send;
+    expect(settled).toBe(true);
+    await connection.disconnect();
+  });
 });
 
 describe('detectMedia / extractMessageText helpers', () => {

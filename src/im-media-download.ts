@@ -7,6 +7,8 @@ import { MAX_FILE_SIZE } from './im-downloader.js';
 export const IM_MEDIA_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 export interface DownloadHttpsBufferOptions {
+  /** Cancel DNS/connect, redirect, or body I/O when the admitting connection ends. */
+  signal?: AbortSignal;
   /** Legacy single-protocol Agent. Redirects to another protocol are rejected. */
   agent?: http.Agent | https.Agent;
   /** Per-hop selector for protocol-aware agents such as ProxyAgent. */
@@ -92,10 +94,22 @@ export function downloadHttpsBuffer(
     let activeResponse: http.IncomingMessage | null = null;
     let deadlineTimer: NodeJS.Timeout;
 
+    const abortError = (): Error => {
+      if (options.signal?.reason instanceof Error) {
+        return options.signal.reason;
+      }
+      const error = new Error('IM media download aborted');
+      error.name = 'AbortError';
+      return error;
+    };
+
+    const onAbort = (): void => finish(abortError());
+
     const finish = (error?: Error, value?: Buffer): void => {
       if (settled) return;
       settled = true;
       clearTimeout(deadlineTimer);
+      options.signal?.removeEventListener('abort', onAbort);
       const request = activeRequest;
       const response = activeResponse;
       activeRequest = null;
@@ -121,6 +135,12 @@ export function downloadHttpsBuffer(
       },
       Math.max(0, timeoutMs),
     );
+
+    if (options.signal?.aborted) {
+      finish(abortError());
+      return;
+    }
+    options.signal?.addEventListener('abort', onAbort, { once: true });
 
     const parseHttpUrl = (raw: string | URL, base?: URL): URL => {
       const parsed = raw instanceof URL ? raw : new URL(raw, base);

@@ -132,7 +132,10 @@ describe('Discord empty-gate live persist', () => {
     }
   });
 
-  async function connect(authorized = true) {
+  async function connect(
+    authorized = true,
+    overrides: Record<string, unknown> = {},
+  ) {
     connection = createDiscordConnection({ botToken: 'test-token' });
     const ok = await connection.connect({
       onNewChat: vi.fn(),
@@ -141,6 +144,7 @@ describe('Discord empty-gate live persist', () => {
         effectiveJid: jid,
         agentId: null,
       }),
+      ...overrides,
     });
     expect(ok).toBe(true);
     return connection;
@@ -194,5 +198,67 @@ describe('Discord empty-gate live persist', () => {
     const handlers = discord.listeners.get('messageCreate') ?? [];
     await handlers[0]?.(fakeMsg({ id: 'empty-1' }));
     expect(storeMessageDirect).not.toHaveBeenCalled();
+  });
+
+  test('disconnect fences a held media callback and a new connection stores redelivery once', async () => {
+    let releaseDownload!: (response: unknown) => void;
+    let admittedSignal: AbortSignal | undefined;
+    const heldFetch = vi.fn(
+      async (_url: string, init?: { signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          admittedSignal = init?.signal;
+          releaseDownload = resolve;
+        }),
+    );
+    vi.stubGlobal('fetch', heldFetch);
+
+    const onMessagePersisted = vi.fn();
+    await connect(true, { onMessagePersisted });
+    const inbound = fakeMsg({
+      id: 'disconnect-media-1',
+      attachments: {
+        values: () => [
+          {
+            url: 'https://cdn.discord.test/held.png',
+            name: 'held.png',
+            contentType: 'image/png',
+          },
+        ],
+      },
+    });
+    const oldHandler = (discord.listeners.get('messageCreate') ?? [])[0]!;
+    const oldAttempt = Promise.resolve(oldHandler(inbound));
+    await vi.waitFor(() => expect(heldFetch).toHaveBeenCalledOnce());
+
+    const disconnect = connection!.disconnect();
+    await vi.waitFor(() => expect(admittedSignal?.aborted).toBe(true));
+    releaseDownload({
+      ok: true,
+      arrayBuffer: async () =>
+        Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+          .buffer,
+    });
+    await Promise.all([oldAttempt, disconnect]);
+
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+    expect(onMessagePersisted).not.toHaveBeenCalled();
+    expect(inbound.react).not.toHaveBeenCalled();
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () =>
+          Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+            .buffer,
+      })),
+    );
+    await connect(true, { onMessagePersisted });
+    const newHandler = (discord.listeners.get('messageCreate') ?? []).at(-1)!;
+    await newHandler(inbound);
+    await newHandler(inbound);
+
+    expect(storeMessageDirect).toHaveBeenCalledTimes(1);
+    expect(onMessagePersisted).toHaveBeenCalledTimes(1);
   });
 });
