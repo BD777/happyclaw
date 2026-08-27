@@ -52,7 +52,11 @@ import {
   processingIndicatorKey,
 } from './processing-indicator.js';
 import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
-import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
+import {
+  classifyImSendFailure,
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -455,75 +459,161 @@ export interface DingTalkGroupMessageSuccess {
   message?: string;
 }
 
-/** Timeout / 5xx / 429: the first send may already have left the client. */
-function isUncertainFormatFallbackError(err: unknown): boolean {
+/** The provider authoritatively rejected the attempted markdown encoding. */
+export class DingTalkFormatRejectedError extends ImDeliveryPhaseError {
+  readonly formatRejected = true;
+
+  constructor(message: string, options: { cause?: unknown } = {}) {
+    super('rejected', message, options);
+    this.name = 'DingTalkFormatRejectedError';
+  }
+}
+
+function dingTalkErrorChainHasFormatRejection(err: unknown): boolean {
   let current: unknown = err;
   const seen = new Set<unknown>();
   while (current && typeof current === 'object' && !seen.has(current)) {
     seen.add(current);
     const rec = current as Record<string, unknown>;
-    const code = String(rec.code ?? rec.errno ?? '');
-    const status = Number(rec.error_code ?? rec.statusCode ?? rec.status);
-    const message = String(rec.message ?? '');
-    if (
-      /ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_|timed out|AbortError/i.test(
-        `${code} ${message}`,
-      ) ||
-      status === 429 ||
-      (status >= 500 && status <= 599) ||
-      /HTTP failed \((429|5\d\d)\)/.test(message)
-    ) {
-      return true;
-    }
+    if (rec.formatRejected === true) return true;
     current = rec.cause ?? rec.error;
   }
   return false;
+}
+
+/**
+ * A plain-text retry is another provider mutation. Permit it only when the
+ * markdown request provably never reached the provider, or DingTalk explicitly
+ * rejected that encoding. Unknown/malformed ACKs must fail closed.
+ */
+function shouldFallbackDingTalkMarkdownToPlain(err: unknown): boolean {
+  return (
+    dingTalkErrorChainHasFormatRejection(err) ||
+    classifyImSendFailure(err) === 'pre_accept'
+  );
+}
+
+function isAuthoritativeDingTalkFormatRejection(
+  msgKey: string | undefined,
+  details: string,
+): boolean {
+  if (msgKey !== 'sampleMarkdown') return false;
+  return /markdown|msg[_\s-]*(?:key|param)|message[_\s-]*(?:type|format)|content[_\s-]*format|unsupported.{0,40}format|格式/i.test(
+    details,
+  );
+}
+
+function rejectedDingTalkGroupMessageError(
+  message: string,
+  msgKey: string | undefined,
+  details: string,
+): Error {
+  return isAuthoritativeDingTalkFormatRejection(msgKey, details)
+    ? new DingTalkFormatRejectedError(message)
+    : new ImDeliveryPhaseError('rejected', message);
 }
 
 /** Validate the persistent groupMessages endpoint's transport and envelope. */
 export function parseDingTalkGroupMessageResponse(
   statusCode: number | undefined,
   body: string,
+  msgKey?: string,
 ): DingTalkGroupMessageSuccess {
   if (!statusCode || statusCode < 200 || statusCode >= 300) {
-    throw new Error(
-      `DingTalk groupMessages API HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
-    );
+    const message =
+      `DingTalk groupMessages API HTTP failed (${statusCode ?? 'unknown'}): ` +
+      body.slice(0, 200);
+    if (
+      !statusCode ||
+      statusCode === 408 ||
+      statusCode === 425 ||
+      statusCode === 429 ||
+      statusCode >= 500
+    ) {
+      throw new ImDeliveryPhaseError('uncertain', message);
+    }
+    throw rejectedDingTalkGroupMessageError(message, msgKey, body);
   }
   if (!body.trim()) {
-    throw new Error('DingTalk groupMessages API returned an empty response');
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      'DingTalk groupMessages API returned an empty response',
+    );
   }
   let data: DingTalkGroupMessageSuccess;
   try {
     data = JSON.parse(body) as DingTalkGroupMessageSuccess;
-  } catch {
-    throw new Error('DingTalk groupMessages API returned invalid JSON');
+  } catch (error) {
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      'DingTalk groupMessages API returned invalid JSON',
+      { cause: error },
+    );
   }
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new Error('DingTalk groupMessages API returned an invalid envelope');
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      'DingTalk groupMessages API returned an invalid envelope',
+    );
   }
-  if (data.errcode !== undefined && Number(data.errcode) !== 0) {
-    throw new Error(
-      `DingTalk groupMessages API error: ${data.errcode} ${data.errmsg ?? data.message ?? ''}`,
+  const rawErrcode = (data as { errcode?: unknown }).errcode;
+  if (
+    rawErrcode !== undefined &&
+    (typeof rawErrcode !== 'number' || !Number.isFinite(rawErrcode))
+  ) {
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      'DingTalk groupMessages API returned invalid errcode metadata',
+    );
+  }
+  if (typeof rawErrcode === 'number' && rawErrcode !== 0) {
+    const message =
+      `DingTalk groupMessages API error: ${rawErrcode} ` +
+      (data.errmsg ?? data.message ?? '');
+    throw rejectedDingTalkGroupMessageError(
+      message,
+      msgKey,
+      `${rawErrcode} ${data.errmsg ?? data.message ?? ''}`,
     );
   }
   const successCodes = new Set(['0', 'ok', 'success']);
+  const rawCode = (data as { code?: unknown }).code;
   if (
-    data.code !== undefined &&
-    !successCodes.has(String(data.code).toLowerCase())
+    rawCode !== undefined &&
+    typeof rawCode !== 'string' &&
+    typeof rawCode !== 'number'
   ) {
-    throw new Error(
-      `DingTalk groupMessages API error: ${String(data.code)} ${data.message ?? data.errmsg ?? ''}`,
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      'DingTalk groupMessages API returned invalid code metadata',
+    );
+  }
+  const normalizedCode =
+    rawCode === undefined ? undefined : String(rawCode).trim().toLowerCase();
+  if (normalizedCode === '') {
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      'DingTalk groupMessages API returned empty code metadata',
+    );
+  }
+  if (normalizedCode !== undefined && !successCodes.has(normalizedCode)) {
+    const message =
+      `DingTalk groupMessages API error: ${String(rawCode)} ` +
+      (data.message ?? data.errmsg ?? '');
+    throw rejectedDingTalkGroupMessageError(
+      message,
+      msgKey,
+      `${String(rawCode)} ${data.message ?? data.errmsg ?? ''}`,
     );
   }
   const hasSuccessMarker =
     (typeof data.processQueryKey === 'string' &&
-      data.processQueryKey.length > 0) ||
-    data.errcode === 0 ||
-    (data.code !== undefined &&
-      successCodes.has(String(data.code).toLowerCase()));
+      data.processQueryKey.trim().length > 0) ||
+    rawErrcode === 0 ||
+    (normalizedCode !== undefined && successCodes.has(normalizedCode));
   if (!hasSuccessMarker) {
-    throw new Error(
+    throw new ImDeliveryPhaseError(
+      'uncertain',
       'DingTalk groupMessages API returned an unrecognized success envelope',
     );
   }
@@ -734,7 +824,7 @@ export async function sendViaGroupMessagesAPI(
     body,
   );
   const respBody = respBuf.toString('utf8');
-  const data = parseDingTalkGroupMessageResponse(statusCode, respBody);
+  const data = parseDingTalkGroupMessageResponse(statusCode, respBody, msgKey);
   logger.info(
     {
       statusCode,
@@ -3085,7 +3175,7 @@ export function createDingTalkConnection(
               msgParam,
             );
           } catch (err) {
-            if (isUncertainFormatFallbackError(err)) {
+            if (!shouldFallbackDingTalkMarkdownToPlain(err)) {
               throw err;
             }
             logger.debug(

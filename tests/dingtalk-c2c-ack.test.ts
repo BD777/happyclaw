@@ -2,11 +2,59 @@ import { describe, expect, test } from 'vitest';
 
 import {
   DingTalkBatchRecipientError,
+  DingTalkFormatRejectedError,
   parseDingTalkBatchSendResponse,
+  parseDingTalkGroupMessageResponse,
   parseDingTalkSessionWebhookResponse,
 } from '../src/dingtalk.js';
+import { classifyImSendFailure } from '../src/im-send-retry-policy.js';
 
 describe('DingTalk outbound strict ACK envelopes', () => {
+  test.each([
+    '',
+    '<html>ok</html>',
+    '{broken',
+    '{}',
+    '{"code":null}',
+    '{"errcode":"0"}',
+    '{"processQueryKey":"   "}',
+  ])(
+    'classifies malformed or unknown group response %j as uncertain',
+    (body) => {
+      let failure: unknown;
+      try {
+        parseDingTalkGroupMessageResponse(200, body, 'sampleMarkdown');
+      } catch (error) {
+        failure = error;
+      }
+      expect(classifyImSendFailure(failure)).toBe('uncertain');
+      expect(failure).not.toBeInstanceOf(DingTalkFormatRejectedError);
+    },
+  );
+
+  test('marks only an explicit markdown-format verdict as fallback-safe', () => {
+    const formatBody = JSON.stringify({
+      code: 'InvalidParameter',
+      message: 'sampleMarkdown msgParam format is invalid',
+    });
+    expect(() =>
+      parseDingTalkGroupMessageResponse(200, formatBody, 'sampleMarkdown'),
+    ).toThrow(DingTalkFormatRejectedError);
+
+    let authFailure: unknown;
+    try {
+      parseDingTalkGroupMessageResponse(
+        403,
+        JSON.stringify({ code: 'Forbidden', message: 'bot is not allowed' }),
+        'sampleMarkdown',
+      );
+    } catch (error) {
+      authFailure = error;
+    }
+    expect(authFailure).not.toBeInstanceOf(DingTalkFormatRejectedError);
+    expect(classifyImSendFailure(authFailure)).toBe('rejected');
+  });
+
   test.each(['', '<html>ok</html>', '{broken', '{}'])(
     'rejects malformed or unknown session webhook response %j',
     (body) => {
