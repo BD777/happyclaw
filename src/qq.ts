@@ -380,6 +380,18 @@ export function validateQQGatewayUrl(value: string): string {
 
 // ─── Factory Function ───────────────────────────────────────────
 
+/** Official v2 C2C/group send success is `{ id, timestamp }`. */
+export function requireQQOfficialSendId(data: unknown): { id: string } {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('QQ send response is not a JSON object');
+  }
+  const id = (data as { id?: unknown }).id;
+  if (id == null || String(id).trim() === '') {
+    throw new Error('QQ send response missing official id');
+  }
+  return { id: String(id) };
+}
+
 export function createQQConnection(config: QQConnectionConfig): QQConnection {
   // Token state
   let tokenInfo: TokenInfo | null = null;
@@ -692,11 +704,16 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ? `/v2/users/${openid}/messages`
         : `/v2/groups/${openid}/messages`;
 
-    await apiRequest('POST', endpoint, {
-      markdown: { content },
-      msg_type: 2, // markdown
-      msg_seq: msgSeq,
-    });
+    const sent = await apiRequest<{ id?: string; timestamp?: string }>(
+      'POST',
+      endpoint,
+      {
+        markdown: { content },
+        msg_type: 2, // markdown
+        msg_seq: msgSeq,
+      },
+    );
+    requireQQOfficialSendId(sent);
   }
 
   // ─── Image Sending ───────────────────────────────────────
@@ -772,12 +789,17 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ? `/v2/users/${openid}/messages`
         : `/v2/groups/${openid}/messages`;
 
-    await apiRequest('POST', endpoint, {
-      msg_type: 7, // rich media
-      media: { file_info: fileInfo },
-      content: caption || '',
-      msg_seq: msgSeq,
-    });
+    const sent = await apiRequest<{ id?: string; timestamp?: string }>(
+      'POST',
+      endpoint,
+      {
+        msg_type: 7, // rich media
+        media: { file_info: fileInfo },
+        content: caption || '',
+        msg_seq: msgSeq,
+      },
+    );
+    requireQQOfficialSendId(sent);
   }
 
   // ─── Chunked File Upload ─────────────────────────────────────
@@ -1060,12 +1082,17 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ? `/v2/users/${openid}/messages`
         : `/v2/groups/${openid}/messages`;
 
-    await apiRequest('POST', endpoint, {
-      msg_type: 7,
-      media: { file_info: fileInfo },
-      content: '',
-      msg_seq: msgSeq,
-    });
+    const sent = await apiRequest<{ id?: string; timestamp?: string }>(
+      'POST',
+      endpoint,
+      {
+        msg_type: 7,
+        media: { file_info: fileInfo },
+        content: '',
+        msg_seq: msgSeq,
+      },
+    );
+    requireQQOfficialSendId(sent);
   }
 
   // ─── File Download ─────────────────────────────────────────
