@@ -160,7 +160,10 @@ describe('DingTalkStreamingCardController', () => {
       const ctrl = makeController();
       ctrl.startTool('tool-1', 'ReadFile');
       ctrl.endTool('tool-1', false);
-      expect(ctrl.getToolInfo('tool-1')).toMatchObject({ name: 'ReadFile', status: 'complete' });
+      expect(ctrl.getToolInfo('tool-1')).toMatchObject({
+        name: 'ReadFile',
+        status: 'complete',
+      });
     });
 
     test('tracks multiple tools independently', () => {
@@ -170,7 +173,10 @@ describe('DingTalkStreamingCardController', () => {
       expect(ctrl.getToolInfo('tool-1')).toMatchObject({ name: 'ReadFile' });
       expect(ctrl.getToolInfo('tool-2')).toMatchObject({ name: 'WriteFile' });
       ctrl.endTool('tool-1', false);
-      expect(ctrl.getToolInfo('tool-1')).toMatchObject({ name: 'ReadFile', status: 'complete' });
+      expect(ctrl.getToolInfo('tool-1')).toMatchObject({
+        name: 'ReadFile',
+        status: 'complete',
+      });
       expect(ctrl.getToolInfo('tool-2')).toMatchObject({ name: 'WriteFile' });
     });
   });

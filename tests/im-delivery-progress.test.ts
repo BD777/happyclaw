@@ -11,9 +11,9 @@ describe('PhysicalDeliveryTracker', () => {
     const failure = new Error('connect failed before accept');
     const tracker = new PhysicalDeliveryTracker(2);
 
-    await expect(tracker.send(async () => Promise.reject(failure))).rejects.toBe(
-      failure,
-    );
+    await expect(
+      tracker.send(async () => Promise.reject(failure)),
+    ).rejects.toBe(failure);
   });
 
   test('fences an acknowledged prefix when a later mutation fails', async () => {
