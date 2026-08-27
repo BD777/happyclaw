@@ -4,6 +4,7 @@ import {
   PartialChannelDeliveryError,
   PhysicalDeliveryTracker,
 } from '../src/im-delivery-progress.js';
+import { retryUnscopedImSend } from '../src/im-send-retry-policy.js';
 
 describe('PhysicalDeliveryTracker', () => {
   test('preserves the original error before any provider ACK', async () => {
@@ -37,5 +38,29 @@ describe('PhysicalDeliveryTracker', () => {
       totalOutputs: 2,
       cause: tail,
     });
+  });
+
+  test('prevents the host retry loop from resending an acknowledged prefix', async () => {
+    let connectorAttempts = 0;
+    let visibleFirstChunks = 0;
+    const tail = Object.assign(new Error('second chunk DNS failure'), {
+      code: 'ENOTFOUND',
+    });
+
+    const result = await retryUnscopedImSend(
+      async () => {
+        connectorAttempts += 1;
+        const tracker = new PhysicalDeliveryTracker(2);
+        await tracker.send(async () => {
+          visibleFirstChunks += 1;
+        });
+        await tracker.send(async () => Promise.reject(tail));
+      },
+      { sleep: async () => {} },
+    );
+
+    expect(result).toMatchObject({ ok: false, outcome: 'uncertain' });
+    expect(connectorAttempts).toBe(1);
+    expect(visibleFirstChunks).toBe(1);
   });
 });
