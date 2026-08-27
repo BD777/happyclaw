@@ -65,6 +65,7 @@ import {
 export { buildInterruptedReply } from './reply-finalization.js';
 import { resolveTurnOutcome } from './turn-outcome.js';
 import { finalizeChannelCardAfterDelivery } from './channel-card-finalization.js';
+import { persistUncertainStreamingDelivery } from './channel-streaming-uncertainty.js';
 import { resolveContainerOutputInputTurnId } from './channel-output-correlation.js';
 import { SteeringTransitionRegistry } from './steering-transition.js';
 import {
@@ -355,6 +356,7 @@ import {
 import {
   buildFailedTaskImageNotification,
   settleTaskNotificationDeliveries,
+  taskNotificationPreAcceptFailure,
   type TaskNotificationDeliveryAttempt,
 } from './task-notification.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
@@ -8598,6 +8600,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // prevents a completed card from claiming success while one of
               // its files is still missing.
               let pendingStreamingCardCompleted = false;
+              let streamingCardDeliveryUncertain = false;
               if (pendingStreamingCardCompletion) {
                 if (localImagePaths.length > 0 && outputReplySourceJid) {
                   for (
@@ -8655,9 +8658,31 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   heldUsagePatchTarget = pendingStreamingCardCompletion;
                   heldCardParts = [];
                 } else if (cardFinalization.error) {
+                  const fenced = outputChannelScope.scope
+                    ? await persistUncertainStreamingDelivery({
+                        scope: outputChannelScope.scope,
+                        operationKey: `streaming-card-final:${outputChannelScope.inputId}:${durableOutputIdentity}`,
+                        payload: {
+                          role: 'primary_stream_final',
+                          contentHash: crypto
+                            .createHash('sha256')
+                            .update(dbText)
+                            .digest('hex'),
+                        },
+                        error: cardFinalization.error,
+                      })
+                    : null;
+                  streamingCardDeliveryUncertain =
+                    fenced?.status === 'uncertain';
                   logger.warn(
-                    { cardError: cardFinalization.error, chatJid },
-                    'Streaming card final ACK failed; keeping the channel turn retryable',
+                    {
+                      cardError: cardFinalization.error,
+                      chatJid,
+                      streamingCardDeliveryUncertain,
+                    },
+                    streamingCardDeliveryUncertain
+                      ? 'Streaming card final ACK is uncertain; fenced for manual reconciliation'
+                      : 'Streaming card final ACK was rejected before acceptance; keeping the channel turn retryable',
                   );
                 } else {
                   logger.error(
@@ -8668,7 +8693,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
                 // A provisional active card is not a delivery ACK.  Failed
                 // attachment/card completion must flow into the retry path.
-                streamingCardHandledIM = pendingStreamingCardCompleted;
+                // An uncertain stream may already be visible. Treat it as the
+                // sole native presentation so no static fallback can duplicate
+                // it; it is deliberately not a delivery acknowledgement.
+                streamingCardHandledIM =
+                  pendingStreamingCardCompleted ||
+                  streamingCardDeliveryUncertain;
                 if (pendingStreamingCardCompleted) {
                   channelStreamingSessionsByInput.delete(
                     outputChannelScope.inputId,
@@ -8688,9 +8718,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // card. Any separately emitted local image is part of the same
               // logical reply and must also be durably ACKed before the turn can
               // advance its cursor.
-              let replyDeliveryAcknowledged = streamingCardHandledIM
-                ? streamingCardAttachmentsDelivered
-                : replySendOutcome.targetDelivered;
+              let replyDeliveryAcknowledged = streamingCardDeliveryUncertain
+                ? false
+                : streamingCardHandledIM
+                  ? streamingCardAttachmentsDelivered
+                  : replySendOutcome.targetDelivered;
               // A Web-only group-mode task must not replay Agent work after
               // its canonical projection failure has been persisted for
               // idempotent notification-worker repair.
@@ -10981,8 +11013,12 @@ function startIpcWatcher(): void {
                         addTargetAttempts(targetJid);
                       }
                       for (const channel of targetPlan.unavailableChannels) {
+                        const failure = taskNotificationPreAcceptFailure(
+                          `No connected ${channel} binding exists for this workspace`,
+                        );
                         attempts.push({
                           channel,
+                          failure,
                           payload: {
                             kind: 'im_channel_message',
                             targetChannel: channel,
@@ -10994,8 +11030,12 @@ function startIpcWatcher(): void {
                         });
                         for (const imagePath of taskLocalImages) {
                           const imageBuffer = fs.readFileSync(imagePath);
+                          const imageFailure = taskNotificationPreAcceptFailure(
+                            `No connected ${channel} binding exists for this workspace`,
+                          );
                           attempts.push({
                             channel,
+                            failure: imageFailure,
                             payload: {
                               kind: 'im_channel_image',
                               targetChannel: channel,
@@ -11492,8 +11532,12 @@ function startIpcWatcher(): void {
                       attempts.push(imageAttempt(targetJid));
                     }
                     for (const channel of taskImageUnavailableChannels) {
+                      const failure = taskNotificationPreAcceptFailure(
+                        `No connected ${channel} binding exists for this workspace`,
+                      );
                       attempts.push({
                         channel,
+                        failure,
                         payload: {
                           kind: 'im_channel_image',
                           targetChannel: channel,
@@ -14222,8 +14266,12 @@ async function processTaskIpc(
                   };
                 });
               for (const channel of targetPlan.unavailableChannels) {
+                const failure = taskNotificationPreAcceptFailure(
+                  `No connected ${channel} binding exists for this workspace`,
+                );
                 attempts.push({
                   channel,
+                  failure,
                   payload: {
                     kind: 'im_channel_file',
                     targetChannel: channel,
@@ -16477,6 +16525,7 @@ async function processAgentConversation(
         let streamingCardHandledIM = false;
         let agentCardAttachmentsDelivered = true;
         let agentStaticImDelivered = false;
+        let agentStreamingCardDeliveryUncertain = false;
         let pendingAgentCardCompletion:
           | NonNullable<typeof outputAgentStreamingSession>
           | undefined;
@@ -16585,9 +16634,32 @@ async function processAgentConversation(
             heldAgentUsagePatchPending = true;
             heldAgentParts = [];
           } else if (cardFinalization.error) {
+            const fenced = outputAgentScope.scope
+              ? await persistUncertainStreamingDelivery({
+                  scope: outputAgentScope.scope,
+                  operationKey: `agent-streaming-card-final:${agentId}:${outputAgentScope.inputId}`,
+                  payload: {
+                    role: 'agent_primary_stream_final',
+                    contentHash: crypto
+                      .createHash('sha256')
+                      .update(dbText)
+                      .digest('hex'),
+                  },
+                  error: cardFinalization.error,
+                })
+              : null;
+            agentStreamingCardDeliveryUncertain =
+              fenced?.status === 'uncertain';
             logger.warn(
-              { err: cardFinalization.error, chatJid, agentId },
-              'Agent streaming card final ACK failed, falling back to exact static delivery',
+              {
+                err: cardFinalization.error,
+                chatJid,
+                agentId,
+                agentStreamingCardDeliveryUncertain,
+              },
+              agentStreamingCardDeliveryUncertain
+                ? 'Agent streaming card final ACK is uncertain; fenced for manual reconciliation'
+                : 'Agent streaming card final ACK was rejected; falling back to exact static delivery',
             );
             heldAgentParts = [];
             heldAgentUsage = null;
@@ -16597,7 +16669,8 @@ async function processAgentConversation(
               'Agent streaming card remains unfinished because an attachment was not physically ACKed',
             );
           }
-          streamingCardHandledIM = cardCompleted;
+          streamingCardHandledIM =
+            cardCompleted || agentStreamingCardDeliveryUncertain;
           if (cardCompleted) {
             agentStreamingSessionsByInput.delete(outputAgentScope.inputId);
             if (outputAgentStreamingSession === agentStreamingSession) {
@@ -16719,6 +16792,7 @@ async function processAgentConversation(
             agentPhysicalDeliveryAckByInput.get(outputAgentScope.inputId) ===
               true ||
             (streamingCardHandledIM &&
+              !agentStreamingCardDeliveryUncertain &&
               !holdReason &&
               agentCardAttachmentsDelivered) ||
             agentStaticImDelivered) &&
@@ -21874,14 +21948,13 @@ async function main(): Promise<void> {
           options.notifyChannels,
         );
         for (const channel of unavailableChannels) {
+          const failure = taskNotificationPreAcceptFailure(
+            `未找到已连接且绑定到当前工作区的 ${channel} 渠道`,
+          );
           deliveries.push({
             channel,
             result: Promise.resolve(false),
-            failure: {
-              error: new Error(
-                `未找到已连接且绑定到当前工作区的 ${channel} 渠道`,
-              ),
-            },
+            failure,
           });
         }
       }

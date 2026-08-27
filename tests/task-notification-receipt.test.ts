@@ -3,6 +3,7 @@ import { describe, expect, test, vi } from 'vitest';
 import {
   buildFailedTaskImageNotification,
   settleTaskNotificationDeliveries,
+  taskNotificationPreAcceptFailure,
 } from '../src/task-notification.js';
 
 function payload(targetJid: string) {
@@ -87,6 +88,29 @@ describe('scheduled task physical delivery receipts', () => {
       },
     });
     expect(result.retryPayload).toEqual(payload('feishu:direct'));
+  });
+
+  test('production missing-binding fan-out is a retryable pre-send failure', async () => {
+    const missing = taskNotificationPreAcceptFailure(
+      'No connected qq binding exists for this workspace',
+    );
+    const target = payload('qq:c2c:missing');
+    const result = await settleTaskNotificationDeliveries([
+      {
+        channel: 'qq',
+        payload: target,
+        failure: missing,
+        deliver: async () => false,
+      },
+    ]);
+
+    expect(missing.outcome).toBe('pre_accept');
+    expect(result.receipt).toMatchObject({
+      status: 'failed',
+      summary: { failed_channels: ['qq'] },
+    });
+    expect(result.receipt.summary.uncertain).toBeUndefined();
+    expect(result.retryPayload).toEqual(target);
   });
 
   test('uncertain provider acceptance is persisted but never queued for retry', async () => {

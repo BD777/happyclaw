@@ -41,8 +41,11 @@ vi.mock('../src/runtime-config.js', async () => {
   };
 });
 
-const { runAgentWithModelFallback } =
-  await import('../src/container-runner.js');
+const {
+  applyProviderFailureDisposition,
+  runAgentWithModelFallback,
+  transientRetryProfileForInput,
+} = await import('../src/container-runner.js');
 const { providerPool } = await import('../src/provider-pool.js');
 const { PROVIDER_TRANSIENT_FAILURE_USER_NOTICE } =
   await import('../src/provider-failure.js');
@@ -268,6 +271,73 @@ describe('scheduled provider fallback', () => {
 
     expect(runFn).toHaveBeenCalledTimes(2);
     // Neither the account nor any tier may be quarantined by upstream noise.
+    for (const provider of mocks.enabledProviders) {
+      expect(providerPool.getHealthStatus(provider.id).healthy).toBe(true);
+    }
+  });
+
+  test('isolated task without turnId reuses one stable id and the same provider', async () => {
+    for (const provider of mocks.enabledProviders) {
+      providerPool.resetHealth(provider.id);
+    }
+    providerPool.refreshFromConfig(mocks.enabledProviders, {
+      strategy: 'round-robin',
+      unhealthyThreshold: 1,
+      recoveryIntervalMs: 300_000,
+    });
+    const attemptedProviders: Array<string | null> = [];
+    const turnIds: Array<string | undefined> = [];
+    const onProcess = vi.fn();
+    const runFn = vi.fn(
+      async (
+        _group: unknown,
+        input: { turnId?: string },
+        onProcess: (
+          proc: never,
+          identifier: string,
+          selectedProviderId: string | null,
+        ) => void,
+      ): Promise<ContainerOutput> => {
+        turnIds.push(input.turnId);
+        const selectedProviderId =
+          transientRetryProfileForInput(input.turnId) ??
+          providerPool.selectProvider();
+        attemptedProviders.push(selectedProviderId);
+        onProcess(
+          {} as never,
+          `stable-transient-${attemptedProviders.length}`,
+          selectedProviderId,
+        );
+        const output: ContainerOutput = {
+          status: 'success',
+          result: null,
+          providerFailure: true,
+          providerFailureClass: 'transient',
+          inputTurnId: input.turnId,
+        };
+        applyProviderFailureDisposition(output, selectedProviderId);
+        return output;
+      },
+    );
+
+    const output = await runAgentWithModelFallback(
+      runFn as unknown as AgentRunner,
+      group,
+      {
+        ...scheduledInput('stable transient retry'),
+        taskRunId: 'durable-task-run-id',
+      },
+      onProcess,
+    );
+
+    expect(turnIds).toEqual(['durable-task-run-id', 'durable-task-run-id']);
+    expect(attemptedProviders).toHaveLength(2);
+    expect(attemptedProviders[1]).toBe(attemptedProviders[0]);
+    expect(onProcess.mock.calls.map((call) => call[2])).toEqual([
+      attemptedProviders[0],
+      attemptedProviders[0],
+    ]);
+    expect(output.providerFailureTerminal).toBe(true);
     for (const provider of mocks.enabledProviders) {
       expect(providerPool.getHealthStatus(provider.id).healthy).toBe(true);
     }

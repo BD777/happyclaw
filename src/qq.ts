@@ -125,6 +125,10 @@ export function isDefinitiveQQPassiveReplyRejection(
   return false;
 }
 
+export function shouldRetireQQPassiveReplyReference(error: unknown): boolean {
+  return isDefinitiveQQPassiveReplyRejection(error);
+}
+
 export enum QQMediaFileType {
   IMAGE = 1,
   VIDEO = 2,
@@ -723,22 +727,24 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
   function rejectPassiveReply(
     chatKey: string,
-    msgId: string,
+    _msgId: string,
     error: unknown,
   ): boolean {
+    const retireReference = shouldRetireQQPassiveReplyReference(error);
+    if (retireReference) passiveReplies.discard(chatKey, _msgId);
     if (error instanceof QQApiError && error.httpStatus === 400) {
-      passiveReplies.discard(chatKey, msgId);
       logger.warn(
         {
           chatType: chatKey.split(':')[0],
           httpStatus: error.httpStatus,
           bizCode: error.bizCode,
           outcome: 'uncertain',
+          passiveReferenceRetained: !retireReference,
         },
-        'QQ passive reply returned an unclassified HTTP 400; retiring reference without replay',
+        'QQ passive reply returned an unclassified HTTP 400; preserving reference and refusing replay',
       );
     }
-    return isDefinitiveQQPassiveReplyRejection(error);
+    return retireReference;
   }
 
   async function sendWithQQAddressing(

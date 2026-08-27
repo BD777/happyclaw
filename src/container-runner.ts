@@ -577,6 +577,12 @@ function poolCanStillServe(): boolean {
 /** Host-process replay budget; each transient retry runs a fresh runner. */
 const transientRetries = new TransientRetryLedger();
 
+export function transientRetryProfileForInput(
+  inputTurnId: string | undefined,
+): string | null {
+  return transientRetries.pinnedProfileId(inputTurnId);
+}
+
 /**
  * Exported for tests: the transient escalation spans this function, the
  * host-process retry ledger and the provider pool, so asserting it on source
@@ -2278,7 +2284,7 @@ export async function runContainerAgent(
     group.folder,
     sessionAgentId,
     input.agentProfile?.modelConfigId,
-    transientRetries.pinnedProfileId(input.turnId),
+    transientRetryProfileForInput(input.turnId),
   );
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
@@ -3334,7 +3340,7 @@ export async function runHostAgent(
     group.folder,
     sessionAgentId,
     input.agentProfile?.modelConfigId,
-    transientRetries.pinnedProfileId(input.turnId),
+    transientRetryProfileForInput(input.turnId),
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
@@ -3977,6 +3983,16 @@ export async function runAgentWithModelFallback(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
+  // Isolated scheduled tasks historically omitted turnId. Give the whole
+  // outer fallback loop one stable logical identity so the transient ledger
+  // can pin its authorized replay to the first attempted provider. Reuse the
+  // durable task occurrence when available; otherwise generate exactly once.
+  if (input.isScheduledTask && !input.turnId) {
+    input = {
+      ...input,
+      turnId: input.taskRunId?.trim() || randomUUID(),
+    };
+  }
   // A top-level Agent owns exactly one complete model configuration. Retrying
   // through other enabled configurations would violate that contract and can
   // send a Workspace to a different gateway or official subscription. An

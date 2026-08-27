@@ -5,8 +5,16 @@ import type {
 } from './db.js';
 import {
   classifyImSendFailure,
+  preAcceptImDeliveryError,
   type ImSendFailureRef,
 } from './im-send-retry-policy.js';
+
+export function taskNotificationPreAcceptFailure(
+  message: string,
+): ImSendFailureRef {
+  const error = preAcceptImDeliveryError(message);
+  return { error, outcome: error.deliveryPhase };
+}
 
 export interface TaskNotificationDeliveryAttempt {
   channel: string;
