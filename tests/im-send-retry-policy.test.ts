@@ -46,4 +46,14 @@ describe('imSendFailurePolicy', () => {
       countsTowardChannelRemoval: false,
     });
   });
+
+  test('does not replay or health-count a partially acknowledged multi-chunk send', () => {
+    const partial = Object.assign(new Error('tail chunk failed'), {
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+    });
+    expect(imSendFailurePolicy(partial)).toEqual({
+      retryable: false,
+      countsTowardChannelRemoval: false,
+    });
+  });
 });

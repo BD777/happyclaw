@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
-import { afterEach, describe, expect, test } from 'vitest';
+import https from 'node:https';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import { downloadAndDecryptWeComMedia } from '../src/wecom.js';
 
@@ -24,6 +26,7 @@ function encryptWeComFile(plaintext: Buffer, key: Buffer): Buffer {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     servers
       .splice(0)
@@ -152,5 +155,42 @@ describe('WeCom bounded encrypted media download', () => {
 
     await expect(pending).rejects.toThrow('cancelled');
     await expect.poll(() => responseClosed).toBe(true);
+  });
+
+  test('rejects an HTTPS redirect downgrade before opening the HTTP target', async () => {
+    const httpRequest = vi.spyOn(http, 'request');
+    vi.spyOn(https, 'request').mockImplementation(
+      (_options: any, callback?: any) => {
+        const req = new EventEmitter() as EventEmitter & {
+          end: () => void;
+          setTimeout: () => void;
+          destroy: () => void;
+        };
+        req.setTimeout = () => undefined;
+        req.destroy = () => undefined;
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & {
+            statusCode: number;
+            headers: Record<string, string>;
+            destroy: () => void;
+          };
+          res.statusCode = 302;
+          res.headers = { location: 'http://insecure.example/media' };
+          res.destroy = () => undefined;
+          callback?.(res);
+        };
+        return req as any;
+      },
+    );
+
+    await expect(
+      downloadAndDecryptWeComMedia(
+        'https://secure.example/start',
+        undefined,
+        1024,
+        1000,
+      ),
+    ).rejects.toThrow('HTTPS downgrade');
+    expect(httpRequest).not.toHaveBeenCalled();
   });
 });
