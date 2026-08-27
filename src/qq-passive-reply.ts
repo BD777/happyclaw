@@ -63,6 +63,8 @@ export interface PassiveReplyStore {
     now?: number,
     options?: { reserve?: number },
   ): PassiveReplyClaim | undefined;
+  /** Retire a reference after the platform definitively rejects it. */
+  discard(chatKey: string, msgId: string): void;
   /** Drop all state (used when the socket goes away). */
   clear(): void;
   /** Number of tracked chats. Exposed for tests and diagnostics. */
@@ -104,10 +106,9 @@ export function createPassiveReplyStore(
       const refs = chats.get(chatKey) ?? [];
 
       // The same msg_id can be recorded twice if an event is redelivered.
-      // Refresh its timestamp instead of handing out a second budget for it.
+      // Neither its platform TTL nor its budget restarts on redelivery.
       const existing = refs.find((ref) => ref.msgId === msgId);
       if (existing) {
-        existing.receivedAt = now;
         touch(chatKey, refs);
         return;
       }
@@ -141,6 +142,17 @@ export function createPassiveReplyStore(
       }
 
       return undefined;
+    },
+
+    discard(chatKey: string, msgId: string): void {
+      const refs = chats.get(chatKey);
+      if (!refs) return;
+      const remaining = refs.filter((ref) => ref.msgId !== msgId);
+      if (remaining.length === 0) {
+        chats.delete(chatKey);
+        return;
+      }
+      touch(chatKey, remaining);
     },
 
     clear(): void {

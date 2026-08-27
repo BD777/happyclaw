@@ -859,11 +859,10 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       const { QQStreamingController } = await import('./qq-streaming-card.js');
       const openid = chatId.startsWith('c2c:') ? chatId.slice(4) : chatId;
       const chatKey = `c2c:${openid}`;
-      const msgSeq = inner.getNextMsgSeq(chatKey);
-      const passiveMsgId = inner.getLastIncomingMsgId(openid);
+      const passiveClaim = inner.claimPassiveReply(chatKey);
       const conn = inner;
 
-      if (!passiveMsgId) {
+      if (!passiveClaim) {
         // QQ stream_messages endpoint rejects requests without a passive
         // msg_id reference. Without it there's no point starting a session.
         logger.debug(
@@ -875,10 +874,12 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
 
       return new QQStreamingController({
         openid,
-        msgSeq,
+        msgSeq: passiveClaim.msgSeq,
         sendStreamChunk: (oid, params) => conn.sendStreamMessage(oid, params),
         fallbackSend: (text) => conn.sendMessage(chatKey, text),
-        passiveMsgId,
+        passiveMsgId: passiveClaim.msgId,
+        onDefinitiveRejection: (error) =>
+          conn.rejectPassiveReply(chatKey, passiveClaim.msgId, error),
       });
     },
   };

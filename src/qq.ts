@@ -36,7 +36,10 @@ import {
   getReconnectDelay,
   classifyCloseCode,
 } from './qq-reconnect.js';
-import { createPassiveReplyStore } from './qq-passive-reply.js';
+import {
+  createPassiveReplyStore,
+  type PassiveReplyClaim,
+} from './qq-passive-reply.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
 import {
   isRuntimeControlLike,
@@ -88,14 +91,22 @@ const IMAGE_EXT_MAP: Record<string, string> = {
 
 // ─── QQ File Upload Types & Constants ──────────────────────────
 
-class QQApiError extends Error {
+export class QQApiError extends Error {
   constructor(
     message: string,
     public readonly bizCode?: number,
+    public readonly httpStatus?: number,
   ) {
     super(message);
     this.name = 'QQApiError';
   }
+}
+
+/** A received validation rejection proves the passive mutation was not sent. */
+export function isDefinitiveQQPassiveReplyRejection(
+  error: unknown,
+): error is QQApiError {
+  return error instanceof QQApiError && error.httpStatus === 400;
 }
 
 export enum QQMediaFileType {
@@ -401,10 +412,13 @@ export interface QQConnection {
       event_id?: string;
     },
   ): Promise<{ id?: string }>;
-  /** Get next msg_seq for a chat (for stream session). */
-  getNextMsgSeq(chatId: string): number;
-  /** Latest msg_id received from a C2C openid, for passive reply. */
-  getLastIncomingMsgId(openid: string): string | undefined;
+  /** Reserve the shared per-msg_id sequence used by every passive surface. */
+  claimPassiveReply(
+    chatId: string,
+    options?: { reserve?: number },
+  ): PassiveReplyClaim | undefined;
+  /** Retire a provider-rejected passive reference and expose the evidence. */
+  rejectPassiveReply(chatId: string, msgId: string, error: unknown): boolean;
   /**
    * Show the "bot is typing" state to a C2C user for `TYPING_NOTIFY_SECONDS`.
    *
@@ -540,10 +554,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
   // Per-chat msg_seq counter for active messages
   const msgSeqCounters = new Map<string, number>();
-
-  // Latest incoming msg_id per C2C openid, used as passive-reply reference
-  // for stream_messages (QQ API rejects the endpoint without msg_id).
-  const lastIncomingMsgId = new Map<string, string>();
 
   // Passive-reply budget per chat. Replying with an inbound msg_id is free;
   // once the budget is spent we fall back to a (quota-billed) active push.
@@ -695,6 +705,50 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     return { msg_seq: getNextMsgSeq(chatKey) };
   }
 
+  function rejectPassiveReply(
+    chatKey: string,
+    msgId: string,
+    error: unknown,
+  ): boolean {
+    if (!isDefinitiveQQPassiveReplyRejection(error)) return false;
+    passiveReplies.discard(chatKey, msgId);
+    logger.warn(
+      {
+        chatType: chatKey.split(':')[0],
+        httpStatus: error.httpStatus,
+        bizCode: error.bizCode,
+      },
+      'QQ passive reply was definitively rejected; retiring reference',
+    );
+    return true;
+  }
+
+  async function sendWithQQAddressing(
+    chatKey: string,
+    kind: 'text' | 'image' | 'file',
+    send: (ref: { msg_id?: string; msg_seq: number }) => Promise<void>,
+  ): Promise<void> {
+    const ref = resolveSendRef(chatKey, kind);
+    try {
+      await send(ref);
+    } catch (error) {
+      if (!ref.msg_id || !rejectPassiveReply(chatKey, ref.msg_id, error)) {
+        throw error;
+      }
+      const fallback = { msg_seq: getNextMsgSeq(chatKey) };
+      logger.warn(
+        {
+          chatType: chatKey.split(':')[0],
+          kind,
+          mode: 'active-push-fallback',
+          msgSeq: fallback.msg_seq,
+        },
+        'QQ passive reply rejected; retrying once without msg_id',
+      );
+      await send(fallback);
+    }
+  }
+
   // ─── Token Management ──────────────────────────────────────
 
   async function getAccessToken(): Promise<string> {
@@ -839,6 +893,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
                   new QQApiError(
                     `QQ API ${method} ${path} failed (${res.statusCode}): ${errMsg}`,
                     bizCode,
+                    res.statusCode,
                   ),
                 );
                 return;
@@ -849,6 +904,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
                 reject(
                   new QQApiError(
                     `QQ API ${method} ${path} failed (${res.statusCode}): ${text}`,
+                    undefined,
+                    res.statusCode,
                   ),
                 );
               } else {
@@ -889,11 +946,13 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ? `/v2/users/${openid}/messages`
         : `/v2/groups/${openid}/messages`;
 
-    await apiRequest('POST', endpoint, {
-      markdown: { content },
-      msg_type: 2, // markdown
-      ...resolveSendRef(chatKey, 'text'),
-    });
+    await sendWithQQAddressing(chatKey, 'text', (ref) =>
+      apiRequest('POST', endpoint, {
+        markdown: { content },
+        msg_type: 2, // markdown
+        ...ref,
+      }),
+    );
   }
 
   // ─── Image Sending ───────────────────────────────────────
@@ -967,12 +1026,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ? `/v2/users/${openid}/messages`
         : `/v2/groups/${openid}/messages`;
 
-    await apiRequest('POST', endpoint, {
-      msg_type: 7, // rich media
-      media: { file_info: fileInfo },
-      content: caption || '',
-      ...resolveSendRef(chatKey, 'image'),
-    });
+    await sendWithQQAddressing(chatKey, 'image', (ref) =>
+      apiRequest('POST', endpoint, {
+        msg_type: 7, // rich media
+        media: { file_info: fileInfo },
+        content: caption || '',
+        ...ref,
+      }),
+    );
   }
 
   // ─── Chunked File Upload ─────────────────────────────────────
@@ -1256,12 +1317,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ? `/v2/users/${openid}/messages`
         : `/v2/groups/${openid}/messages`;
 
-    await apiRequest('POST', endpoint, {
-      msg_type: 7,
-      media: { file_info: fileInfo },
-      content: '',
-      ...resolveSendRef(chatKey, 'file'),
-    });
+    await sendWithQQAddressing(chatKey, 'file', (ref) =>
+      apiRequest('POST', endpoint, {
+        msg_type: 7,
+        media: { file_info: fileInfo },
+        content: '',
+        ...ref,
+      }),
+    );
   }
 
   // ─── File Download ─────────────────────────────────────────
@@ -1813,7 +1876,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         const { targetJid, routing: agentRouting } = resolvedRoute;
 
         // Only a routable message may update reply context caches.
-        lastIncomingMsgId.set(userOpenId, msgId);
         passiveReplies.record(`c2c:${userOpenId}`, msgId);
 
         // ── Authorized: process message ──
@@ -2478,12 +2540,19 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       return apiRequest<{ id?: string }>('POST', endpoint, body);
     },
 
-    getNextMsgSeq(chatId: string): number {
-      return getNextMsgSeq(chatId);
+    claimPassiveReply(
+      chatId: string,
+      options?: { reserve?: number },
+    ): PassiveReplyClaim | undefined {
+      return passiveReplies.claim(chatId, Date.now(), options);
     },
 
-    getLastIncomingMsgId(openid: string): string | undefined {
-      return lastIncomingMsgId.get(openid);
+    rejectPassiveReply(
+      chatId: string,
+      msgId: string,
+      error: unknown,
+    ): boolean {
+      return rejectPassiveReply(chatId, msgId, error);
     },
 
     async sendTypingIndicator(openid: string): Promise<boolean> {
@@ -2491,21 +2560,26 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       // courtesy: dropping it costs nothing, while spending the last passive
       // reply on it would push an actual reply onto the active-push quota.
       // For the same reason it never falls back to an active push.
-      const claim = passiveReplies.claim(`c2c:${openid}`, Date.now(), {
+      const chatKey = `c2c:${openid}`;
+      const claim = passiveReplies.claim(chatKey, Date.now(), {
         reserve: TYPING_PASSIVE_RESERVE,
       });
       if (!claim) return false;
-
-      await apiRequest('POST', `/v2/users/${openid}/messages`, {
-        msg_type: 6, // input notification
-        input_notify: {
-          input_type: 1, // "typing"
-          input_second: TYPING_NOTIFY_SECONDS,
-        },
-        msg_id: claim.msgId,
-        msg_seq: claim.msgSeq,
-      });
-      return true;
+      try {
+        await apiRequest('POST', `/v2/users/${openid}/messages`, {
+          msg_type: 6, // input notification
+          input_notify: {
+            input_type: 1, // "typing"
+            input_second: TYPING_NOTIFY_SECONDS,
+          },
+          msg_id: claim.msgId,
+          msg_seq: claim.msgSeq,
+        });
+        return true;
+      } catch (error) {
+        if (rejectPassiveReply(chatKey, claim.msgId, error)) return false;
+        throw error;
+      }
     },
   };
 

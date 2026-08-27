@@ -69,32 +69,48 @@ describe('createPassiveReplyStore', () => {
   });
 
   test('skips an expired newer reference to reach a live older one', () => {
-    // Only reachable because a redelivered event refreshes an entry in place,
-    // which breaks the by-age ordering of the list.
+    // The injected clock can observe events out of timestamp order; the store
+    // must inspect every bounded entry rather than assume array age ordering.
     const store = createPassiveReplyStore();
-    store.record('c2c:u1', 'm1', T0);
-    store.record('c2c:u1', 'm2', T0);
-    // m1 is redelivered much later, so it outlives m2 while staying at the
-    // older position in the list.
     store.record('c2c:u1', 'm1', T0 + PASSIVE_REPLY_TTL_MS - 1);
+    store.record('c2c:u1', 'm2', T0);
 
-    // At this instant m2 (recorded at T0) has expired but m1 has 1ms left, so
-    // the scan has to look past the newer entry instead of stopping at it.
+    // m2 is newest in insertion order but expired; m1 is still live.
     const claim = store.claim('c2c:u1', T0 + PASSIVE_REPLY_TTL_MS);
     expect(claim?.msgId).toBe('m1');
   });
 
-  test('re-recording the same msg_id refreshes it without resetting budget', () => {
+  test('redelivery neither refreshes TTL nor resets budget', () => {
     const store = createPassiveReplyStore();
     store.record('c2c:u1', 'm1', T0);
     store.claim('c2c:u1', T0);
 
-    // Same event redelivered: the window restarts, the platform budget does not.
-    store.record('c2c:u1', 'm1', T0 + 1_000);
-    expect(store.claim('c2c:u1', T0 + 1_000)).toEqual({
-      msgId: 'm1',
-      msgSeq: 2,
-    });
+    store.record('c2c:u1', 'm1', T0 + PASSIVE_REPLY_TTL_MS - 1);
+    expect(store.claim('c2c:u1', T0 + PASSIVE_REPLY_TTL_MS)).toBeUndefined();
+  });
+
+  test('typing, stream, text, and media share one per-msg_id sequence', () => {
+    const store = createPassiveReplyStore();
+    store.record('c2c:u1', 'm1', T0);
+
+    const typing = store.claim('c2c:u1', T0, { reserve: 2 });
+    const stream = store.claim('c2c:u1', T0);
+    const text = store.claim('c2c:u1', T0);
+    const media = store.claim('c2c:u1', T0);
+
+    expect([typing, stream, text, media].map((claim) => claim?.msgSeq)).toEqual([
+      1, 2, 3, 4,
+    ]);
+    expect(new Set([typing, stream, text, media].map((claim) => claim?.msgId))).toEqual(
+      new Set(['m1']),
+    );
+  });
+
+  test('discard retires a definitively rejected reference', () => {
+    const store = createPassiveReplyStore();
+    store.record('c2c:u1', 'm1', T0);
+    store.discard('c2c:u1', 'm1');
+    expect(store.claim('c2c:u1', T0)).toBeUndefined();
   });
 
   test('reserve leaves budget for higher-value sends', () => {
