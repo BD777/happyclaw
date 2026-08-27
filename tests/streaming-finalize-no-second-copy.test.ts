@@ -14,6 +14,7 @@ import { QQStreamingController } from '../src/qq-streaming-card.js';
 import { WeComStreamingController } from '../src/wecom-streaming.js';
 import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
 import { preAcceptImDeliveryError } from '../src/im-send-retry-policy.js';
+import { DefinitiveChannelDeliveryError } from '../src/channel-outbox-delivery.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -372,4 +373,208 @@ describe('streaming finalize must not send a second full copy', () => {
       vi.useRealTimers();
     }
   });
+
+  test('WeCom: preview plus failed abort DONE is sticky partial and never sends a third fallback', async () => {
+    vi.useFakeTimers();
+    const fallbackSend = vi.fn(async () => {});
+    const abortError = new Error('WeCom abort DONE ACK was lost');
+    const streamCalls: Array<{ content: string; finish: boolean }> = [];
+    const sendStream = vi.fn(async (content: string, finish: boolean) => {
+      streamCalls.push({ content, finish });
+      if (finish) throw abortError;
+    });
+    const ctrl = new WeComStreamingController({
+      chatId: 'chat-abort-preview',
+      sendStream,
+      fallbackSend,
+    });
+
+    ctrl.append('visible preview');
+    await vi.advanceTimersByTimeAsync(800);
+    const first = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'unused final',
+      false,
+      'attachment failed',
+    );
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'unused final',
+      false,
+      'attachment failed',
+    );
+
+    expect(first).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+        cause: abortError,
+      },
+    });
+    expect(repeated).toEqual(first);
+    expect(streamCalls).toEqual([
+      { content: 'visible preview', finish: false },
+      {
+        content: 'visible preview\n\n⚠️ 已中断: attachment failed',
+        finish: true,
+      },
+    ]);
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('WeCom: successful abort of an existing preview still fences static fallback', async () => {
+    vi.useFakeTimers();
+    const fallbackSend = vi.fn(async () => {});
+    const sendStream = vi.fn(async () => {});
+    const ctrl = new WeComStreamingController({
+      chatId: 'chat-abort-ack',
+      sendStream,
+      fallbackSend,
+    });
+
+    ctrl.append('visible preview');
+    await vi.advanceTimersByTimeAsync(800);
+    const result = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'unused final',
+      false,
+      'attachment failed',
+    );
+
+    expect(result).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 2,
+        totalOutputs: 3,
+      },
+    });
+    expect(sendStream).toHaveBeenCalledTimes(2);
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('WeCom: preview update ACK loss becomes sticky before complete can send DONE', async () => {
+    vi.useFakeTimers();
+    const fallbackSend = vi.fn(async () => {});
+    const previewError = new Error('WeCom preview update ACK was lost');
+    let calls = 0;
+    const sendStream = vi.fn(async () => {
+      calls += 1;
+      if (calls === 2) throw previewError;
+    });
+    const ctrl = new WeComStreamingController({
+      chatId: 'chat-preview-update',
+      sendStream,
+      fallbackSend,
+    });
+
+    ctrl.append('first acknowledged preview');
+    await vi.advanceTimersByTimeAsync(800);
+    ctrl.append('second uncertain preview');
+    await vi.advanceTimersByTimeAsync(800);
+    const first = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'final answer must not create a third mutation',
+      true,
+      'finalize failed',
+    );
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'final answer must not create a third mutation',
+      true,
+      'finalize failed',
+    );
+
+    expect(first).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+        cause: previewError,
+      },
+    });
+    expect(repeated).toEqual(first);
+    expect(sendStream).toHaveBeenCalledTimes(2);
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('WeCom: first preview ACK loss blocks both DONE and static fallback', async () => {
+    vi.useFakeTimers();
+    const fallbackSend = vi.fn(async () => {});
+    const previewError = new Error('WeCom first preview ACK was lost');
+    const sendStream = vi.fn(async () => Promise.reject(previewError));
+    const ctrl = new WeComStreamingController({
+      chatId: 'chat-first-preview',
+      sendStream,
+      fallbackSend,
+    });
+
+    ctrl.append('possibly visible preview');
+    await vi.advanceTimersByTimeAsync(800);
+    const result = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'must not send DONE',
+      true,
+      'finalize failed',
+    );
+
+    expect(result).toEqual({ acknowledged: false, error: previewError });
+    expect(sendStream).toHaveBeenCalledOnce();
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('WeCom: zero-output abort performs no provider mutation and leaves fallback to the host', async () => {
+    const fallbackSend = vi.fn(async () => {});
+    const sendStream = vi.fn(async () => {});
+    const ctrl = new WeComStreamingController({
+      chatId: 'chat-abort-empty',
+      sendStream,
+      fallbackSend,
+    });
+
+    const result = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'unused final',
+      false,
+      'attachment failed',
+    );
+
+    expect(result).toEqual({ acknowledged: false });
+    expect(sendStream).not.toHaveBeenCalled();
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    [
+      'pre-accept',
+      preAcceptImDeliveryError('WeCom stream rejected before provider send'),
+    ],
+    [
+      'definitive rejection',
+      new DefinitiveChannelDeliveryError('WeCom provider rejected DONE'),
+    ],
+  ])(
+    'WeCom: zero-output %s remains authoritative for host fallback',
+    async (_label, failure) => {
+      const fallbackSend = vi.fn(async () => {});
+      const ctrl = new WeComStreamingController({
+        chatId: 'chat-zero-rejected',
+        sendStream: vi.fn(async () => Promise.reject(failure)),
+        fallbackSend,
+      });
+
+      const result = await finalizeChannelCardAfterDelivery(
+        ctrl,
+        'final text',
+        true,
+        'finalize failed',
+      );
+
+      expect(result).toEqual({ acknowledged: false, error: failure });
+      expect(fallbackSend).not.toHaveBeenCalled();
+    },
+  );
 });
