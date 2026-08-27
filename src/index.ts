@@ -276,6 +276,11 @@ import {
   CHANNEL_RELIABILITY_TERMINAL_STATUSES,
 } from './channel-reliability-store.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
+import {
+  retryTaskNotification as deliverRetryTaskNotification,
+  sendTaskFileWithRetry as deliverTaskFileWithRetry,
+  sendTaskImageWithRetry as deliverTaskImageWithRetry,
+} from './unscoped-task-media-outbox.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp-auth.js';
 import {
@@ -3262,24 +3267,22 @@ async function sendTaskImageWithRetry(
   fileName?: string,
   outbox?: ChannelOutboxDeliveryRef,
 ): Promise<boolean> {
-  if (!imManager.isChannelAvailableForJid(targetJid)) return false;
-  const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
-    kind: 'image',
-    payload: {
-      mimeType,
-      caption: caption ?? null,
-      fileName: fileName ?? null,
-      contentHash: crypto
-        .createHash('sha256')
-        .update(imageBuffer)
-        .digest('hex'),
+  return deliverTaskImageWithRetry(
+    targetJid,
+    imageBuffer,
+    mimeType,
+    caption,
+    fileName,
+    outbox,
+    {
+      isChannelAvailable: (jid) => imManager.isChannelAvailableForJid(jid),
+      sendImage: (jid, buffer, mime, cap, name) =>
+        imManager.sendImage(jid, buffer, mime, cap, name),
+      sendFile: (jid, filePath, name) =>
+        imManager.sendFile(jid, filePath, name),
+      resolveRoute: resolveDurableChannelRoute,
+      deliverScoped: deliverScopedChannelOutput,
     },
-    send: () =>
-      imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
-  });
-  if (scoped !== null) return scoped;
-  return retryImOperation('send_task_image', targetJid, () =>
-    imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
   );
 }
 
@@ -3289,22 +3292,14 @@ async function sendTaskFileWithRetry(
   fileName: string,
   outbox?: ChannelOutboxDeliveryRef,
 ): Promise<boolean> {
-  if (!imManager.isChannelAvailableForJid(targetJid)) return false;
-  const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
-    kind: 'file',
-    payload: {
-      fileName,
-      contentHash: crypto
-        .createHash('sha256')
-        .update(fs.readFileSync(filePath))
-        .digest('hex'),
-    },
-    send: () => imManager.sendFile(targetJid, filePath, fileName),
+  return deliverTaskFileWithRetry(targetJid, filePath, fileName, outbox, {
+    isChannelAvailable: (jid) => imManager.isChannelAvailableForJid(jid),
+    sendImage: (jid, buffer, mime, cap, name) =>
+      imManager.sendImage(jid, buffer, mime, cap, name),
+    sendFile: (jid, destPath, name) => imManager.sendFile(jid, destPath, name),
+    resolveRoute: resolveDurableChannelRoute,
+    deliverScoped: deliverScopedChannelOutput,
   });
-  if (scoped !== null) return scoped;
-  return retryImOperation('send_task_file', targetJid, () =>
-    imManager.sendFile(targetJid, filePath, fileName),
-  );
 }
 
 /**
@@ -21884,38 +21879,24 @@ async function main(): Promise<void> {
           payload.kind === 'im_channel_image' ||
           payload.kind === 'im_channel_file'
         ) {
-          const workspaceRoot = path.resolve(
-            GROUPS_DIR,
-            payload.workspaceFolder,
+          success = await deliverRetryTaskNotification(
+            {
+              ...payload,
+              targetJid: targetJid!,
+            },
+            {
+              groupsDir: GROUPS_DIR,
+              isRealpathInside,
+              isChannelAvailable: (jid) =>
+                imManager.isChannelAvailableForJid(jid),
+              sendImage: (jid, buffer, mime, cap, name) =>
+                imManager.sendImage(jid, buffer, mime, cap, name),
+              sendFile: (jid, destPath, name) =>
+                imManager.sendFile(jid, destPath, name),
+              resolveRoute: resolveDurableChannelRoute,
+              deliverScoped: deliverScopedChannelOutput,
+            },
           );
-          const resolvedPath = path.resolve(workspaceRoot, payload.filePath);
-          if (
-            resolvedPath !== workspaceRoot &&
-            !resolvedPath.startsWith(`${workspaceRoot}${path.sep}`)
-          ) {
-            throw new Error('Persisted notification path left its workspace');
-          }
-          if (!isRealpathInside(resolvedPath, workspaceRoot)) {
-            throw new Error('Persisted notification file is unavailable');
-          }
-          if (
-            payload.kind === 'im_image' ||
-            payload.kind === 'im_channel_image'
-          ) {
-            success = await sendTaskImageWithRetry(
-              targetJid!,
-              fs.readFileSync(resolvedPath),
-              payload.mimeType,
-              payload.caption,
-              payload.fileName,
-            );
-          } else {
-            success = await sendTaskFileWithRetry(
-              targetJid!,
-              resolvedPath,
-              payload.fileName,
-            );
-          }
         } else {
           throw new Error(
             `Unsupported direct notification kind: ${payload.kind}`,
