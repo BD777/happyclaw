@@ -546,6 +546,37 @@ export function validateQQGatewayUrl(value: string): string {
   return url.toString();
 }
 
+/**
+ * A 2xx transport response is not delivery evidence by itself. QQ's official
+ * v2 C2C/group send contract returns a JSON object with a non-empty string
+ * message id; empty/HTML/malformed bodies are therefore an uncertain ACK, not
+ * permission to commit the channel Outbox row.
+ */
+export class QQOfficialSendAckError extends Error {
+  readonly code = 'QQ_SEND_ACK_UNCERTAIN';
+  readonly deliveryPhase = 'uncertain' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'QQOfficialSendAckError';
+  }
+}
+
+export function requireQQOfficialSendId(data: unknown): { id: string } {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new QQOfficialSendAckError(
+      'QQ send response is not a JSON object with an official id',
+    );
+  }
+  const id = (data as { id?: unknown }).id;
+  if (typeof id !== 'string' || id.trim() === '') {
+    throw new QQOfficialSendAckError(
+      'QQ send response is missing a non-empty official id',
+    );
+  }
+  return { id: id.trim() };
+}
+
 // ─── Factory Function ───────────────────────────────────────────
 
 export function createQQConnection(config: QQConnectionConfig): QQConnection {
@@ -944,6 +975,18 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     });
   }
 
+  async function postQQMessageWithOfficialAck(
+    endpoint: string,
+    body: Record<string, unknown>,
+  ): Promise<void> {
+    const sent = await apiRequest<{ id?: unknown; timestamp?: unknown }>(
+      'POST',
+      endpoint,
+      body,
+    );
+    requireQQOfficialSendId(sent);
+  }
+
   async function getGatewayUrl(): Promise<string> {
     const data = await apiRequest<{ url: string }>('GET', '/gateway/bot');
     if (!data.url) throw new Error('QQ gateway response did not include url');
@@ -965,7 +1008,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         : `/v2/groups/${openid}/messages`;
 
     await sendWithQQAddressing(chatKey, 'text', (ref) =>
-      apiRequest('POST', endpoint, {
+      postQQMessageWithOfficialAck(endpoint, {
         markdown: { content },
         msg_type: 2, // markdown
         ...ref,
@@ -1045,7 +1088,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         : `/v2/groups/${openid}/messages`;
 
     await sendWithQQAddressing(chatKey, 'image', (ref) =>
-      apiRequest('POST', endpoint, {
+      postQQMessageWithOfficialAck(endpoint, {
         msg_type: 7, // rich media
         media: { file_info: fileInfo },
         content: caption || '',
@@ -1336,7 +1379,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         : `/v2/groups/${openid}/messages`;
 
     await sendWithQQAddressing(chatKey, 'file', (ref) =>
-      apiRequest('POST', endpoint, {
+      postQQMessageWithOfficialAck(endpoint, {
         msg_type: 7,
         media: { file_info: fileInfo },
         content: '',
