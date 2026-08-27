@@ -325,6 +325,14 @@ export async function downloadAndDecryptWeComMedia(
               );
               return;
             }
+            if (current.protocol === 'https:' && next.protocol !== 'https:') {
+              finishReject(
+                new Error(
+                  `Refusing WeCom media HTTPS downgrade redirect to ${next.protocol}`,
+                ),
+              );
+              return;
+            }
             requestUrl(next, redirects + 1);
             return;
           }

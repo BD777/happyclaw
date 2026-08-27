@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import https from 'node:https';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const sdk = vi.hoisted(() => {
   class MockDWClient {
@@ -134,6 +136,10 @@ describe('DingTalk inbound Stream ACK must not precede handle', () => {
     vi.mocked(storeMessageDirect).mockImplementation(() => 'stored');
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   test('does not ACK when storeMessageDirect throws, then persists and ACKs on redelivery', async () => {
     vi.mocked(storeMessageDirect)
       .mockImplementationOnce(() => {
@@ -248,5 +254,142 @@ describe('DingTalk inbound Stream ACK must not precede handle', () => {
     expect(storeMessageDirect).toHaveBeenCalledTimes(1);
     expect(onMessagePersisted).toHaveBeenCalledTimes(1);
     expect(client.socketCallBackResponse).toHaveBeenCalledTimes(2);
+  });
+
+  test('disconnect fences immediately but waits for a non-abortable inbound callback', async () => {
+    let resolvePair!: (paired: boolean) => void;
+    const onPairAttempt = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolvePair = resolve;
+        }),
+    );
+    const { client, connection } = await connect({
+      isChatAuthorized: () => false,
+      onPairAttempt,
+    });
+    const delivery = client.listener!(
+      robotDownstream({ content: '/pair WAIT-FOR-DISCONNECT' }),
+    );
+    await vi.waitFor(() => expect(onPairAttempt).toHaveBeenCalledTimes(1));
+
+    let disconnected = false;
+    const disconnect = connection.disconnect().then(() => {
+      disconnected = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(client.disconnect).toHaveBeenCalledTimes(1);
+    expect(disconnected).toBe(false);
+    resolvePair(true);
+    await Promise.all([delivery, disconnect]);
+
+    expect(client.socketCallBackResponse).not.toHaveBeenCalled();
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+  });
+
+  test('disconnect aborts an active media response and suppresses persistence and ACK', async () => {
+    let responseStarted = false;
+    let requestDestroyed = false;
+    vi.spyOn(https, 'request').mockImplementation(
+      (_options: any, callback?: any) => {
+        let res:
+          | (EventEmitter & {
+              statusCode: number;
+              headers: Record<string, string>;
+              destroy: () => void;
+            })
+          | undefined;
+        const req = new EventEmitter() as EventEmitter & {
+          end: () => void;
+          setTimeout: () => void;
+          destroy: () => void;
+        };
+        req.setTimeout = () => undefined;
+        req.destroy = () => {
+          requestDestroyed = true;
+          res?.destroy();
+        };
+        req.end = () => {
+          res = new EventEmitter() as typeof res & {
+            statusCode: number;
+            headers: Record<string, string>;
+            destroy: () => void;
+          };
+          res.statusCode = 200;
+          res.headers = {};
+          res.destroy = () => undefined;
+          callback?.(res);
+          responseStarted = true;
+          res.emit('data', Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+        };
+        return req as any;
+      },
+    );
+    const { client, connection } = await connect();
+    const delivery = client.listener!({
+      headers: { messageId: 'stream-media-1' },
+      data: JSON.stringify({
+        conversationId: 'staff-1',
+        conversationType: '1',
+        msgId: 'dt-media-1',
+        senderId: 'staff-1',
+        senderNick: '钉钉用户',
+        senderStaffId: 'staff-1',
+        createAt: Date.now(),
+        msgtype: 'image',
+        image: { contentUrl: 'https://cdn.example/hanging.jpg' },
+      }),
+    });
+    await vi.waitFor(() => expect(responseStarted).toBe(true));
+
+    await connection.disconnect();
+    await delivery;
+
+    expect(requestDestroyed).toBe(true);
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+    expect(client.socketCallBackResponse).not.toHaveBeenCalled();
+  });
+
+  test('a stale listener cannot ACK through a newly connected client', async () => {
+    const first = await connect();
+    const staleListener = first.client.listener!;
+    await first.connection.disconnect();
+
+    const ok = await first.connection.connect({
+      onNewChat: vi.fn(),
+      isChatAuthorized: () => true,
+      resolveEffectiveChatJid: (jid: string) => ({
+        effectiveJid: jid,
+        agentId: null,
+      }),
+      onMessagePersisted: vi.fn(),
+    });
+    expect(ok).toBe(true);
+    const currentClient = sdk.MockDWClient.instances.at(-1)!;
+
+    await staleListener(
+      robotDownstream({
+        messageId: 'stale-stream',
+        msgId: 'stale-provider-message',
+      }),
+    );
+    expect(first.client.socketCallBackResponse).not.toHaveBeenCalled();
+    expect(currentClient.socketCallBackResponse).not.toHaveBeenCalled();
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+
+    await currentClient.listener!(
+      robotDownstream({
+        messageId: 'fresh-stream',
+        msgId: 'fresh-provider-message',
+      }),
+    );
+    expect(currentClient.socketCallBackResponse).toHaveBeenCalledWith(
+      'fresh-stream',
+      { success: true },
+    );
+    expect(storeMessageDirect).toHaveBeenCalledTimes(1);
+    await first.connection.disconnect();
   });
 });

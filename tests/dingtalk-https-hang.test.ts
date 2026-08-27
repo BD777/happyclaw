@@ -1,7 +1,13 @@
+import { EventEmitter } from 'node:events';
+import https from 'node:https';
 import net from 'node:net';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { batchSendToUser, sendViaGroupMessagesAPI } from '../src/dingtalk.js';
+import {
+  batchSendToUser,
+  dingtalkHttpsRequest,
+  sendViaGroupMessagesAPI,
+} from '../src/dingtalk.js';
 
 async function listenBlackhole(): Promise<{
   server: net.Server;
@@ -40,7 +46,53 @@ describe('DingTalk HTTPS send timeout against a blackhole TCP peer', () => {
   const closers: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await Promise.allSettled(closers.splice(0).map((close) => close()));
+  });
+
+  test('POST wall deadline cannot be extended by trickling response bytes', async () => {
+    let responseDestroyed = false;
+    vi.spyOn(https, 'request').mockImplementation(
+      (_options: any, callback?: any) => {
+        let writer: NodeJS.Timeout | undefined;
+        const req = new EventEmitter() as EventEmitter & {
+          write: () => void;
+          end: () => void;
+          setTimeout: () => void;
+          destroy: () => void;
+        };
+        req.write = () => undefined;
+        req.setTimeout = () => undefined;
+        req.destroy = () => undefined;
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & {
+            statusCode: number;
+            headers: Record<string, string>;
+            destroy: () => void;
+          };
+          res.statusCode = 200;
+          res.headers = {};
+          res.destroy = () => {
+            if (writer) clearInterval(writer);
+            responseDestroyed = true;
+          };
+          callback?.(res);
+          writer = setInterval(() => res.emit('data', Buffer.from('.')), 5);
+        };
+        return req as any;
+      },
+    );
+    const started = Date.now();
+
+    await expect(
+      dingtalkHttpsRequest(
+        { hostname: 'trickle.example', method: 'POST', timeoutMs: 40 },
+        '{}',
+      ),
+    ).rejects.toThrow('timed out');
+
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(responseDestroyed).toBe(true);
   });
 
   test('sendViaGroupMessagesAPI rejects with timeout instead of hanging', async () => {

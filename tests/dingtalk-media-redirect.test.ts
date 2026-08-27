@@ -1,5 +1,7 @@
 import http from 'node:http';
-import { afterEach, describe, expect, test } from 'vitest';
+import { EventEmitter } from 'node:events';
+import https from 'node:https';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import { downloadDingTalkHttpBuffer } from '../src/dingtalk.js';
 
@@ -17,6 +19,7 @@ async function listen(
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     servers
       .splice(0)
@@ -109,5 +112,58 @@ describe('DingTalk bounded media redirects', () => {
       'download byte limit',
     );
     await expect.poll(() => responseClosed).toBe(true);
+  });
+
+  test('enforces one absolute wall deadline despite a trickling response', async () => {
+    let responseClosed = false;
+    const { origin } = await listen((_req, res) => {
+      res.writeHead(200);
+      res.flushHeaders();
+      const writer = setInterval(() => res.write(Buffer.from('.')), 5);
+      res.on('close', () => {
+        clearInterval(writer);
+        responseClosed = true;
+      });
+    });
+    const started = Date.now();
+
+    await expect(
+      downloadDingTalkHttpBuffer(origin, 1024 * 1024, 40),
+    ).rejects.toThrow('timed out');
+
+    expect(Date.now() - started).toBeLessThan(500);
+    await expect.poll(() => responseClosed).toBe(true);
+  });
+
+  test('rejects an HTTPS redirect downgrade before opening the HTTP target', async () => {
+    const httpRequest = vi.spyOn(http, 'request');
+    vi.spyOn(https, 'request').mockImplementation(
+      (_options: any, callback?: any) => {
+        const req = new EventEmitter() as EventEmitter & {
+          end: () => void;
+          setTimeout: () => void;
+          destroy: () => void;
+        };
+        req.setTimeout = () => undefined;
+        req.destroy = () => undefined;
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & {
+            statusCode: number;
+            headers: Record<string, string>;
+            destroy: () => void;
+          };
+          res.statusCode = 302;
+          res.headers = { location: 'http://insecure.example/media' };
+          res.destroy = () => undefined;
+          callback?.(res);
+        };
+        return req as any;
+      },
+    );
+
+    await expect(
+      downloadDingTalkHttpBuffer('https://secure.example/start', 1024, 1000),
+    ).rejects.toThrow('HTTPS downgrade');
+    expect(httpRequest).not.toHaveBeenCalled();
   });
 });
