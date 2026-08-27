@@ -75,7 +75,10 @@ import {
   storeMessageDirect,
 } from '../src/db.js';
 import { notifyNewImMessage } from '../src/message-notifier.js';
-import { createWeComConnection } from '../src/wecom.js';
+import {
+  createWeComConnection,
+  type WeComConnectionConfig,
+} from '../src/wecom.js';
 
 type MockClient = InstanceType<typeof sdkMock.MockWSClient>;
 
@@ -142,7 +145,10 @@ function mediaFrame(input: {
   return { headers: { req_id: input.reqId }, body } as any;
 }
 
-async function connect(overrides: Record<string, unknown> = {}): Promise<{
+async function connect(
+  overrides: Record<string, unknown> = {},
+  configOverrides: Partial<WeComConnectionConfig> = {},
+): Promise<{
   connection: ReturnType<typeof createWeComConnection>;
   client: MockClient;
   opts: Record<string, any>;
@@ -153,6 +159,7 @@ async function connect(overrides: Record<string, unknown> = {}): Promise<{
     channelAccountId: 'account-1',
     authTimeoutMs: 1000,
     mediaDownloader: mediaDownload,
+    ...configOverrides,
   });
   const opts = {
     onNewChat: vi.fn(),
@@ -359,6 +366,232 @@ describe('WeCom inbound media persist/notify', () => {
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(mediaDownload).toHaveBeenCalledTimes(1);
     expect(storeMessageDirect).toHaveBeenCalledTimes(1);
+  });
+
+  test('bounds 11 concurrent media messages at 2 active + 8 queued and persists a busy marker', async () => {
+    let releaseDownloads!: () => void;
+    const downloadGate = new Promise<void>((resolve) => {
+      releaseDownloads = resolve;
+    });
+    let active = 0;
+    let maxActive = 0;
+    mediaDownload.mockImplementation(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await downloadGate;
+      active -= 1;
+      return {
+        buffer: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        filename: 'queued.jpg',
+      };
+    });
+    const { client } = await connect();
+
+    for (let index = 0; index < 11; index += 1) {
+      client.emit(
+        'message.image',
+        mediaFrame({ reqId: `concurrent-${index}`, msgtype: 'image' }),
+      );
+    }
+
+    await vi.waitFor(() => expect(mediaDownload).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(
+        storeMessageDirect.mock.calls.some(
+          (call) => call[4] === '[图片（系统繁忙未下载）]',
+        ),
+      ).toBe(true),
+    );
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(mediaDownload).toHaveBeenCalledTimes(2);
+
+    releaseDownloads();
+    await vi.waitFor(() => expect(mediaDownload).toHaveBeenCalledTimes(10));
+    await vi.waitFor(() =>
+      expect(storeMessageDirect).toHaveBeenCalledTimes(11),
+    );
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(
+      storeMessageDirect.mock.calls.filter(
+        (call) => call[4] === '[图片（系统繁忙未下载）]',
+      ),
+    ).toHaveLength(1);
+  });
+
+  test('bounds media concurrency to four across connections', async () => {
+    let releaseDownloads!: () => void;
+    const downloadGate = new Promise<void>((resolve) => {
+      releaseDownloads = resolve;
+    });
+    let active = 0;
+    let maxActive = 0;
+    mediaDownload.mockImplementation(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await downloadGate;
+      active -= 1;
+      return {
+        buffer: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        filename: 'global.jpg',
+      };
+    });
+    const connected = await Promise.all([connect(), connect(), connect()]);
+
+    connected.forEach(({ client }, connectionIndex) => {
+      for (let mediaIndex = 0; mediaIndex < 2; mediaIndex += 1) {
+        client.emit(
+          'message.image',
+          mediaFrame({
+            reqId: `global-${connectionIndex}-${mediaIndex}`,
+            msgtype: 'image',
+          }),
+        );
+      }
+    });
+
+    await vi.waitFor(() => expect(mediaDownload).toHaveBeenCalledTimes(4));
+    expect(maxActive).toBeLessThanOrEqual(4);
+    releaseDownloads();
+    await vi.waitFor(() => expect(mediaDownload).toHaveBeenCalledTimes(6));
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(6));
+    expect(maxActive).toBeLessThanOrEqual(4);
+    await Promise.all(
+      connected.map(({ connection }) => connection.disconnect()),
+    );
+  });
+
+  test('queued media shares the total download deadline', async () => {
+    let releaseDownloads!: () => void;
+    const downloadGate = new Promise<void>((resolve) => {
+      releaseDownloads = resolve;
+    });
+    mediaDownload.mockImplementation(async () => {
+      await downloadGate;
+      return {
+        buffer: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        filename: 'deadline.jpg',
+      };
+    });
+    const { client } = await connect({}, { mediaDownloadTimeoutMs: 20 });
+
+    for (let index = 0; index < 3; index += 1) {
+      client.emit(
+        'message.image',
+        mediaFrame({ reqId: `deadline-${index}`, msgtype: 'image' }),
+      );
+    }
+
+    await vi.waitFor(() =>
+      expect(
+        storeMessageDirect.mock.calls.some(
+          (call) => call[4] === '[图片（系统繁忙未下载）]',
+        ),
+      ).toBe(true),
+    );
+    expect(mediaDownload).toHaveBeenCalledTimes(2);
+
+    releaseDownloads();
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(3));
+  });
+
+  test('disconnect aborts two active downloads and removes one local waiter without persistence', async () => {
+    let aborted = 0;
+    mediaDownload.mockImplementation(
+      async (
+        _url: string,
+        _aesKey: string | undefined,
+        _maxBytes: number,
+        _timeoutMs: number,
+        signal?: AbortSignal,
+      ) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            'abort',
+            () => {
+              aborted += 1;
+              reject(new Error('transport aborted'));
+            },
+            { once: true },
+          );
+        }),
+    );
+    const { client, connection } = await connect();
+    for (let index = 0; index < 3; index += 1) {
+      client.emit(
+        'message.image',
+        mediaFrame({ reqId: `disconnect-local-${index}`, msgtype: 'image' }),
+      );
+    }
+    await vi.waitFor(() => expect(mediaDownload).toHaveBeenCalledTimes(2));
+
+    await connection.disconnect();
+    await vi.waitFor(() => expect(aborted).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mediaDownload).toHaveBeenCalledTimes(2);
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+    expect(mediaStore.saveDownloadedFile).not.toHaveBeenCalled();
+  });
+
+  test('disconnect removes a global waiter and does not leak the global permit', async () => {
+    let releaseBlockers!: () => void;
+    const blockerGate = new Promise<void>((resolve) => {
+      releaseBlockers = resolve;
+    });
+    const imageResult = {
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
+      filename: 'global-cancel.jpg',
+    };
+    const blockerDownload = vi.fn(async () => {
+      await blockerGate;
+      return imageResult;
+    });
+    const targetDownload = vi.fn(async () => imageResult);
+    const blockers = await Promise.all([
+      connect({}, { mediaDownloader: blockerDownload }),
+      connect({}, { mediaDownloader: blockerDownload }),
+    ]);
+    blockers.forEach(({ client }, connectionIndex) => {
+      for (let mediaIndex = 0; mediaIndex < 2; mediaIndex += 1) {
+        client.emit(
+          'message.image',
+          mediaFrame({
+            reqId: `global-blocker-${connectionIndex}-${mediaIndex}`,
+            msgtype: 'image',
+          }),
+        );
+      }
+    });
+    await vi.waitFor(() => expect(blockerDownload).toHaveBeenCalledTimes(4));
+
+    const target = await connect({}, { mediaDownloader: targetDownload });
+    target.client.emit(
+      'message.image',
+      mediaFrame({ reqId: 'global-cancel-target', msgtype: 'image' }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(targetDownload).not.toHaveBeenCalled();
+    await target.connection.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(targetDownload).not.toHaveBeenCalled();
+    expect(storeMessageDirect).not.toHaveBeenCalled();
+
+    releaseBlockers();
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(4));
+
+    const freshDownload = vi.fn(async () => imageResult);
+    const fresh = await connect({}, { mediaDownloader: freshDownload });
+    fresh.client.emit(
+      'message.image',
+      mediaFrame({ reqId: 'global-after-cancel', msgtype: 'image' }),
+    );
+    await vi.waitFor(() => expect(freshDownload).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(5));
+
+    await Promise.all([
+      ...blockers.map(({ connection }) => connection.disconnect()),
+      fresh.connection.disconnect(),
+    ]);
   });
 
   test('durable media replay is detected before download', async () => {

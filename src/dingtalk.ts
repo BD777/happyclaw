@@ -119,7 +119,7 @@ export async function downloadDingTalkHttpBuffer(
         const status = res.statusCode ?? 0;
         if (status >= 300 && status < 400) {
           const location = res.headers.location;
-          res.resume();
+          res.destroy();
           if (!location) {
             reject(
               new Error(`DingTalk media redirect ${status} has no Location`),
@@ -141,14 +141,14 @@ export async function downloadDingTalkHttpBuffer(
           return;
         }
         if (status < 200 || status >= 300) {
-          res.resume();
+          res.destroy();
           reject(new Error(`DingTalk media GET HTTP failed (${status})`));
           return;
         }
 
         const contentLength = Number(res.headers['content-length']);
         if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-          res.resume();
+          res.destroy();
           reject(new Error('DingTalk media exceeds the download byte limit'));
           return;
         }

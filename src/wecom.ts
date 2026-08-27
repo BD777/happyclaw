@@ -59,6 +59,165 @@ const WECOM_MIXED_MAX_PLAINTEXT_BYTES = WECOM_MEDIA_MAX_PLAINTEXT_BYTES;
 const WECOM_MIXED_MAX_BASE64_BYTES = 8 * 1024 * 1024;
 const WECOM_PROGRESS_TTL_MS = 10 * 60_000;
 const WECOM_PROGRESS_MAX_STAGED_BYTES = 32 * 1024 * 1024;
+const WECOM_MEDIA_ACTIVE_LIMIT = 2;
+const WECOM_MEDIA_QUEUE_LIMIT = 8;
+const WECOM_GLOBAL_MEDIA_ACTIVE_LIMIT = 4;
+const WECOM_GLOBAL_MEDIA_QUEUE_LIMIT = 32;
+
+class WeComMediaBusyError extends Error {
+  readonly code = 'WECOM_MEDIA_BUSY';
+
+  constructor(message = 'WeCom media downloader is busy') {
+    super(message);
+    this.name = 'WeComMediaBusyError';
+  }
+}
+
+class WeComMediaCancelledError extends Error {
+  readonly code = 'WECOM_MEDIA_CANCELLED';
+
+  constructor(message = 'WeCom media operation was cancelled') {
+    super(message);
+    this.name = 'WeComMediaCancelledError';
+  }
+}
+
+function throwIfWeComMediaCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new WeComMediaCancelledError();
+}
+
+interface WeComMediaWaiter {
+  deadline: number;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
+class WeComMediaSemaphore {
+  private active = 0;
+  private readonly queued: WeComMediaWaiter[] = [];
+  private closed = false;
+
+  constructor(
+    private readonly activeLimit: number,
+    private readonly queueLimit: number,
+  ) {}
+
+  async run<T>(
+    totalDeadlineMs: number,
+    task: (remainingMs: number) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const deadline = Date.now() + Math.max(1, totalDeadlineMs);
+    await this.acquire(deadline, signal);
+    try {
+      if (signal?.aborted) throw new WeComMediaCancelledError();
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new WeComMediaBusyError(
+          'WeCom media queue exceeded its total deadline',
+        );
+      }
+      return await task(remainingMs);
+    } finally {
+      this.release();
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const entry of this.queued.splice(0)) {
+      clearTimeout(entry.timer);
+      if (entry.signal && entry.onAbort) {
+        entry.signal.removeEventListener('abort', entry.onAbort);
+      }
+      entry.reject(new WeComMediaCancelledError('WeCom media queue closed'));
+    }
+  }
+
+  private acquire(deadline: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new WeComMediaCancelledError());
+    }
+    if (this.closed) {
+      return Promise.reject(
+        new WeComMediaCancelledError('WeCom media queue closed'),
+      );
+    }
+    if (this.active < this.activeLimit) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    if (this.queued.length >= this.queueLimit) {
+      return Promise.reject(
+        new WeComMediaBusyError('WeCom media queue capacity exceeded'),
+      );
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      let entry: WeComMediaWaiter;
+      const onAbort = () => {
+        const index = this.queued.indexOf(entry);
+        if (index >= 0) this.queued.splice(index, 1);
+        clearTimeout(entry.timer);
+        reject(new WeComMediaCancelledError());
+      };
+      entry = {
+        deadline,
+        resolve,
+        reject,
+        signal,
+        onAbort,
+        timer: setTimeout(() => {
+          const index = this.queued.indexOf(entry);
+          if (index >= 0) this.queued.splice(index, 1);
+          signal?.removeEventListener('abort', onAbort);
+          reject(
+            new WeComMediaBusyError(
+              'WeCom media queue exceeded its total deadline',
+            ),
+          );
+        }, remainingMs),
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.queued.push(entry);
+    });
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    while (this.queued.length > 0) {
+      const entry = this.queued.shift()!;
+      clearTimeout(entry.timer);
+      if (entry.signal && entry.onAbort) {
+        entry.signal.removeEventListener('abort', entry.onAbort);
+      }
+      if (entry.signal?.aborted) {
+        entry.reject(new WeComMediaCancelledError());
+        continue;
+      }
+      if (entry.deadline <= Date.now()) {
+        entry.reject(
+          new WeComMediaBusyError(
+            'WeCom media queue exceeded its total deadline',
+          ),
+        );
+        continue;
+      }
+      this.active += 1;
+      entry.resolve();
+      break;
+    }
+  }
+}
+
+const globalWeComMediaSemaphore = new WeComMediaSemaphore(
+  WECOM_GLOBAL_MEDIA_ACTIVE_LIMIT,
+  WECOM_GLOBAL_MEDIA_QUEUE_LIMIT,
+);
 
 export interface WeComDownloadedMedia {
   buffer: Buffer;
@@ -85,19 +244,64 @@ export async function downloadAndDecryptWeComMedia(
   aesKey: string | undefined,
   maxPlaintextBytes = WECOM_MEDIA_MAX_PLAINTEXT_BYTES,
   timeoutMs = WECOM_MEDIA_DOWNLOAD_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<WeComDownloadedMedia> {
+  throwIfWeComMediaCancelled(signal);
   const encryptedLimit = maxPlaintextBytes + (aesKey ? 32 : 0);
   const downloaded = await new Promise<WeComDownloadedMedia>(
     (resolve, reject) => {
+      const deadline = Date.now() + Math.max(1, timeoutMs);
+      let activeRequest: http.ClientRequest | null = null;
+      let settled = false;
+      let deadlineTimer: NodeJS.Timeout;
+      let onAbort: (() => void) | undefined;
+      const finishResolve = (value: WeComDownloadedMedia): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        if (onAbort) signal?.removeEventListener('abort', onAbort);
+        resolve(value);
+      };
+      const finishReject = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        if (onAbort) signal?.removeEventListener('abort', onAbort);
+        reject(error);
+      };
+      deadlineTimer = setTimeout(
+        () => {
+          const request = activeRequest;
+          finishReject(
+            new Error(`WeCom media request timed out after ${timeoutMs}ms`),
+          );
+          request?.destroy();
+        },
+        Math.max(1, timeoutMs),
+      );
+      onAbort = () => {
+        const request = activeRequest;
+        finishReject(new WeComMediaCancelledError());
+        request?.destroy();
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+
       const requestUrl = (current: URL, redirects: number): void => {
         if (!['http:', 'https:'].includes(current.protocol)) {
-          reject(
+          finishReject(
             new Error(`Unsupported WeCom media protocol: ${current.protocol}`),
           );
           return;
         }
         if (redirects > 5) {
-          reject(new Error('Too many WeCom media redirects'));
+          finishReject(new Error('Too many WeCom media redirects'));
+          return;
+        }
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          finishReject(
+            new Error(`WeCom media request timed out after ${timeoutMs}ms`),
+          );
           return;
         }
         const transport = current.protocol === 'https:' ? https : http;
@@ -105,9 +309,9 @@ export async function downloadAndDecryptWeComMedia(
           const status = res.statusCode ?? 0;
           if (status >= 300 && status < 400) {
             const location = res.headers.location;
-            res.resume();
+            res.destroy();
             if (!location) {
-              reject(
+              finishReject(
                 new Error(`WeCom media redirect ${status} has no Location`),
               );
               return;
@@ -116,7 +320,7 @@ export async function downloadAndDecryptWeComMedia(
             try {
               next = new URL(location, current);
             } catch (error) {
-              reject(
+              finishReject(
                 new Error('Invalid WeCom media redirect URL', { cause: error }),
               );
               return;
@@ -125,14 +329,16 @@ export async function downloadAndDecryptWeComMedia(
             return;
           }
           if (status < 200 || status >= 300) {
-            res.resume();
-            reject(new Error(`WeCom media GET HTTP failed (${status})`));
+            res.destroy();
+            finishReject(new Error(`WeCom media GET HTTP failed (${status})`));
             return;
           }
           const declared = Number(res.headers['content-length']);
           if (Number.isFinite(declared) && declared > encryptedLimit) {
-            res.resume();
-            reject(new Error('WeCom encrypted media exceeds the byte limit'));
+            res.destroy();
+            finishReject(
+              new Error('WeCom encrypted media exceeds the byte limit'),
+            );
             return;
           }
           const chunks: Buffer[] = [];
@@ -152,7 +358,7 @@ export async function downloadAndDecryptWeComMedia(
           });
           res.on('end', () => {
             if (exceeded) return;
-            resolve({
+            finishResolve({
               buffer: Buffer.concat(chunks, total),
               filename: contentDispositionFilename(
                 typeof res.headers['content-disposition'] === 'string'
@@ -161,12 +367,17 @@ export async function downloadAndDecryptWeComMedia(
               ),
             });
           });
-          res.on('error', reject);
+          res.on('error', (error) => {
+            if (activeRequest === req) finishReject(error);
+          });
         });
-        req.on('error', reject);
-        req.setTimeout(timeoutMs, () => {
+        activeRequest = req;
+        req.on('error', (error) => {
+          if (activeRequest === req) finishReject(error);
+        });
+        req.setTimeout(remainingMs, () => {
           req.destroy(
-            new Error(`WeCom media request timed out after ${timeoutMs}ms`),
+            new Error(`WeCom media request timed out after ${remainingMs}ms`),
           );
         });
         req.end();
@@ -176,13 +387,14 @@ export async function downloadAndDecryptWeComMedia(
       try {
         initial = new URL(url);
       } catch (error) {
-        reject(new Error('Invalid WeCom media URL', { cause: error }));
+        finishReject(new Error('Invalid WeCom media URL', { cause: error }));
         return;
       }
       requestUrl(initial, 0);
     },
   );
 
+  throwIfWeComMediaCancelled(signal);
   const buffer = aesKey
     ? decryptWeComFile(downloaded.buffer, aesKey)
     : downloaded.buffer;
@@ -211,7 +423,11 @@ export interface WeComConnectionConfig {
     url: string,
     aesKey: string | undefined,
     maxPlaintextBytes?: number,
+    timeoutMs?: number,
+    signal?: AbortSignal,
   ) => Promise<WeComDownloadedMedia>;
+  /** Test-only total media queue + download deadline. */
+  mediaDownloadTimeoutMs?: number;
 }
 
 export interface WeComConnectOpts {
@@ -372,8 +588,44 @@ export function createWeComConnection(
   let authenticated = false;
   let opts: WeComConnectOpts | null = null;
   let intentionalDisconnect = false;
+  let connectionGeneration = 0;
+  const mediaAbortController = new AbortController();
   const logCtx = { accountId: config.channelAccountId, botId: config.botId };
-  const downloadMedia = config.mediaDownloader ?? downloadAndDecryptWeComMedia;
+  const rawDownloadMedia =
+    config.mediaDownloader ?? downloadAndDecryptWeComMedia;
+  const mediaSemaphore = new WeComMediaSemaphore(
+    WECOM_MEDIA_ACTIVE_LIMIT,
+    WECOM_MEDIA_QUEUE_LIMIT,
+  );
+  const downloadMedia = (
+    url: string,
+    aesKey: string | undefined,
+    maxPlaintextBytes: number,
+    generation: number,
+    signal: AbortSignal,
+  ) =>
+    mediaSemaphore
+      .run(
+        config.mediaDownloadTimeoutMs ?? WECOM_MEDIA_DOWNLOAD_TIMEOUT_MS,
+        (remainingMs) =>
+          globalWeComMediaSemaphore.run(
+            remainingMs,
+            (globalRemainingMs) =>
+              rawDownloadMedia(
+                url,
+                aesKey,
+                maxPlaintextBytes,
+                globalRemainingMs,
+                signal,
+              ),
+            signal,
+          ),
+        signal,
+      )
+      .then((downloaded) => {
+        assertConnectionGeneration(generation, signal);
+        return downloaded;
+      });
   const dedup = createDedupCache({
     ttlMs: MESSAGE_DEDUP_TTL_MS,
     max: MESSAGE_DEDUP_MAX,
@@ -393,6 +645,19 @@ export function createWeComConnection(
   // Exact durable input id -> original callback frame. Map insertion order is
   // the LRU order; a session removes its entry and retains the frozen frame.
   const inboundFrames = new Map<string, CachedInboundFrame>();
+
+  function assertConnectionGeneration(
+    generation: number,
+    signal: AbortSignal,
+  ): void {
+    if (
+      generation !== connectionGeneration ||
+      signal !== mediaAbortController.signal ||
+      signal.aborted
+    ) {
+      throw new WeComMediaCancelledError();
+    }
+  }
 
   function clearProgressPayload(progress: WeComInboundProgress): void {
     inboundProgressBytes = Math.max(
@@ -428,7 +693,10 @@ export function createWeComConnection(
     progress: WeComInboundProgress,
     content: string,
     attachmentsJson: string | undefined,
+    generation: number,
+    signal: AbortSignal,
   ): void {
+    assertConnectionGeneration(generation, signal);
     clearProgressPayload(progress);
     const stagedBytes =
       Buffer.byteLength(content, 'utf8') +
@@ -599,6 +867,8 @@ export function createWeComConnection(
     sourceJid: string,
     targetJid: string,
     fallbackName: string,
+    generation: number,
+    signal: AbortSignal,
     limits: { plaintextBytes?: number; base64Bytes?: number } = {},
   ): Promise<NormalizedWeComInbound> {
     if (!image?.url) {
@@ -614,7 +884,10 @@ export function createWeComConnection(
         image.url,
         image.aeskey,
         plaintextLimit,
+        generation,
+        signal,
       );
+      assertConnectionGeneration(generation, signal);
       const buffer = downloaded.buffer;
       if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
         logger.warn({ ...logCtx, sourceJid }, 'WeCom image download was empty');
@@ -628,6 +901,7 @@ export function createWeComConnection(
         return { content: '[图片（文件过大）]', attachments: [] };
       }
 
+      assertConnectionGeneration(generation, signal);
       const mimeType = detectImageMimeTypeStrict(buffer);
       const base64Limit = limits.base64Bytes ?? Number.POSITIVE_INFINITY;
       const encodedBytes = Math.ceil(buffer.length / 3) * 4;
@@ -659,14 +933,18 @@ export function createWeComConnection(
         return { content: '[图片]', attachments, ...usage };
       }
       try {
+        assertConnectionGeneration(generation, signal);
         const savedPath = await saveDownloadedFile(
           folder,
           'wecom',
           fileName,
           buffer,
         );
+        assertConnectionGeneration(generation, signal);
         return { content: `[图片: ${savedPath}]`, attachments, ...usage };
       } catch (error) {
+        if (error instanceof WeComMediaCancelledError) throw error;
+        assertConnectionGeneration(generation, signal);
         logger.warn(
           { ...logCtx, sourceJid, targetJid, error },
           'Failed to save WeCom image to workspace',
@@ -674,6 +952,18 @@ export function createWeComConnection(
         return { content: '[图片（保存失败）]', attachments, ...usage };
       }
     } catch (error) {
+      if (error instanceof WeComMediaCancelledError) throw error;
+      assertConnectionGeneration(generation, signal);
+      if (error instanceof WeComMediaBusyError) {
+        logger.warn(
+          { ...logCtx, sourceJid, error },
+          'WeCom image skipped because the media queue is busy',
+        );
+        return {
+          content: '[图片（系统繁忙未下载）]',
+          attachments: [],
+        };
+      }
       logger.warn(
         { ...logCtx, sourceJid, error },
         'Failed to download WeCom image',
@@ -687,6 +977,8 @@ export function createWeComConnection(
     sourceJid: string,
     targetJid: string,
     kind: 'file' | 'video',
+    generation: number,
+    signal: AbortSignal,
   ): Promise<NormalizedWeComInbound> {
     const label = kind === 'video' ? '视频' : '文件';
     if (!media?.url) {
@@ -701,7 +993,10 @@ export function createWeComConnection(
         media.url,
         media.aeskey,
         WECOM_MEDIA_MAX_PLAINTEXT_BYTES,
+        generation,
+        signal,
       );
+      assertConnectionGeneration(generation, signal);
       const buffer = downloaded.buffer;
       if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
         logger.warn(
@@ -732,14 +1027,18 @@ export function createWeComConnection(
         };
       }
       try {
+        assertConnectionGeneration(generation, signal);
         const savedPath = await saveDownloadedFile(
           folder,
           'wecom',
           fileName,
           buffer,
         );
+        assertConnectionGeneration(generation, signal);
         return { content: `[${label}: ${savedPath}]`, attachments: [] };
       } catch (error) {
+        if (error instanceof WeComMediaCancelledError) throw error;
+        assertConnectionGeneration(generation, signal);
         logger.warn(
           { ...logCtx, sourceJid, targetJid, kind, error },
           `Failed to save WeCom ${kind} to workspace`,
@@ -750,6 +1049,18 @@ export function createWeComConnection(
         };
       }
     } catch (error) {
+      if (error instanceof WeComMediaCancelledError) throw error;
+      assertConnectionGeneration(generation, signal);
+      if (error instanceof WeComMediaBusyError) {
+        logger.warn(
+          { ...logCtx, sourceJid, kind, error },
+          `WeCom ${kind} skipped because the media queue is busy`,
+        );
+        return {
+          content: `[${label}（系统繁忙未下载）]`,
+          attachments: [],
+        };
+      }
       logger.warn(
         { ...logCtx, sourceJid, kind, error },
         `Failed to download WeCom ${kind}`,
@@ -762,6 +1073,8 @@ export function createWeComConnection(
     body: BaseMessage,
     sourceJid: string,
     targetJid: string,
+    generation: number,
+    signal: AbortSignal,
   ): Promise<NormalizedWeComInbound> {
     const msgtype = body.msgtype;
     if (
@@ -782,6 +1095,8 @@ export function createWeComConnection(
         sourceJid,
         targetJid,
         `image_${Date.now()}.jpg`,
+        generation,
+        signal,
       );
     }
     if (msgtype === 'file' || msgtype === 'video') {
@@ -790,6 +1105,8 @@ export function createWeComConnection(
         sourceJid,
         targetJid,
         msgtype,
+        generation,
+        signal,
       );
     }
     if (msgtype === 'mixed') {
@@ -803,6 +1120,7 @@ export function createWeComConnection(
       let base64Bytes = 0;
       let limitMarkerAdded = false;
       for (const item of items) {
+        assertConnectionGeneration(generation, signal);
         if (item?.msgtype === 'text') {
           const text = item.text?.content?.trim();
           if (text) parts.push(text);
@@ -827,6 +1145,8 @@ export function createWeComConnection(
             sourceJid,
             targetJid,
             `mixed_image_${Date.now()}_${imageIndex}.jpg`,
+            generation,
+            signal,
             {
               plaintextBytes: WECOM_MIXED_MAX_PLAINTEXT_BYTES - plaintextBytes,
               base64Bytes: WECOM_MIXED_MAX_BASE64_BYTES - base64Bytes,
@@ -849,6 +1169,9 @@ export function createWeComConnection(
   }
 
   async function handleInbound(frame: WsFrame<BaseMessage>): Promise<void> {
+    const generation = connectionGeneration;
+    const signal = mediaAbortController.signal;
+    if (signal.aborted) return;
     const body = frame.body;
     if (!body) return;
     const conversation = rawConversationJid(body);
@@ -861,6 +1184,7 @@ export function createWeComConnection(
     dedup.markSeen(dedupKey);
 
     try {
+      assertConnectionGeneration(generation, signal);
       const createdAt = body.create_time ? body.create_time * 1000 : 0;
       if (
         opts?.ignoreMessagesBefore &&
@@ -888,6 +1212,7 @@ export function createWeComConnection(
         isChatAuthorized: opts?.isChatAuthorized ?? (() => false),
         onPairAttempt: opts?.onPairAttempt,
       });
+      assertConnectionGeneration(generation, signal);
       if (admission.kind === 'paired') {
         if (ws)
           await sendReply(ws, frame, '配对成功！此聊天已连接到你的工作区。');
@@ -1067,7 +1392,13 @@ export function createWeComConnection(
         return;
       }
       if (!progress.normalized) {
-        const normalized = await normalizeInbound(body, jid, targetJid);
+        const normalized = await normalizeInbound(
+          body,
+          jid,
+          targetJid,
+          generation,
+          signal,
+        );
         const attachmentsJson =
           normalized.attachments.length > 0
             ? JSON.stringify(normalized.attachments)
@@ -1077,6 +1408,8 @@ export function createWeComConnection(
           progress,
           normalized.content,
           attachmentsJson,
+          generation,
+          signal,
         );
         progress.normalized = true;
       }
@@ -1104,11 +1437,13 @@ export function createWeComConnection(
         proposedTimestamp,
       );
       const timestamp = progress.timestamp;
+      assertConnectionGeneration(generation, signal);
       if (!progress.registered) {
         opts?.onNewChat(jid, senderName);
         progress.registered = true;
       }
       if (!progress.stored) {
+        assertConnectionGeneration(generation, signal);
         storeMessageDirect(
           id,
           targetJid,
@@ -1170,7 +1505,12 @@ export function createWeComConnection(
       // The mark is provisional until every required effect completes. A
       // provider retry with the same msgid resumes from inboundProgress.
       dedup.forget(dedupKey);
-      logger.error({ ...logCtx, error }, 'WeCom inbound handling failed');
+      if (error instanceof WeComMediaCancelledError) {
+        deleteProgress(dedupKey);
+        logger.debug({ ...logCtx }, 'WeCom inbound handling cancelled');
+      } else {
+        logger.error({ ...logCtx, error }, 'WeCom inbound handling failed');
+      }
     } finally {
       processingLock.release(dedupKey);
     }
@@ -1284,8 +1624,11 @@ export function createWeComConnection(
     },
 
     async disconnect(): Promise<void> {
+      connectionGeneration += 1;
+      mediaAbortController.abort();
       intentionalDisconnect = true;
       authenticated = false;
+      mediaSemaphore.close();
       const client = ws;
       ws = null;
       opts = null;

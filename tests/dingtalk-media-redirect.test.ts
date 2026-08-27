@@ -70,4 +70,44 @@ describe('DingTalk bounded media redirects', () => {
       'download byte limit',
     );
   });
+
+  test('actively closes a replaced redirect response that keeps writing', async () => {
+    let redirectClosed = false;
+    const { origin } = await listen((req, res) => {
+      if (req.url === '/start') {
+        res.writeHead(302, { location: '/final' });
+        res.flushHeaders();
+        const writer = setInterval(() => res.write(Buffer.alloc(1024)), 1);
+        res.on('close', () => {
+          clearInterval(writer);
+          redirectClosed = true;
+        });
+        return;
+      }
+      res.end('final');
+    });
+
+    await expect(
+      downloadDingTalkHttpBuffer(`${origin}/start`),
+    ).resolves.toEqual(Buffer.from('final'));
+    await expect.poll(() => redirectClosed).toBe(true);
+  });
+
+  test('actively closes a declared-oversize response that keeps writing', async () => {
+    let responseClosed = false;
+    const { origin } = await listen((_req, res) => {
+      res.writeHead(200, { 'content-length': 1_000_000 });
+      res.flushHeaders();
+      const writer = setInterval(() => res.write(Buffer.alloc(1024)), 1);
+      res.on('close', () => {
+        clearInterval(writer);
+        responseClosed = true;
+      });
+    });
+
+    await expect(downloadDingTalkHttpBuffer(origin, 10)).rejects.toThrow(
+      'download byte limit',
+    );
+    await expect.poll(() => responseClosed).toBe(true);
+  });
 });
