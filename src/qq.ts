@@ -47,6 +47,10 @@ import {
   parseRuntimeControl,
 } from './follow-up-policy.js';
 import type { FollowUpDisposition, FollowUpMode } from './types.js';
+import {
+  ChannelInboundLifecycle,
+  type ChannelInboundLease,
+} from './channel-inbound-lifecycle.js';
 // ─── Constants ──────────────────────────────────────────────────
 
 const QQ_TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken';
@@ -560,6 +564,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   let resumeGatewayUrl: string | null = null;
   let stopping = false;
   let readyFired = false;
+  const inboundLifecycle = new ChannelInboundLifecycle();
 
   // Reconnect control state. Mutated by ws lifecycle handlers and the
   // reconnect timer; read by scheduleReconnect to pick the next strategy.
@@ -1342,15 +1347,21 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
   // ─── File Download ─────────────────────────────────────────
 
-  async function downloadQQAttachment(url: string): Promise<Buffer | null> {
+  async function downloadQQAttachment(
+    url: string,
+    lease: ChannelInboundLease,
+  ): Promise<Buffer | null> {
     try {
       const buffer = await downloadHttpsBuffer(url, {
         followRedirects: true,
+        signal: lease.signal,
       });
+      inboundLifecycle.assertCurrent(lease);
 
       if (buffer.length === 0) return null;
       return buffer;
     } catch (err) {
+      inboundLifecycle.assertCurrent(lease);
       logger.warn({ err }, 'Failed to download QQ attachment');
       return null;
     }
@@ -1367,13 +1378,15 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     content: string,
     opts: QQConnectOpts,
     logContext: string,
+    lease: ChannelInboundLease,
   ): Promise<{ content: string; attachmentsJson?: string }> {
     if (!attachment.url) return { content };
 
     const attachUrl = attachment.url.startsWith('http')
       ? attachment.url
       : `https://${attachment.url}`;
-    const buffer = await downloadQQAttachment(attachUrl);
+    const buffer = await downloadQQAttachment(attachUrl, lease);
+    inboundLifecycle.assertCurrent(lease);
     if (!buffer) return { content };
 
     const imageMime = detectImageMimeTypeStrict(buffer);
@@ -1388,14 +1401,17 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         const ext = IMAGE_EXT_MAP[imageMime] ?? '.jpg';
         const fileName = `qq_img_${msgId.slice(-8)}${ext}`;
         try {
+          inboundLifecycle.assertCurrent(lease);
           const relPath = await saveDownloadedFile(
             groupFolder,
             'qq',
             fileName,
             buffer,
           );
+          inboundLifecycle.assertCurrent(lease);
           if (relPath) content = `[图片: ${relPath}]\n${content}`.trim();
         } catch (err) {
+          inboundLifecycle.assertCurrent(lease);
           logger.warn({ err }, `Failed to save QQ ${logContext} image`);
         }
       }
@@ -1413,14 +1429,17 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
     if (groupFolder) {
       try {
+        inboundLifecycle.assertCurrent(lease);
         const relPath = await saveDownloadedFile(
           groupFolder,
           'qq',
           fileName,
           buffer,
         );
+        inboundLifecycle.assertCurrent(lease);
         if (relPath) content = `[文件: ${relPath}]\n${content}`.trim();
       } catch (err) {
+        inboundLifecycle.assertCurrent(lease);
         logger.warn({ err }, `Failed to save QQ ${logContext} file`);
       }
     }
@@ -1489,6 +1508,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     isResume: boolean = false,
   ): Promise<void> {
     if (stopping) return;
+    const lease = inboundLifecycle.begin();
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -1519,18 +1539,33 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         // Don't reset reconnectAttempts here — wait until READY/RESUMED
       });
 
-      ws.on('message', async (data) => {
-        try {
-          const payload: QQWsPayload = JSON.parse(data.toString());
-          await handleWsMessage(payload, opts, gatewayUrl, onSessionReady);
-        } catch (err) {
-          logger.error({ err }, 'Error parsing QQ WebSocket message');
-        }
+      ws.on('message', (data) => {
+        if (!inboundLifecycle.isCurrent(lease)) return;
+        const task = (async (): Promise<void> => {
+          try {
+            const payload: QQWsPayload = JSON.parse(data.toString());
+            await handleWsMessage(
+              payload,
+              opts,
+              gatewayUrl,
+              lease,
+              onSessionReady,
+            );
+          } catch (err) {
+            if (inboundLifecycle.isCancellation(err, lease)) {
+              logger.debug('QQ inbound callback cancelled');
+            } else {
+              logger.error({ err }, 'Error handling QQ WebSocket message');
+            }
+          }
+        })();
+        return inboundLifecycle.track(task);
       });
 
       ws.on('close', (code, reason) => {
         logger.info({ code, reason: reason.toString() }, 'QQ WebSocket closed');
         clearTimers();
+        if (inboundLifecycle.isCurrent(lease)) inboundLifecycle.invalidate();
 
         if (!settled) {
           settled = true;
@@ -1619,8 +1654,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     payload: QQWsPayload,
     opts: QQConnectOpts,
     gatewayUrl: string,
+    lease: ChannelInboundLease,
     onSessionReady?: () => void,
   ): Promise<void> {
+    inboundLifecycle.assertCurrent(lease);
     switch (payload.op) {
       case OP_HELLO: {
         const heartbeatInterval = payload.d?.heartbeat_interval || 41250;
@@ -1672,9 +1709,21 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           logger.info('QQ bot session resumed');
           onSessionReady?.();
         } else if (eventType === 'C2C_MESSAGE_CREATE') {
-          await handleC2CMessage(eventData, opts);
+          await inboundLifecycle.runMessage(
+            lease,
+            eventData?.id,
+            (id) => dedup.isDuplicate(id),
+            (id) => dedup.markSeen(id),
+            () => handleC2CMessage(eventData, opts, lease),
+          );
         } else if (eventType === 'GROUP_AT_MESSAGE_CREATE') {
-          await handleGroupMessage(eventData, opts);
+          await inboundLifecycle.runMessage(
+            lease,
+            eventData?.id,
+            (id) => dedup.isDuplicate(id),
+            (id) => dedup.markSeen(id),
+            () => handleGroupMessage(eventData, opts, lease),
+          );
         }
         break;
       }
@@ -1771,8 +1820,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   async function handleC2CMessage(
     data: any,
     opts: QQConnectOpts,
+    lease: ChannelInboundLease,
   ): Promise<void> {
     try {
+      inboundLifecycle.assertCurrent(lease);
       const msgId = data.id;
       if (!msgId) return;
       const msgTimeMs = data.timestamp ? new Date(data.timestamp).getTime() : 0;
@@ -1783,12 +1834,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         );
         return;
       }
-      if (dedup.isDuplicate(msgId)) return;
-      if (!processingLock.acquire(msgId)) {
-        logger.debug({ msgId }, 'QQ C2C message already in-flight, skipping');
-        return;
-      }
-      dedup.markSeen(msgId);
+      if (!processingLock.acquire(msgId)) return;
       try {
         // Skip stale messages from before connection (hot-reload scenario)
         if (opts.ignoreMessagesBefore && data.timestamp) {
@@ -1854,27 +1900,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           return;
         }
         const { targetJid, routing: agentRouting } = resolvedRoute;
-
-        // Only a routable message may update reply context caches.
-        passiveReplies.record(`c2c:${userOpenId}`, msgId);
-
-        // ── Authorized: process message ──
-        storeChatMetadata(jid, new Date().toISOString());
-
-        // QQ C2C payloads usually omit author.username, so naively writing
-        // chatName here would clobber user-set names (the rename API writes
-        // to both chats.name and registered_groups.name).  Only persist when
-        // the platform gave us a real username; otherwise pass the existing
-        // registered name through so buildOnNewChat's diff guard leaves it
-        // untouched, and fall back to the placeholder only for first-time
-        // registration.
-        if (realName) {
-          updateChatName(jid, realName);
-          opts.onNewChat(jid, realName);
-        } else {
-          const existing = getRegisteredGroup(jid);
-          opts.onNewChat(jid, existing?.name ?? chatName);
-        }
 
         // Runtime controls are parsed before the generic slash handler so
         // `/steer` and `/break` cannot be swallowed as unknown commands.
@@ -1952,9 +1977,22 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             content,
             opts,
             'c2c',
+            lease,
           );
+          inboundLifecycle.assertCurrent(lease);
           content = result.content;
           attachmentsJson = result.attachmentsJson;
+        }
+
+        inboundLifecycle.assertCurrent(lease);
+        passiveReplies.record(`c2c:${userOpenId}`, msgId);
+        storeChatMetadata(jid, new Date().toISOString());
+        if (realName) {
+          updateChatName(jid, realName);
+          opts.onNewChat(jid, realName);
+        } else {
+          const existing = getRegisteredGroup(jid);
+          opts.onNewChat(jid, existing?.name ?? chatName);
         }
 
         // Store the already-resolved route. A configured resolver is
@@ -1969,6 +2007,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           timestamp = new Date().toISOString();
         }
         const senderId = `qq:${userOpenId}`;
+        inboundLifecycle.assertCurrent(lease);
         storeChatMetadata(targetJid, timestamp);
         storeMessageDirect(
           id,
@@ -2039,6 +2078,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         processingLock.release(msgId);
       }
     } catch (err) {
+      if (inboundLifecycle.isCancellation(err, lease)) throw err;
       logger.error({ err }, 'Error handling QQ C2C message');
     }
   }
@@ -2046,8 +2086,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   async function handleGroupMessage(
     data: any,
     opts: QQConnectOpts,
+    lease: ChannelInboundLease,
   ): Promise<void> {
     try {
+      inboundLifecycle.assertCurrent(lease);
       const msgId = data.id;
       if (!msgId) return;
       const msgTimeMs = data.timestamp ? new Date(data.timestamp).getTime() : 0;
@@ -2058,12 +2100,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         );
         return;
       }
-      if (dedup.isDuplicate(msgId)) return;
-      if (!processingLock.acquire(msgId)) {
-        logger.debug({ msgId }, 'QQ group message already in-flight, skipping');
-        return;
-      }
-      dedup.markSeen(msgId);
+      if (!processingLock.acquire(msgId)) return;
       try {
         // Skip stale messages from before connection (hot-reload scenario)
         if (opts.ignoreMessagesBefore && data.timestamp) {
@@ -2128,25 +2165,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           return;
         }
         const { targetJid, routing: agentRouting } = resolvedRoute;
-
-        // Only a routable message may update reply context caches. Groups have
-        // no streaming endpoint, so unlike C2C this is the passive-reply
-        // reference only.
-        passiveReplies.record(`group:${groupOpenId}`, msgId);
-
-        // ── Authorized: process message ──
-        storeChatMetadata(jid, new Date().toISOString());
-
-        // QQ group payloads don't carry a group name; chatName is always a
-        // placeholder derived from groupOpenId.  Only write it on first-time
-        // registration — otherwise we'd clobber user-set names (rename API).
-        const existing = getRegisteredGroup(jid);
-        if (!existing) {
-          updateChatName(jid, chatName);
-          opts.onNewChat(jid, chatName);
-        } else {
-          opts.onNewChat(jid, existing.name ?? chatName);
-        }
 
         // Runtime controls are parsed before the generic slash handler so
         // `/steer` and `/break` cannot be swallowed as unknown commands.
@@ -2231,9 +2249,22 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             content,
             opts,
             'group',
+            lease,
           );
+          inboundLifecycle.assertCurrent(lease);
           content = result.content;
           attachmentsJson = result.attachmentsJson;
+        }
+
+        inboundLifecycle.assertCurrent(lease);
+        passiveReplies.record(`group:${groupOpenId}`, msgId);
+        storeChatMetadata(jid, new Date().toISOString());
+        const existing = getRegisteredGroup(jid);
+        if (!existing) {
+          updateChatName(jid, chatName);
+          opts.onNewChat(jid, chatName);
+        } else {
+          opts.onNewChat(jid, existing.name ?? chatName);
         }
 
         // Store the already-resolved route.
@@ -2247,6 +2278,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           timestamp = new Date().toISOString();
         }
         const senderId = memberOpenId ? `qq:${memberOpenId}` : 'qq:unknown';
+        inboundLifecycle.assertCurrent(lease);
         storeChatMetadata(targetJid, timestamp);
         storeMessageDirect(
           id,
@@ -2313,6 +2345,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         processingLock.release(msgId);
       }
     } catch (err) {
+      if (inboundLifecycle.isCancellation(err, lease)) throw err;
       logger.error({ err }, 'Error handling QQ group message');
     }
   }
@@ -2358,17 +2391,20 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
     async disconnect(): Promise<void> {
       stopping = true;
+      inboundLifecycle.invalidate();
       stopWatchdog();
       clearTimers();
 
-      if (ws) {
+      const currentWs = ws;
+      if (currentWs) {
         try {
-          ws.close(1000, 'Disconnecting');
+          currentWs.close(1000, 'Disconnecting');
         } catch (err) {
           logger.debug({ err }, 'Error closing QQ WebSocket');
         }
-        ws = null;
       }
+      await inboundLifecycle.settle();
+      if (ws === currentWs) ws = null;
 
       tokenInfo = null;
       sessionId = null;

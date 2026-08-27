@@ -61,6 +61,19 @@ describe('Inbound IM media download timeout against a blackhole peer', () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
+  test('connection abort cancels an active blackhole request immediately', async () => {
+    const blackhole = await listenBlackhole();
+    closers.push(blackhole.close);
+    const controller = new AbortController();
+    const download = downloadHttpsBuffer(
+      `http://127.0.0.1:${blackhole.port}/held-media`,
+      { timeoutMs: 10_000, signal: controller.signal },
+    );
+
+    controller.abort();
+    await expect(download).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
   test('QQ-style redirect GET also times out on the follow-up hop', async () => {
     const blackhole = await listenBlackhole();
     closers.push(blackhole.close);
