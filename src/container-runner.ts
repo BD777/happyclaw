@@ -71,6 +71,8 @@ import { releaseHappyClawOwnerIntroductionLease } from './owner-profile-store.js
 import { applyProviderSwitchToInput } from './provider-switch-context.js';
 import {
   getUserById,
+  getTaskRunById,
+  isDatabaseInitialized,
   getSessionProviderId,
   setSessionProviderId,
 } from './db.js';
@@ -667,6 +669,22 @@ function applyKnownProviderFailureDisposition(
     const notice = resolveTerminalProviderFailureNotice(output);
     if (notice) output.providerFailureNotice = notice;
   }
+}
+
+export function hasNonReplayableTaskNotificationEvidence(
+  summary: { succeeded: number; uncertain?: number } | null | undefined,
+): boolean {
+  return Boolean(
+    summary && (summary.succeeded > 0 || (summary.uncertain ?? 0) > 0),
+  );
+}
+
+function scheduledInputHasPhysicalSideEffect(input: ContainerInput): boolean {
+  if (!input.isScheduledTask || !input.taskRunId || !isDatabaseInitialized())
+    return false;
+  return hasNonReplayableTaskNotificationEvidence(
+    getTaskRunById(input.taskRunId)?.notification_summary,
+  );
 }
 
 function providerFailureDispositionLogMessage(
@@ -4073,6 +4091,24 @@ export async function runAgentWithModelFallback(
           attempt: attempt + 1,
         },
         'Provider failed after scheduled input completed; suppressing replay to avoid duplicate side effects',
+      );
+      return {
+        ...lastOutput,
+        status: 'success',
+        result: null,
+        providerFailure: false,
+        providerFailureTerminal: undefined,
+        inputTurnCompleted: true,
+      };
+    }
+    if (
+      input.isScheduledTask &&
+      lastOutput.providerFailure &&
+      scheduledInputHasPhysicalSideEffect(input)
+    ) {
+      logger.warn(
+        { group: group.name, taskRunId: input.taskRunId },
+        'Scheduled input produced an acknowledged or uncertain physical side effect; suppressing whole-prompt provider replay',
       );
       return {
         ...lastOutput,

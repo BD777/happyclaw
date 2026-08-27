@@ -20,6 +20,7 @@ import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
 import {
   classifyImSendFailure,
+  ImDeliveryPhaseError,
   imSendFailurePolicy,
   isUncertainAfterAcceptImError,
   retryUnscopedImSend,
@@ -283,6 +284,7 @@ import {
 } from './channel-outbox-runtime-scope.js';
 import {
   cleanupChannelReliability,
+  getFailedChannelOutboxForTurn,
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
   CHANNEL_RELIABILITY_TERMINAL_STATUSES,
@@ -2670,12 +2672,15 @@ interface ChannelOutboxDeliveryRef {
 }
 
 class ScopedChannelDeliveryError extends Error {
+  readonly deliveryPhase: 'rejected' | 'uncertain';
+
   constructor(
     readonly status: Exclude<ChannelOutboxDeliveryOutcome, 'delivered'>,
     message: string,
   ) {
     super(message);
     this.name = 'ScopedChannelDeliveryError';
+    this.deliveryPhase = status === 'failed' ? 'rejected' : 'uncertain';
   }
 }
 
@@ -3077,6 +3082,43 @@ async function deliverChannelManualReconciliationNotice(input: {
     input.logicalChatJid,
     'delivery_uncertain',
     CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+  );
+  return true;
+}
+
+async function deliverChannelDefinitiveFailureNotice(input: {
+  logicalChatJid: string;
+  scopeKey: string;
+  targetJid: string;
+  runtime: ChannelTurnRuntime;
+  agentId?: string | null;
+  presentation?: 'default' | 'native';
+  route: {
+    provider: string;
+    accountId: string;
+    sourceJid: string;
+    chatId: string;
+    rootId?: string | null;
+    threadId?: string | null;
+  };
+}): Promise<boolean> {
+  const delivered = await deliverIndependentChannelSystemNotice({
+    logicalChatJid: input.logicalChatJid,
+    scopeKey: input.scopeKey,
+    targetJid: input.targetJid,
+    route: input.route,
+    agentId: input.agentId,
+    originalInputTurnId: input.runtime.inputTurnId,
+    originalRunId: input.runtime.runId,
+    noticeKey: 'definitive-delivery-failure',
+    text: CHANNEL_DEFINITIVE_REJECTION_NOTICE,
+    presentation: input.presentation,
+  });
+  if (delivered) return true;
+  sendSystemMessage(
+    input.logicalChatJid,
+    'delivery_rejected',
+    CHANNEL_DEFINITIVE_REJECTION_NOTICE,
   );
   return true;
 }
@@ -6393,6 +6435,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         })
       : undefined;
   const channelTurnRuntimes = new Map<string, ChannelTurnRuntime>();
+  let channelDefinitiveFailureSettled = false;
   if (channelTurnRuntime) {
     channelTurnRuntimes.set(lastProcessed.id, channelTurnRuntime);
   }
@@ -6409,6 +6452,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const runtime = channelTurnRuntimes.get(inputId);
       if (!runtime) {
         await clearProcessingIndicatorForInput(inputId);
+        continue;
+      }
+      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+      if (failedDelivery) {
+        const failed = runtime.fail(
+          `Channel delivery ${failedDelivery.id} was definitively rejected`,
+        );
+        const exactScope = channelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelDefinitiveFailureNotice({
+              logicalChatJid: chatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : true;
+        if (failed && notified) {
+          channelDefinitiveFailureSettled = true;
+          await clearProcessingIndicatorForInput(inputId);
+          runtime.dispose();
+          channelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
         continue;
       }
       const uncertainDelivery = getUncertainChannelOutboxForTurn(runtime.runId);
@@ -8877,7 +8947,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
               if (
                 result.inputTurnCompleted &&
-                replyDeliveryAcknowledged &&
+                (replyDeliveryAcknowledged ||
+                  Boolean(
+                    outputChannelScope.scope &&
+                    getFailedChannelOutboxForTurn(
+                      outputChannelScope.scope.turnRunId,
+                    ),
+                  )) &&
                 (await completeChannelRuntimesForOutput(result))
               ) {
                 commitCursor(outputChannelScope.inputId);
@@ -9038,7 +9114,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
         );
-        if (uncertainDelivery) {
+        const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+        if (failedDelivery) {
+          settled = runtime.fail(
+            `Channel delivery ${failedDelivery.id} was definitively rejected`,
+          );
+          const exactScope = channelOutboxScopesByInput.get(inputTurnId);
+          await (exactScope?.chatId
+            ? deliverChannelDefinitiveFailureNotice({
+                logicalChatJid: chatJid,
+                scopeKey: channelTurnScope(effectiveGroup.folder),
+                targetJid: exactScope.sourceJid,
+                runtime,
+                presentation:
+                  interactionMode === 'proactive' ? 'native' : 'default',
+                route: { ...exactScope, chatId: exactScope.chatId },
+              })
+            : Promise.resolve(true));
+          terminal = settled;
+          channelDefinitiveFailureSettled ||= settled;
+        } else if (uncertainDelivery) {
           channelDeliveryNeedsManualReconciliation = true;
           settled = runtime.interrupt(
             `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
@@ -9125,6 +9220,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (channelDeliveryNeedsManualReconciliation) {
         if (channelManualNoticesAcknowledged) commitCursor();
       }
+      if (channelDefinitiveFailureSettled) commitCursor();
     }
 
     // ── 保存中断内容到数据库 + 广播到 Web ──
@@ -10129,6 +10225,9 @@ interface SendMessageOutcome {
    * IM JID this requires connector success; for a Web/virtual JID it requires
    * successful persistence+broadcast. */
   targetDelivered: boolean;
+  /** Exact physical delivery evidence retained even when Web projection
+   * succeeds independently. */
+  failure?: ImSendFailureRef;
 }
 
 async function sendMessageWithOutcome(
@@ -10140,6 +10239,7 @@ async function sendMessageWithOutcome(
   const sendToIM = options.sendToIM ?? isIMChannel;
   let targetDelivered = false;
   let webProjected = false;
+  const failure: ImSendFailureRef = {};
   try {
     if (sendToIM && isIMChannel) {
       try {
@@ -10152,8 +10252,13 @@ async function sendMessageWithOutcome(
           imText,
           localImagePaths,
           options.channelOutbox,
+          undefined,
+          undefined,
+          failure,
         );
       } catch (err) {
+        failure.error = err;
+        failure.outcome = classifyImSendFailure(err);
         logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
     }
@@ -10218,10 +10323,23 @@ async function sendMessageWithOutcome(
     if (!options.source) {
       broadcastToWebClients(jid, text);
     }
-    return { messageId: persistedMsgId, targetDelivered, webProjected };
+    return {
+      messageId: persistedMsgId,
+      targetDelivered,
+      webProjected,
+      ...(failure.error !== undefined || failure.outcome !== undefined
+        ? { failure }
+        : {}),
+    };
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
-    return { targetDelivered, webProjected };
+    return {
+      targetDelivered,
+      webProjected,
+      ...(failure.error !== undefined || failure.outcome !== undefined
+        ? { failure }
+        : {}),
+    };
   }
 }
 
@@ -14988,6 +15106,7 @@ async function processAgentConversation(
         })
       : undefined;
   const agentChannelTurnRuntimes = new Map<string, ChannelTurnRuntime>();
+  let agentDefinitiveFailureSettled = false;
   if (agentChannelTurnRuntime) {
     agentChannelTurnRuntimes.set(lastProcessed.id, agentChannelTurnRuntime);
   }
@@ -15004,6 +15123,34 @@ async function processAgentConversation(
       const runtime = agentChannelTurnRuntimes.get(inputId);
       if (!runtime) {
         await clearAgentProcessingIndicatorForInput(inputId);
+        continue;
+      }
+      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+      if (failedDelivery) {
+        const failed = runtime.fail(
+          `Channel delivery ${failedDelivery.id} was definitively rejected`,
+        );
+        const exactScope = agentChannelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelDefinitiveFailureNotice({
+              logicalChatJid: virtualChatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              agentId,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : true;
+        if (failed && notified) {
+          agentDefinitiveFailureSettled = true;
+          await clearAgentProcessingIndicatorForInput(inputId);
+          runtime.dispose();
+          agentChannelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
         continue;
       }
       const uncertainDelivery = getUncertainChannelOutboxForTurn(runtime.runId);
@@ -17304,9 +17451,29 @@ async function processAgentConversation(
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
         );
+        const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
         let settled: boolean;
         let terminal = false;
-        if (uncertainDelivery) {
+        if (failedDelivery) {
+          settled = runtime.fail(
+            `Channel delivery ${failedDelivery.id} was definitively rejected`,
+          );
+          const exactScope = agentChannelOutboxScopesByInput.get(inputTurnId);
+          await (exactScope?.chatId
+            ? deliverChannelDefinitiveFailureNotice({
+                logicalChatJid: virtualChatJid,
+                scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+                targetJid: exactScope.sourceJid,
+                runtime,
+                agentId,
+                presentation:
+                  interactionMode === 'proactive' ? 'native' : 'default',
+                route: { ...exactScope, chatId: exactScope.chatId },
+              })
+            : Promise.resolve(true));
+          terminal = settled;
+          agentDefinitiveFailureSettled ||= settled;
+        } else if (uncertainDelivery) {
           agentDeliveryNeedsManualReconciliation = true;
           settled = runtime.interrupt(
             `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
@@ -17398,6 +17565,10 @@ async function processAgentConversation(
         } else {
           retryUnfinishedTurn = true;
         }
+      }
+      if (agentDefinitiveFailureSettled) {
+        commitCursor();
+        retryUnfinishedTurn = false;
       }
     }
 
@@ -21779,7 +21950,16 @@ async function main(): Promise<void> {
     sendMessage: async (jid, text, options) => {
       const outcome = await sendMessageWithOutcome(jid, text, options);
       if (!outcome.targetDelivered) {
-        throw new Error(`Scheduled-task target did not acknowledge: ${jid}`);
+        const failure =
+          outcome.failure ??
+          taskNotificationPreAcceptFailure(
+            `Scheduled-task target did not acknowledge: ${jid}`,
+          );
+        throw new ImDeliveryPhaseError(
+          failure.outcome ?? 'pre_accept',
+          `Scheduled-task target did not acknowledge: ${jid}`,
+          { cause: failure.error },
+        );
       }
       return outcome.messageId;
     },

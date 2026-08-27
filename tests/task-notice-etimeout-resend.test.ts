@@ -3,7 +3,10 @@ import path from 'node:path';
 
 import { describe, expect, test } from 'vitest';
 
-import { retryUnscopedImSend } from '../src/im-send-retry-policy.js';
+import {
+  physicalDeliveryProgressError,
+  retryUnscopedImSend,
+} from '../src/im-send-retry-policy.js';
 
 function etimedoutAfterAccept(): NodeJS.ErrnoException {
   const error = new Error(
@@ -51,6 +54,25 @@ describe('unscoped task notice send without outbox', () => {
     expect(attempts).toBe(3);
     expect(result.ok).toBe(false);
     expect(result.outcome).toBe('pre_accept');
+  });
+
+  test('an acknowledged first chunk prevents whole-batch retry after tail failure', async () => {
+    let batchAttempts = 0;
+    const result = await retryUnscopedImSend(
+      async () => {
+        batchAttempts += 1;
+        throw physicalDeliveryProgressError(
+          Object.assign(new Error('tail connection refused'), {
+            code: 'ECONNREFUSED',
+          }),
+          1,
+        );
+      },
+      { sleep: async () => {} },
+    );
+
+    expect(batchAttempts).toBe(1);
+    expect(result).toMatchObject({ ok: false, outcome: 'uncertain' });
   });
 
   test('sendImWithRetry else-branch and retryTaskNotification use the unscoped helper', () => {

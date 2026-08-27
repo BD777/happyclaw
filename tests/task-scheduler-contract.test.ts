@@ -11,7 +11,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { settleTaskNotificationDeliveries } from '../src/task-notification.js';
-import { preAcceptImDeliveryError } from '../src/im-send-retry-policy.js';
+import {
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+} from '../src/im-send-retry-policy.js';
 
 const tmpDir = fs.mkdtempSync(
   path.join(os.tmpdir(), 'task-scheduler-contract-'),
@@ -2264,6 +2267,84 @@ describe('scheduled task workspace/session contract', () => {
       status: 'success',
       result: 'script result',
     });
+  });
+
+  test('accepted-timeout source receipt stays uncertain and is never resent', async () => {
+    const ownerId = 'script-source-accepted-timeout-owner';
+    const sourceJid = 'feishu:script-source-accepted-timeout';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'script-source-accepted-timeout',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'printf ok',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+    deps.sendMessage.mockRejectedValue(
+      new ImDeliveryPhaseError(
+        'uncertain',
+        'provider accepted but acknowledgement timed out',
+      ),
+    );
+    deps.storeResultAndNotify.mockResolvedValue({
+      status: 'skipped',
+      summary: {
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    expect(deps.sendMessage).toHaveBeenCalledOnce();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      notification_status: 'uncertain',
+      notification_summary: {
+        uncertain: 1,
+        uncertain_channels: [sourceJid],
+      },
+    });
+    expect(
+      (
+        db.getTaskRunById(trigger.runId!) as unknown as {
+          notification_payload: string | null;
+        }
+      ).notification_payload,
+    ).toBeNull();
+    expect(
+      db.claimTaskRunNotificationById(
+        trigger.runId!,
+        'must-not-resend-accepted-timeout',
+        60_000,
+      ),
+    ).toBeUndefined();
   });
 
   test('an owner-revoked script abort is recorded as failed and never sends a success notification', async () => {

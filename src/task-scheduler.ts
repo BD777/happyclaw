@@ -109,6 +109,7 @@ import {
 import { getScriptTaskHostExecutionError } from './script-task-policy.js';
 import { resolveScheduledGroupDeliveryContract } from './reply-delivery.js';
 import { resolveRuntimeInteractionMode } from './workspace-interaction-runtime.js';
+import { explicitImDeliveryPhase } from './im-send-retry-policy.js';
 
 export function shouldFinalizeScheduledRunOutput(
   output: Pick<
@@ -2543,13 +2544,16 @@ function failedNotificationReceipt(
   channel: string,
   error: unknown,
 ): TaskRunNotificationReceipt {
+  const deliveryPhase = explicitImDeliveryPhase(error);
+  const uncertain = deliveryPhase === 'uncertain';
   return {
-    status: 'failed',
+    status: uncertain ? 'uncertain' : 'failed',
     summary: {
       attempted: 1,
       succeeded: 0,
       failed: 1,
       failed_channels: [channel],
+      ...(uncertain ? { uncertain: 1, uncertain_channels: [channel] } : {}),
     },
     error: error instanceof Error ? error.message : String(error),
   };
@@ -2630,14 +2634,17 @@ function trackTaskRunNotifications(
       } catch (err) {
         directlyDeliveredJids.delete(jid);
         const receipt = failedNotificationReceipt(jid, err);
+        const retryPayload = retryPayloadForReceipt(payload, receipt);
         // Persist before returning to Agent/script work: the process may crash
         // or continue running for a long time before the owner fallback/finish.
-        recordTaskRunNotificationReceipt(claim.id, receipt, payload);
-        pendingDirectFailure = {
-          jid,
-          receipt,
-          payload,
-        };
+        recordTaskRunNotificationReceipt(claim.id, receipt, retryPayload);
+        if (retryPayload) {
+          pendingDirectFailure = { jid, receipt, payload: retryPayload };
+        } else {
+          // Uncertain delivery is historical evidence, not provisional retry
+          // work that a later fallback may replace or erase.
+          trackPersistedReceipt(receipt);
+        }
         // Notification transport is independent of execution. The durable
         // retry payload above owns recovery; do not turn successful script or
         // Agent work into an execution failure.

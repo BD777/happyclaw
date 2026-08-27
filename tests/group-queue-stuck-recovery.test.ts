@@ -64,6 +64,8 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
     drainSentinelWritten: false,
     hasIpcInjectedMessages: opts.hasIpcInjectedMessages ?? false,
     ipcOwedSinceAt: opts.ipcOwedSinceAt ?? null,
+    pendingIpcDeliveries: new Map(),
+    acknowledgedIpcDeliveryIds: new Set(),
   });
 }
 
@@ -365,6 +367,15 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
       ipcOwedSinceAt: owedAt,
       lastActivityAt: owedAt,
     });
+    const receipt = {
+      deliveryId: 'pending-delivery',
+      chatJid: jid,
+      cursor: { timestamp: '2026-08-27T00:00:00.000Z', id: 'message-1' },
+    };
+    (getState(q, jid).pendingIpcDeliveries as Map<string, typeof receipt>).set(
+      receipt.deliveryId,
+      receipt,
+    );
 
     q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
 
@@ -373,6 +384,33 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
     const stuck = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
     expect(stuck).toHaveLength(1);
     expect(stuck[0].reason).toBe('ipc_injected');
+
+    q.setIpcDeliveryCommitEligibilityChecker(() => true);
+    q.acknowledgeIpcDeliveries(jid, [receipt], () => {});
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(false);
+  });
+
+  test('disk IPC preserves continue debt even before receipt bookkeeping exists', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    const owedAt = Date.now() - IDLE_THRESHOLD_MS - 1000;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      ipcOwedSinceAt: owedAt,
+      lastActivityAt: owedAt,
+    });
+    const inputDir = path.join(ipcDir, 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    fs.writeFileSync(path.join(inputDir, 'pending.json'), '{}');
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(true);
+
+    fs.unlinkSync(path.join(inputDir, 'pending.json'));
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(false);
   });
 
   test('internal-continue preserve hint still closes a query with no real IPC debt', () => {

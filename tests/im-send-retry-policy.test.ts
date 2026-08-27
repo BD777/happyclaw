@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest';
 import {
   classifyImSendFailure,
   ImDeliveryPhaseError,
+  physicalDeliveryProgressError,
   imSendFailurePolicy,
   isUncertainAfterAcceptImError,
 } from '../src/im-send-retry-policy.js';
@@ -99,5 +100,15 @@ describe('imSendFailurePolicy', () => {
     );
     expect(classifyImSendFailure(error)).toBe('pre_accept');
     expect(imSendFailurePolicy(error)).toMatchObject({ retryable: true });
+  });
+
+  test('acknowledged multi-part progress makes a retryable tail failure uncertain', () => {
+    const tail = Object.assign(new Error('connect refused on chunk 2'), {
+      code: 'ECONNREFUSED',
+    });
+    const partial = physicalDeliveryProgressError(tail, 1);
+    expect(partial.acknowledgedParts).toBe(1);
+    expect(classifyImSendFailure(partial)).toBe('uncertain');
+    expect(imSendFailurePolicy(partial)).toMatchObject({ retryable: false });
   });
 });
