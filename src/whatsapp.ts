@@ -1123,12 +1123,10 @@ export function createWhatsAppConnection(
               await tracker.send(async () => {
                 const buf = await readFile(imgPath);
                 const mime = guessMimeType(imgPath) || 'image/jpeg';
-                await providerAcks.send(
-                  activeSock,
-                  lease.generation,
-                  jid,
-                  { image: buf, mimetype: mime },
-                );
+                await providerAcks.send(activeSock, lease.generation, jid, {
+                  image: buf,
+                  mimetype: mime,
+                });
               });
             } catch (err) {
               logger.error(
