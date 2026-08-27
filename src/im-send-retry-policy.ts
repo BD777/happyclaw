@@ -115,6 +115,16 @@ export function explicitImDeliveryPhase(
  */
 export function classifyImSendFailure(error: unknown): ImSendFailureOutcome {
   const chain = errorChain(error);
+  // Any acknowledged-prefix/uncertain evidence dominates a nested definitive
+  // tail rejection. The outer operation can no longer be replayed safely even
+  // when the final provider mutation was explicitly rejected.
+  if (
+    errorChainHasCode(error, UNCERTAIN_DELIVERY_CODE) ||
+    errorChainHasCode(error, PARTIAL_DELIVERY_CODE) ||
+    explicitImDeliveryPhase(error) === 'uncertain'
+  ) {
+    return 'uncertain';
+  }
   if (
     errorChainHasCode(error, REFRESH_REQUIRED_CODE) ||
     errorChainHasCode(error, DEFINITIVE_DELIVERY_REJECTION_CODE) ||
@@ -122,17 +132,8 @@ export function classifyImSendFailure(error: unknown): ImSendFailureOutcome {
   ) {
     return 'rejected';
   }
-  if (
-    errorChainHasCode(error, UNCERTAIN_DELIVERY_CODE) ||
-    errorChainHasCode(error, PARTIAL_DELIVERY_CODE)
-  ) {
-    return 'uncertain';
-  }
   if (explicitImDeliveryPhase(error) === 'pre_accept') {
     return 'pre_accept';
-  }
-  if (explicitImDeliveryPhase(error) === 'uncertain') {
-    return 'uncertain';
   }
 
   const codes = new Set(chain.map((item) => String(item.code ?? '')));

@@ -10,6 +10,48 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
+const dingtalkHttps = vi.hoisted(() => ({
+  request(options: { path?: string }, cb: (res: any) => void) {
+    const requestListeners: Record<string, Array<(arg?: unknown) => void>> = {};
+    const req = {
+      on(event: string, handler: (arg?: unknown) => void) {
+        (requestListeners[event] ??= []).push(handler);
+        return req;
+      },
+      write() {},
+      end() {
+        const responseListeners: Record<
+          string,
+          Array<(arg?: unknown) => void>
+        > = {};
+        const res = {
+          statusCode: 200,
+          on(event: string, handler: (arg?: unknown) => void) {
+            (responseListeners[event] ??= []).push(handler);
+            return res;
+          },
+        };
+        queueMicrotask(() => {
+          cb(res);
+          queueMicrotask(() => {
+            const payload = String(options.path).includes('/gettoken')
+              ? { errcode: 0, access_token: 'test-token', expires_in: 7200 }
+              : { code: 'success' };
+            const body = Buffer.from(JSON.stringify(payload));
+            for (const handler of responseListeners.data ?? []) handler(body);
+            for (const handler of responseListeners.end ?? []) handler();
+          });
+        });
+      },
+    };
+    return req;
+  },
+}));
+
+vi.mock('node:https', () => ({
+  default: { request: dingtalkHttps.request },
+}));
+
 import {
   DingTalkStreamingCardController,
   type DingTalkStreamingCardConfig,

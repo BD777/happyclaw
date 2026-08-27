@@ -580,7 +580,7 @@ describe('WeCom connection security and delivery', () => {
     ).rejects.toThrow('ACK failed');
   });
 
-  test('propagates failure when both streaming finalization and fallback fail', async () => {
+  test('propagates streaming finalization failure without controller fallback', async () => {
     const connected = await connect();
     connected.client.emit('message.text', frame({ reqId: 'req-fail' }));
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(1));
@@ -590,8 +590,8 @@ describe('WeCom connection security and delivery', () => {
       inputId,
     );
     connected.client.replyStream.mockRejectedValueOnce(new Error('stream ACK'));
-    connected.client.sendMessage.mockRejectedValueOnce(new Error('send ACK'));
-    await expect(session!.complete('answer')).rejects.toThrow('send ACK');
+    await expect(session!.complete('answer')).rejects.toThrow('stream ACK');
+    expect(connected.client.sendMessage).not.toHaveBeenCalled();
   });
 });
 

@@ -2413,10 +2413,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         // Send local images after text (same pattern as Feishu)
         for (const imgPath of localImagePaths || []) {
           try {
-            const buf = fs.readFileSync(imgPath);
-            await tracker.send(() =>
-              sendQQImageMessage(parsed.type, parsed.openid, buf),
-            );
+            await tracker.send(async () => {
+              const buf = fs.readFileSync(imgPath);
+              await sendQQImageMessage(parsed.type, parsed.openid, buf);
+            });
             logger.info({ chatId, imgPath }, 'QQ local image sent');
           } catch (imgErr) {
             logger.error(

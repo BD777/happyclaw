@@ -16,6 +16,10 @@
 import https from 'node:https';
 import { logger } from './logger.js';
 import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import {
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -86,7 +90,12 @@ async function getAccessToken(
           try {
             const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
             if (data.errcode !== 0) {
-              reject(new Error(`DingTalk token error: ${data.errmsg}`));
+              reject(
+                new ImDeliveryPhaseError(
+                  'rejected',
+                  `DingTalk token error: ${data.errmsg}`,
+                ),
+              );
               return;
             }
             const expiresIn = Number(data.expires_in) || 7200;
@@ -271,15 +280,14 @@ export class DingTalkStreamingCardController {
   // Card state
   private cardInstanceId: string | null = null;
   private inputingStarted = false;
+  private cardCreationError: unknown;
   private accumulatedText = '';
 
   // Throttle
   private lastUpdateTime = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Fallback: sendMessage callback when card fails
-  private fallbackSend: ((text: string) => Promise<void>) | null;
-  private fallbackPromise: Promise<void> | null = null;
+  private terminalDeliveryError: unknown;
 
   // Auxiliary flush throttle (separate from text flush)
   private auxFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -318,7 +326,6 @@ export class DingTalkStreamingCardController {
     this.config = config;
     this.target = target;
     this.onCardCreated = opts?.onCardCreated;
-    this.fallbackSend = opts?.fallbackSend ?? null;
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────
@@ -340,6 +347,9 @@ export class DingTalkStreamingCardController {
   }
 
   async complete(finalText: string): Promise<void> {
+    if (this.state === 'aborted' && this.terminalDeliveryError) {
+      throw this.terminalDeliveryError;
+    }
     if (this.state === 'completed' || this.state === 'aborted') return;
     this.accumulatedText = finalText;
     this.clearFlushTimer();
@@ -369,21 +379,23 @@ export class DingTalkStreamingCardController {
         { err: err.message },
         'DingTalk AI Card ensureCard failed in complete()',
       );
-      // Card creation failed — use fallback
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      this.terminalDeliveryError = err;
+      this.state = 'aborted';
+      throw err;
     }
 
     if (!this.cardInstanceId) {
       // Card creation didn't produce an instance (e.g. state was 'error')
       logger.warn(
         { state: this.state },
-        'DingTalk AI Card complete(): no cardInstanceId after ensureCard, using fallback',
+        'DingTalk AI Card complete(): no cardInstanceId after ensureCard',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      const creationError =
+        this.cardCreationError ??
+        preAcceptImDeliveryError('DingTalk streaming card was not created');
+      this.terminalDeliveryError = creationError;
+      this.state = 'aborted';
+      throw creationError;
     }
 
     try {
@@ -407,17 +419,14 @@ export class DingTalkStreamingCardController {
       // The card already has streamed preview content. A plain sendMessage
       // would deliver a second full copy of the same reply.
       if (!this.inputingStarted) {
-        try {
-          await this.tryFallback(finalText);
-          this.state = 'completed';
-          return;
-        } catch (fallbackError) {
-          this.state = 'aborted';
-          throw fallbackError;
-        }
+        this.terminalDeliveryError = err;
+        this.state = 'aborted';
+        throw err;
       }
+      const partial = new PartialChannelDeliveryError(1, 2, err);
+      this.terminalDeliveryError = partial;
       this.state = 'aborted';
-      throw new PartialChannelDeliveryError(1, 2, err);
+      throw partial;
     }
   }
 
@@ -738,10 +747,12 @@ export class DingTalkStreamingCardController {
         );
 
         this.cardInstanceId = cardId;
+        this.cardCreationError = undefined;
         this.state = 'streaming';
         this.onCardCreated?.(cardId);
         logger.info({ cardId }, 'DingTalk AI Card created and delivered');
       } catch (err: any) {
+        this.cardCreationError = err;
         logger.warn(
           { err: err.message },
           'DingTalk AI Card creation failed, degrading to plain message',
@@ -779,17 +790,25 @@ export class DingTalkStreamingCardController {
   private async doFlush(): Promise<void> {
     if (!this.accumulatedText.trim()) return;
 
-    // If card creation failed, use fallback
+    // Let the host choose the one durable static fallback.
     if (this.state === 'error') {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.cardCreationError ??
+        preAcceptImDeliveryError('DingTalk streaming card was not created');
+      this.terminalDeliveryError = creationError;
+      this.state = 'aborted';
+      throw creationError;
     }
 
     await this.ensureCard();
 
     if (!this.cardInstanceId) {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.cardCreationError ??
+        preAcceptImDeliveryError('DingTalk streaming card was not created');
+      this.terminalDeliveryError = creationError;
+      this.state = 'aborted';
+      throw creationError;
     }
 
     const content =
@@ -889,18 +908,5 @@ export class DingTalkStreamingCardController {
       { cardId: this.cardInstanceId, flowStatus, resp },
       'DingTalk AI Card updateFlowStatus response',
     );
-  }
-
-  private async tryFallback(text: string): Promise<void> {
-    if (!this.fallbackSend) {
-      throw new Error('DingTalk streaming fallback is unavailable');
-    }
-    this.fallbackPromise ??= this.fallbackSend(text);
-    try {
-      await this.fallbackPromise;
-    } catch (err: any) {
-      logger.warn({ err: err.message }, 'DingTalk fallback send also failed');
-      throw err;
-    }
   }
 }

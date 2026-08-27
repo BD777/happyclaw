@@ -30,6 +30,7 @@
 
 import { logger } from './logger.js';
 import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -101,6 +102,7 @@ export class WeComStreamingController {
   private readonly sendStream: WeComSendStreamFn;
   private readonly fallbackSend: WeComFallbackSendFn;
   private fallbackPromise: Promise<void> | null = null;
+  private terminalDeliveryError: unknown;
 
   // Transient status (rendered in streaming view only, NEVER in final text)
   private systemStatus: string | null = null;
@@ -155,6 +157,9 @@ export class WeComStreamingController {
   }
 
   async complete(finalText: string): Promise<void> {
+    if (this.state === 'aborted' && this.terminalDeliveryError) {
+      throw this.terminalDeliveryError;
+    }
     if (
       this.state === 'completed' ||
       this.state === 'aborted' ||
@@ -185,7 +190,18 @@ export class WeComStreamingController {
       // Nothing to say. If we already opened a stream, close it empty so the
       // bubble is finalized; otherwise there is simply nothing to send.
       if (this.sentChunkCount > 0) {
-        await this.sendStream(this.accumulatedText || '', true);
+        try {
+          await this.sendStream(this.accumulatedText || '', true);
+        } catch (error) {
+          const partial = new PartialChannelDeliveryError(
+            this.sentChunkCount,
+            this.sentChunkCount + 1,
+            error,
+          );
+          this.terminalDeliveryError = partial;
+          this.state = 'aborted';
+          throw partial;
+        }
       }
       this.state = 'completed';
       return;
@@ -196,18 +212,29 @@ export class WeComStreamingController {
     // ACK-governed proactive pagination path.
     if (utf8Bytes(finalBody) > WECOM_MARKDOWN_MAX_BYTES) {
       if (this.sentChunkCount > 0) {
-        await this.sendStream('内容较长，完整回复将分段发送。', true).catch(
-          (err: any) => {
-            logger.warn(
-              { err: err?.message, chatId: this.chatId },
-              'WeCom oversized stream close failed; continuing with pagination',
-            );
-          },
-        );
+        try {
+          await this.sendStream('内容较长，完整回复将分段发送。', true);
+        } catch (error) {
+          logger.warn(
+            { err: (error as Error)?.message, chatId: this.chatId },
+            'WeCom oversized stream close failed; refusing duplicate pagination fallback',
+          );
+          const partial = new PartialChannelDeliveryError(
+            this.sentChunkCount,
+            this.sentChunkCount + 1,
+            error,
+          );
+          this.terminalDeliveryError = partial;
+          this.state = 'aborted';
+          throw partial;
+        }
       }
-      await this.tryFallback(finalBody);
-      this.state = 'completed';
-      return;
+      const fallbackRequired = preAcceptImDeliveryError(
+        'WeCom streaming final exceeds the provider limit; use durable static pagination',
+      );
+      this.terminalDeliveryError = fallbackRequired;
+      this.state = 'aborted';
+      throw fallbackRequired;
     }
 
     try {
@@ -226,21 +253,18 @@ export class WeComStreamingController {
       // Preview bubble already exists. A plain sendMessage would deliver a
       // second full copy of the same reply.
       if (this.sentChunkCount === 0) {
-        try {
-          await this.tryFallback(finalBody);
-          this.state = 'completed';
-          return;
-        } catch (fallbackError) {
-          this.state = 'aborted';
-          throw fallbackError;
-        }
+        this.terminalDeliveryError = err;
+        this.state = 'aborted';
+        throw err;
       }
-      this.state = 'aborted';
-      throw new PartialChannelDeliveryError(
+      const partial = new PartialChannelDeliveryError(
         this.sentChunkCount,
         this.sentChunkCount + 1,
         err,
       );
+      this.terminalDeliveryError = partial;
+      this.state = 'aborted';
+      throw partial;
     }
   }
 

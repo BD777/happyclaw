@@ -36,6 +36,7 @@ import {
   saveDownloadedFile,
 } from './im-downloader.js';
 import { detectImageMimeTypeStrict } from './image-detector.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 import {
   WECOM_MARKDOWN_MAX_BYTES,
   WeComStreamingController,
@@ -778,6 +779,7 @@ export function createWeComConnection(
   ): Promise<void> {
     const pageLimit = WECOM_MARKDOWN_MAX_BYTES - PAGE_HEADER_RESERVE_BYTES;
     const pages = splitWeComMarkdown(text, pageLimit);
+    const tracker = new PhysicalDeliveryTracker(pages.length);
     for (let index = 0; index < pages.length; index += 1) {
       const header =
         pages.length > 1 ? `（${index + 1}/${pages.length}）\n` : '';
@@ -787,10 +789,14 @@ export function createWeComConnection(
       }
       // The SDK rejects on a timeout or non-zero errcode; awaiting each page
       // makes a resolved delivery promise a strict provider ACK.
-      await client.sendMessage(sdkChatId(chatId), {
-        msgtype: 'markdown',
-        markdown: { content },
-      });
+      await tracker.send(() =>
+        client
+          .sendMessage(sdkChatId(chatId), {
+            msgtype: 'markdown',
+            markdown: { content },
+          })
+          .then(() => undefined),
+      );
     }
   }
 

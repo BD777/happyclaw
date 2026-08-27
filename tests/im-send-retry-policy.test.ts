@@ -135,4 +135,18 @@ describe('imSendFailurePolicy', () => {
     expect(classifyImSendFailure(partial)).toBe('uncertain');
     expect(imSendFailurePolicy(partial)).toMatchObject({ retryable: false });
   });
+
+  test('acknowledged progress dominates a definitive tail rejection', () => {
+    const tail = new DefinitiveChannelDeliveryError(
+      'provider rejected the second chunk',
+    );
+    const partial = physicalDeliveryProgressError(tail, 1);
+
+    expect(classifyImSendFailure(partial)).toBe('uncertain');
+    expect(imSendFailurePolicy(partial)).toEqual({
+      retryable: false,
+      countsTowardChannelRemoval: false,
+      outcome: 'uncertain',
+    });
+  });
 });

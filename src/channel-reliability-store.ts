@@ -1731,6 +1731,20 @@ export function getFailedChannelOutboxForTurn(
   return row ? mapOutbox(row) : undefined;
 }
 
+/** A provider-acknowledged sibling means a later failed row is partial delivery. */
+export function getDeliveredChannelOutboxForTurn(
+  turnRunId: string,
+): ChannelOutboxItem | undefined {
+  const row = requireDatabase()
+    .prepare(
+      `SELECT * FROM channel_outbox
+       WHERE turn_run_id = ? AND status = 'delivered'
+       ORDER BY updated_at, id LIMIT 1`,
+    )
+    .get(turnRunId) as OutboxRow | undefined;
+  return row ? mapOutbox(row) : undefined;
+}
+
 /**
  * Every uncertain side effect awaiting reconciliation, oldest first.
  *

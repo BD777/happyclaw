@@ -149,6 +149,16 @@ describe('DingTalk streaming finalize must not send a second full copy', () => {
 
     expect(finalized.acknowledged).toBe(false);
     expect(finalized.error).toBeInstanceOf(Error);
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Hello from the preview — final',
+      true,
+      'finalize failed',
+    );
+    expect(repeated).toMatchObject({
+      acknowledged: false,
+      error: { code: 'CHANNEL_DELIVERY_PARTIAL' },
+    });
     expect(
       dingtalkHttps.requests.some(
         (req) =>

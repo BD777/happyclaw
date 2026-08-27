@@ -13,6 +13,7 @@ import { DiscordStreamingEditController } from '../src/discord-streaming-edit.js
 import { QQStreamingController } from '../src/qq-streaming-card.js';
 import { WeComStreamingController } from '../src/wecom-streaming.js';
 import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
+import { preAcceptImDeliveryError } from '../src/im-send-retry-policy.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -63,17 +64,27 @@ describe('streaming finalize must not send a second full copy', () => {
         cause: finalizeError,
       },
     });
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Hello from the preview — final',
+      true,
+      'finalize failed',
+    );
+    expect(repeated).toMatchObject({
+      acknowledged: false,
+      error: { code: 'CHANNEL_DELIVERY_PARTIAL' },
+    });
     expect(message.edit).toHaveBeenCalledTimes(2);
     expect(fallbackSend).not.toHaveBeenCalled();
     expect(channel.send).toHaveBeenCalledTimes(1);
   });
 
-  test('Discord: failed finalize without a flushed preview still fallback-sends', async () => {
+  test('Discord: pre-accept final failure delegates static fallback to the host', async () => {
     const fallbackSend = vi.fn(async () => {});
     const message = {
       id: 'msg-placeholder',
       edit: vi.fn(async () => {
-        throw new Error('discord finalize edit failed');
+        throw preAcceptImDeliveryError('discord finalize edit failed');
       }),
     };
     const channel = {
@@ -83,10 +94,48 @@ describe('streaming finalize must not send a second full copy', () => {
     const ctrl = new DiscordStreamingEditController(channel as any, {
       fallbackSend,
     });
-    await ctrl.complete('Only the final text');
+    const finalized = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Only the final text',
+      true,
+      'finalize failed',
+    );
 
-    expect(fallbackSend).toHaveBeenCalledTimes(1);
-    expect(fallbackSend).toHaveBeenCalledWith('Only the final text');
+    expect(finalized.acknowledged).toBe(false);
+    expect(finalized.error).toMatchObject({ deliveryPhase: 'pre_accept' });
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('Discord: uncertain first final edit never falls back', async () => {
+    const uncertain = new Error('Discord edit ACK lost');
+    const fallbackSend = vi.fn(async () => {});
+    const message = {
+      id: 'msg-placeholder',
+      edit: vi.fn(async () => Promise.reject(uncertain)),
+    };
+    const channel = {
+      send: vi.fn(async () => message),
+    };
+    const ctrl = new DiscordStreamingEditController(channel as any, {
+      fallbackSend,
+    });
+
+    const first = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Only the final text',
+      true,
+      'finalize failed',
+    );
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Only the final text',
+      true,
+      'finalize failed',
+    );
+
+    expect(first).toEqual({ acknowledged: false, error: uncertain });
+    expect(repeated).toEqual({ acknowledged: false, error: uncertain });
+    expect(fallbackSend).not.toHaveBeenCalled();
   });
 
   test('Discord: no-preview multi-chunk partial send is fenced without full fallback', async () => {
@@ -123,6 +172,16 @@ describe('streaming finalize must not send a second full copy', () => {
         totalOutputs: 2,
         cause: continuationError,
       },
+    });
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Hello from the preview — final',
+      true,
+      'finalize failed',
+    );
+    expect(repeated).toMatchObject({
+      acknowledged: false,
+      error: { code: 'CHANNEL_DELIVERY_PARTIAL' },
     });
     expect(channel.send).toHaveBeenCalledTimes(2);
     expect(message.edit).toHaveBeenCalledOnce();
@@ -208,6 +267,16 @@ describe('streaming finalize must not send a second full copy', () => {
         cause: finalizeError,
       },
     });
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Hello from the preview — final',
+      true,
+      'finalize failed',
+    );
+    expect(repeated).toMatchObject({
+      acknowledged: false,
+      error: { code: 'CHANNEL_DELIVERY_PARTIAL' },
+    });
     expect(streamCalls).toContainEqual({
       content: 'Hello from the preview — final',
       finish: true,
@@ -215,10 +284,10 @@ describe('streaming finalize must not send a second full copy', () => {
     expect(fallbackSend).not.toHaveBeenCalled();
   });
 
-  test('WeCom: failed finalize without a flushed preview still fallback-sends', async () => {
+  test('WeCom: pre-accept first DONE delegates static fallback to the host', async () => {
     const fallbackSend = vi.fn(async () => {});
     const sendStream = vi.fn(async () => {
-      throw new Error('wecom finalize DONE failed');
+      throw preAcceptImDeliveryError('wecom finalize DONE failed');
     });
 
     const ctrl = new WeComStreamingController({
@@ -226,9 +295,81 @@ describe('streaming finalize must not send a second full copy', () => {
       sendStream,
       fallbackSend,
     });
-    await ctrl.complete('Only the final text');
+    const finalized = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Only the final text',
+      true,
+      'finalize failed',
+    );
 
-    expect(fallbackSend).toHaveBeenCalledTimes(1);
-    expect(fallbackSend).toHaveBeenCalledWith('Only the final text');
+    expect(finalized.acknowledged).toBe(false);
+    expect(finalized.error).toMatchObject({ deliveryPhase: 'pre_accept' });
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('WeCom: uncertain first DONE never falls back and remains unacknowledged', async () => {
+    const uncertain = new Error('WeCom DONE ACK was lost');
+    const fallbackSend = vi.fn(async () => {});
+    const ctrl = new WeComStreamingController({
+      chatId: 'chat-1',
+      sendStream: vi.fn(async () => Promise.reject(uncertain)),
+      fallbackSend,
+    });
+
+    const first = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Only the final text',
+      true,
+      'finalize failed',
+    );
+    const repeated = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'Only the final text',
+      true,
+      'finalize failed',
+    );
+
+    expect(first).toEqual({ acknowledged: false, error: uncertain });
+    expect(repeated).toEqual({ acknowledged: false, error: uncertain });
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
+  test('WeCom: oversized final close failure fences the preview before pagination', async () => {
+    vi.useFakeTimers();
+    try {
+      const closeError = new Error('WeCom oversized close ACK lost');
+      let calls = 0;
+      const sendStream = vi.fn(async () => {
+        calls += 1;
+        if (calls > 1) throw closeError;
+      });
+      const fallbackSend = vi.fn(async () => {});
+      const ctrl = new WeComStreamingController({
+        chatId: 'chat-1',
+        sendStream,
+        fallbackSend,
+      });
+
+      ctrl.append('visible preview');
+      await vi.advanceTimersByTimeAsync(800);
+      const finalized = await finalizeChannelCardAfterDelivery(
+        ctrl,
+        'x'.repeat(21_000),
+        true,
+        'finalize failed',
+      );
+
+      expect(finalized).toMatchObject({
+        acknowledged: false,
+        error: {
+          code: 'CHANNEL_DELIVERY_PARTIAL',
+          cause: closeError,
+        },
+      });
+      expect(sendStream).toHaveBeenCalledTimes(2);
+      expect(fallbackSend).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -17,6 +17,7 @@
 import type { TextChannel, DMChannel, NewsChannel, Message } from 'discord.js';
 import { logger } from './logger.js';
 import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -41,7 +42,6 @@ export class DiscordStreamingEditController {
   private state: StreamingState = 'idle';
   private channel: TextChannel | DMChannel | NewsChannel;
   private onCardCreated?: (messageId: string) => void;
-  private fallbackSend: ((text: string) => Promise<void>) | null;
 
   // Message state — we may need multiple messages if text exceeds 2000 chars
   private messages: Message[] = [];
@@ -71,12 +71,10 @@ export class DiscordStreamingEditController {
   >();
   private recentEvents: string[] = [];
 
-  // A fallback is one physical send. Reuse the same Promise so concurrent or
-  // repeated callers observe the same ACK/failure instead of treating a prior
-  // failed attempt as success.
-  private fallbackPromise: Promise<void> | null = null;
+  private terminalDeliveryError: unknown;
   // Creation guard
   private messageCreationPromise: Promise<void> | null = null;
+  private messageCreationError: unknown;
   // 上次已推送到 Discord 的完整 content（含 aux prefix），用于跳过 no-op edit，
   // 避免在文本/工具状态未变化时仍占用 Discord 的 5/5s edit 配额。
   private lastPushedContent: string | null = null;
@@ -90,7 +88,6 @@ export class DiscordStreamingEditController {
   ) {
     this.channel = channel;
     this.onCardCreated = opts?.onCardCreated;
-    this.fallbackSend = opts?.fallbackSend ?? null;
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────
@@ -112,6 +109,9 @@ export class DiscordStreamingEditController {
   }
 
   async complete(finalText: string): Promise<void> {
+    if (this.state === 'aborted' && this.terminalDeliveryError) {
+      throw this.terminalDeliveryError;
+    }
     if (this.state === 'completed' || this.state === 'aborted') return;
     this.accumulatedText = finalText;
     this.clearFlushTimer();
@@ -139,19 +139,22 @@ export class DiscordStreamingEditController {
         { err: err.message },
         'Discord ensureMessage failed in complete()',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      this.terminalDeliveryError = err;
+      this.state = 'aborted';
+      throw err;
     }
 
     if (this.messages.length === 0) {
       logger.warn(
         { state: this.state },
-        'Discord complete(): no messages after ensureMessage, using fallback',
+        'Discord complete(): no messages after ensureMessage',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      const creationError =
+        this.messageCreationError ??
+        preAcceptImDeliveryError('Discord streaming message was not created');
+      this.terminalDeliveryError = creationError;
+      this.state = 'aborted';
+      throw creationError;
     }
 
     try {
@@ -174,25 +177,23 @@ export class DiscordStreamingEditController {
       // A preview is already visible on the existing message. Sending the
       // full text again via fallback would duplicate the reply.
       if (err?.code === 'CHANNEL_DELIVERY_PARTIAL') {
+        this.terminalDeliveryError = err;
         this.state = 'aborted';
         throw err;
       }
       if (this.lastPushedContent == null) {
-        try {
-          await this.tryFallback(finalText);
-          this.state = 'completed';
-          return;
-        } catch (fallbackError) {
-          this.state = 'aborted';
-          throw fallbackError;
-        }
+        this.terminalDeliveryError = err;
+        this.state = 'aborted';
+        throw err;
       }
-      this.state = 'aborted';
-      throw new PartialChannelDeliveryError(
+      const partial = new PartialChannelDeliveryError(
         Math.max(1, this.messages.length),
         Math.max(1, this.messages.length) + 1,
         err,
       );
+      this.terminalDeliveryError = partial;
+      this.state = 'aborted';
+      throw partial;
     }
   }
 
@@ -450,9 +451,11 @@ export class DiscordStreamingEditController {
       try {
         const msg = await this.channel.send('💭 思考中...');
         this.messages.push(msg);
+        this.messageCreationError = undefined;
         this.state = 'streaming';
         if (this.onCardCreated) this.onCardCreated(msg.id);
       } catch (err: any) {
+        this.messageCreationError = err;
         logger.warn(
           { err: err.message },
           'Discord initial message creation failed',
@@ -497,17 +500,27 @@ export class DiscordStreamingEditController {
       return;
     }
 
-    // If message creation failed, use fallback
+    // Let the host choose the one durable static fallback. The controller
+    // cannot know whether a failed creation request was accepted before its
+    // ACK was lost.
     if (this.state === 'error') {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.messageCreationError ??
+        preAcceptImDeliveryError('Discord streaming message was not created');
+      this.terminalDeliveryError = creationError;
+      this.state = 'aborted';
+      throw creationError;
     }
 
     await this.ensureMessage();
 
     if (this.messages.length === 0) {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.messageCreationError ??
+        preAcceptImDeliveryError('Discord streaming message was not created');
+      this.terminalDeliveryError = creationError;
+      this.state = 'aborted';
+      throw creationError;
     }
 
     const content = this.buildAuxPrefix() + this.accumulatedText;
@@ -606,19 +619,6 @@ export class DiscordStreamingEditController {
         );
       }
       throw firstError;
-    }
-  }
-
-  private async tryFallback(text: string): Promise<void> {
-    if (!this.fallbackSend) {
-      throw new Error('Discord streaming fallback is unavailable');
-    }
-    this.fallbackPromise ??= this.fallbackSend(text);
-    try {
-      await this.fallbackPromise;
-    } catch (err: any) {
-      logger.warn({ err: err.message }, 'Discord fallback send also failed');
-      throw err;
     }
   }
 }

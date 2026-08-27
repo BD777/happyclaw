@@ -4,7 +4,7 @@ import { QQStreamingController } from '../src/qq-streaming-card.js';
 import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
 
 describe('QQ streaming passive rejection fallback', () => {
-  test('definitive start rejection falls back once with the final text', async () => {
+  test('definitive start rejection delegates static fallback to the durable host', async () => {
     const rejection = new Error('provider rejected msg_id');
     const fallback = vi.fn(async () => {});
     const controller = new QQStreamingController({
@@ -19,10 +19,18 @@ describe('QQ streaming passive rejection fallback', () => {
     });
 
     controller.append('partial');
-    await controller.complete('partial and final');
+    const finalized = await finalizeChannelCardAfterDelivery(
+      controller,
+      'partial and final',
+      true,
+      'delivery failed',
+    );
 
-    expect(fallback).toHaveBeenCalledOnce();
-    expect(fallback).toHaveBeenCalledWith('partial and final');
+    expect(finalized).toMatchObject({
+      acknowledged: false,
+      error: { deliveryPhase: 'rejected', cause: rejection },
+    });
+    expect(fallback).not.toHaveBeenCalled();
   });
 
   test('uncertain start never falls back or reuses the sequence', async () => {
@@ -41,16 +49,29 @@ describe('QQ streaming passive rejection fallback', () => {
     });
 
     controller.append('partial');
-    await expect(controller.complete('partial and final')).rejects.toBe(
-      timeout,
+    const first = await finalizeChannelCardAfterDelivery(
+      controller,
+      'partial and final',
+      true,
+      'delivery failed',
     );
+    const repeated = await finalizeChannelCardAfterDelivery(
+      controller,
+      'partial and final',
+      true,
+      'delivery failed',
+    );
+    expect(first).toEqual({ acknowledged: false, error: timeout });
+    expect(repeated).toEqual({ acknowledged: false, error: timeout });
     expect(send).toHaveBeenCalledOnce();
     expect(fallback).not.toHaveBeenCalled();
   });
 
-  test('failed plain fallback rejects finalization so the cursor is not acknowledged', async () => {
+  test('definitive rejection remains sticky and never invokes controller fallback', async () => {
     const rejection = new Error('verified expired reference');
-    const fallbackFailure = new Error('active push rejected');
+    const fallback = vi.fn(async () => {
+      throw new Error('controller fallback must not run');
+    });
     const controller = new QQStreamingController({
       openid: 'user',
       msgSeq: 1,
@@ -58,9 +79,7 @@ describe('QQ streaming passive rejection fallback', () => {
       sendStreamChunk: vi.fn(async () => {
         throw rejection;
       }),
-      fallbackSend: vi.fn(async () => {
-        throw fallbackFailure;
-      }),
+      fallbackSend: fallback,
       onDefinitiveRejection: (error) => error === rejection,
     });
     controller.append('partial');
@@ -72,10 +91,21 @@ describe('QQ streaming passive rejection fallback', () => {
       'delivery failed',
     );
 
-    expect(finalized).toEqual({
+    expect(finalized).toMatchObject({
       acknowledged: false,
-      error: fallbackFailure,
+      error: { deliveryPhase: 'rejected', cause: rejection },
     });
+    const repeated = await finalizeChannelCardAfterDelivery(
+      controller,
+      'complete answer',
+      true,
+      'delivery failed',
+    );
+    expect(repeated).toMatchObject({
+      acknowledged: false,
+      error: { deliveryPhase: 'rejected', cause: rejection },
+    });
+    expect(fallback).not.toHaveBeenCalled();
     expect(controller.isActive()).toBe(false);
   });
 
@@ -110,6 +140,49 @@ describe('QQ streaming passive rejection fallback', () => {
         deliveredOutputs: 1,
       });
       expect(send).toHaveBeenCalledOnce();
+      expect(fallback).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('initial overflow delegates one durable static send to the host', async () => {
+    vi.useFakeTimers();
+    try {
+      const send = vi.fn(async () => ({ id: 'must-not-start' }));
+      const fallback = vi.fn(async () => {});
+      const controller = new QQStreamingController({
+        openid: 'user',
+        msgSeq: 1,
+        passiveMsgId: 'message',
+        sendStreamChunk: send,
+        fallbackSend: fallback,
+      });
+
+      controller.append('x'.repeat(4600));
+      await vi.advanceTimersByTimeAsync(600);
+      const first = await finalizeChannelCardAfterDelivery(
+        controller,
+        'x'.repeat(4600),
+        true,
+        'delivery failed',
+      );
+      const repeated = await finalizeChannelCardAfterDelivery(
+        controller,
+        'x'.repeat(4600),
+        true,
+        'delivery failed',
+      );
+
+      expect(first).toMatchObject({
+        acknowledged: false,
+        error: { deliveryPhase: 'pre_accept' },
+      });
+      expect(repeated).toMatchObject({
+        acknowledged: false,
+        error: { deliveryPhase: 'pre_accept' },
+      });
+      expect(send).not.toHaveBeenCalled();
       expect(fallback).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();

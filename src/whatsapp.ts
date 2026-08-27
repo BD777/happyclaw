@@ -1020,13 +1020,11 @@ export function createWhatsAppConnection(
         if (localImagePaths && localImagePaths.length > 0) {
           for (const imgPath of localImagePaths) {
             try {
-              const buf = await readFile(imgPath);
-              const mime = guessMimeType(imgPath) || 'image/jpeg';
-              await tracker.send(() =>
-                sock!
-                  .sendMessage(jid, { image: buf, mimetype: mime })
-                  .then(() => undefined),
-              );
+              await tracker.send(async () => {
+                const buf = await readFile(imgPath);
+                const mime = guessMimeType(imgPath) || 'image/jpeg';
+                await sock!.sendMessage(jid, { image: buf, mimetype: mime });
+              });
             } catch (err) {
               logger.error(
                 { err, imgPath, chatId },

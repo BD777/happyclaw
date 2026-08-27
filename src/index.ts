@@ -284,6 +284,7 @@ import {
 } from './channel-outbox-runtime-scope.js';
 import {
   cleanupChannelReliability,
+  getDeliveredChannelOutboxForTurn,
   getFailedChannelOutboxForTurn,
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
@@ -3162,7 +3163,9 @@ async function sendImWithRetry(
 const CHANNEL_MANUAL_RECONCILIATION_NOTICE =
   '刚才的回复可能没有完整送达。为避免重复消息，系统未自动重发；如内容不完整，重新发送问题即可。';
 const CHANNEL_DEFINITIVE_REJECTION_NOTICE =
-  '刚才的回复未能送达飞书，完整内容已保存在 HappyClaw Web。你可以前往 Web 查看，或稍后重新发送问题。';
+  '刚才的回复未能送达当前渠道，完整内容已保存在 HappyClaw Web。你可以前往 Web 查看，或稍后重新发送问题。';
+const CHANNEL_PARTIAL_REJECTION_NOTICE =
+  '刚才的回复仅部分送达当前渠道，完整内容已保存在 HappyClaw Web。为避免重复消息，系统未自动重发。';
 
 /**
  * Surface a crash-after-delivery fence to the exact native route. The notice
@@ -3217,6 +3220,7 @@ async function deliverChannelDefinitiveFailureNotice(input: {
   runtime: ChannelTurnRuntime;
   agentId?: string | null;
   presentation?: 'default' | 'native';
+  partial?: boolean;
   route: {
     provider: string;
     accountId: string;
@@ -3226,6 +3230,9 @@ async function deliverChannelDefinitiveFailureNotice(input: {
     threadId?: string | null;
   };
 }): Promise<boolean> {
+  const noticeText = input.partial
+    ? CHANNEL_PARTIAL_REJECTION_NOTICE
+    : CHANNEL_DEFINITIVE_REJECTION_NOTICE;
   const delivered = await deliverIndependentChannelSystemNotice({
     logicalChatJid: input.logicalChatJid,
     scopeKey: input.scopeKey,
@@ -3235,15 +3242,11 @@ async function deliverChannelDefinitiveFailureNotice(input: {
     originalInputTurnId: input.runtime.inputTurnId,
     originalRunId: input.runtime.runId,
     noticeKey: 'definitive-delivery-failure',
-    text: CHANNEL_DEFINITIVE_REJECTION_NOTICE,
+    text: noticeText,
     presentation: input.presentation,
   });
   if (delivered) return true;
-  sendSystemMessage(
-    input.logicalChatJid,
-    'delivery_rejected',
-    CHANNEL_DEFINITIVE_REJECTION_NOTICE,
-  );
+  sendSystemMessage(input.logicalChatJid, 'delivery_rejected', noticeText);
   return true;
 }
 
@@ -6650,33 +6653,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         await clearProcessingIndicatorForInput(inputId);
         continue;
       }
-      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
-      if (failedDelivery) {
-        const failed = runtime.fail(
-          `Channel delivery ${failedDelivery.id} was definitively rejected`,
-        );
-        const exactScope = channelOutboxScopesByInput.get(inputId);
-        const notified = exactScope?.chatId
-          ? await deliverChannelDefinitiveFailureNotice({
-              logicalChatJid: chatJid,
-              scopeKey: channelTurnScope(effectiveGroup.folder),
-              targetJid: exactScope.sourceJid,
-              runtime,
-              presentation:
-                interactionMode === 'proactive' ? 'native' : 'default',
-              route: { ...exactScope, chatId: exactScope.chatId },
-            })
-          : true;
-        if (failed && notified) {
-          channelDefinitiveFailureSettled = true;
-          await clearProcessingIndicatorForInput(inputId);
-          runtime.dispose();
-          channelTurnRuntimes.delete(inputId);
-        } else {
-          allCompleted = false;
-        }
-        continue;
-      }
       const uncertainDelivery = getUncertainChannelOutboxForTurn(runtime.runId);
       if (uncertainDelivery) {
         channelDeliveryNeedsManualReconciliation = true;
@@ -6696,6 +6672,39 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             })
           : false;
         if (interrupted && notified) {
+          await clearProcessingIndicatorForInput(inputId);
+          runtime.dispose();
+          channelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
+        continue;
+      }
+      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+      if (failedDelivery) {
+        const partialFailure = Boolean(
+          getDeliveredChannelOutboxForTurn(runtime.runId),
+        );
+        const failed = runtime.fail(
+          partialFailure
+            ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+            : `Channel delivery ${failedDelivery.id} was definitively rejected`,
+        );
+        const exactScope = channelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelDefinitiveFailureNotice({
+              logicalChatJid: chatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              partial: partialFailure,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : true;
+        if (failed && notified) {
+          channelDefinitiveFailureSettled = true;
           await clearProcessingIndicatorForInput(inputId);
           runtime.dispose();
           channelTurnRuntimes.delete(inputId);
@@ -9310,10 +9319,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
         );
-        const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+        const failedDelivery = uncertainDelivery
+          ? undefined
+          : getFailedChannelOutboxForTurn(runtime.runId);
         if (failedDelivery) {
+          const partialFailure = Boolean(
+            getDeliveredChannelOutboxForTurn(runtime.runId),
+          );
           settled = runtime.fail(
-            `Channel delivery ${failedDelivery.id} was definitively rejected`,
+            partialFailure
+              ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+              : `Channel delivery ${failedDelivery.id} was definitively rejected`,
           );
           const exactScope = channelOutboxScopesByInput.get(inputTurnId);
           await (exactScope?.chatId
@@ -9322,6 +9338,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 scopeKey: channelTurnScope(effectiveGroup.folder),
                 targetJid: exactScope.sourceJid,
                 runtime,
+                partial: partialFailure,
                 presentation:
                   interactionMode === 'proactive' ? 'native' : 'default',
                 route: { ...exactScope, chatId: exactScope.chatId },
@@ -15332,34 +15349,6 @@ async function processAgentConversation(
         await clearAgentProcessingIndicatorForInput(inputId);
         continue;
       }
-      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
-      if (failedDelivery) {
-        const failed = runtime.fail(
-          `Channel delivery ${failedDelivery.id} was definitively rejected`,
-        );
-        const exactScope = agentChannelOutboxScopesByInput.get(inputId);
-        const notified = exactScope?.chatId
-          ? await deliverChannelDefinitiveFailureNotice({
-              logicalChatJid: virtualChatJid,
-              scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
-              targetJid: exactScope.sourceJid,
-              runtime,
-              agentId,
-              presentation:
-                interactionMode === 'proactive' ? 'native' : 'default',
-              route: { ...exactScope, chatId: exactScope.chatId },
-            })
-          : true;
-        if (failed && notified) {
-          agentDefinitiveFailureSettled = true;
-          await clearAgentProcessingIndicatorForInput(inputId);
-          runtime.dispose();
-          agentChannelTurnRuntimes.delete(inputId);
-        } else {
-          allCompleted = false;
-        }
-        continue;
-      }
       const uncertainDelivery = getUncertainChannelOutboxForTurn(runtime.runId);
       if (uncertainDelivery) {
         agentDeliveryNeedsManualReconciliation = true;
@@ -15380,6 +15369,40 @@ async function processAgentConversation(
             })
           : false;
         if (interrupted && notified) {
+          await clearAgentProcessingIndicatorForInput(inputId);
+          runtime.dispose();
+          agentChannelTurnRuntimes.delete(inputId);
+        } else {
+          allCompleted = false;
+        }
+        continue;
+      }
+      const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+      if (failedDelivery) {
+        const partialFailure = Boolean(
+          getDeliveredChannelOutboxForTurn(runtime.runId),
+        );
+        const failed = runtime.fail(
+          partialFailure
+            ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+            : `Channel delivery ${failedDelivery.id} was definitively rejected`,
+        );
+        const exactScope = agentChannelOutboxScopesByInput.get(inputId);
+        const notified = exactScope?.chatId
+          ? await deliverChannelDefinitiveFailureNotice({
+              logicalChatJid: virtualChatJid,
+              scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+              targetJid: exactScope.sourceJid,
+              runtime,
+              agentId,
+              partial: partialFailure,
+              presentation:
+                interactionMode === 'proactive' ? 'native' : 'default',
+              route: { ...exactScope, chatId: exactScope.chatId },
+            })
+          : true;
+        if (failed && notified) {
+          agentDefinitiveFailureSettled = true;
           await clearAgentProcessingIndicatorForInput(inputId);
           runtime.dispose();
           agentChannelTurnRuntimes.delete(inputId);
@@ -17658,12 +17681,19 @@ async function processAgentConversation(
         const uncertainDelivery = getUncertainChannelOutboxForTurn(
           runtime.runId,
         );
-        const failedDelivery = getFailedChannelOutboxForTurn(runtime.runId);
+        const failedDelivery = uncertainDelivery
+          ? undefined
+          : getFailedChannelOutboxForTurn(runtime.runId);
         let settled: boolean;
         let terminal = false;
         if (failedDelivery) {
+          const partialFailure = Boolean(
+            getDeliveredChannelOutboxForTurn(runtime.runId),
+          );
           settled = runtime.fail(
-            `Channel delivery ${failedDelivery.id} was definitively rejected`,
+            partialFailure
+              ? `Channel delivery was partial before ${failedDelivery.id} was definitively rejected`
+              : `Channel delivery ${failedDelivery.id} was definitively rejected`,
           );
           const exactScope = agentChannelOutboxScopesByInput.get(inputTurnId);
           await (exactScope?.chatId
@@ -17673,6 +17703,7 @@ async function processAgentConversation(
                 targetJid: exactScope.sourceJid,
                 runtime,
                 agentId,
+                partial: partialFailure,
                 presentation:
                   interactionMode === 'proactive' ? 'native' : 'default',
                 route: { ...exactScope, chatId: exactScope.chatId },
