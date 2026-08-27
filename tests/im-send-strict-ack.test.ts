@@ -463,6 +463,10 @@ describe('IM strict send acknowledgement', () => {
     controls.telegramSendPhoto.mockRejectedValue(new Error('photo denied'));
     await expect(
       telegram.sendMessage('1', 'hello', [imagePath]),
-    ).rejects.toThrow('photo denied');
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredOutputs: 1,
+      cause: expect.objectContaining({ message: 'photo denied' }),
+    });
   });
 });
