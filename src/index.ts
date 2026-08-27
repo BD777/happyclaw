@@ -9865,7 +9865,10 @@ async function runAgent(
       output.queryIdle === true ||
       (isInterruptStatus && output.queryIdle !== false)
     ) {
-      queue.markRunnerQueryIdle(chatJid);
+      const preserveIpcDebt =
+        output.sourceKind === 'truncation_continue' ||
+        output.sourceKind === 'auto_continue';
+      queue.markRunnerQueryIdle(chatJid, { preserveIpcDebt });
     }
     // 仅从成功的输出中更新 session ID；
     // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
@@ -15757,7 +15760,10 @@ async function processAgentConversation(
         output.streamEvent.statusText === 'interrupted' &&
         output.queryIdle !== false)
     ) {
-      queue.markRunnerQueryIdle(virtualJid);
+      const preserveIpcDebt =
+        output.sourceKind === 'truncation_continue' ||
+        output.sourceKind === 'auto_continue';
+      queue.markRunnerQueryIdle(virtualJid, { preserveIpcDebt });
     }
 
     // #549: a provider switch surfaced as a failure clears the agent session so
