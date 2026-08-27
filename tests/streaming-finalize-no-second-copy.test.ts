@@ -89,6 +89,46 @@ describe('streaming finalize must not send a second full copy', () => {
     expect(fallbackSend).toHaveBeenCalledWith('Only the final text');
   });
 
+  test('Discord: no-preview multi-chunk partial send is fenced without full fallback', async () => {
+    const continuationError = new Error('discord continuation failed');
+    const fallbackSend = vi.fn(async () => {});
+    const message = {
+      id: 'msg-placeholder',
+      edit: vi.fn(async () => message),
+    };
+    let sends = 0;
+    const channel = {
+      send: vi.fn(async () => {
+        sends += 1;
+        if (sends > 1) throw continuationError;
+        return message;
+      }),
+    };
+
+    const ctrl = new DiscordStreamingEditController(channel as any, {
+      fallbackSend,
+    });
+    const finalized = await finalizeChannelCardAfterDelivery(
+      ctrl,
+      'x'.repeat(3000),
+      true,
+      'finalize failed',
+    );
+
+    expect(finalized).toMatchObject({
+      acknowledged: false,
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+        cause: continuationError,
+      },
+    });
+    expect(channel.send).toHaveBeenCalledTimes(2);
+    expect(message.edit).toHaveBeenCalledOnce();
+    expect(fallbackSend).not.toHaveBeenCalled();
+  });
+
   test('QQ: preview flush + failed DONE chunk does not fallback-send', async () => {
     vi.useFakeTimers();
 

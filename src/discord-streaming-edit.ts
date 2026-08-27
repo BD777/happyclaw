@@ -173,6 +173,10 @@ export class DiscordStreamingEditController {
       );
       // A preview is already visible on the existing message. Sending the
       // full text again via fallback would duplicate the reply.
+      if (err?.code === 'CHANNEL_DELIVERY_PARTIAL') {
+        this.state = 'aborted';
+        throw err;
+      }
       if (this.lastPushedContent == null) {
         try {
           await this.tryFallback(finalText);
@@ -559,12 +563,14 @@ export class DiscordStreamingEditController {
   private async splitAndSend(fullContent: string): Promise<void> {
     const chunks = splitWithCodeFences(fullContent, DISCORD_MSG_LIMIT);
     let firstError: Error | null = null;
+    let acknowledgedOutputs = 0;
 
     for (let i = 0; i < chunks.length; i++) {
       if (i < this.messages.length) {
         // Edit existing message
         try {
           await this.messages[i].edit(chunks[i]);
+          acknowledgedOutputs += 1;
         } catch (err: any) {
           logger.warn(
             { err: err.message, index: i },
@@ -577,6 +583,7 @@ export class DiscordStreamingEditController {
         try {
           const msg = await this.channel.send(chunks[i]);
           this.messages.push(msg);
+          acknowledgedOutputs += 1;
         } catch (err: any) {
           logger.warn(
             { err: err.message, index: i },
@@ -588,8 +595,18 @@ export class DiscordStreamingEditController {
       }
     }
 
-    // Propagate the first error so complete() can fallback
-    if (firstError) throw firstError;
+    // Propagate the first error. Once any final mutation has an ACK, an
+    // all-text fallback would duplicate that prefix and must be fenced.
+    if (firstError) {
+      if (acknowledgedOutputs > 0) {
+        throw new PartialChannelDeliveryError(
+          acknowledgedOutputs,
+          chunks.length,
+          firstError,
+        );
+      }
+      throw firstError;
+    }
   }
 
   private async tryFallback(text: string): Promise<void> {
