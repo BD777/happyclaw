@@ -329,6 +329,47 @@ describe('host browser process identity policy', () => {
         ],
       }),
     ).toBe(true);
+    // macOS `ps` flattens the existing `Google Chrome` shim path without
+    // quotes. The process reader must recover that first positional script
+    // without treating arbitrary later arguments as process identity.
+    const splitChromePath = path.join(BIN_DIR, 'Google Chrome').split(' ');
+    expect(splitChromePath).toHaveLength(2);
+    expect(
+      isManagedHostBrowserProcess({
+        executable: process.execPath,
+        argv: [process.execPath, ...splitChromePath, '--headless=new'],
+      }),
+    ).toBe(true);
+
+    const realPrefixScript = path.join(BIN_DIR, 'Google');
+    fs.writeFileSync(realPrefixScript, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    try {
+      for (const executable of [
+        process.execPath,
+        '/bin/bash',
+        '/usr/bin/python3',
+      ]) {
+        expect(
+          isManagedHostBrowserProcess({
+            executable,
+            argv: [executable, realPrefixScript, 'Chrome', '--background-job'],
+          }),
+        ).toBe(false);
+      }
+    } finally {
+      fs.rmSync(realPrefixScript, { force: true });
+    }
+
+    for (const argv of [
+      ['/bin/bash', '--rcfile', ...splitChromePath, 'worker.sh'],
+      ['/bin/bash', '--init-file', ...splitChromePath, 'worker.sh'],
+      ['/usr/bin/python3', '-W', ...splitChromePath, 'worker.py'],
+      [process.execPath, '--require', ...splitChromePath, 'worker.js'],
+    ]) {
+      expect(isManagedHostBrowserProcess({ executable: argv[0], argv })).toBe(
+        false,
+      );
+    }
   });
 
   test('does not match shell/python jobs that only mention agent-browser in arguments', () => {

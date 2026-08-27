@@ -2982,26 +2982,30 @@ function interpreterScript(argv: readonly string[]): string | undefined {
     'python3',
   ]);
   if (!shell.has(executable) && !interpreter.has(executable)) return undefined;
-  if (argv.slice(1).some((arg) => arg === '-c' || arg === '--command')) {
-    return undefined;
-  }
-  const optionsWithValues = new Set([
-    '-r',
-    '--require',
-    '--loader',
-    '--import',
-    '--config',
-  ]);
-  for (let index = 1; index < argv.length; index++) {
-    const value = argv[index] ?? '';
-    if (optionsWithValues.has(value)) {
-      index += 1;
-      continue;
+  // Process listings flatten shell quoting, so once an interpreter option is
+  // present we cannot safely distinguish its operand from the real script.
+  // Fail closed instead of scanning later arguments and risking an unrelated
+  // background job. Managed browser CLIs are launched with the script as the
+  // immediate first argv operand.
+  const value = argv[1];
+  if (!value || value.startsWith('-')) return undefined;
+
+  // macOS `ps -o args=` also flattens an immediate script path such as
+  // `.../Google Chrome` into two tokens. Recover that one exact shape only
+  // when the unjoined prefix is not itself a real script, the joined path is
+  // real, and its basename is explicitly managed.
+  const next = argv[2];
+  if (next) {
+    const joined = `${value} ${next}`;
+    if (
+      !fs.existsSync(value) &&
+      MANAGED_BROWSER_EXECUTABLES.has(normalizedExecutableName(joined)) &&
+      fs.existsSync(joined)
+    ) {
+      return joined;
     }
-    if (value.startsWith('-')) continue;
-    return value;
   }
-  return undefined;
+  return value;
 }
 
 /** Match executable/script identity, never arbitrary command arguments. */
