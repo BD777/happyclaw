@@ -2177,13 +2177,25 @@ export function createTelegramConnection(
           );
         }
 
-        await bot.api.sendDocument(
-          target.chatId,
-          new InputFile(filePath, fileName),
-          target.messageThreadId
-            ? { message_thread_id: target.messageThreadId }
-            : {},
-        );
+        const inputFile = new InputFile(filePath, fileName);
+        const threadOptions = target.messageThreadId
+          ? { message_thread_id: target.messageThreadId }
+          : {};
+        const ext = (fileName.split('.').pop() || '').toLowerCase();
+        if (ext === 'mp4' || ext === 'mov' || ext === 'webm') {
+          await bot.api.sendVideo(target.chatId, inputFile, threadOptions);
+        } else if (
+          ext === 'ogg' ||
+          ext === 'opus' ||
+          ext === 'mp3' ||
+          ext === 'wav' ||
+          ext === 'm4a' ||
+          ext === 'aac'
+        ) {
+          await bot.api.sendAudio(target.chatId, inputFile, threadOptions);
+        } else {
+          await bot.api.sendDocument(target.chatId, inputFile, threadOptions);
+        }
 
         logger.info(
           { chatId, filePath, fileName, size: stat.size },
