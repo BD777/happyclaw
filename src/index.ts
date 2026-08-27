@@ -29,6 +29,11 @@ import {
 } from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
+  deliverTextAndLocalImages,
+  prepareLocalImages,
+  type PreparedLocalImage,
+} from './im-local-attachments.js';
+import {
   acknowledgeIpcReplyTurn,
   decideAssistantPrimaryProjection,
   isGenuineReplyResult,
@@ -3098,16 +3103,60 @@ async function sendImWithRetry(
       deliveryId: deliveryOptions?.deliveryId ?? crypto.randomUUID(),
       chunkIndex: deliveryOptions?.chunkIndex ?? 0,
     };
+    let preparedImages: PreparedLocalImage[];
+    let textPhysicalOutputs: number;
+    try {
+      preparedImages = prepareLocalImages(localImagePaths);
+      const sendsText = text.length > 0 || preparedImages.length === 0;
+      textPhysicalOutputs = sendsText
+        ? getChannelType(imJid) === 'wechat'
+          ? prepareWeChatTextChunks(text).length
+          : 1
+        : 0;
+    } catch (error) {
+      const preflightError = preAcceptImDeliveryError(
+        'Local image attachment preflight failed before provider send',
+        error,
+      );
+      sendFailure.error = preflightError;
+      sendFailure.outcome = 'pre_accept';
+      if (failure) {
+        failure.error = preflightError;
+        failure.outcome = 'pre_accept';
+      }
+      logger.error(
+        { imJid, err: preflightError },
+        'IM local image preflight failed',
+      );
+      return false;
+    }
     // Task/notice sends have no outbox fence. An ETIMEDOUT after the
     // provider accepted the request must not physically resend.
     const result = await retryUnscopedImSend(
-      () =>
-        imManager.sendMessage(
-          imJid,
+      async () => {
+        await deliverTextAndLocalImages({
           text,
-          localImagePaths,
-          connectorDeliveryOptions,
-        ),
+          images: preparedImages,
+          sendText: () =>
+            imManager.sendMessage(imJid, text, [], connectorDeliveryOptions),
+          sendImage: (image, index) =>
+            imManager.sendImage(
+              imJid,
+              image.buffer,
+              image.mimeType,
+              undefined,
+              image.fileName,
+              {
+                ...connectorDeliveryOptions,
+                chunkIndex:
+                  (connectorDeliveryOptions.chunkIndex ?? 0) +
+                  textPhysicalOutputs +
+                  index,
+                physicalOutput: getChannelType(imJid) === 'wechat',
+              },
+            ),
+        });
+      },
       {
         maxAttempts: IM_SEND_MAX_RETRIES,
         delayMs: IM_SEND_RETRY_DELAY_MS,
@@ -3468,13 +3517,18 @@ async function sendTaskImageWithRetry(
   failure?: ImSendFailureRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
-  const weChat = getChannelType(targetJid) === 'wechat';
+  const channelType = getChannelType(targetJid);
+  const separatesImageCaption =
+    channelType === 'wechat' ||
+    channelType === 'dingtalk' ||
+    channelType === 'wecom';
   let effectiveOutbox = outbox;
   let effectiveCaption = caption;
   let captionChunkCount = 0;
 
-  if (weChat && outbox && caption) {
-    const captionChunks = prepareWeChatTextChunks(caption);
+  if (separatesImageCaption && outbox && caption) {
+    const captionChunks =
+      channelType === 'wechat' ? prepareWeChatTextChunks(caption) : [caption];
     captionChunkCount = captionChunks.length;
     let acknowledgedCaptions = 0;
     for (let index = 0; index < captionChunks.length; index++) {
@@ -3501,7 +3555,7 @@ async function sendTaskImageWithRetry(
               acknowledgedOutputs: acknowledgedCaptions,
               totalOutputs: captionChunks.length + 1,
             },
-            'WeChat image delivery is partial after caption chunk failure',
+            'Image delivery is partial after caption chunk failure',
           );
         }
         return false;
@@ -3533,7 +3587,7 @@ async function sendTaskImageWithRetry(
         {
           deliveryId: item.id,
           chunkIndex: captionChunkCount,
-          physicalOutput: weChat,
+          physicalOutput: separatesImageCaption,
         },
       ),
   });
@@ -3545,7 +3599,7 @@ async function sendTaskImageWithRetry(
           acknowledgedOutputs: captionChunkCount,
           totalOutputs: captionChunkCount + 1,
         },
-        'WeChat image delivery is partial after image send failure',
+        'Image delivery is partial after image send failure',
       );
     }
     return scoped;

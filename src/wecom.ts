@@ -8,8 +8,10 @@
 //   later message in the same chat cannot steal its req_id;
 // - outbound promises resolve only after the SDK receives a successful ACK.
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
+import path from 'node:path';
 import {
   WSClient,
   decryptFile as decryptWeComFile,
@@ -37,6 +39,11 @@ import {
 } from './im-downloader.js';
 import { detectImageMimeTypeStrict } from './image-detector.js';
 import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
+import { DefinitiveChannelDeliveryError } from './channel-outbox-delivery.js';
+import {
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 import {
   WECOM_MARKDOWN_MAX_BYTES,
   WeComStreamingController,
@@ -64,6 +71,64 @@ const WECOM_MEDIA_ACTIVE_LIMIT = 2;
 const WECOM_MEDIA_QUEUE_LIMIT = 8;
 const WECOM_GLOBAL_MEDIA_ACTIVE_LIMIT = 4;
 const WECOM_GLOBAL_MEDIA_QUEUE_LIMIT = 32;
+const WECOM_OUTBOUND_MEDIA_MAX_BYTES = Math.min(
+  MAX_FILE_SIZE,
+  50 * 1024 * 1024,
+);
+
+function assertWeComProviderAck(frame: unknown, operation: string): void {
+  if (!frame || typeof frame !== 'object' || Array.isArray(frame)) {
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      `WeCom ${operation} returned no structured provider ACK`,
+    );
+  }
+  const errcode = (frame as { errcode?: unknown }).errcode;
+  if (errcode === 0) return;
+  if (typeof errcode === 'number') {
+    throw new DefinitiveChannelDeliveryError(
+      `WeCom ${operation} was rejected with errcode ${errcode}`,
+      { cause: frame },
+    );
+  }
+  throw new ImDeliveryPhaseError(
+    'uncertain',
+    `WeCom ${operation} response omitted errcode`,
+    { cause: frame },
+  );
+}
+
+async function awaitWeComProviderAck(
+  operation: string,
+  send: () => Promise<unknown>,
+): Promise<void> {
+  let ack: unknown;
+  try {
+    ack = await send();
+  } catch (error) {
+    if (
+      error &&
+      typeof error === 'object' &&
+      typeof (error as { errcode?: unknown }).errcode === 'number'
+    ) {
+      throw new DefinitiveChannelDeliveryError(
+        `WeCom ${operation} was rejected with errcode ${String(
+          (error as { errcode: number }).errcode,
+        )}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  assertWeComProviderAck(ack, operation);
+}
+
+function normalizeWeComOutboundFileName(
+  fileName: string | undefined,
+  fallback: string,
+): string {
+  return sanitizeImFilename(fileName || fallback);
+}
 
 class WeComMediaBusyError extends Error {
   readonly code = 'WECOM_MEDIA_BUSY';
@@ -484,6 +549,14 @@ export interface WeComConnection {
     text: string,
     localImagePaths?: string[],
   ): Promise<void>;
+  sendImage(
+    chatId: string,
+    imageBuffer: Buffer,
+    mimeType: string,
+    caption?: string,
+    fileName?: string,
+  ): Promise<void>;
+  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   createStreamingSession(
     chatId: string,
     inputMessageId?: string,
@@ -668,6 +741,68 @@ export function createWeComConnection(
     }
   }
 
+  function assertOutboundConnection(
+    client: WSClient,
+    generation: number,
+    signal: AbortSignal,
+  ): void {
+    assertConnectionGeneration(generation, signal);
+    if (ws !== client || !authenticated) {
+      throw new WeComMediaCancelledError(
+        'WeCom outbound operation lost its authenticated connection',
+      );
+    }
+  }
+
+  async function sendOutboundMedia(
+    client: WSClient,
+    generation: number,
+    signal: AbortSignal,
+    chatId: string,
+    mediaType: 'image' | 'file',
+    buffer: Buffer,
+    fileName: string,
+  ): Promise<void> {
+    assertOutboundConnection(client, generation, signal);
+    if (buffer.length === 0 || buffer.length > WECOM_OUTBOUND_MEDIA_MAX_BYTES) {
+      throw preAcceptImDeliveryError(
+        `WeCom outbound ${mediaType} has invalid size ${buffer.length}`,
+      );
+    }
+    if (mediaType === 'image' && !detectImageMimeTypeStrict(buffer)) {
+      throw preAcceptImDeliveryError(
+        `WeCom outbound image is not a supported image: ${fileName}`,
+      );
+    }
+
+    let mediaId: string;
+    try {
+      const uploaded = await client.uploadMedia(buffer, {
+        type: mediaType,
+        filename: normalizeWeComOutboundFileName(
+          fileName,
+          mediaType === 'image' ? 'image.png' : 'file.bin',
+        ),
+      });
+      mediaId = uploaded?.media_id?.trim() ?? '';
+    } catch (error) {
+      throw preAcceptImDeliveryError(
+        `WeCom ${mediaType} upload failed before visible send`,
+        error,
+      );
+    }
+    if (!mediaId) {
+      throw preAcceptImDeliveryError(
+        `WeCom ${mediaType} upload returned no media_id`,
+      );
+    }
+
+    assertOutboundConnection(client, generation, signal);
+    await awaitWeComProviderAck(`${mediaType} send`, () =>
+      client.sendMediaMessage(sdkChatId(chatId), mediaType, mediaId),
+    );
+  }
+
   function clearProgressPayload(progress: WeComInboundProgress): void {
     inboundProgressBytes = Math.max(
       0,
@@ -790,12 +925,12 @@ export function createWeComConnection(
       // The SDK rejects on a timeout or non-zero errcode; awaiting each page
       // makes a resolved delivery promise a strict provider ACK.
       await tracker.send(() =>
-        client
-          .sendMessage(sdkChatId(chatId), {
+        awaitWeComProviderAck('markdown send', () =>
+          client.sendMessage(sdkChatId(chatId), {
             msgtype: 'markdown',
             markdown: { content },
-          })
-          .then(() => undefined),
+          }),
+        ),
       );
     }
   }
@@ -1656,12 +1791,133 @@ export function createWeComConnection(
       client?.disconnect();
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+    ): Promise<void> {
       const client = ws;
       if (!client || !authenticated) {
-        throw new Error('WeCom channel is not authenticated');
+        throw preAcceptImDeliveryError('WeCom channel is not authenticated');
       }
-      await sendMarkdownPages(client, chatId, text);
+      const generation = connectionGeneration;
+      const signal = mediaAbortController.signal;
+      const images = await Promise.all(
+        (localImagePaths ?? []).map(async (imagePath) => {
+          let buffer: Buffer;
+          try {
+            buffer = await fs.promises.readFile(imagePath);
+          } catch (error) {
+            throw preAcceptImDeliveryError(
+              `WeCom local image is unavailable: ${imagePath}`,
+              error,
+            );
+          }
+          if (
+            buffer.length === 0 ||
+            buffer.length > WECOM_OUTBOUND_MEDIA_MAX_BYTES ||
+            !detectImageMimeTypeStrict(buffer)
+          ) {
+            throw preAcceptImDeliveryError(
+              `WeCom local image failed preflight: ${imagePath}`,
+            );
+          }
+          return { buffer, fileName: path.basename(imagePath) };
+        }),
+      );
+      const sendsText = text.length > 0 || images.length === 0;
+      const tracker = new PhysicalDeliveryTracker(
+        (sendsText ? 1 : 0) + images.length,
+      );
+      if (sendsText) {
+        await tracker.send(() => sendMarkdownPages(client, chatId, text));
+      }
+      for (const image of images) {
+        await tracker.send(() =>
+          sendOutboundMedia(
+            client,
+            generation,
+            signal,
+            chatId,
+            'image',
+            image.buffer,
+            image.fileName,
+          ),
+        );
+      }
+    },
+
+    async sendImage(
+      chatId: string,
+      imageBuffer: Buffer,
+      mimeType: string,
+      caption?: string,
+      fileName?: string,
+    ): Promise<void> {
+      const client = ws;
+      if (!client || !authenticated) {
+        throw preAcceptImDeliveryError('WeCom channel is not authenticated');
+      }
+      if (!mimeType.startsWith('image/')) {
+        throw preAcceptImDeliveryError(
+          `WeCom sendImage received non-image MIME type ${mimeType}`,
+        );
+      }
+      if (
+        imageBuffer.length === 0 ||
+        imageBuffer.length > WECOM_OUTBOUND_MEDIA_MAX_BYTES ||
+        !detectImageMimeTypeStrict(imageBuffer)
+      ) {
+        throw preAcceptImDeliveryError(
+          `WeCom outbound image failed preflight: ${fileName ?? 'image'}`,
+        );
+      }
+      const generation = connectionGeneration;
+      const signal = mediaAbortController.signal;
+      const tracker = new PhysicalDeliveryTracker(caption ? 2 : 1);
+      if (caption) {
+        await tracker.send(() => sendMarkdownPages(client, chatId, caption));
+      }
+      await tracker.send(() =>
+        sendOutboundMedia(
+          client,
+          generation,
+          signal,
+          chatId,
+          'image',
+          imageBuffer,
+          normalizeWeComOutboundFileName(fileName, 'image.png'),
+        ),
+      );
+    },
+
+    async sendFile(
+      chatId: string,
+      filePath: string,
+      fileName: string,
+    ): Promise<void> {
+      const client = ws;
+      if (!client || !authenticated) {
+        throw preAcceptImDeliveryError('WeCom channel is not authenticated');
+      }
+      let buffer: Buffer;
+      try {
+        buffer = await fs.promises.readFile(filePath);
+      } catch (error) {
+        throw preAcceptImDeliveryError(
+          `WeCom outbound file is unavailable: ${filePath}`,
+          error,
+        );
+      }
+      await sendOutboundMedia(
+        client,
+        connectionGeneration,
+        mediaAbortController.signal,
+        chatId,
+        'file',
+        buffer,
+        normalizeWeComOutboundFileName(fileName, path.basename(filePath)),
+      );
     },
 
     async createStreamingSession(
