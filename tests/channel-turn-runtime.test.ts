@@ -969,7 +969,7 @@ describe('durable channel turn runtime', () => {
 });
 
 describe('provider reconciliation', () => {
-  test('updates the original CardKit card instead of creating a replacement', async () => {
+  test('updates the original CardKit card and marks an orphan body interrupted', async () => {
     const settings = vi.fn().mockResolvedValue({ code: 0 });
     const update = vi.fn().mockResolvedValue({ code: 0 });
     const create = vi.fn();
@@ -998,7 +998,7 @@ describe('provider reconciliation', () => {
     expect(create).not.toHaveBeenCalled();
     const updated = JSON.stringify(update.mock.calls[0][0]);
     expect(updated).toContain('保留的部分回答');
-    expect(updated).not.toContain('上次服务中断');
+    expect(updated).toContain('上次服务中断');
   });
 
   test('writes only the interrupt banner when the leftover card has no body', async () => {
@@ -1021,17 +1021,25 @@ describe('provider reconciliation', () => {
     expect(JSON.stringify(patch.mock.calls[0][0])).toContain('上次服务中断');
   });
 
-  test('prefers a stored assistant reply over the orphan snapshot and skips the banner', () => {
+  test('shows done only for an explicitly completed recovered body', () => {
     expect(
       resolveInterruptedStreamingCardRewrite({
         snapshot: { text: '卡片上的半截' },
         reason: '上次服务中断，本次任务未完成',
       }),
     ).toEqual({
-      text: '卡片上的半截',
-      status: 'done',
+      text: '卡片上的半截\n\n> ⚠️ 上次服务中断，本次任务未完成',
+      status: 'warning',
       hasBody: true,
     });
+    expect(
+      resolveInterruptedStreamingCardRewrite({
+        snapshot: {
+          text: '持久化的完整回答',
+          recovery: { completed: true },
+        },
+      }),
+    ).toEqual({ text: '持久化的完整回答', status: 'done', hasBody: true });
     expect(
       resolveInterruptedStreamingCardRewrite({
         snapshot: { text: '', recovery: { completed: true } },
@@ -1044,6 +1052,143 @@ describe('provider reconciliation', () => {
 });
 
 describe('persisted assistant recovery', () => {
+  test('requires the exact turn id and an explicitly completed terminal', () => {
+    const input = {
+      ...route,
+      sourceJid:
+        'feishu:chat-strict-recovery#account:bot-runtime#root:root-strict#thread:thread-strict',
+      chatId: 'chat-strict-recovery',
+      rootId: 'root-strict',
+      threadId: 'thread-strict',
+      externalMessageId: 'msg-strict-recovery',
+      agentId: 'agent-strict-recovery',
+      sessionId: 'long-lived-session',
+    };
+    const runtime = ChannelTurnRuntime.start(input);
+    runtime.reserveStreamingCard()!.onEvent({
+      status: 'streaming',
+      messageId: 'om_strict_recovery',
+      cardId: 'card_strict_recovery',
+      version: 1,
+      snapshot: { text: '当前卡片的半截内容' },
+    });
+    const leftover = reliability
+      .listAllNonterminalStreamingCards()
+      .find((card) => card.turnRunId === runtime.runId)!;
+    db.ensureChatExists(input.sourceJid);
+    db.storeMessageDirect(
+      'assistant-same-session-wrong-turn',
+      input.sourceJid,
+      'happyclaw-agent',
+      'HappyClaw',
+      '同一个长期 session 里另一轮的完整回答',
+      new Date().toISOString(),
+      true,
+      {
+        meta: {
+          turnId: 'another-turn',
+          sessionId: input.sessionId,
+          sourceKind: 'sdk_final',
+          finalizationReason: 'completed',
+        },
+      },
+    );
+    db.storeMessageDirect(
+      'assistant-exact-turn-interrupted',
+      input.sourceJid,
+      'happyclaw-agent',
+      'HappyClaw',
+      '当前 turn 的中断片段',
+      new Date().toISOString(),
+      true,
+      {
+        meta: {
+          turnId: input.externalMessageId,
+          sessionId: input.sessionId,
+          sourceKind: 'interrupt_partial',
+          finalizationReason: 'interrupted',
+        },
+      },
+    );
+
+    expect(
+      resolveStreamingCardRecoveryBody(
+        leftover,
+        reliability.getChannelTurnRun(runtime.runId),
+      ),
+    ).toEqual({ body: '当前卡片的半截内容', persisted: false });
+    runtime.dispose();
+  });
+
+  test('finds the exact completed reply in a conversation-agent transcript', () => {
+    const agentId = 'conversation-agent-recovery';
+    const workspaceJid = 'web:conversation-agent-workspace';
+    db.createAgent({
+      id: agentId,
+      group_folder: 'conversation-agent-workspace',
+      chat_jid: workspaceJid,
+      name: 'Conversation Agent',
+      prompt: '',
+      status: 'idle',
+      kind: 'conversation',
+      created_by: 'owner-conversation-agent',
+      created_at: new Date().toISOString(),
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+    });
+    const input = {
+      ...route,
+      sourceJid:
+        'feishu:chat-agent-recovery#account:bot-runtime#root:root-agent#thread:thread-agent',
+      chatId: 'chat-agent-recovery',
+      rootId: 'root-agent',
+      threadId: 'thread-agent',
+      externalMessageId: 'msg-agent-recovery',
+      agentId,
+      sessionId: 'session-agent-recovery',
+    };
+    const runtime = ChannelTurnRuntime.start(input);
+    runtime.reserveStreamingCard()!.onEvent({
+      status: 'streaming',
+      messageId: 'om_agent_recovery',
+      cardId: 'card_agent_recovery',
+      version: 2,
+      snapshot: { text: '卡片半截' },
+    });
+    const leftover = reliability
+      .listAllNonterminalStreamingCards()
+      .find((card) => card.turnRunId === runtime.runId)!;
+    const transcriptJid = `${workspaceJid}#agent:${agentId}`;
+    db.ensureChatExists(transcriptJid);
+    db.storeMessageDirect(
+      'assistant-agent-persisted',
+      transcriptJid,
+      'happyclaw-agent',
+      'HappyClaw',
+      '会话 Agent 的完整回答',
+      new Date().toISOString(),
+      true,
+      {
+        meta: {
+          turnId: input.externalMessageId,
+          sessionId: input.sessionId,
+          sourceKind: 'sdk_final',
+          finalizationReason: 'completed',
+        },
+      },
+    );
+
+    expect(
+      resolveStreamingCardRecoveryBody(
+        leftover,
+        reliability.getChannelTurnRun(runtime.runId),
+      ),
+    ).toEqual({ body: '会话 Agent 的完整回答', persisted: true });
+    runtime.dispose();
+  });
+
   test('startup rewrites a leftover card with the stored reply and does not abort', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-28T08:00:00.000Z'));
@@ -1129,6 +1274,73 @@ describe('persisted assistant recovery', () => {
       'completed',
     );
     vi.useRealTimers();
+  });
+
+  test('does not show success when the exact persisted reply conflicts with a failed turn', async () => {
+    const input = {
+      ...route,
+      sourceJid:
+        'feishu:chat-failed-turn#account:bot-runtime#root:root-failed#thread:thread-failed',
+      chatId: 'chat-failed-turn',
+      rootId: 'root-failed',
+      threadId: 'thread-failed',
+      externalMessageId: 'msg-failed-turn',
+      agentId: 'agent-failed-turn',
+      sessionId: 'session-failed-turn',
+    };
+    const runtime = ChannelTurnRuntime.start(input);
+    runtime.reserveStreamingCard()!.onEvent({
+      status: 'streaming',
+      messageId: 'om_failed_turn',
+      cardId: 'card_failed_turn',
+      version: 3,
+      snapshot: { text: '卡片半截' },
+    });
+    const leftover = reliability
+      .listAllNonterminalStreamingCards()
+      .find((card) => card.turnRunId === runtime.runId)!;
+    db.ensureChatExists(input.sourceJid);
+    db.storeMessageDirect(
+      'assistant-failed-turn-conflict',
+      input.sourceJid,
+      'happyclaw-agent',
+      'HappyClaw',
+      '虽然持久化但不能覆盖失败围栏的回答',
+      new Date().toISOString(),
+      true,
+      {
+        meta: {
+          turnId: input.externalMessageId,
+          sessionId: input.sessionId,
+          sourceKind: 'sdk_final',
+          finalizationReason: 'completed',
+        },
+      },
+    );
+    expect(runtime.fail('provider delivery failed')).toBe(true);
+    runtime.dispose();
+
+    const reconcile = vi.fn().mockResolvedValue({
+      version: 5,
+      method: 'cardkit' as const,
+    });
+    await expect(
+      reconcileChannelReliabilityOnStartup({
+        reconcileStreamingCard: reconcile,
+      }),
+    ).resolves.toMatchObject({ reconciled: 1 });
+    expect(reconcile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        snapshot: expect.objectContaining({
+          text: '虽然持久化但不能覆盖失败围栏的回答',
+          recovery: expect.objectContaining({ completed: false }),
+        }),
+      }),
+    );
+    expect(reliability.getChannelTurnRun(runtime.runId)?.status).toBe('failed');
+    expect(reliability.getStreamingCardRecord(leftover.id)?.status).toBe(
+      'aborted',
+    );
   });
 
   test('a leftover card with no stored body still aborts and keeps the banner path', async () => {

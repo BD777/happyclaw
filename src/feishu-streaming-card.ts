@@ -131,23 +131,21 @@ function streamingCardRecoveryCompleted(snapshot: unknown): boolean {
   return recovery?.completed === true;
 }
 
-/**
- * Crash recovery rewrite: keep a real body as-is. The interrupt banner is
- * only for cards that have nothing to show.
- */
+/** Crash recovery rewrite: only an explicitly completed recovery looks done. */
 export function resolveInterruptedStreamingCardRewrite(input: {
   snapshot?: unknown;
   reason?: string;
 }): { text: string; status: 'done' | 'warning'; hasBody: boolean } {
   const body = streamingCardSnapshotText(input.snapshot);
-  if (body) {
-    return { text: body, status: 'done', hasBody: true };
-  }
   if (streamingCardRecoveryCompleted(input.snapshot)) {
-    return { text: '', status: 'done', hasBody: false };
+    return { text: body, status: 'done', hasBody: body.length > 0 };
   }
   const reason = input.reason?.trim() || DEFAULT_INTERRUPT_REASON;
-  return { text: `> ⚠️ ${reason}`, status: 'warning', hasBody: false };
+  return {
+    text: body ? `${body}\n\n> ⚠️ ${reason}` : `> ⚠️ ${reason}`,
+    status: 'warning',
+    hasBody: body.length > 0,
+  };
 }
 
 /** Extract the platform error code from both rejected SDK calls and resolved

@@ -14,7 +14,7 @@ import {
   type ChannelTurnRun,
   type StreamingCardRecord,
 } from './channel-reliability-store.js';
-import { getMessagesPage } from './db.js';
+import { getAgent, getMessagesForTurn } from './db.js';
 import { streamingCardSnapshotText } from './feishu-streaming-card.js';
 import { logger } from './logger.js';
 
@@ -42,19 +42,6 @@ function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
   ];
 }
 
-function turnResultText(result: unknown): string {
-  if (typeof result === 'string') return result.trim();
-  if (!result || typeof result !== 'object') return '';
-  const record = result as { text?: unknown; content?: unknown };
-  if (typeof record.text === 'string' && record.text.trim()) {
-    return record.text.trim();
-  }
-  if (typeof record.content === 'string' && record.content.trim()) {
-    return record.content.trim();
-  }
-  return '';
-}
-
 /**
  * Prefer the conversation's stored assistant reply over the leftover card
  * snapshot. The snapshot is only an orphan copy of what the dead process
@@ -64,40 +51,30 @@ export function resolveStreamingCardRecoveryBody(
   card: Pick<StreamingCardRecord, 'sourceJid' | 'createdAt' | 'snapshot'>,
   turn: ChannelTurnRun | undefined,
 ): { body: string; persisted: boolean } {
-  const sessionId = turn?.sessionId?.trim() || '';
   const turnId = turn?.correlationId?.trim() || '';
-  const since = turn?.startedAt || turn?.createdAt || card.createdAt;
+  const agent = turn?.agentId ? getAgent(turn.agentId) : undefined;
   const chatJids = uniqueNonEmpty([
+    agent ? `${agent.chat_jid}#agent:${agent.id}` : undefined,
     card.sourceJid,
     channelConversationJid(card.sourceJid),
   ]);
 
-  for (const chatJid of chatJids) {
-    const recent = getMessagesPage(chatJid, undefined, 40);
-    const matched = recent.find((message) => {
-      if (!message.is_from_me || !message.content.trim()) return false;
-      if (sessionId && message.session_id === sessionId) return true;
-      if (turnId && message.turn_id === turnId) return true;
-      return false;
-    });
-    if (matched) {
-      return { body: matched.content.trim(), persisted: true };
-    }
-  }
-
-  const fromTurn = turnResultText(turn?.result);
-  if (fromTurn) {
-    return { body: fromTurn, persisted: true };
-  }
-
-  if (since) {
+  if (turnId) {
     for (const chatJid of chatJids) {
-      const recent = getMessagesPage(chatJid, undefined, 20);
-      const matched = recent.find(
+      const matched = getMessagesForTurn(chatJid, turnId).find(
         (message) =>
           message.is_from_me &&
+          message.sender === 'happyclaw-agent' &&
           message.content.trim().length > 0 &&
-          message.timestamp >= since,
+          message.turn_id === turnId &&
+          message.finalization_reason === 'completed' &&
+          ![
+            'interrupt_partial',
+            'overflow_partial',
+            'compact_partial',
+            'input_rejection_warning',
+            'provider_fallback_notice',
+          ].includes(message.source_kind ?? ''),
       );
       if (matched) {
         return { body: matched.content.trim(), persisted: true };
@@ -205,8 +182,23 @@ async function reconcileChannelReliabilityPass(
     }
     try {
       const recovered = resolveStreamingCardRecoveryBody(claimed, turn);
-      const recoveredComplete =
-        recovered.persisted || turn?.status === 'completed';
+      let recoveredComplete = recovered.persisted;
+      if (recoveredComplete) {
+        const turnCompleted =
+          completeRecoveredChannelTurnRun(claimed.turnRunId) ||
+          getChannelTurnRun(claimed.turnRunId)?.status === 'completed';
+        if (!turnCompleted) {
+          recoveredComplete = false;
+          logger.error(
+            {
+              cardId: claimed.id,
+              turnRunId: claimed.turnRunId,
+              turnStatus: getChannelTurnRun(claimed.turnRunId)?.status,
+            },
+            'Refused to mark a recovered card completed because its Turn could not be completed',
+          );
+        }
+      }
       const snapshotBase =
         claimed.snapshot && typeof claimed.snapshot === 'object'
           ? (claimed.snapshot as Record<string, unknown>)
@@ -226,9 +218,6 @@ async function reconcileChannelReliabilityPass(
           },
         },
       });
-      if (recoveredComplete) {
-        completeRecoveredChannelTurnRun(claimed.turnRunId);
-      }
       const final = finalizeStreamingCardRecord(claimed.id, claimed.revision, {
         status: recoveredComplete ? 'completed' : 'aborted',
         version: result.version,
@@ -236,9 +225,12 @@ async function reconcileChannelReliabilityPass(
           ...snapshotBase,
           ...(recovered.body ? { text: recovered.body } : {}),
           recovery: {
+            completed: recoveredComplete,
             reason: recoveredComplete
               ? 'persisted_reply'
-              : 'process_interrupted',
+              : recovered.persisted
+                ? 'turn_completion_conflict'
+                : 'process_interrupted',
             method: result.method,
             source: recovered.persisted
               ? 'persisted_assistant'
