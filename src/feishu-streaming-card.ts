@@ -115,6 +115,39 @@ export interface InterruptedStreamingCardInput {
   reason?: string;
 }
 
+const DEFAULT_INTERRUPT_REASON = '上次服务中断，本次任务未完成';
+
+/** Visible body stored on a leftover streaming-card snapshot. */
+export function streamingCardSnapshotText(snapshot: unknown): string {
+  if (!snapshot || typeof snapshot !== 'object') return '';
+  const text = (snapshot as { text?: unknown }).text;
+  return typeof text === 'string' ? text.trim() : '';
+}
+
+function streamingCardRecoveryCompleted(snapshot: unknown): boolean {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  const recovery = (snapshot as { recovery?: { completed?: unknown } })
+    .recovery;
+  return recovery?.completed === true;
+}
+
+/** Crash recovery rewrite: only an explicitly completed recovery looks done. */
+export function resolveInterruptedStreamingCardRewrite(input: {
+  snapshot?: unknown;
+  reason?: string;
+}): { text: string; status: 'done' | 'warning'; hasBody: boolean } {
+  const body = streamingCardSnapshotText(input.snapshot);
+  if (streamingCardRecoveryCompleted(input.snapshot)) {
+    return { text: body, status: 'done', hasBody: body.length > 0 };
+  }
+  const reason = input.reason?.trim() || DEFAULT_INTERRUPT_REASON;
+  return {
+    text: body ? `${body}\n\n> ⚠️ ${reason}` : `> ⚠️ ${reason}`,
+    status: 'warning',
+    hasBody: body.length > 0,
+  };
+}
+
 /** Extract the platform error code from both rejected SDK calls and resolved
  * error envelopes. Lark SDK versions differ in where they expose this field. */
 function feishuErrorCode(value: unknown): number | undefined {
@@ -3776,14 +3809,11 @@ export async function reconcileInterruptedStreamingCard(
   client: lark.Client,
   input: InterruptedStreamingCardInput,
 ): Promise<{ version: number; method: 'cardkit' | 'message_patch' }> {
-  const saved = input.snapshot as
-    | { text?: unknown; thinking?: unknown }
-    | null
-    | undefined;
-  const partial = typeof saved?.text === 'string' ? saved.text.trim() : '';
-  const reason = input.reason?.trim() || '上次服务中断，本次任务未完成';
-  const text = partial ? `${partial}\n\n---\n> ⚠️ ${reason}` : `> ⚠️ ${reason}`;
-  const card = buildAgentReplyCard({ status: 'warning', text });
+  const rewrite = resolveInterruptedStreamingCardRewrite(input);
+  const card = buildAgentReplyCard({
+    status: rewrite.status,
+    text: rewrite.text,
+  });
 
   if (input.cardId) {
     let version = Math.max(0, Math.trunc(input.version));

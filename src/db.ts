@@ -12347,6 +12347,28 @@ export function getMessagesPage(
   return rows.map((row) => normalizeMessageRow(row));
 }
 
+/** Exact persisted rows for one logical input turn, newest first. */
+export function getMessagesForTurn(
+  chatJid: string,
+  turnId: string,
+): Array<NewMessage & { is_from_me: boolean }> {
+  const normalizedTurnId = turnId.trim();
+  if (!normalizedTurnId) return [];
+  const rows = db
+    .prepare(
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
+       FROM messages
+       WHERE chat_jid = ? AND turn_id = ?
+       ORDER BY timestamp DESC, id DESC`,
+    )
+    .all(chatJid, normalizedTurnId) as Array<
+    NewMessage & { is_from_me: number }
+  >;
+  return rows.map((row) => normalizeMessageRow(row));
+}
+
 /**
  * Recent persisted messages that are safe to replay into a fresh model
  * session. Privacy migrations leave the Web transcript untouched and fence
