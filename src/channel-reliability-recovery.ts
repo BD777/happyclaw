@@ -1,5 +1,7 @@
+import { channelConversationJid } from './channel-address.js';
 import {
   claimStreamingCardRecovery,
+  completeRecoveredChannelTurnRun,
   finalizeStreamingCardRecord,
   getChannelTurnRun,
   getStreamingCardRecord,
@@ -9,8 +11,11 @@ import {
   interruptExpiredChannelTurnRuns,
   listAllNonterminalStreamingCards,
   releaseStreamingCardRecovery,
+  type ChannelTurnRun,
   type StreamingCardRecord,
 } from './channel-reliability-store.js';
+import { getMessagesPage } from './db.js';
+import { streamingCardSnapshotText } from './feishu-streaming-card.js';
 import { logger } from './logger.js';
 
 export interface StreamingCardReconciler {
@@ -30,6 +35,78 @@ interface ReconciliationPassOptions {
 const MISSING_PROVIDER_IDENTITY_ERROR = manualReconciliationError(
   'Streaming card creation was interrupted before provider identity was persisted; manual reconciliation required',
 );
+
+function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
+  return [
+    ...new Set(values.map((value) => value?.trim() ?? '').filter(Boolean)),
+  ];
+}
+
+function turnResultText(result: unknown): string {
+  if (typeof result === 'string') return result.trim();
+  if (!result || typeof result !== 'object') return '';
+  const record = result as { text?: unknown; content?: unknown };
+  if (typeof record.text === 'string' && record.text.trim()) {
+    return record.text.trim();
+  }
+  if (typeof record.content === 'string' && record.content.trim()) {
+    return record.content.trim();
+  }
+  return '';
+}
+
+/**
+ * Prefer the conversation's stored assistant reply over the leftover card
+ * snapshot. The snapshot is only an orphan copy of what the dead process
+ * last flushed.
+ */
+export function resolveStreamingCardRecoveryBody(
+  card: Pick<StreamingCardRecord, 'sourceJid' | 'createdAt' | 'snapshot'>,
+  turn: ChannelTurnRun | undefined,
+): { body: string; persisted: boolean } {
+  const sessionId = turn?.sessionId?.trim() || '';
+  const turnId = turn?.correlationId?.trim() || '';
+  const since = turn?.startedAt || turn?.createdAt || card.createdAt;
+  const chatJids = uniqueNonEmpty([
+    card.sourceJid,
+    channelConversationJid(card.sourceJid),
+  ]);
+
+  for (const chatJid of chatJids) {
+    const recent = getMessagesPage(chatJid, undefined, 40);
+    const matched = recent.find((message) => {
+      if (!message.is_from_me || !message.content.trim()) return false;
+      if (sessionId && message.session_id === sessionId) return true;
+      if (turnId && message.turn_id === turnId) return true;
+      return false;
+    });
+    if (matched) {
+      return { body: matched.content.trim(), persisted: true };
+    }
+  }
+
+  const fromTurn = turnResultText(turn?.result);
+  if (fromTurn) {
+    return { body: fromTurn, persisted: true };
+  }
+
+  if (since) {
+    for (const chatJid of chatJids) {
+      const recent = getMessagesPage(chatJid, undefined, 20);
+      const matched = recent.find(
+        (message) =>
+          message.is_from_me &&
+          message.content.trim().length > 0 &&
+          message.timestamp >= since,
+      );
+      if (matched) {
+        return { body: matched.content.trim(), persisted: true };
+      }
+    }
+  }
+
+  return { body: streamingCardSnapshotText(card.snapshot), persisted: false };
+}
 
 async function reconcileChannelReliabilityPass(
   reconciler: StreamingCardReconciler,
@@ -127,25 +204,58 @@ async function reconcileChannelReliabilityPass(
       continue;
     }
     try {
-      const result = await reconciler.reconcileStreamingCard(claimed);
-      const final = finalizeStreamingCardRecord(claimed.id, claimed.revision, {
-        status: 'aborted',
-        version: result.version,
+      const recovered = resolveStreamingCardRecoveryBody(claimed, turn);
+      const recoveredComplete =
+        recovered.persisted || turn?.status === 'completed';
+      const snapshotBase =
+        claimed.snapshot && typeof claimed.snapshot === 'object'
+          ? (claimed.snapshot as Record<string, unknown>)
+          : {};
+      const result = await reconciler.reconcileStreamingCard({
+        ...claimed,
         snapshot: {
-          ...(claimed.snapshot && typeof claimed.snapshot === 'object'
-            ? claimed.snapshot
-            : {}),
+          ...snapshotBase,
+          ...(recovered.body ? { text: recovered.body } : {}),
           recovery: {
-            reason: 'process_interrupted',
-            method: result.method,
+            completed: recoveredComplete,
+            source: recovered.persisted
+              ? 'persisted_assistant'
+              : recovered.body
+                ? 'orphan_snapshot'
+                : 'empty',
           },
         },
-        error: 'Process interrupted before the card reached a terminal state',
+      });
+      if (recoveredComplete) {
+        completeRecoveredChannelTurnRun(claimed.turnRunId);
+      }
+      const final = finalizeStreamingCardRecord(claimed.id, claimed.revision, {
+        status: recoveredComplete ? 'completed' : 'aborted',
+        version: result.version,
+        snapshot: {
+          ...snapshotBase,
+          ...(recovered.body ? { text: recovered.body } : {}),
+          recovery: {
+            reason: recoveredComplete
+              ? 'persisted_reply'
+              : 'process_interrupted',
+            method: result.method,
+            source: recovered.persisted
+              ? 'persisted_assistant'
+              : recovered.body
+                ? 'orphan_snapshot'
+                : 'empty',
+          },
+        },
+        error: recoveredComplete
+          ? null
+          : 'Process interrupted before the card reached a terminal state',
       });
       if (!final) {
         throw new Error('Streaming card recovery fence was lost');
       }
       if (
+        !recoveredComplete &&
         interruptChannelTurnRunById(
           claimed.turnRunId,
           'Process restarted before the streaming card reached a terminal state',
