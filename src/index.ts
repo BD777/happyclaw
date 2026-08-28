@@ -10770,6 +10770,7 @@ function canSendCrossGroupMessage(
     sourceGroupEntry,
     targetGroup,
     (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+    (agentId) => getAgent(agentId)?.group_folder,
   );
 }
 
