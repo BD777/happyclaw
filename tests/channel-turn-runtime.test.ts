@@ -26,10 +26,13 @@ const { deliverChannelOutboxItem, DefinitiveChannelDeliveryError } =
 const runtimeScope = await import('../src/channel-outbox-runtime-scope.js');
 const {
   reconcileChannelReliabilityOnStartup,
+  resolveStreamingCardRecoveryBody,
   startChannelReliabilityRecoveryLoop,
 } = await import('../src/channel-reliability-recovery.js');
-const { reconcileInterruptedStreamingCard } =
-  await import('../src/feishu-streaming-card.js');
+const {
+  reconcileInterruptedStreamingCard,
+  resolveInterruptedStreamingCardRewrite,
+} = await import('../src/feishu-streaming-card.js');
 
 const route = {
   provider: 'feishu',
@@ -993,5 +996,187 @@ describe('provider reconciliation', () => {
       }),
     );
     expect(create).not.toHaveBeenCalled();
+    const updated = JSON.stringify(update.mock.calls[0][0]);
+    expect(updated).toContain('保留的部分回答');
+    expect(updated).not.toContain('上次服务中断');
+  });
+
+  test('writes only the interrupt banner when the leftover card has no body', async () => {
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
+    const client = {
+      cardkit: {
+        v1: { card: { settings: vi.fn(), update: vi.fn(), create: vi.fn() } },
+      },
+      im: { v1: { message: { patch, create: vi.fn() } } },
+    } as any;
+
+    await expect(
+      reconcileInterruptedStreamingCard(client, {
+        messageId: 'om_empty',
+        cardId: null,
+        version: 1,
+        snapshot: { text: '' },
+      }),
+    ).resolves.toEqual({ version: 1, method: 'message_patch' });
+    expect(JSON.stringify(patch.mock.calls[0][0])).toContain('上次服务中断');
+  });
+
+  test('prefers a stored assistant reply over the orphan snapshot and skips the banner', () => {
+    expect(
+      resolveInterruptedStreamingCardRewrite({
+        snapshot: { text: '卡片上的半截' },
+        reason: '上次服务中断，本次任务未完成',
+      }),
+    ).toEqual({
+      text: '卡片上的半截',
+      status: 'done',
+      hasBody: true,
+    });
+    expect(
+      resolveInterruptedStreamingCardRewrite({
+        snapshot: { text: '', recovery: { completed: true } },
+      }),
+    ).toEqual({ text: '', status: 'done', hasBody: false });
+    expect(
+      resolveInterruptedStreamingCardRewrite({ snapshot: { text: '  ' } }),
+    ).toMatchObject({ status: 'warning', hasBody: false });
+  });
+});
+
+describe('persisted assistant recovery', () => {
+  test('startup rewrites a leftover card with the stored reply and does not abort', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-28T08:00:00.000Z'));
+    const input = {
+      ...route,
+      sourceJid:
+        'feishu:chat-persisted#account:bot-runtime#root:root-persisted#thread:thread-persisted',
+      chatId: 'chat-persisted',
+      rootId: 'root-persisted',
+      threadId: 'thread-persisted',
+      externalMessageId: 'msg-persisted-reply',
+      agentId: 'agent-persisted-reply',
+      sessionId: 'sess-persisted-reply',
+      leaseMs: 5_000,
+      heartbeatMs: 2_000,
+    };
+    const first = ChannelTurnRuntime.start(input);
+    first.reserveStreamingCard()!.onEvent({
+      status: 'streaming',
+      messageId: 'om_persisted_reply',
+      cardId: 'card_persisted_reply',
+      version: 4,
+      snapshot: { text: '卡片上还停着半截' },
+    });
+    const leftover = reliability
+      .listAllNonterminalStreamingCards()
+      .find((card) => card.turnRunId === first.runId)!;
+    db.ensureChatExists(input.sourceJid);
+    db.storeMessageDirect(
+      'assistant-persisted-reply',
+      input.sourceJid,
+      'happyclaw-agent',
+      'HappyClaw',
+      '已经写进会话的完整回复',
+      new Date().toISOString(),
+      true,
+      {
+        meta: {
+          turnId: input.externalMessageId,
+          sessionId: input.sessionId,
+          sourceKind: 'sdk_final',
+          finalizationReason: 'completed',
+        },
+      },
+    );
+    expect(
+      resolveStreamingCardRecoveryBody(
+        leftover,
+        reliability.getChannelTurnRun(first.runId),
+      ),
+    ).toEqual({
+      body: '已经写进会话的完整回复',
+      persisted: true,
+    });
+    first.dispose();
+    vi.setSystemTime(new Date('2026-08-28T08:00:06.000Z'));
+
+    const reconcile = vi.fn().mockResolvedValue({
+      version: 6,
+      method: 'cardkit' as const,
+    });
+    await expect(
+      reconcileChannelReliabilityOnStartup({
+        reconcileStreamingCard: reconcile,
+      }),
+    ).resolves.toMatchObject({ reconciled: 1 });
+    expect(reconcile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: 'om_persisted_reply',
+        snapshot: expect.objectContaining({
+          text: '已经写进会话的完整回复',
+          recovery: expect.objectContaining({
+            completed: true,
+            source: 'persisted_assistant',
+          }),
+        }),
+      }),
+    );
+    expect(reliability.getChannelTurnRun(first.runId)?.status).toBe(
+      'completed',
+    );
+    expect(reliability.getStreamingCardRecord(leftover.id)?.status).toBe(
+      'completed',
+    );
+    vi.useRealTimers();
+  });
+
+  test('a leftover card with no stored body still aborts and keeps the banner path', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-28T08:10:00.000Z'));
+    const input = {
+      ...route,
+      sourceJid:
+        'feishu:chat-empty-recover#account:bot-runtime#root:root-empty#thread:thread-empty',
+      chatId: 'chat-empty-recover',
+      rootId: 'root-empty',
+      threadId: 'thread-empty',
+      externalMessageId: 'msg-empty-recover',
+      agentId: 'agent-empty-recover',
+      leaseMs: 5_000,
+      heartbeatMs: 2_000,
+    };
+    const first = ChannelTurnRuntime.start(input);
+    first.reserveStreamingCard()!.onEvent({
+      status: 'streaming',
+      messageId: 'om_empty_recover',
+      cardId: 'card_empty_recover',
+      version: 1,
+      snapshot: { text: '' },
+    });
+    first.dispose();
+    vi.setSystemTime(new Date('2026-08-28T08:10:06.000Z'));
+
+    const reconcile = vi.fn().mockResolvedValue({
+      version: 2,
+      method: 'cardkit' as const,
+    });
+    await reconcileChannelReliabilityOnStartup({
+      reconcileStreamingCard: reconcile,
+    });
+    expect(reconcile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        snapshot: expect.objectContaining({
+          recovery: expect.objectContaining({
+            completed: false,
+            source: 'empty',
+          }),
+        }),
+      }),
+    );
+    expect(reliability.getChannelTurnRun(first.runId)?.status).toBe(
+      'interrupted',
+    );
+    vi.useRealTimers();
   });
 });

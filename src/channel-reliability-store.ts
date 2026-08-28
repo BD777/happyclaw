@@ -1514,6 +1514,30 @@ export function interruptExpiredChannelTurnRuns(
 }
 
 /**
+ * Close a Turn whose reply was already persisted before the process died.
+ * Lease-free on purpose: crash recovery runs after the old owner is gone.
+ * Terminal rows stay immutable.
+ */
+export function completeRecoveredChannelTurnRun(
+  id: string,
+  nowInput?: Date | string,
+): boolean {
+  const now = isoNow(nowInput);
+  const changed = requireDatabase()
+    .prepare(
+      `UPDATE turn_runs
+       SET status = 'completed', completed_at = COALESCE(completed_at, ?),
+           updated_at = ?, error = NULL,
+           lease_owner = NULL, lease_expires_at = NULL,
+           lease_token = lease_token + 1, revision = revision + 1
+       WHERE id = ?
+         AND status IN ('queued','running','finalizing','waiting_user','retry_wait')`,
+    )
+    .run(now, now, id);
+  return changed.changes === 1;
+}
+
+/**
  * Explicitly fence one live conversation Turn (stop button, shutdown, or
  * unrecoverable card/run reconciliation). Terminal rows are immutable, so
  * repeating the same interrupt is a no-op.
