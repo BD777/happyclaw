@@ -29,6 +29,10 @@ import {
 } from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
+  DEFAULT_IPC_WATCHER_FALLBACK_MS,
+  IpcWatcherManager,
+} from './ipc-watcher-manager.js';
+import {
   deliverTextAndLocalImages,
   prepareLocalImages,
   type PreparedLocalImage,
@@ -70,7 +74,10 @@ import {
   stripRedundantCompletionPreamble,
 } from './reply-finalization.js';
 export { buildInterruptedReply } from './reply-finalization.js';
-import { resolveTurnOutcome } from './turn-outcome.js';
+import {
+  hasUnfinishedProactiveOutput,
+  resolveTurnOutcome,
+} from './turn-outcome.js';
 import { finalizeChannelCardAfterDelivery } from './channel-card-finalization.js';
 import { persistUncertainStreamingDelivery } from './channel-streaming-uncertainty.js';
 import { resolveContainerOutputInputTurnId } from './channel-output-correlation.js';
@@ -81,7 +88,10 @@ import {
   type ProcessingIndicatorOwner,
 } from './processing-indicator-batch.js';
 import { resolveFollowUpMode } from './follow-up-policy.js';
-import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
+import {
+  discardStartupTypedIpcDeliveries,
+  isIpcInputPayloadFilename,
+} from './ipc-delivery-recovery.js';
 import {
   DeferredOutOfBandCursorLedger,
   hasEarlierCursorMessage,
@@ -137,6 +147,7 @@ import {
   getUserById,
   getMessagesSince,
   getNewMessages,
+  resolveMessageCursorSequence,
   getRouterState,
   getSessionChannelOwner,
   getRouterStateByPrefix,
@@ -891,7 +902,7 @@ export function feedStreamEventToCard(
   }
 }
 
-let globalMessageCursor: MessageCursor = { timestamp: '', id: '' };
+let globalMessageCursor: MessageCursor = { timestamp: '', id: '', sequence: 0 };
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, MessageCursor> = {};
@@ -903,8 +914,9 @@ const startupRecoveredDeliveryJids = new Set<string>();
 
 /** Set both cursors directly (no max-merge) and persist. */
 function setCursors(jid: string, cursor: MessageCursor): void {
-  lastAgentTimestamp[jid] = cursor;
-  lastCommittedCursor[jid] = cursor;
+  const resolved = resolveMessageCursorSequence(cursor, jid);
+  lastAgentTimestamp[jid] = resolved;
+  lastCommittedCursor[jid] = resolved;
   saveState();
 }
 
@@ -919,16 +931,14 @@ function setCursors(jid: string, cursor: MessageCursor): void {
  * reply commit and the agent finishing processing of the earlier
  * messages would lose them (#18 P2-bug-2).
  *
- * Comparison uses lexicographic (timestamp, id) via `isCursorAfter` —
- * `getMessagesSince` sorts by `(timestamp, id)` so two messages with the
- * same timestamp must be ordered by id. Comparing on timestamp alone
- * could regress the cursor to an earlier id when the later id has
- * already been processed (#20 P2-3, #24 round-16 P2-2).
+ * Comparison uses the host-assigned ingest sequence. Legacy cursors retain
+ * the old `(timestamp,id)` fallback only until load/first use upgrades them.
  */
 function advanceNextPullCursorOnly(
   jid: string,
   candidate: MessageCursor,
 ): void {
+  candidate = resolveMessageCursorSequence(candidate, jid);
   const current = lastAgentTimestamp[jid];
   const target =
     current && isCursorAfter(current, candidate) ? current : candidate;
@@ -939,14 +949,14 @@ function advanceNextPullCursorOnly(
 /**
  * Advance cursors to `candidate`, never regressing behind existing position.
  *
- * Comparison uses lexicographic (timestamp, id) via `isCursorAfter` so
- * mixed batches with same-timestamp ids cannot regress the cursor (#24
- * round-16 P2-2). Pre-fix, only timestamps were compared, so a `/cmd`
+ * Comparison uses the host-assigned ingest sequence so provider clocks and
+ * random IDs cannot regress the cursor. Pre-fix, only timestamps were compared, so a `/cmd`
  * reply that ran `setCursors` to (T,m2) followed by the agent processing
  * a plain m1 with the same timestamp T would call `advanceCursors(T,m1)`
  * → cursor regressed to m1 → next poll re-read m2 and reply re-fired.
  */
 function advanceCursors(jid: string, candidate: MessageCursor): void {
+  candidate = resolveMessageCursorSequence(candidate, jid);
   const currentPull = lastAgentTimestamp[jid];
   lastAgentTimestamp[jid] =
     currentPull && isCursorAfter(currentPull, candidate)
@@ -987,6 +997,9 @@ function bindRunnerActiveIpcCoverage(
     .flatMap((receipt) => receipt.coveredCursors ?? [receipt.cursor])
     .map((cursor) => ({ ...cursor }))
     .sort((a, b) => {
+      if (a.sequence !== undefined && b.sequence !== undefined) {
+        return a.sequence - b.sequence;
+      }
       if (a.timestamp !== b.timestamp)
         return a.timestamp < b.timestamp ? -1 : 1;
       if (a.id === b.id) return 0;
@@ -1006,7 +1019,10 @@ function hasEarlierPendingMessage(
   candidate: MessageCursor,
 ): boolean {
   const sinceCursor = lastCommittedCursor[jid] || EMPTY_CURSOR;
-  return hasEarlierCursorMessage(getMessagesSince(jid, sinceCursor), candidate);
+  return hasEarlierCursorMessage(
+    getMessagesSince(jid, sinceCursor),
+    resolveMessageCursorSequence(candidate, jid),
+  );
 }
 
 function createIpcDeliveryTarget(
@@ -1014,6 +1030,7 @@ function createIpcDeliveryTarget(
   messages: Array<{
     timestamp: string;
     id: string;
+    ingest_sequence?: number;
     source_jid?: string;
     chat_jid?: string;
   }>,
@@ -1021,20 +1038,29 @@ function createIpcDeliveryTarget(
   if (messages.length === 0) return undefined;
   const unique = new Map<
     string,
-    { timestamp: string; id: string; sourceJid?: string }
+    { timestamp: string; id: string; sequence?: number; sourceJid?: string }
   >();
   for (const message of messages) {
     const candidateSourceJid = message.source_jid ?? message.chat_jid;
     const cursor = {
       timestamp: message.timestamp,
       id: message.id,
+      sequence: message.ingest_sequence,
       ...(candidateSourceJid && getChannelType(candidateSourceJid)
         ? { sourceJid: candidateSourceJid }
         : {}),
     };
-    unique.set(`${cursor.timestamp}\u0000${cursor.id}`, cursor);
+    unique.set(
+      cursor.sequence !== undefined
+        ? `sequence:${cursor.sequence}`
+        : `${cursor.timestamp}\u0000${cursor.id}`,
+      cursor,
+    );
   }
   const coveredCursors = [...unique.values()].sort((a, b) => {
+    if (a.sequence !== undefined && b.sequence !== undefined) {
+      return a.sequence - b.sequence;
+    }
     if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
     if (a.id === b.id) return 0;
     return a.id < b.id ? -1 : 1;
@@ -1054,14 +1080,18 @@ function hasUncoveredPendingMessage(receipt: IpcDeliveryReceipt): boolean {
       : [receipt.cursor];
   return hasUncoveredCursorMessageThrough(
     getMessagesSince(receipt.chatJid, sinceCursor),
-    receipt.cursor,
-    covered,
+    resolveMessageCursorSequence(receipt.cursor, receipt.chatJid),
+    covered.map((cursor) => ({
+      ...cursor,
+      sequence: resolveMessageCursorSequence(cursor, receipt.chatJid).sequence,
+    })),
   );
 }
 
 /** Complete an out-of-band reply/drop without crossing earlier work that an
  * active runner accepted but has not receipted yet. */
 function completeOutOfBandMessage(jid: string, candidate: MessageCursor): void {
+  candidate = resolveMessageCursorSequence(candidate, jid);
   if (hasEarlierPendingMessage(jid, candidate)) {
     advanceNextPullCursorOnly(jid, candidate);
     deferredOutOfBandCursors.defer(jid, candidate);
@@ -1074,17 +1104,21 @@ function completeOutOfBandMessage(jid: string, candidate: MessageCursor): void {
 
 function completeOutOfBandMessages(
   jid: string,
-  messages: Array<{ timestamp: string; id: string }>,
+  messages: Array<{ timestamp: string; id: string; ingest_sequence?: number }>,
 ): void {
-  const ordered = [...messages].sort((a, b) =>
-    a.timestamp === b.timestamp
+  const ordered = [...messages].sort((a, b) => {
+    if (a.ingest_sequence !== undefined && b.ingest_sequence !== undefined) {
+      return a.ingest_sequence - b.ingest_sequence;
+    }
+    return a.timestamp === b.timestamp
       ? a.id.localeCompare(b.id)
-      : a.timestamp.localeCompare(b.timestamp),
-  );
+      : a.timestamp.localeCompare(b.timestamp);
+  });
   for (const message of ordered) {
     completeOutOfBandMessage(jid, {
       timestamp: message.timestamp,
       id: message.id,
+      sequence: message.ingest_sequence,
     });
   }
 }
@@ -1119,7 +1153,7 @@ function clearPersistedIpcDeliveriesForChats(chatJids: Set<string>): number {
         visit(filepath);
         continue;
       }
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      if (!entry.isFile() || !isIpcInputPayloadFilename(entry.name)) continue;
       try {
         const payload = JSON.parse(fs.readFileSync(filepath, 'utf8')) as {
           receipt?: { chatJid?: unknown };
@@ -1144,158 +1178,12 @@ let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let shuttingDown = false;
 
-// ── IPC Watcher Manager (event-driven fs.watch + fallback polling) ──
-
-class IpcWatcherManager {
-  private watchers = new Map<
-    string,
-    { watchers: fs.FSWatcher[]; refCount: number }
-  >();
-  private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private processingFolders = new Set<string>();
-  private pendingReprocess = new Set<string>();
-  private fallbackTimer: ReturnType<typeof setInterval> | null = null;
-  private processGroupFn: ((folder: string) => Promise<void>) | null = null;
-  private processFullFn: (() => Promise<void>) | null = null;
-
-  /** Bind the per-group and full-scan processing functions (set once from startIpcWatcher). */
-  bind(
-    processGroup: (folder: string) => Promise<void>,
-    processFull: () => Promise<void>,
-  ): void {
-    this.processGroupFn = processGroup;
-    this.processFullFn = processFull;
-  }
-
-  /** Start watching a group's IPC directories. Called when a container/process starts. */
-  watchGroup(folder: string): void {
-    const existing = this.watchers.get(folder);
-    if (existing) {
-      existing.refCount++;
-      return;
-    }
-
-    const groupIpcRoot = path.join(DATA_DIR, 'ipc', folder);
-    const dirsToWatch = [
-      path.join(groupIpcRoot, 'messages'),
-      path.join(groupIpcRoot, 'tasks'),
-    ];
-
-    const folderWatchers: fs.FSWatcher[] = [];
-    for (const dir of dirsToWatch) {
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-        // Listen to all event types — 'rename' covers atomic writes on Linux,
-        // but Docker bind mounts (macOS virtiofs) may emit 'change' instead.
-        const w = fs.watch(dir, () => {
-          this.debouncedProcess(folder);
-        });
-        w.on('error', () => {
-          // Watcher error — fallback polling will handle it
-        });
-        folderWatchers.push(w);
-      } catch {
-        // Watch failed — fallback polling will handle it
-      }
-    }
-    this.watchers.set(folder, { watchers: folderWatchers, refCount: 1 });
-  }
-
-  /** Stop watching a group's IPC directories. Called when a container/process stops. */
-  unwatchGroup(folder: string): void {
-    const entry = this.watchers.get(folder);
-    if (!entry) return;
-    entry.refCount--;
-    if (entry.refCount > 0) return;
-
-    for (const w of entry.watchers) {
-      try {
-        w.close();
-      } catch {}
-    }
-    this.watchers.delete(folder);
-    const timer = this.debounceTimers.get(folder);
-    if (timer) {
-      clearTimeout(timer);
-      this.debounceTimers.delete(folder);
-    }
-  }
-
-  private debouncedProcess(folder: string): void {
-    const existing = this.debounceTimers.get(folder);
-    if (existing) clearTimeout(existing);
-    this.debounceTimers.set(
-      folder,
-      setTimeout(() => {
-        this.debounceTimers.delete(folder);
-        // Skip if a previous processGroupIpc call for this folder is still running;
-        // the pending flag ensures we re-process after the current run finishes.
-        if (this.processingFolders.has(folder)) {
-          this.pendingReprocess.add(folder);
-          return;
-        }
-        this.processingFolders.add(folder);
-        this.processGroupFn?.(folder)
-          .catch((err) => {
-            logger.error({ err, folder }, 'Error processing IPC for group');
-          })
-          .finally(() => {
-            this.processingFolders.delete(folder);
-            // Files may have arrived during processing — run once more
-            if (
-              this.pendingReprocess.delete(folder) &&
-              this.watchers.has(folder)
-            ) {
-              this.debouncedProcess(folder);
-            }
-          });
-      }, 100),
-    );
-  }
-
-  /** Trigger processing for a folder through the concurrency guard. */
-  triggerProcess(folder: string): void {
-    this.debouncedProcess(folder);
-  }
-
-  /** Start fallback polling (every 5s) as safety net for inotify failures. */
-  startFallback(): void {
-    this.fallbackTimer = setInterval(() => {
-      if (shuttingDown) return;
-      this.processFullFn?.().catch((err) => {
-        logger.error({ err }, 'Error in IPC fallback scan');
-      });
-    }, 5000);
-    this.fallbackTimer.unref(); // Don't prevent process from naturally exiting
-  }
-
-  /** Close all watchers and timers. */
-  closeAll(): void {
-    for (const [, entry] of this.watchers) {
-      for (const w of entry.watchers) {
-        try {
-          w.close();
-        } catch {}
-      }
-    }
-    this.watchers.clear();
-    for (const [, timer] of this.debounceTimers) {
-      clearTimeout(timer);
-    }
-    this.debounceTimers.clear();
-    if (this.fallbackTimer) {
-      clearInterval(this.fallbackTimer);
-      this.fallbackTimer = null;
-    }
-  }
-}
-
 let ipcWatcherManager: IpcWatcherManager | null = null;
 /** JIDs already persisted by the shutdown handler — prevents finally blocks from duplicating. */
 const shutdownSavedJids = new Set<string>();
 
 const queue = new GroupQueue();
-const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
+const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '', sequence: 0 };
 const terminalWarmupInFlight = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 3 * 60 * 1000;
@@ -1573,6 +1461,7 @@ async function completeFollowUpReply(
   completeOutOfBandMessage(item.chat_jid, {
     timestamp: item.timestamp,
     id: item.id,
+    sequence: item.ingest_sequence,
   });
   broadcastFollowUpUpdate(item.chat_jid, {
     id: item.id,
@@ -3717,6 +3606,9 @@ async function settleAndRecordTaskIpcDeliveries(
 }
 
 function isCursorAfter(candidate: MessageCursor, base: MessageCursor): boolean {
+  if (candidate.sequence !== undefined && base.sequence !== undefined) {
+    return candidate.sequence > base.sequence;
+  }
   if (candidate.timestamp > base.timestamp) return true;
   if (candidate.timestamp < base.timestamp) return false;
   return candidate.id > base.id;
@@ -3732,9 +3624,15 @@ function normalizeCursor(value: unknown): MessageCursor {
     typeof (value as { timestamp?: unknown }).timestamp === 'string'
   ) {
     const maybeId = (value as { id?: unknown }).id;
+    const maybeSequence = (value as { sequence?: unknown }).sequence;
     return {
       timestamp: (value as { timestamp: string }).timestamp,
       id: typeof maybeId === 'string' ? maybeId : '',
+      ...(typeof maybeSequence === 'number' &&
+      Number.isSafeInteger(maybeSequence) &&
+      maybeSequence >= 0
+        ? { sequence: maybeSequence }
+        : {}),
     };
   }
   return { ...EMPTY_CURSOR };
@@ -5394,17 +5292,21 @@ function loadState(): void {
   // Load from SQLite
   const persistedTimestamp = getRouterState('last_timestamp') || '';
   const lastTimestampId = getRouterState('last_timestamp_id') || '';
-  globalMessageCursor = {
+  const persistedSequence = Number(getRouterState('last_ingest_sequence'));
+  globalMessageCursor = resolveMessageCursorSequence({
     timestamp: persistedTimestamp,
     id: lastTimestampId,
-  };
+    ...(Number.isSafeInteger(persistedSequence) && persistedSequence >= 0
+      ? { sequence: persistedSequence }
+      : {}),
+  });
   const loadCursorMap = (key: string): Record<string, MessageCursor> => {
     const raw = getRouterState(key);
     try {
       const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
       const normalized: Record<string, MessageCursor> = {};
       for (const [jid, v] of Object.entries(parsed)) {
-        normalized[jid] = normalizeCursor(v);
+        normalized[jid] = resolveMessageCursorSequence(normalizeCursor(v), jid);
       }
       return normalized;
     } catch {
@@ -5569,6 +5471,7 @@ function saveState(): void {
   const entries: Array<[string, string]> = [
     ['last_timestamp', globalMessageCursor.timestamp],
     ['last_timestamp_id', globalMessageCursor.id],
+    ['last_ingest_sequence', String(globalMessageCursor.sequence ?? 0)],
     ['last_agent_timestamp', JSON.stringify(lastAgentTimestamp)],
     ['last_committed_cursor', JSON.stringify(lastCommittedCursor)],
   ];
@@ -6158,6 +6061,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       completeOutOfBandMessage(chatJid, {
         timestamp: message.timestamp,
         id: message.id,
+        sequence: message.ingest_sequence,
       });
     }
     const terminalIds = new Set(
@@ -6317,6 +6221,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         advanceReplyCursor(chatJid, {
           timestamp: r.originalMsg.timestamp,
           id: r.originalMsg.id,
+          sequence: r.originalMsg.ingest_sequence,
         });
       }
       if (!pluginRepliesAcknowledged) return false;
@@ -6607,6 +6512,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const channelPhysicalDeliveryAckByInput = new Map<string, boolean>([
     [lastProcessed.id, false],
   ]);
+  const channelNonTerminalDeliveryAckByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
   // Cold-start MCP output uses the triggering DB message id. Warm IPC turns
   // replace this with the receipt delivery id through activeRouteUpdaters.
   const ipcReplyTurnTracker: IpcReplyTurnTracker = {
@@ -6663,6 +6571,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let currentInputCursor: MessageCursor = {
     timestamp: lastProcessed.timestamp,
     id: lastProcessed.id,
+    sequence: lastProcessed.ingest_sequence,
   };
 
   // ── Feishu Streaming Card ──
@@ -6693,6 +6602,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (channelTurnRuntime) {
     channelTurnRuntimes.set(lastProcessed.id, channelTurnRuntime);
   }
+  const markMainOutputSettled = (result: ContainerOutput): void => {
+    const completedInputTurnIds = result.ipcReceipts?.length
+      ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [result.inputTurnId ?? lastProcessed.id];
+    const completedInputs = result.ipcReceipts?.length
+      ? result.ipcReceipts.flatMap((receipt) =>
+          (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
+            chatJid: receipt.chatJid,
+            messageId: cursor.id,
+          })),
+        )
+      : [{ chatJid, messageId: lastProcessed.id }];
+    activeAgentBuilderTurns.clearCompleted(
+      effectiveGroup.folder,
+      completedInputs,
+    );
+    for (const inputTurnId of completedInputTurnIds) {
+      healthyCompletedInputTurns.add(inputTurnId);
+    }
+  };
   const completeChannelRuntimesForOutput = async (
     result: ContainerOutput,
   ): Promise<boolean> => {
@@ -6702,9 +6631,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
       : [result.inputTurnId ?? lastProcessed.id];
     for (const inputId of inputIds) {
-      healthyCompletedInputTurns.add(inputId);
       const runtime = channelTurnRuntimes.get(inputId);
+      const unfinishedProactiveOutput = hasUnfinishedProactiveOutput({
+        interactionMode,
+        nonTerminalDelivered:
+          channelNonTerminalDeliveryAckByInput.get(inputId) === true,
+        finalDelivered: channelPhysicalDeliveryAckByInput.get(inputId) === true,
+      });
       if (!runtime) {
+        if (unfinishedProactiveOutput) {
+          allCompleted = false;
+          logger.error(
+            { chatJid, inputTurnId: inputId },
+            'Refusing to settle Proactive input after progress/separate output without final',
+          );
+          continue;
+        }
         await clearProcessingIndicatorForInput(inputId);
         continue;
       }
@@ -6768,6 +6710,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         }
         continue;
       }
+      if (unfinishedProactiveOutput) {
+        allCompleted = false;
+        logger.error(
+          { chatJid, inputTurnId: inputId, runId: runtime.runId },
+          'Refusing to complete Proactive channel input without final delivery ACK',
+        );
+        continue;
+      }
       const utteranceDelivered =
         channelPhysicalDeliveryAckByInput.get(inputId) === true;
       if (publishesFrameworkAnswer(interactionMode) && !utteranceDelivered) {
@@ -6808,6 +6758,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         );
       }
     }
+    if (allCompleted) markMainOutputSettled(result);
     return allCompleted;
   };
   const channelScopeForOutput = (
@@ -6860,6 +6811,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       advanceCursors(chatJid, {
         timestamp: lastProcessed.timestamp,
         id: lastProcessed.id,
+        sequence: lastProcessed.ingest_sequence,
       });
       return true;
     }
@@ -6871,6 +6823,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       advanceCursors(chatJid, {
         timestamp: lastProcessed.timestamp,
         id: lastProcessed.id,
+        sequence: lastProcessed.ingest_sequence,
       });
       return true;
     }
@@ -7126,6 +7079,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         channelPhysicalDeliveryAckByInput.set(inputTurnId, true);
         sentReplyByInput.set(inputTurnId, true);
         acknowledgeIpcReplyTurn(ipcReplyTurnTracker, inputTurnId);
+      },
+      onNonTerminalDelivered: () => {
+        if (interactionMode !== 'proactive') return;
+        channelNonTerminalDeliveryAckByInput.set(inputTurnId, true);
       },
     });
     turnOutputCoordinators.set(inputTurnId, coordinator);
@@ -7412,6 +7369,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (inputTurnId) sentReplyByInput.set(inputTurnId, false);
       if (inputTurnId) {
         channelPhysicalDeliveryAckByInput.set(inputTurnId, false);
+        channelNonTerminalDeliveryAckByInput.set(inputTurnId, false);
       }
       // Do not rotate the visible provider projection merely because B was
       // published while A is still emitting. The first B-correlated runner
@@ -7610,6 +7568,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     advanceCursors(chatJid, {
       timestamp: lastProcessed.timestamp,
       id: lastProcessed.id,
+      sequence: lastProcessed.ingest_sequence,
     });
     flushAcknowledgedIpcForJid(chatJid);
     cursorCommittedInputTurns.add(inputTurnId);
@@ -7771,28 +7730,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           if (!suppressSupersededOutput) {
             await activateMainProjectionForInput(result.inputTurnId);
           }
-          if (result.inputTurnCompleted) {
-            const completedInputTurnIds = result.ipcReceipts?.length
-              ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
-              : [result.inputTurnId ?? lastProcessed.id];
-            for (const inputTurnId of completedInputTurnIds) {
-              healthyCompletedInputTurns.add(inputTurnId);
-            }
-            const completedInputs = result.ipcReceipts?.length
-              ? result.ipcReceipts.flatMap((receipt) =>
-                  (receipt.coveredCursors ?? [receipt.cursor]).map(
-                    (cursor) => ({
-                      chatJid: receipt.chatJid,
-                      messageId: cursor.id,
-                    }),
-                  ),
-                )
-              : [{ chatJid, messageId: lastProcessed.id }];
-            activeAgentBuilderTurns.clearCompleted(
-              effectiveGroup.folder,
-              completedInputs,
-            );
-          }
           if (result.newSessionId && result.status !== 'error') {
             activeSessionId = result.newSessionId;
           }
@@ -7801,6 +7738,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // physical input even though its assistant projection is hidden.
             // Commit it just like an interrupted terminal so later IPC receipt
             // commits are not fenced behind a permanently pending cold root.
+            if (result.inputTurnCompleted) markMainOutputSettled(result);
             commitCursor(
               resolveContainerOutputInputTurnId(result, lastProcessed.id),
             );
@@ -8471,11 +8409,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               })
             ) {
               if (result.inputTurnCompleted) {
-                if (await completeChannelRuntimesForOutput(result)) {
-                  commitCursor(
-                    resolveContainerOutputInputTurnId(result, lastProcessed.id),
+                if (!(await completeChannelRuntimesForOutput(result))) {
+                  throw new Error(
+                    'host_turn_settlement_failed: Proactive output did not reach a durable terminal state',
                   );
                 }
+                commitCursor(
+                  resolveContainerOutputInputTurnId(result, lastProcessed.id),
+                );
                 finalizeProactiveOutputCoordinators(result);
                 broadcastStreamEvent(chatJid, {
                   eventType: 'status',
@@ -8526,10 +8467,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             });
             if (!projectionDecision.project) {
               result.result = null;
-              if (
-                result.inputTurnCompleted &&
-                (await completeChannelRuntimesForOutput(result))
-              ) {
+              if (result.inputTurnCompleted) {
+                if (!(await completeChannelRuntimesForOutput(result))) {
+                  throw new Error(
+                    'host_turn_settlement_failed: lifecycle-only output did not reach a durable terminal state',
+                  );
+                }
                 commitCursor(resultInputTurnId);
               }
               logger.info(
@@ -9257,18 +9200,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   channelPhysicalDeliveryAckByInput.set(inputId, true);
                 }
               }
-              if (
-                result.inputTurnCompleted &&
-                (replyDeliveryAcknowledged ||
+              if (result.inputTurnCompleted) {
+                if (!(await completeChannelRuntimesForOutput(result))) {
+                  throw new Error(
+                    'host_turn_settlement_failed: primary output did not reach a durable terminal state',
+                  );
+                }
+                if (
+                  replyDeliveryAcknowledged ||
                   Boolean(
                     outputChannelScope.scope &&
                     getFailedChannelOutboxForTurn(
                       outputChannelScope.scope.turnRunId,
                     ),
-                  )) &&
-                (await completeChannelRuntimesForOutput(result))
-              ) {
-                commitCursor(outputChannelScope.inputId);
+                  )
+                ) {
+                  commitCursor(outputChannelScope.inputId);
+                }
               }
             }
             // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -9282,6 +9230,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         } catch (err) {
           logger.error({ group: group.name, err }, 'onOutput callback failed');
           hadError = true;
+          throw err;
         }
       },
       imagesForAgent,
@@ -10316,16 +10265,6 @@ async function runAgent(
       resolveSteeringInterrupt(chatJid, outputTurnId);
     }
     if (
-      output.ipcReceipts?.length &&
-      (!output.providerFailure || output.providerFailureTerminal === true)
-    ) {
-      queue.acknowledgeIpcDeliveries(
-        chatJid,
-        output.ipcReceipts,
-        commitIpcDeliveryReceipts,
-      );
-    }
-    if (
       output.queryIdle === true ||
       (isInterruptStatus && output.queryIdle !== false)
     ) {
@@ -10349,6 +10288,20 @@ async function runAgent(
       });
     }
     await onOutput?.(output);
+    // A runner receipt proves model consumption, not successful Host
+    // persistence/projection. Commit it only after the Host callback resolves;
+    // callback failure leaves the receipt pending for exact-input recovery.
+    if (
+      output.inputTurnCompleted === true &&
+      output.ipcReceipts?.length &&
+      (!output.providerFailure || output.providerFailureTerminal === true)
+    ) {
+      queue.acknowledgeIpcDeliveries(
+        chatJid,
+        output.ipcReceipts,
+        commitIpcDeliveryReceipts,
+      );
+    }
     if (
       closeRunnerAfterRotatingProviderTurn(
         rotateProviderAfterTurn,
@@ -10368,7 +10321,7 @@ async function runAgent(
     }
   };
 
-  ipcWatcherManager?.watchGroup(group.folder);
+  ipcWatcherManager?.watchRuntime(group.folder);
   try {
     const executionMode = group.executionMode || 'container';
     const feishuCliAccountId =
@@ -10532,7 +10485,7 @@ async function runAgent(
     logger.error({ group: group.name, err }, 'Agent error');
     return { status: 'error', error: errorMsg };
   } finally {
-    ipcWatcherManager?.unwatchGroup(group.folder);
+    ipcWatcherManager?.unwatchRuntime(group.folder);
   }
 }
 
@@ -11178,6 +11131,22 @@ function startIpcWatcher(): void {
                 // DB/IM side effect. SDK Result will finalize the same primary
                 // answer; a failed staging attempt must not fall through into
                 // the legacy separate-message path.
+              } else if (hostOutputRoute.path === 'rejected') {
+                messageDeliveryRejected = true;
+                messageDeliveryError =
+                  hostOutputRoute.reason === 'conflicting_final'
+                    ? 'A different final has already sealed this input turn; the second final was not sent.'
+                    : 'Unauthorized message target.';
+                logger.warn(
+                  {
+                    sourceGroup,
+                    agentId: ipcAgentId,
+                    inputTurnId: data.inputTurnId,
+                    deliveryRole: hostOutputRoute.deliveryRole,
+                    reason: hostOutputRoute.reason,
+                  },
+                  'Rejected IPC send_message before provider delivery',
+                );
               } else if (
                 isRetryDuplicateIpcSend(sourceGroup, data.chatJid, data.text)
               ) {
@@ -11709,6 +11678,7 @@ function startIpcWatcher(): void {
                 messageDelivered &&
                 !messageStaged &&
                 isMainUserTurnReply &&
+                hostOutputRoute.deliveryRole === 'final' &&
                 typeof data.inputTurnId === 'string' &&
                 data.inputTurnId
               ) {
@@ -12351,8 +12321,27 @@ function startIpcWatcher(): void {
     }
   };
 
+  // Keep the recovery poll below the bounded Runner context-IPC deadline.
+  // Pass the value explicitly so runtime behavior and startup telemetry cannot
+  // silently diverge from the manager default.
+  const fallbackMs = DEFAULT_IPC_WATCHER_FALLBACK_MS;
+
   // Initialize the event-driven IPC watcher manager
-  ipcWatcherManager = new IpcWatcherManager();
+  ipcWatcherManager = new IpcWatcherManager({
+    ipcBaseDir,
+    fallbackMs,
+    isShuttingDown: () => shuttingDown,
+    onError: (err, context) => {
+      if (context.phase === 'process_group') {
+        logger.error(
+          { err, folder: context.folder },
+          'Error processing IPC for group',
+        );
+      } else {
+        logger.error({ err }, 'Error in IPC fallback scan');
+      }
+    },
+  });
   ipcWatcherManager.bind(processGroupIpc, processIpcFilesFull);
 
   // Initial full scan
@@ -12360,10 +12349,13 @@ function startIpcWatcher(): void {
     logger.error({ err }, 'Error in initial IPC scan');
   });
 
-  // Start fallback polling (5s instead of 1s)
+  // Start bounded fallback polling alongside event-driven watchers.
   ipcWatcherManager.startFallback();
 
-  logger.info('IPC watcher started (event-driven + 5s fallback)');
+  logger.info(
+    { fallbackMs },
+    'IPC watcher started (event-driven + bounded fallback)',
+  );
 }
 
 /** Atomically acknowledge send_message only after the host has completed its
@@ -15144,6 +15136,7 @@ async function processAgentConversation(
         advanceReplyCursor(virtualChatJid, {
           timestamp: r.originalMsg.timestamp,
           id: r.originalMsg.id,
+          sequence: r.originalMsg.ingest_sequence,
         });
       }
       if (!agentPluginRepliesAcknowledged) return false;
@@ -15442,6 +15435,23 @@ async function processAgentConversation(
   if (agentChannelTurnRuntime) {
     agentChannelTurnRuntimes.set(lastProcessed.id, agentChannelTurnRuntime);
   }
+  const markAgentOutputSettled = (result: ContainerOutput): void => {
+    const completedInputTurnIds = result.ipcReceipts?.length
+      ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [result.inputTurnId ?? lastProcessed.id];
+    const completedInputs = result.ipcReceipts?.length
+      ? result.ipcReceipts.flatMap((receipt) =>
+          (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
+            chatJid: receipt.chatJid,
+            messageId: cursor.id,
+          })),
+        )
+      : [{ chatJid: virtualChatJid, messageId: lastProcessed.id }];
+    activeAgentBuilderTurns.clearCompleted(agentBuilderScope, completedInputs);
+    for (const inputTurnId of completedInputTurnIds) {
+      healthyAgentCompletedInputTurns.add(inputTurnId);
+    }
+  };
   const completeAgentChannelRuntimesForOutput = async (
     result: ContainerOutput,
   ): Promise<boolean> => {
@@ -15451,9 +15461,22 @@ async function processAgentConversation(
       ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
       : [result.inputTurnId ?? lastProcessed.id];
     for (const inputId of inputIds) {
-      healthyAgentCompletedInputTurns.add(inputId);
       const runtime = agentChannelTurnRuntimes.get(inputId);
+      const unfinishedProactiveOutput = hasUnfinishedProactiveOutput({
+        interactionMode,
+        nonTerminalDelivered:
+          agentNonTerminalDeliveryAckByInput.get(inputId) === true,
+        finalDelivered: agentPhysicalDeliveryAckByInput.get(inputId) === true,
+      });
       if (!runtime) {
+        if (unfinishedProactiveOutput) {
+          allCompleted = false;
+          logger.error(
+            { chatJid, agentId, inputTurnId: inputId },
+            'Refusing to settle Proactive agent input after progress/separate output without final',
+          );
+          continue;
+        }
         await clearAgentProcessingIndicatorForInput(inputId);
         continue;
       }
@@ -15519,6 +15542,14 @@ async function processAgentConversation(
         }
         continue;
       }
+      if (unfinishedProactiveOutput) {
+        allCompleted = false;
+        logger.error(
+          { chatJid, agentId, inputTurnId: inputId, runId: runtime.runId },
+          'Refusing to complete Proactive agent input without final delivery ACK',
+        );
+        continue;
+      }
       const utteranceDelivered =
         agentPhysicalDeliveryAckByInput.get(inputId) === true;
       if (publishesFrameworkAnswer(interactionMode) && !utteranceDelivered) {
@@ -15557,6 +15588,7 @@ async function processAgentConversation(
         );
       }
     }
+    if (allCompleted) markAgentOutputSettled(result);
     return allCompleted;
   };
   const agentScopeForOutput = (
@@ -15611,6 +15643,7 @@ async function processAgentConversation(
       advanceCursors(virtualChatJid, {
         timestamp: lastProcessed.timestamp,
         id: lastProcessed.id,
+        sequence: lastProcessed.ingest_sequence,
       });
       return true;
     }
@@ -15627,6 +15660,7 @@ async function processAgentConversation(
       advanceCursors(virtualChatJid, {
         timestamp: lastProcessed.timestamp,
         id: lastProcessed.id,
+        sequence: lastProcessed.ingest_sequence,
       });
       return true;
     }
@@ -15858,6 +15892,10 @@ async function processAgentConversation(
         agentPhysicalDeliveryAckByInput.set(inputTurnId, true);
         agentReplySentByInput.set(inputTurnId, true);
       },
+      onNonTerminalDelivered: () => {
+        if (interactionMode !== 'proactive') return;
+        agentNonTerminalDeliveryAckByInput.set(inputTurnId, true);
+      },
     });
     agentTurnOutputCoordinators.set(inputTurnId, coordinator);
     return coordinator;
@@ -16052,6 +16090,7 @@ async function processAgentConversation(
       agentReplySentByInput.set(inputTurnId, false);
       agentAnyReplyProjectedByInput.set(inputTurnId, false);
       agentPhysicalDeliveryAckByInput.set(inputTurnId, false);
+      agentNonTerminalDeliveryAckByInput.set(inputTurnId, false);
       const typingTransportJid = targetSourceJid ?? virtualChatJid;
       const typingReady = setTyping(
         virtualChatJid,
@@ -16211,6 +16250,9 @@ async function processAgentConversation(
   const agentPhysicalDeliveryAckByInput = new Map<string, boolean>([
     [lastProcessed.id, false],
   ]);
+  const agentNonTerminalDeliveryAckByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
   const proactiveAgentTailNoticesDelivered = new Set<string>();
   const notifyProactiveAgentTailInterruption = async (
     inputTurnId: string,
@@ -16257,12 +16299,13 @@ async function processAgentConversation(
     advanceCursors(virtualChatJid, {
       timestamp: lastProcessed.timestamp,
       id: lastProcessed.id,
+      sequence: lastProcessed.ingest_sequence,
     });
     flushAcknowledgedIpcForJid(virtualChatJid);
     cursorCommittedInputTurns.add(inputTurnId);
   };
 
-  const wrappedOnOutput = async (output: ContainerOutput) => {
+  const handleAgentOutput = async (output: ContainerOutput) => {
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
@@ -16301,36 +16344,6 @@ async function processAgentConversation(
     }
     if (!suppressSupersededOutput) {
       await activateAgentProjectionForInput(output.inputTurnId);
-    }
-    if (
-      output.ipcReceipts?.length &&
-      (!output.providerFailure || output.providerFailureTerminal === true)
-    ) {
-      queue.acknowledgeIpcDeliveries(
-        virtualJid,
-        output.ipcReceipts,
-        commitIpcDeliveryReceipts,
-      );
-    }
-    if (output.inputTurnCompleted) {
-      const completedInputTurnIds = output.ipcReceipts?.length
-        ? output.ipcReceipts.map((receipt) => receipt.deliveryId)
-        : [output.inputTurnId ?? lastProcessed.id];
-      for (const inputTurnId of completedInputTurnIds) {
-        healthyAgentCompletedInputTurns.add(inputTurnId);
-      }
-      const completedInputs = output.ipcReceipts?.length
-        ? output.ipcReceipts.flatMap((receipt) =>
-            (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
-              chatJid: receipt.chatJid,
-              messageId: cursor.id,
-            })),
-          )
-        : [{ chatJid: virtualChatJid, messageId: lastProcessed.id }];
-      activeAgentBuilderTurns.clearCompleted(
-        agentBuilderScope,
-        completedInputs,
-      );
     }
     if (
       output.queryIdle === true ||
@@ -16391,6 +16404,7 @@ async function processAgentConversation(
     }
 
     if (suppressSupersededOutput) {
+      if (output.inputTurnCompleted) markAgentOutputSettled(output);
       commitCursor(output.inputTurnId ?? activeAgentInputTurnId);
       logger.info(
         {
@@ -16718,11 +16732,14 @@ async function processAgentConversation(
         })
       ) {
         if (output.inputTurnCompleted) {
-          if (await completeAgentChannelRuntimesForOutput(output)) {
-            commitCursor(
-              resolveContainerOutputInputTurnId(output, lastProcessed.id),
+          if (!(await completeAgentChannelRuntimesForOutput(output))) {
+            throw new Error(
+              'host_turn_settlement_failed: Proactive agent output did not reach a durable terminal state',
             );
           }
+          commitCursor(
+            resolveContainerOutputInputTurnId(output, lastProcessed.id),
+          );
           finalizeProactiveAgentOutputCoordinators(output);
           broadcastStreamEvent(
             chatJid,
@@ -16803,10 +16820,12 @@ async function processAgentConversation(
       });
       if (!projectionDecision.project) {
         output.result = null;
-        if (
-          output.inputTurnCompleted &&
-          (await completeAgentChannelRuntimesForOutput(output))
-        ) {
+        if (output.inputTurnCompleted) {
+          if (!(await completeAgentChannelRuntimesForOutput(output))) {
+            throw new Error(
+              'host_turn_settlement_failed: lifecycle-only agent output did not reach a durable terminal state',
+            );
+          }
           commitCursor(resultInputTurnId);
         }
         logger.info(
@@ -17310,10 +17329,12 @@ async function processAgentConversation(
           }
         }
 
-        if (
-          output.inputTurnCompleted &&
-          (await completeAgentChannelRuntimesForOutput(output))
-        ) {
+        if (output.inputTurnCompleted) {
+          if (!(await completeAgentChannelRuntimesForOutput(output))) {
+            throw new Error(
+              'host_turn_settlement_failed: primary agent output did not reach a durable terminal state',
+            );
+          }
           commitCursor(
             resolveContainerOutputInputTurnId(output, lastProcessed.id),
           );
@@ -17384,7 +17405,32 @@ async function processAgentConversation(
     }
   };
 
-  ipcWatcherManager?.watchGroup(effectiveGroup.folder);
+  const wrappedOnOutput = async (output: ContainerOutput): Promise<void> => {
+    try {
+      await handleAgentOutput(output);
+    } catch (err) {
+      hadError = true;
+      lastError = err instanceof Error ? err.message : String(err);
+      retryUnfinishedTurn = true;
+      throw err;
+    }
+    // Match the main-runtime contract: IPC consumption becomes durable only
+    // after every Host-side persistence/projection callback above has
+    // completed. A thrown callback leaves these receipts replayable.
+    if (
+      output.inputTurnCompleted === true &&
+      output.ipcReceipts?.length &&
+      (!output.providerFailure || output.providerFailureTerminal === true)
+    ) {
+      queue.acknowledgeIpcDeliveries(
+        virtualJid,
+        output.ipcReceipts,
+        commitIpcDeliveryReceipts,
+      );
+    }
+  };
+
+  ipcWatcherManager?.watchRuntime(effectiveGroup.folder, { agentId });
   try {
     agentChannelOutboxScope =
       agentChannelTurnRuntime &&
@@ -18169,7 +18215,7 @@ async function processAgentConversation(
     }
     activeAgentBuilderTurns.delete(agentBuilderScope);
     activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder, agentId));
-    ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
+    ipcWatcherManager?.unwatchRuntime(effectiveGroup.folder, { agentId });
   }
 
   return !retryUnfinishedTurn;
@@ -18442,6 +18488,7 @@ async function startMessageLoop(): Promise<void> {
                 advanceReplyCursor(chatJid, {
                   timestamp: r.originalMsg.timestamp,
                   id: r.originalMsg.id,
+                  sequence: r.originalMsg.ingest_sequence,
                 });
               }
               if (!warmPluginRepliesAcknowledged) {
@@ -21836,8 +21883,9 @@ async function main(): Promise<void> {
     advanceNextPullCursorOnly,
     completeOutOfBandMessage,
     advanceGlobalCursor: (cursor: MessageCursor) => {
-      if (isCursorAfter(cursor, globalMessageCursor)) {
-        globalMessageCursor = cursor;
+      const resolved = resolveMessageCursorSequence(cursor);
+      if (isCursorAfter(resolved, globalMessageCursor)) {
+        globalMessageCursor = resolved;
         saveState();
       }
     },
@@ -22292,14 +22340,33 @@ async function main(): Promise<void> {
       displayName,
       taskRunId,
       selectedProviderId,
-    ) =>
-      queue.registerProcess(groupJid, proc, {
-        containerName,
-        groupFolder,
-        displayName,
-        taskRunId,
-        selectedProviderId,
-      }),
+    ) => {
+      let taskWatchReleased = false;
+      const releaseTaskWatch = (): void => {
+        if (taskWatchReleased || !taskRunId) return;
+        taskWatchReleased = true;
+        ipcWatcherManager?.unwatchRuntime(groupFolder, { taskRunId });
+      };
+      if (taskRunId) {
+        ipcWatcherManager?.watchRuntime(groupFolder, { taskRunId });
+        // Isolated-task namespaces are run-scoped. Releasing on child close
+        // keeps fallback/provider process rotations reference-counted without
+        // retaining one watcher pair per historical task run.
+        proc.once('close', releaseTaskWatch);
+      }
+      try {
+        queue.registerProcess(groupJid, proc, {
+          containerName,
+          groupFolder,
+          displayName,
+          taskRunId,
+          selectedProviderId,
+        });
+      } catch (err) {
+        releaseTaskWatch();
+        throw err;
+      }
+    },
     sendMessage: async (jid, text, options) => {
       const outcome = await sendMessageWithOutcome(jid, text, options);
       if (!outcome.targetDelivered) {
@@ -22692,8 +22759,6 @@ async function main(): Promise<void> {
     },
     assistantName: ASSISTANT_NAME,
   };
-  startSchedulerLoop(schedulerDeps);
-
   // Inject triggerTaskRun into WebDeps (schedulerDeps must exist first)
   const webDeps = getWebDeps();
   if (webDeps) {
@@ -22981,10 +23046,18 @@ async function main(): Promise<void> {
   });
   imManager.resumeDeferredInbound();
   streamingBuffer.recover();
+  // The watcher must exist before any recovery or scheduler path can spawn a
+  // main/conversation/isolated Runner. Otherwise the first nested Memory or
+  // Profile request is invisible until fallback polling and can lose the race
+  // with the Runner-side deadline.
+  startIpcWatcher();
   recoverStartupTypedIpcDeliveries();
   recoverPendingMessages();
   recoverConversationAgents();
-  startIpcWatcher();
+  // Start new scheduled work only after every persisted IPC receipt has been
+  // rewound/discarded and conversation recovery has normalized its cursors.
+  // Otherwise an overdue task can race startup recovery with a fresh Runner.
+  startSchedulerLoop(schedulerDeps);
   streamingBuffer.start();
   startMessageLoop();
 

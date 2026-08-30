@@ -2,7 +2,10 @@ import { describe, expect, test } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { resolveTurnOutcome } from '../src/turn-outcome.js';
+import {
+  hasUnfinishedProactiveOutput,
+  resolveTurnOutcome,
+} from '../src/turn-outcome.js';
 import { resolveStreamingCardReplyAcknowledgement } from '../src/reply-delivery.js';
 
 describe('resolveStreamingCardReplyAcknowledgement', () => {
@@ -57,6 +60,29 @@ describe('resolveStreamingCardReplyAcknowledgement', () => {
 });
 
 describe('resolveTurnOutcome', () => {
+  test('requires a final after progress or separate Proactive output', () => {
+    expect(
+      hasUnfinishedProactiveOutput({
+        interactionMode: 'proactive',
+        nonTerminalDelivered: true,
+        finalDelivered: false,
+      }),
+    ).toBe(true);
+    expect(
+      hasUnfinishedProactiveOutput({
+        interactionMode: 'proactive',
+        nonTerminalDelivered: false,
+        finalDelivered: false,
+      }),
+    ).toBe(false);
+    expect(
+      hasUnfinishedProactiveOutput({
+        interactionMode: 'proactive',
+        nonTerminalDelivered: true,
+        finalDelivered: true,
+      }),
+    ).toBe(false);
+  });
   test('retries an in-flight close with no reply or healthy completion', () => {
     expect(
       resolveTurnOutcome({
@@ -69,6 +95,22 @@ describe('resolveTurnOutcome', () => {
       kind: 'retryable',
       cursor: 'keep',
       reason: 'runner_closed_in_flight',
+    });
+  });
+
+  test('retries after an acknowledged progress update followed by runner error', () => {
+    expect(
+      resolveTurnOutcome({
+        status: 'error',
+        healthyInputTurnCompleted: false,
+        cursorCommitted: false,
+        replyDelivered: false,
+        progressDelivered: true,
+      }),
+    ).toEqual({
+      kind: 'retryable',
+      cursor: 'keep',
+      reason: 'runner_failed_in_flight',
     });
   });
 
@@ -221,9 +263,12 @@ describe('resolveTurnOutcome', () => {
     expect(deliveryBranch).toContain(
       'replyDeliveryAcknowledged &&\n                isGenuineReplyResult',
     );
-    expect(deliveryBranch).toContain('result.inputTurnCompleted &&');
+    expect(deliveryBranch).toContain('if (result.inputTurnCompleted) {');
     expect(deliveryBranch).toContain(
-      '(replyDeliveryAcknowledged ||\n                  Boolean(',
+      'if (!(await completeChannelRuntimesForOutput(result)))',
+    );
+    expect(deliveryBranch).toContain(
+      'replyDeliveryAcknowledged ||\n                  Boolean(',
     );
     expect(deliveryBranch).toContain('getFailedChannelOutboxForTurn(');
     expect(deliveryBranch).not.toContain(

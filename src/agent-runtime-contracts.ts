@@ -41,5 +41,6 @@ export interface RuntimeIpcReceipt {
 export interface RuntimeIpcCursor {
   timestamp: string;
   id: string;
+  sequence?: number;
   sourceJid?: string;
 }

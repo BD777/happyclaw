@@ -424,6 +424,8 @@ export interface AgentBuilderDraft {
 export interface NewMessage {
   id: string;
   chat_jid: string;
+  /** Host-assigned durable arrival order. Provider clocks never participate. */
+  ingest_sequence?: number;
   source_jid?: string;
   sender: string;
   sender_name: string;
@@ -463,6 +465,7 @@ export type FollowUpStatus =
 export interface QueuedFollowUp {
   id: string;
   chat_jid: string;
+  ingest_sequence?: number;
   source_jid?: string;
   sender: string;
   sender_name: string;
@@ -537,6 +540,8 @@ export interface MessageAttachment {
 export interface MessageCursor {
   timestamp: string;
   id: string;
+  /** Durable host ingest position. Missing only on legacy persisted cursors. */
+  sequence?: number;
 }
 
 export interface ScheduledTask {

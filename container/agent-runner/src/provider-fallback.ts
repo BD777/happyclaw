@@ -168,6 +168,7 @@ export type ProviderFailureClass = 'account' | 'transient' | 'config';
 const ACCOUNT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
   'authentication_failed',
   'oauth_org_not_allowed',
+  'account_on_hold',
   'billing_error',
   // A bare `rate_limit` assistant error carries no rateLimitType, so its blast
   // radius is unknown. classifyProviderRateLimitType() already fails safe as
@@ -183,6 +184,14 @@ const ACCOUNT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
 const TRANSIENT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
   'overloaded',
   'server_error',
+  // The SDK could not attribute the failure more precisely. It is not a
+  // verdict on the OAuth profile, so keep the account healthy and use the
+  // host's bounded same-provider replay budget.
+  'unknown',
+  // This can be emitted by compatible endpoints as an Assistant error rather
+  // than a normal truncated Result. Replaying once is safer than quarantining
+  // the account or waiting forever for a Result which will never arrive.
+  'max_output_tokens',
 ]);
 
 /**
@@ -192,6 +201,7 @@ const TRANSIENT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
  * it would empty the pool over a typo.
  */
 const CONFIG_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
+  'invalid_request',
   'model_not_found',
 ]);
 
@@ -202,17 +212,26 @@ const CONFIG_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
  * wait indefinitely for a Result that may never arrive — but only the returned
  * class decides what happens to the account and to the user's input.
  *
- * @returns the failure class, or undefined when the error is not a provider
- * failure at all and normal processing should continue.
+ * @returns the failure class, or undefined only when no error was reported.
+ * Every non-empty Assistant error is a terminal SDK-attempt boundary.
  */
 export function classifyProviderAssistantError(
-  error: SDKAssistantMessageError | undefined,
+  error: SDKAssistantMessageError | (string & {}) | undefined,
 ): ProviderFailureClass | undefined {
   if (!error) return undefined;
-  if (ACCOUNT_PROVIDER_ASSISTANT_ERRORS.has(error)) return 'account';
-  if (TRANSIENT_PROVIDER_ASSISTANT_ERRORS.has(error)) return 'transient';
-  if (CONFIG_PROVIDER_ASSISTANT_ERRORS.has(error)) return 'config';
-  return undefined;
+  if (ACCOUNT_PROVIDER_ASSISTANT_ERRORS.has(error as SDKAssistantMessageError))
+    return 'account';
+  if (
+    TRANSIENT_PROVIDER_ASSISTANT_ERRORS.has(error as SDKAssistantMessageError)
+  )
+    return 'transient';
+  if (CONFIG_PROVIDER_ASSISTANT_ERRORS.has(error as SDKAssistantMessageError))
+    return 'config';
+  // Assistant.error is already a terminal SDK event even when a newer CLI or
+  // compatible endpoint introduces a value this runner does not know yet.
+  // Unknown failures say nothing about account health, so fail safe as a
+  // bounded transient replay instead of parking the stream indefinitely.
+  return 'transient';
 }
 
 /**

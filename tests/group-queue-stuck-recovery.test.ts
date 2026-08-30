@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 
@@ -411,6 +411,76 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
     fs.unlinkSync(path.join(inputDir, 'pending.json'));
     q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
     expect(getState(q, jid).queryInFlight).toBe(false);
+  });
+
+  test('runner claim files preserve IPC debt after a crash', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+      lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+    });
+    const inputDir = path.join(ipcDir, 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    const claim = path.join(
+      inputDir,
+      'pending.json.happyclaw-claimed-123-1-test',
+    );
+    fs.writeFileSync(claim, '{}');
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(true);
+
+    fs.unlinkSync(claim);
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(false);
+  });
+
+  test('unacknowledged recovery removes the Runner claim before DB replay', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, { groupFolder: folder, queryInFlight: true });
+    const receipt = {
+      deliveryId: 'delivery-claim',
+      chatJid: jid,
+      cursor: {
+        timestamp: '2026-08-31T00:00:00.000Z',
+        id: 'message-claim',
+        sequence: 42,
+      },
+    };
+    const state = getState(q, jid);
+    (state.pendingIpcDeliveries as Map<string, typeof receipt>).set(
+      receipt.deliveryId,
+      receipt,
+    );
+    const inputDir = path.join(ipcDir, 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    const claim = path.join(
+      inputDir,
+      'pending.json.happyclaw-claimed-123-1-test',
+    );
+    fs.writeFileSync(
+      claim,
+      JSON.stringify({ type: 'message', text: 'pending', receipt }),
+    );
+    const rewind = vi.fn();
+    q.setOnUnacknowledgedIpcDeliveries(rewind);
+
+    (
+      q as unknown as {
+        recoverUnacknowledgedIpcDeliveries: (
+          groupJid: string,
+          groupState: Record<string, unknown>,
+        ) => void;
+      }
+    ).recoverUnacknowledgedIpcDeliveries(jid, state);
+
+    expect(fs.existsSync(claim)).toBe(false);
+    expect(rewind).toHaveBeenCalledWith(jid, [receipt]);
   });
 
   test('internal-continue preserve hint still closes a query with no real IPC debt', () => {
