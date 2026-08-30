@@ -225,6 +225,8 @@ export interface ContainerInput {
   prompt: string;
   sessionId?: string;
   turnId?: string;
+  /** Persisted message IDs already represented by the cold bootstrap prompt. */
+  currentBatchMessageIds?: readonly string[];
   /** Exact GroupQueue query attempt for Web stream fencing. */
   queryRunId?: string;
   groupFolder: string;
@@ -435,9 +437,15 @@ export interface ContainerOutput {
     coveredCursors?: Array<{
       timestamp: string;
       id: string;
+      sequence?: number;
       sourceJid?: string;
     }>;
-    cursor: { timestamp: string; id: string; sourceJid?: string };
+    cursor: {
+      timestamp: string;
+      id: string;
+      sequence?: number;
+      sourceJid?: string;
+    };
   }>;
   /** Exact durable inputs that became the current SDK turn immediately after
    * this completion. Present only while the same streaming query stays busy.
@@ -449,9 +457,15 @@ export interface ContainerOutput {
     coveredCursors?: Array<{
       timestamp: string;
       id: string;
+      sequence?: number;
       sourceJid?: string;
     }>;
-    cursor: { timestamp: string; id: string; sourceJid?: string };
+    cursor: {
+      timestamp: string;
+      id: string;
+      sequence?: number;
+      sourceJid?: string;
+    };
   }>;
 }
 

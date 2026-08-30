@@ -76,6 +76,7 @@ import {
   getRegisteredGroup,
   getChannelMount,
   getJidsByFolder,
+  getMessageCursor,
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
@@ -399,6 +400,7 @@ app.post('/api/messages', authMiddleware, async (c) => {
     success: true,
     messageId: result.messageId,
     timestamp: result.timestamp,
+    ingestSequence: result.ingestSequence,
     disposition: result.disposition,
     runId: result.runId,
   });
@@ -514,6 +516,7 @@ async function handleWebUserMessage(
       ok: true;
       messageId: string;
       timestamp: string;
+      ingestSequence?: number;
       disposition: 'started' | 'queued' | 'steered';
       runId?: string;
     }
@@ -585,6 +588,10 @@ async function handleWebUserMessage(
         : undefined,
     },
   );
+  const messageCursor = getMessageCursor(chatJid, messageId) ?? {
+    timestamp,
+    id: messageId,
+  };
 
   broadcastNewMessage(chatJid, {
     id: messageId,
@@ -649,7 +656,13 @@ async function handleWebUserMessage(
           id: messageId,
         });
         deps.advanceGlobalCursor({ timestamp, id: messageId });
-        return { ok: true, messageId, timestamp, disposition: 'started' };
+        return {
+          ok: true,
+          messageId,
+          timestamp,
+          ingestSequence: messageCursor.sequence,
+          disposition: 'started',
+        };
       }
     }
   }
@@ -667,6 +680,7 @@ async function handleWebUserMessage(
         ok: true,
         messageId,
         timestamp,
+        ingestSequence: messageCursor.sequence,
         disposition: steerResult?.ok ? 'steered' : 'queued',
         runId: activeRunId!,
       };
@@ -675,6 +689,7 @@ async function handleWebUserMessage(
       ok: true,
       messageId,
       timestamp,
+      ingestSequence: messageCursor.sequence,
       disposition: 'queued',
       runId: activeRunId,
     };
@@ -755,6 +770,7 @@ async function handleWebUserMessage(
           ok: true,
           messageId,
           timestamp,
+          ingestSequence: messageCursor.sequence,
           disposition: activeRunId ? 'steered' : 'started',
           runId: activeRunId ?? undefined,
         };
@@ -831,8 +847,8 @@ async function handleWebUserMessage(
     undefined,
     {
       chatJid,
-      coveredCursors: [{ timestamp, id: messageId }],
-      cursor: { timestamp, id: messageId },
+      coveredCursors: [messageCursor],
+      cursor: messageCursor,
     },
     undefined,
     (receipt) => preAdmitRoute?.(group.folder, null, receipt) ?? false,
@@ -873,6 +889,7 @@ async function handleWebUserMessage(
     ok: true,
     messageId,
     timestamp,
+    ingestSequence: messageCursor.sequence,
     disposition: activeRunId ? 'steered' : 'started',
     runId: activeRunId ?? startedRunId ?? undefined,
   };
@@ -911,6 +928,7 @@ async function handleAgentConversationMessage(
       ok: true;
       messageId: string;
       timestamp: string;
+      ingestSequence?: number;
       disposition: 'started' | 'queued' | 'steered';
       runId?: string;
     }
@@ -987,6 +1005,10 @@ async function handleAgentConversationMessage(
         : undefined,
     },
   );
+  const agentMessageCursor = getMessageCursor(virtualChatJid, messageId) ?? {
+    timestamp,
+    id: messageId,
+  };
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
   // Auto-title: show a quick placeholder derived from the first user message.
@@ -1039,6 +1061,7 @@ async function handleAgentConversationMessage(
         ok: true,
         messageId,
         timestamp,
+        ingestSequence: agentMessageCursor.sequence,
         disposition: steerResult?.ok ? 'steered' : 'queued',
         runId: activeRunId!,
       };
@@ -1047,6 +1070,7 @@ async function handleAgentConversationMessage(
       ok: true,
       messageId,
       timestamp,
+      ingestSequence: agentMessageCursor.sequence,
       disposition: 'queued',
       runId: activeRunId,
     };
@@ -1121,6 +1145,7 @@ async function handleAgentConversationMessage(
             ok: true,
             messageId,
             timestamp,
+            ingestSequence: agentMessageCursor.sequence,
             disposition: activeRunId ? 'steered' : 'started',
             runId: activeRunId ?? undefined,
           };
@@ -1198,8 +1223,8 @@ async function handleAgentConversationMessage(
     undefined,
     {
       chatJid: virtualChatJid,
-      coveredCursors: [{ timestamp, id: messageId }],
-      cursor: { timestamp, id: messageId },
+      coveredCursors: [agentMessageCursor],
+      cursor: agentMessageCursor,
     },
     undefined,
     (receipt) =>
@@ -1207,10 +1232,7 @@ async function handleAgentConversationMessage(
     { feishuCliAccountId: requiredFeishuCliAccountId },
   );
   if (agentSendResult === 'sent') {
-    deps.advanceNextPullCursorOnly(virtualChatJid, {
-      timestamp,
-      id: messageId,
-    });
+    deps.advanceNextPullCursorOnly(virtualChatJid, agentMessageCursor);
   }
   if (agentSendResult === 'no_active') {
     if (eagerExpandAgentActive && agentSendContent !== content) {
@@ -1246,6 +1268,7 @@ async function handleAgentConversationMessage(
     ok: true,
     messageId,
     timestamp,
+    ingestSequence: agentMessageCursor.sequence,
     disposition: activeRunId ? 'steered' : 'started',
     runId: activeRunId ?? startedRunId ?? undefined,
   };
@@ -2310,6 +2333,18 @@ export function broadcastNewMessage(
   agentId?: string,
   source?: string,
 ): void {
+  // WS delivery must use the same durable host-assigned position as REST
+  // pagination. Hydrate persisted rows centrally so billing, plugin and
+  // system producers cannot accidentally omit the sequence. Ephemeral
+  // messages have no matching row and retain the legacy optional field.
+  const persistedCursor =
+    msg.ingest_sequence === undefined
+      ? getMessageCursor(msg.chat_jid, msg.id)
+      : null;
+  const sequencedMessage =
+    persistedCursor?.sequence !== undefined
+      ? { ...msg, ingest_sequence: persistedCursor.sequence }
+      : msg;
   // For virtual JIDs like "web:xxx#agent:yyy", extract base JID and agentId
   let baseChatJid = chatJid;
   let effectiveAgentId = agentId;
@@ -2323,7 +2358,10 @@ export function broadcastNewMessage(
   const wsMsg: WsMessageOut = {
     type: 'new_message',
     chatJid: jid,
-    message: { ...msg, is_from_me: msg.is_from_me ?? false },
+    message: {
+      ...sequencedMessage,
+      is_from_me: sequencedMessage.is_from_me ?? false,
+    },
     ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
     ...(source ? { source } : {}),
   };

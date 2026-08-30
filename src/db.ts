@@ -199,12 +199,15 @@ function stmts() {
          )`,
       ),
       getMessagesSince: db.prepare(
-        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, channel_context, source_kind, task_id,
-                delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-         FROM messages
-         WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
-           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
-         ORDER BY timestamp ASC, id ASC`,
+        `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+                m.attachments, m.channel_context, m.source_kind, m.task_id,
+                m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+                m.delivery_updated_at, seq.sequence AS ingest_sequence
+         FROM message_ingest_sequences seq
+         JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+         WHERE m.chat_jid = ? AND seq.sequence > ? AND m.is_from_me = 0
+           AND COALESCE(m.delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
+         ORDER BY seq.sequence ASC`,
       ),
       getExpiredSessionIds: db.prepare(
         'SELECT id FROM user_sessions WHERE expires_at < ?',
@@ -219,15 +222,18 @@ function getNewMessagesStmt(jidCount: number): any {
   if (!s) {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, channel_context, source_kind, task_id,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
-         AND chat_jid IN (${placeholders})
-         AND is_from_me = 0
-         AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
-         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
-       ORDER BY timestamp ASC, id ASC`,
+      `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.attachments, m.channel_context, m.source_kind, m.task_id,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE seq.sequence > ?
+         AND m.chat_jid IN (${placeholders})
+         AND m.is_from_me = 0
+         AND COALESCE(m.source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
+         AND COALESCE(m.delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
+       ORDER BY seq.sequence ASC`,
     );
     // Cap cache size to avoid unbounded growth in deployments where the
     // distinct jidCount values shift over time. better-sqlite3 does not
@@ -321,6 +327,50 @@ function tableExists(tableName: string): boolean {
   return !!row;
 }
 
+/**
+ * Give every persisted message an immutable host-side arrival position.
+ *
+ * The sequence lives in a separate table so upgrading an existing installation
+ * never rebuilds the large messages table. The mapping intentionally survives
+ * message deletion and INSERT OR REPLACE: re-observing the same provider
+ * message remains idempotent and cannot jump past a committed cursor.
+ */
+function ensureMessageIngestSequenceSchema(backfill: boolean): void {
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS message_ingest_sequences (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_jid TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        UNIQUE (chat_jid, message_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_message_ingest_sequences_chat_sequence
+        ON message_ingest_sequences(chat_jid, sequence);
+    `);
+
+    if (backfill) {
+      // rowid reflects the host's historical insertion order. ORDER BY makes
+      // the AUTOINCREMENT backfill deterministic for an upgraded database.
+      db.exec(`
+        INSERT OR IGNORE INTO message_ingest_sequences (chat_jid, message_id)
+        SELECT chat_jid, id
+        FROM messages
+        ORDER BY rowid ASC;
+      `);
+    }
+    db.exec(`
+      DROP TRIGGER IF EXISTS messages_assign_ingest_sequence;
+      CREATE TRIGGER messages_assign_ingest_sequence
+      AFTER INSERT ON messages
+      BEGIN
+        INSERT INTO message_ingest_sequences (chat_jid, message_id)
+        VALUES (NEW.chat_jid, NEW.id)
+        ON CONFLICT(chat_jid, message_id) DO NOTHING;
+      END;
+    `);
+  })();
+}
+
 function reportKnownForeignKeyOrphans(): void {
   if (!tableExists('users')) return;
   const specs: Array<{
@@ -393,6 +443,20 @@ function sqliteStringLiteral(value: string): string {
  * or data-reconciliation write; a backup failure aborts startup.
  */
 function createPreMigrationBackup(dbPath: string, schemaVersion: number): void {
+  const skipBackup = ['1', 'true'].includes(
+    (process.env.HAPPYCLAW_SKIP_MIGRATION_BACKUP ?? '').trim().toLowerCase(),
+  );
+  if (skipBackup) {
+    logger.warn(
+      {
+        fromVersion: schemaVersion,
+        toVersion: CURRENT_SCHEMA_VERSION,
+        environmentOverride: 'HAPPYCLAW_SKIP_MIGRATION_BACKUP',
+      },
+      'Skipping pre-migration SQLite backup by explicit operator policy',
+    );
+    return;
+  }
   const configuredDir = process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR;
   const backupDir = configuredDir
     ? path.resolve(configuredDir)
@@ -1305,6 +1369,12 @@ export function initDatabase(
   ensureColumn('registered_groups', 'init_git_url', 'TEXT');
   ensureColumn('messages', 'attachments', 'TEXT');
   ensureColumn('messages', 'source_jid', 'TEXT');
+  // v73 -> v74: provider timestamps and random provider IDs are display and
+  // idempotency fields, not a safe durable consumption order.
+  ensureMessageIngestSequenceSchema(
+    rawSchemaVersionBeforeInit === null ||
+      Number(rawSchemaVersionBeforeInit) < 74,
+  );
   ensureColumn('registered_groups', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'is_home', 'INTEGER DEFAULT 0');
   // v56 -> v57: cache provider chat avatars so binding lists do not need an
@@ -3331,6 +3401,8 @@ function normalizeQueuedFollowUpRow(
   return {
     id: String(row.id),
     chat_jid: String(row.chat_jid),
+    ingest_sequence:
+      typeof row.ingest_sequence === 'number' ? row.ingest_sequence : undefined,
     source_jid: row.source_jid ? String(row.source_jid) : undefined,
     sender: String(row.sender ?? ''),
     sender_name: String(row.sender_name ?? ''),
@@ -3351,7 +3423,10 @@ function normalizeQueuedFollowUpRow(
 const FOLLOW_UP_SELECT = `
   SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp,
          attachments, channel_context, delivery_mode, delivery_status, delivery_run_id,
-         delivery_priority
+         delivery_priority,
+         (SELECT sequence FROM message_ingest_sequences seq
+          WHERE seq.chat_jid = messages.chat_jid AND seq.message_id = messages.id)
+           AS ingest_sequence
   FROM messages
 `;
 
@@ -3389,7 +3464,7 @@ export function listQueuedFollowUps(chatJid: string): QueuedFollowUp[] {
     .prepare(
       `${FOLLOW_UP_SELECT}
        WHERE chat_jid = ? AND delivery_status IN ('queued', 'promoting')
-       ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+       ORDER BY delivery_priority ASC, ingest_sequence ASC`,
     )
     .all(chatJid) as Array<Record<string, unknown>>;
   return rows.map(normalizeQueuedFollowUpRow);
@@ -3505,7 +3580,7 @@ export function moveQueuedFollowUp(
     `${FOLLOW_UP_SELECT}
      WHERE chat_jid = ? AND delivery_status = 'queued'
        AND delivery_mode = 'queue'
-     ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+     ORDER BY delivery_priority ASC, ingest_sequence ASC`,
   );
   const update = db.prepare(
     `UPDATE messages
@@ -3588,7 +3663,7 @@ export function claimNextQueuedFollowUp(
   const select = db.prepare(
     `${FOLLOW_UP_SELECT}
      WHERE chat_jid = ? AND delivery_status = 'queued'
-     ORDER BY delivery_priority ASC, timestamp ASC, id ASC
+     ORDER BY delivery_priority ASC, ingest_sequence ASC
      LIMIT 1`,
   );
   const update = db.prepare(
@@ -3627,7 +3702,7 @@ export function claimNextQueuedFollowUpBatch(
   const select = db.prepare(
     `${FOLLOW_UP_SELECT}
      WHERE chat_jid = ? AND delivery_status = 'queued'
-     ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+     ORDER BY delivery_priority ASC, ingest_sequence ASC`,
   );
   const update = db.prepare(
     `UPDATE messages
@@ -4520,17 +4595,22 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newCursor: MessageCursor } {
   if (jids.length === 0) return { messages: [], newCursor: cursor };
 
+  const resolvedCursor = resolveMessageCursorSequence(cursor);
   const rawRows = getNewMessagesStmt(jids.length).all(
-    cursor.timestamp,
-    cursor.timestamp,
-    cursor.id,
+    resolvedCursor.sequence,
     ...jids,
   ) as NewMessage[];
   const rows = rawRows.map((r) => normalizeMessageRow(r));
   const last = rows[rows.length - 1];
   return {
     messages: rows,
-    newCursor: last ? { timestamp: last.timestamp, id: last.id } : cursor,
+    newCursor: last
+      ? {
+          timestamp: last.timestamp,
+          id: last.id,
+          sequence: last.ingest_sequence,
+        }
+      : resolvedCursor,
   };
 }
 
@@ -4538,13 +4618,76 @@ export function getMessagesSince(
   chatJid: string,
   cursor: MessageCursor,
 ): NewMessage[] {
+  const resolvedCursor = resolveMessageCursorSequence(cursor, chatJid);
   const rows = stmts().getMessagesSince.all(
     chatJid,
-    cursor.timestamp,
-    cursor.timestamp,
-    cursor.id,
+    resolvedCursor.sequence,
   ) as NewMessage[];
   return rows.map((row) => normalizeMessageRow(row));
+}
+
+/**
+ * Upgrade a legacy `(timestamp,id)` cursor to the immutable host sequence.
+ * Exact message identity is authoritative. If the old anchor was deleted or
+ * malformed, replay from zero rather than guessing from a provider clock and
+ * silently losing work.
+ */
+export function resolveMessageCursorSequence(
+  cursor: MessageCursor,
+  chatJid?: string,
+): MessageCursor & { sequence: number } {
+  if (
+    typeof cursor.sequence === 'number' &&
+    Number.isSafeInteger(cursor.sequence) &&
+    cursor.sequence >= 0
+  ) {
+    return { ...cursor, sequence: cursor.sequence };
+  }
+
+  let row: { sequence: number } | undefined;
+  if (cursor.id) {
+    if (chatJid) {
+      row = db
+        .prepare(
+          `SELECT sequence FROM message_ingest_sequences
+           WHERE chat_jid = ? AND message_id = ?`,
+        )
+        .get(chatJid, cursor.id) as { sequence: number } | undefined;
+    } else {
+      row = db
+        .prepare(
+          `SELECT seq.sequence
+           FROM message_ingest_sequences seq
+           JOIN messages m
+             ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+           WHERE m.id = ? AND m.timestamp = ?
+           ORDER BY seq.sequence DESC
+           LIMIT 1`,
+        )
+        .get(cursor.id, cursor.timestamp) as { sequence: number } | undefined;
+    }
+  }
+  return { ...cursor, sequence: row?.sequence ?? 0 };
+}
+
+/** Exact stable cursor for a persisted message, used by immediate Web paths. */
+export function getMessageCursor(
+  chatJid: string,
+  messageId: string,
+): MessageCursor | null {
+  const row = db
+    .prepare(
+      `SELECT m.timestamp, seq.sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.id = ?`,
+    )
+    .get(chatJid, messageId) as
+    | { timestamp: string; sequence: number }
+    | undefined;
+  return row
+    ? { timestamp: row.timestamp, id: messageId, sequence: row.sequence }
+    : null;
 }
 
 type CreateTaskInput = Omit<
@@ -12318,28 +12461,60 @@ export function getMessagesPage(
   chatJid: string,
   before?: string,
   limit = 50,
+  beforeSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
-  const sql = before
-    ? `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-             delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-      FROM messages
-      WHERE chat_jid = ? AND timestamp < ?
-      ORDER BY timestamp DESC
+  const stableSequence =
+    typeof beforeSequence === 'number' &&
+    Number.isSafeInteger(beforeSequence) &&
+    beforeSequence >= 0
+      ? beforeSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `
+      SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+             m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+             m.delivery_updated_at, seq.sequence AS ingest_sequence
+      FROM message_ingest_sequences seq
+      JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+      WHERE m.chat_jid = ? AND seq.sequence < ?
+      ORDER BY seq.sequence DESC
       LIMIT ?
     `
-    : `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-             delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-      FROM messages
-      WHERE chat_jid = ?
-      ORDER BY timestamp DESC
+      : before
+        ? `
+      SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+             m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+             m.delivery_updated_at, seq.sequence AS ingest_sequence
+      FROM message_ingest_sequences seq
+      JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+      WHERE m.chat_jid = ? AND m.timestamp < ?
+      ORDER BY m.timestamp DESC, seq.sequence DESC
+      LIMIT ?
+    `
+        : `
+      SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+             m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+             m.delivery_updated_at, seq.sequence AS ingest_sequence
+      FROM message_ingest_sequences seq
+      JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+      WHERE m.chat_jid = ?
+      ORDER BY seq.sequence DESC
       LIMIT ?
     `;
 
-  const params = before ? [chatJid, before, limit] : [chatJid, limit];
+  const params =
+    stableSequence !== undefined
+      ? [chatJid, stableSequence, limit]
+      : before
+        ? [chatJid, before, limit]
+        : [chatJid, limit];
   const rows = db.prepare(sql).all(...params) as Array<
     NewMessage & { is_from_me: number }
   >;
@@ -12356,12 +12531,15 @@ export function getMessagesForTurn(
   if (!normalizedTurnId) return [];
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid = ? AND turn_id = ?
-       ORDER BY timestamp DESC, id DESC`,
+      `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.turn_id = ?
+       ORDER BY seq.sequence DESC`,
     )
     .all(chatJid, normalizedTurnId) as Array<
     NewMessage & { is_from_me: number }
@@ -12384,13 +12562,16 @@ export function getConversationHistoryMessagesPage(
   const safeLimit = Math.min(200, Math.max(1, Math.floor(limit)));
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid = ? AND history_recovery_allowed = 1
-         AND id NOT IN (SELECT value FROM json_each(?))
-       ORDER BY timestamp DESC, id DESC
+      `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.history_recovery_allowed = 1
+         AND m.id NOT IN (SELECT value FROM json_each(?))
+       ORDER BY seq.sequence DESC
        LIMIT ?`,
     )
     .all(chatJid, JSON.stringify(excluded), safeLimit) as Array<
@@ -12405,20 +12586,43 @@ export function getConversationHistoryMessagesPage(
  */
 export function getMessagesAfter(
   chatJid: string,
-  after: string,
+  after = '',
   limit = 50,
+  afterSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
+  const stableSequence =
+    typeof afterSequence === 'number' &&
+    Number.isSafeInteger(afterSequence) &&
+    afterSequence >= 0
+      ? afterSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND seq.sequence > ?
+       ORDER BY seq.sequence ASC
+       LIMIT ?`
+      : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.timestamp > ?
+       ORDER BY m.timestamp ASC, seq.sequence ASC
+       LIMIT ?`;
   const rows = db
-    .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid = ? AND timestamp > ?
-       ORDER BY timestamp ASC
-       LIMIT ?`,
-    )
-    .all(chatJid, after, limit) as Array<NewMessage & { is_from_me: number }>;
+    .prepare(sql)
+    .all(chatJid, stableSequence ?? after, limit) as Array<
+    NewMessage & { is_from_me: number }
+  >;
 
   return rows.map((row) => normalizeMessageRow(row));
 }
@@ -12469,28 +12673,59 @@ export function getMessagesPageMulti(
   chatJids: string[],
   before?: string,
   limit = 50,
+  beforeSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
   if (chatJids.length === 0) return [];
-  if (chatJids.length === 1) return getMessagesPage(chatJids[0], before, limit);
+  if (chatJids.length === 1)
+    return getMessagesPage(chatJids[0], before, limit, beforeSequence);
 
   const placeholders = chatJids.map(() => '?').join(',');
-  const sql = before
-    ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid IN (${placeholders}) AND timestamp < ?
-       ORDER BY timestamp DESC
+  const stableSequence =
+    typeof beforeSequence === 'number' &&
+    Number.isSafeInteger(beforeSequence) &&
+    beforeSequence >= 0
+      ? beforeSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders}) AND seq.sequence < ?
+       ORDER BY seq.sequence DESC
        LIMIT ?`
-    : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid IN (${placeholders})
-       ORDER BY timestamp DESC
+      : before
+        ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+                m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+                m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+                m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+                m.delivery_updated_at, seq.sequence AS ingest_sequence
+         FROM message_ingest_sequences seq
+         JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+         WHERE m.chat_jid IN (${placeholders}) AND m.timestamp < ?
+         ORDER BY m.timestamp DESC, seq.sequence DESC
+         LIMIT ?`
+        : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders})
+       ORDER BY seq.sequence DESC
        LIMIT ?`;
 
-  const params = before ? [...chatJids, before, limit] : [...chatJids, limit];
+  const params =
+    stableSequence !== undefined
+      ? [...chatJids, stableSequence, limit]
+      : before
+        ? [...chatJids, before, limit]
+        : [...chatJids, limit];
   const rows = db.prepare(sql).all(...params) as Array<
     NewMessage & { is_from_me: number }
   >;
@@ -12503,24 +12738,46 @@ export function getMessagesPageMulti(
  */
 export function getMessagesAfterMulti(
   chatJids: string[],
-  after: string,
+  after = '',
   limit = 50,
+  afterSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
   if (chatJids.length === 0) return [];
-  if (chatJids.length === 1) return getMessagesAfter(chatJids[0], after, limit);
+  if (chatJids.length === 1)
+    return getMessagesAfter(chatJids[0], after, limit, afterSequence);
 
   const placeholders = chatJids.map(() => '?').join(',');
+  const stableSequence =
+    typeof afterSequence === 'number' &&
+    Number.isSafeInteger(afterSequence) &&
+    afterSequence >= 0
+      ? afterSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders}) AND seq.sequence > ?
+       ORDER BY seq.sequence ASC
+       LIMIT ?`
+      : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders}) AND m.timestamp > ?
+       ORDER BY m.timestamp ASC, seq.sequence ASC
+       LIMIT ?`;
   const rows = db
-    .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid IN (${placeholders}) AND timestamp > ?
-       ORDER BY timestamp ASC
-       LIMIT ?`,
-    )
-    .all(...chatJids, after, limit) as Array<
+    .prepare(sql)
+    .all(...chatJids, stableSequence ?? after, limit) as Array<
     NewMessage & { is_from_me: number }
   >;
 

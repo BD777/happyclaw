@@ -150,14 +150,16 @@ describe('provider model fallback lifecycle', () => {
       'billing_error',
       'authentication_failed',
       'oauth_org_not_allowed',
+      'account_on_hold',
       'overloaded',
       'server_error',
+      'unknown',
+      'max_output_tokens',
+      'invalid_request',
       'model_not_found',
     ] as const) {
       expect(classifyProviderAssistantError(error)).toBeDefined();
     }
-    expect(classifyProviderAssistantError('invalid_request')).toBeUndefined();
-    expect(classifyProviderAssistantError('max_output_tokens')).toBeUndefined();
     expect(classifyProviderAssistantError(undefined)).toBeUndefined();
   });
 
@@ -168,6 +170,7 @@ describe('provider model fallback lifecycle', () => {
     expect(classifyProviderAssistantError('oauth_org_not_allowed')).toBe(
       'account',
     );
+    expect(classifyProviderAssistantError('account_on_hold')).toBe('account');
     expect(classifyProviderAssistantError('billing_error')).toBe('account');
     // A bare rate_limit carries no rateLimitType, so it fails safe as
     // account-wide — matching classifyProviderRateLimitType's unknown default.
@@ -180,12 +183,20 @@ describe('provider model fallback lifecycle', () => {
     // only profile of a single-account install and retired the user's input.
     expect(classifyProviderAssistantError('overloaded')).toBe('transient');
     expect(classifyProviderAssistantError('server_error')).toBe('transient');
+    expect(classifyProviderAssistantError('unknown')).toBe('transient');
+    expect(classifyProviderAssistantError('max_output_tokens')).toBe(
+      'transient',
+    );
+    expect(classifyProviderAssistantError('future_sdk_error' as never)).toBe(
+      'transient',
+    );
   });
 
   test('an unservable model name is a config failure, not a quota one', () => {
     // Every account would be asked for the same model, so quarantining on this
     // would drain the whole pool over one bad model name.
     expect(classifyProviderAssistantError('model_not_found')).toBe('config');
+    expect(classifyProviderAssistantError('invalid_request')).toBe('config');
   });
 
   test('structured rejection wins over text and preserves model-only errors without fallback', () => {

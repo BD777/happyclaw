@@ -2400,6 +2400,13 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
 
   const before = c.req.query('before');
   const after = c.req.query('after');
+  const parseSequence = (value: string | undefined): number | undefined => {
+    if (value === undefined || !/^\d+$/.test(value)) return undefined;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : undefined;
+  };
+  const beforeSequence = parseSequence(c.req.query('beforeSequence'));
+  const afterSequence = parseSequence(c.req.query('afterSequence'));
   const agentIdParam = c.req.query('agentId');
   const limitRaw = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(
@@ -2415,14 +2422,14 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     }
 
     const virtualJid = `${jid}#agent:${agentIdParam}`;
-    if (after) {
+    if (afterSequence !== undefined || after) {
       const messages = attachSessionWorkflowRuns(
-        getMessagesAfter(virtualJid, after, limit),
+        getMessagesAfter(virtualJid, after, limit, afterSequence),
         { groupFolder: group.folder, agentId: agentIdParam },
       );
       return c.json({ messages });
     }
-    const rows = getMessagesPage(virtualJid, before, limit + 1);
+    const rows = getMessagesPage(virtualJid, before, limit + 1, beforeSequence);
     const hasMore = rows.length > limit;
     const messages = attachSessionWorkflowRuns(
       hasMore ? rows.slice(0, limit) : rows,
@@ -2464,14 +2471,14 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
 
   if (queryJids.length === 1) {
     // 单 JID 走原路径
-    if (after) {
+    if (afterSequence !== undefined || after) {
       const messages = attachSessionWorkflowRuns(
-        getMessagesAfter(jid, after, limit),
+        getMessagesAfter(jid, after, limit, afterSequence),
         { groupFolder: group.folder, agentId: null },
       );
       return c.json({ messages });
     }
-    const rows = getMessagesPage(jid, before, limit + 1);
+    const rows = getMessagesPage(jid, before, limit + 1, beforeSequence);
     const hasMore = rows.length > limit;
     const messages = attachSessionWorkflowRuns(
       hasMore ? rows.slice(0, limit) : rows,
@@ -2481,14 +2488,19 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   }
 
   // 多 JID 合并查询
-  if (after) {
+  if (afterSequence !== undefined || after) {
     const messages = attachSessionWorkflowRuns(
-      getMessagesAfterMulti(queryJids, after, limit),
+      getMessagesAfterMulti(queryJids, after, limit, afterSequence),
       { groupFolder: group.folder, agentId: null },
     );
     return c.json({ messages });
   }
-  const rows = getMessagesPageMulti(queryJids, before, limit + 1);
+  const rows = getMessagesPageMulti(
+    queryJids,
+    before,
+    limit + 1,
+    beforeSequence,
+  );
   const hasMore = rows.length > limit;
   const messages = attachSessionWorkflowRuns(
     hasMore ? rows.slice(0, limit) : rows,
