@@ -4,7 +4,10 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { IpcWatcherManager } from '../src/ipc-watcher-manager.js';
+import {
+  DEFAULT_IPC_WATCHER_FALLBACK_MS,
+  IpcWatcherManager,
+} from '../src/ipc-watcher-manager.js';
 
 const temporaryRoots: string[] = [];
 
@@ -21,6 +24,10 @@ afterEach(() => {
 });
 
 describe('IpcWatcherManager runtime namespaces', () => {
+  test('keeps the default recovery scan below the Runner IPC deadline', () => {
+    expect(DEFAULT_IPC_WATCHER_FALLBACK_MS).toBe(2000);
+  });
+
   test.each([
     {
       name: 'conversation agent tasks',

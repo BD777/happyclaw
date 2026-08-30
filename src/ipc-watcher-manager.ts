@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+export const DEFAULT_IPC_WATCHER_FALLBACK_MS = 2000;
+
 export interface IpcRuntimeNamespace {
   agentId?: string | null;
   taskRunId?: string | null;
@@ -194,7 +196,7 @@ export class IpcWatcherManager {
       // IPC deadline. A 5s fallback paired with a 5s Runner timeout was a
       // deterministic race even after adding a final deadline read, because the
       // Host still debounces the discovered folder before processing it.
-    }, this.options.fallbackMs ?? 2000);
+    }, this.options.fallbackMs ?? DEFAULT_IPC_WATCHER_FALLBACK_MS);
     this.fallbackTimer.unref();
   }
 

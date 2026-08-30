@@ -28,7 +28,10 @@ import {
   preAcceptImDeliveryError,
 } from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
-import { IpcWatcherManager } from './ipc-watcher-manager.js';
+import {
+  DEFAULT_IPC_WATCHER_FALLBACK_MS,
+  IpcWatcherManager,
+} from './ipc-watcher-manager.js';
 import {
   deliverTextAndLocalImages,
   prepareLocalImages,
@@ -12318,9 +12321,15 @@ function startIpcWatcher(): void {
     }
   };
 
+  // Keep the recovery poll below the bounded Runner context-IPC deadline.
+  // Pass the value explicitly so runtime behavior and startup telemetry cannot
+  // silently diverge from the manager default.
+  const fallbackMs = DEFAULT_IPC_WATCHER_FALLBACK_MS;
+
   // Initialize the event-driven IPC watcher manager
   ipcWatcherManager = new IpcWatcherManager({
     ipcBaseDir,
+    fallbackMs,
     isShuttingDown: () => shuttingDown,
     onError: (err, context) => {
       if (context.phase === 'process_group') {
@@ -12340,10 +12349,13 @@ function startIpcWatcher(): void {
     logger.error({ err }, 'Error in initial IPC scan');
   });
 
-  // Start fallback polling (5s instead of 1s)
+  // Start bounded fallback polling alongside event-driven watchers.
   ipcWatcherManager.startFallback();
 
-  logger.info('IPC watcher started (event-driven + 5s fallback)');
+  logger.info(
+    { fallbackMs },
+    'IPC watcher started (event-driven + bounded fallback)',
+  );
 }
 
 /** Atomically acknowledge send_message only after the host has completed its
