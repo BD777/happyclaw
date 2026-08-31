@@ -25,6 +25,7 @@ import {
 } from '../src/database-maintenance.js';
 
 const AQIU_USERNAME = 'aqiu';
+const WINDENG_USERNAME = 'windeng';
 const CONTEXT_AUDIT_TASK_ID = 'task-1774459646386-rbrij6';
 const CONTEXT_AUDIT_CRON = '0 4 * * 0';
 const MIGRATION_SOURCE_ID = 'context-v2-migration-20260831';
@@ -233,11 +234,17 @@ async function main(): Promise<void> {
     await assertDatabaseUnused();
     db = await import('../src/db.js');
     const { createWorkspaceMemory } = await import('../src/memory-service.js');
+    const { getUserFeishuConfig, saveUserFeishuConfig } =
+      await import('../src/runtime-config.js');
     db.initDatabase();
 
     const aqiu = db.getUserByUsername(AQIU_USERNAME);
     if (!aqiu || aqiu.status !== 'active' || aqiu.role !== 'member') {
       throw new Error('Expected active member user aqiu was not found');
+    }
+    const windeng = db.getUserByUsername(WINDENG_USERNAME);
+    if (!windeng || windeng.status !== 'active' || windeng.role !== 'admin') {
+      throw new Error('Expected active admin user windeng was not found');
     }
     const homeJid = `web:home-${aqiu.id}`;
     const homeFolder = `home-${aqiu.id}`;
@@ -298,6 +305,53 @@ async function main(): Promise<void> {
     });
     db.updateTaskWorkspace(CONTEXT_AUDIT_TASK_ID, homeJid, homeFolder);
 
+    // Feishu P2P JIDs cannot be classified as direct from the JID alone.
+    // HappyClaw's supported isolation path is the per-user auto_im toggle:
+    // clear any interim workspace-main binds, then let startup create one
+    // dedicated conversation Session for each existing Feishu chat.
+    const feishuIsolation = [windeng, aqiu].map((user) => {
+      const current = getUserFeishuConfig(user.id);
+      if (!current) {
+        throw new Error(`Expected Feishu config for ${user.username}`);
+      }
+      const configChanged = current.autoIsolateContext !== true;
+      if (configChanged) {
+        saveUserFeishuConfig(user.id, {
+          appId: current.appId,
+          appSecret: current.appSecret,
+          enabled: current.enabled,
+          ownerOpenId: current.ownerOpenId,
+          autoIsolateContext: true,
+        });
+      }
+
+      const clearedWorkspaceMainBindings: string[] = [];
+      for (const [jid, group] of Object.entries(db.getAllRegisteredGroups())) {
+        if (
+          !jid.startsWith('feishu:') ||
+          group.created_by !== user.id ||
+          group.name !== '飞书私聊' ||
+          !group.target_main_jid ||
+          group.target_agent_id
+        ) {
+          continue;
+        }
+        db.setRegisteredGroup(jid, {
+          ...group,
+          target_main_jid: undefined,
+          binding_mode: 'single_context',
+        });
+        clearedWorkspaceMainBindings.push(jid);
+      }
+
+      return {
+        username: user.username,
+        enabled: true,
+        configChanged,
+        clearedWorkspaceMainBindings,
+      };
+    });
+
     console.log(
       JSON.stringify(
         {
@@ -319,6 +373,7 @@ async function main(): Promise<void> {
             nextRun,
             workspaceJid: homeJid,
           },
+          feishuIsolation,
         },
         null,
         2,

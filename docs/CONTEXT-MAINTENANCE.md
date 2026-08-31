@@ -17,11 +17,12 @@
 
 ### windeng
 
-管理员默认 Agent 使用 `host_claude`，个人工程上下文继续来自宿主机 `~/.claude`。这里维护跨项目工作方式、工程规则、项目笔记和个人 skills；不要复制 aqiu 的用户画像或 aqiu Home Memory。
+管理员默认 Agent 使用 `host_claude`，个人工程上下文继续来自宿主机 `~/.claude`。这里维护跨项目工作方式、工程规则、项目笔记和个人 skills；不要复制 aqiu 的用户画像或 aqiu Home Memory。windeng 的私聊渠道也使用独立 Session，不与 Web 主会话混用短期历史。
 
 ### aqiu
 
-- aqiu Home、QQ 私聊和飞书私聊继续使用同一个 Home workspace 与默认 HappyClaw Agent。
+- aqiu Home、QQ 私聊和飞书私聊使用同一个 Home workspace、默认 Agent Profile、Memory 和知识库。
+- Web、QQ 和飞书各自保留独立 Session（短期对话历史）；跨渠道需要长期共享的信息应进入 Memory，不依赖某个渠道的聊天历史。
 - 默认 Agent Profile 保存教学助手身份、沟通方式、检查与交付工作流。
 - aqiu Home Memory 保存短小且可能更新的长期信息。
 - `knowledge-base` skill 保存详细教学方法，并通过 `references/INDEX.md` 按需读取。
@@ -32,6 +33,8 @@
 ### 普通任务
 
 按原来方式在 Web、QQ 或飞书发消息即可。Agent 会先召回当前 workspace 的相关 Memory，再按知识库索引读取需要的规范，不需要在每次消息里重复全部偏好。
+
+飞书的 `autoIsolateContext` 已对 windeng 和 aqiu 开启；QQ 私聊也已绑定独立 Session。不要为了“共享上下文”把私聊手工绑到 workspace 主会话，否则会破坏会话隔离；应使用 Profile、Memory 和 skill 共享长期上下文。
 
 ### 要求记住
 
