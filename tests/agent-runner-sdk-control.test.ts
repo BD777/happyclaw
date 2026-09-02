@@ -85,6 +85,73 @@ describe('agent-runner SDK control requests', () => {
     },
   );
 
+  test('gives an SDK API retry a fresh response window', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(
+        60_000,
+        onTimeout,
+        3 * 60_000,
+      );
+
+      await vi.advanceTimersByTimeAsync(55_000);
+      watchdog.observe('system', 'api_retry');
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(onTimeout).not.toHaveBeenCalled();
+
+      watchdog.observe('assistant');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onTimeout).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('times out when no response follows the last SDK API retry', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(
+        60_000,
+        onTimeout,
+        3 * 60_000,
+      );
+
+      await vi.advanceTimersByTimeAsync(55_000);
+      watchdog.observe('system', 'api_retry');
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(onTimeout).toHaveBeenCalledOnce();
+      expect(onTimeout).toHaveBeenCalledWith('api_retry', 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('caps repeated SDK API retries at one absolute deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(
+        60_000,
+        onTimeout,
+        3 * 60_000,
+      );
+
+      for (let elapsed = 30_000; elapsed < 180_000; elapsed += 30_000) {
+        await vi.advanceTimersByTimeAsync(30_000);
+        watchdog.observe('system', 'api_retry');
+      }
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(onTimeout).toHaveBeenCalledOnce();
+      expect(onTimeout).toHaveBeenCalledWith('api_retry_limit', 3 * 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('allows a long compaction and clears its deadline on the real response', async () => {
     vi.useFakeTimers();
     try {

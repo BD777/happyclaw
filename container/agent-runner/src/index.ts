@@ -2850,7 +2850,10 @@ async function runQueryAttempt(
       ipcPolling = false;
     }
     for await (const message of q) {
-      firstResponseWatchdog.observe(message.type);
+      firstResponseWatchdog.observe(
+        message.type,
+        message.type === 'system' ? message.subtype : undefined,
+      );
       const preservesObservedBackgroundResult =
         (message.type === 'system' &&
           (message.subtype === 'background_tasks_changed' ||

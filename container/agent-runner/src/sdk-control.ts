@@ -40,7 +40,11 @@ const FIRST_RESPONSE_MESSAGE_TYPES = new Set([
   'stream_event',
 ]);
 
-export type SdkFirstResponseWatchdogPhase = 'first_response' | 'compaction';
+export type SdkFirstResponseWatchdogPhase =
+  | 'first_response'
+  | 'api_retry'
+  | 'api_retry_limit'
+  | 'compaction';
 
 /**
  * Last-resort guard for third-party CLI/provider combinations that persist an
@@ -50,6 +54,7 @@ export class SdkFirstResponseWatchdog {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private activePhase: SdkFirstResponseWatchdogPhase | undefined;
   private timedOut = false;
+  private readonly firstResponseStartedAt = Date.now();
 
   constructor(
     readonly timeoutMs: number,
@@ -57,13 +62,46 @@ export class SdkFirstResponseWatchdog {
       phase: SdkFirstResponseWatchdogPhase,
       timeoutMs: number,
     ) => void,
+    private readonly maxRetryWaitMs = timeoutMs * 3,
   ) {
     this.arm(timeoutMs, 'first_response');
   }
 
-  observe(messageType: string): void {
+  observe(messageType: string, messageSubtype?: string): void {
+    if (messageType === 'system' && messageSubtype === 'api_retry') {
+      this.observeApiRetry();
+      return;
+    }
     if (!FIRST_RESPONSE_MESSAGE_TYPES.has(messageType)) return;
     this.clear();
+  }
+
+  /**
+   * An SDK api_retry event proves the provider request is still making
+   * progress. Give the next attempt one fresh first-response window, while an
+   * absolute deadline prevents a noisy retry loop from keeping the runner
+   * alive forever.
+   */
+  private observeApiRetry(): void {
+    if (
+      this.timedOut ||
+      (this.activePhase !== 'first_response' &&
+        this.activePhase !== 'api_retry')
+    ) {
+      return;
+    }
+
+    const remainingMs =
+      this.firstResponseStartedAt + this.maxRetryWaitMs - Date.now();
+    if (remainingMs <= this.timeoutMs) {
+      this.arm(
+        Math.max(0, remainingMs),
+        'api_retry_limit',
+        this.maxRetryWaitMs,
+      );
+      return;
+    }
+    this.arm(this.timeoutMs, 'api_retry');
   }
 
   /**
@@ -84,14 +122,18 @@ export class SdkFirstResponseWatchdog {
     this.activePhase = undefined;
   }
 
-  private arm(timeoutMs: number, phase: SdkFirstResponseWatchdogPhase): void {
+  private arm(
+    timeoutMs: number,
+    phase: SdkFirstResponseWatchdogPhase,
+    reportedTimeoutMs = timeoutMs,
+  ): void {
     this.clear();
     this.activePhase = phase;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       this.activePhase = undefined;
       this.timedOut = true;
-      this.onTimeout(phase, timeoutMs);
+      this.onTimeout(phase, reportedTimeoutMs);
     }, timeoutMs);
   }
 }
