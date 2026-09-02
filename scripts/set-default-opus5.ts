@@ -1,12 +1,14 @@
 /**
- * Pin every enabled official Claude provider to the exact Opus 5 model ID.
+ * Pin every enabled official Claude provider to the exact Opus 5 model ID and
+ * set windeng's and aqiu's default Agent profiles to explicit high effort.
  *
  * Usage (HappyClaw must be stopped):
  *   npx tsx scripts/set-default-opus5.ts --apply
  *
  * This command intentionally creates no database, runtime, or .env backup.
- * Model changes invalidate only provider-bound SDK resume sessions; messages,
- * Workspace Memory, Agent Profiles, channel configuration, and files remain.
+ * Model and effort changes invalidate only provider-bound SDK resume sessions;
+ * messages, Workspace Memory, Agent Profiles, channel configuration, and files
+ * remain.
  */
 import '../src/load-env.js';
 
@@ -23,6 +25,8 @@ import {
 } from '../src/database-maintenance.js';
 
 const TARGET_MODEL = 'claude-opus-5';
+const TARGET_EFFORT = 'high' as const;
+const TARGET_USERNAMES = ['windeng', 'aqiu'] as const;
 const DATABASE_PATH = path.join(process.cwd(), 'data', 'db', 'messages.db');
 const execFileAsync = promisify(execFile);
 
@@ -33,7 +37,9 @@ function parseArgs(): void {
     process.exit(0);
   }
   if (args.length !== 1 || args[0] !== '--apply') {
-    throw new Error('Refusing to change the default model without --apply');
+    throw new Error(
+      'Refusing to change the default model and effort without --apply',
+    );
   }
 }
 
@@ -153,7 +159,19 @@ async function main(): Promise<void> {
       );
     }
 
-    const results = enabled.map((provider) => {
+    const targetProfiles = TARGET_USERNAMES.map((username) => {
+      const user = db!.getUserByUsername(username);
+      if (!user || user.status !== 'active') {
+        throw new Error(`Required active user not found: ${username}`);
+      }
+      return {
+        username,
+        userId: user.id,
+        profile: db!.getOrCreateDefaultAgentProfile(user.id),
+      };
+    });
+
+    const providerResults = enabled.map((provider) => {
       if (provider.anthropicModel === TARGET_MODEL) {
         return {
           providerId: provider.id,
@@ -192,6 +210,64 @@ async function main(): Promise<void> {
       };
     });
 
+    const profileResults = targetProfiles.map(
+      ({ username, userId, profile }) => {
+        const effortAlreadySet =
+          profile.runtime_policy.reasoning.effort === TARGET_EFFORT;
+        const modelAlreadyInherited = profile.model_config_id === null;
+        if (effortAlreadySet && modelAlreadyInherited) {
+          return {
+            username,
+            profileId: profile.id,
+            changed: false,
+            version: profile.version,
+          };
+        }
+
+        const updated = db!.updateAgentProfile(profile.id, userId, {
+          modelConfigId: null,
+          runtimePolicy: { reasoning: { effort: TARGET_EFFORT } },
+          changeSource: 'migration',
+        });
+        if (!updated) {
+          throw new Error(
+            `Failed to update default Agent profile: ${username}`,
+          );
+        }
+        let auditAppended = true;
+        try {
+          runtime.appendClaudeConfigAudit(
+            'deployment',
+            'set_default_agent_effort',
+            [`profile:${profile.id}`, 'reasoning.effort:updated'],
+            {
+              username,
+              targetEffort: TARGET_EFFORT,
+              inheritedSystemModel: true,
+            },
+          );
+        } catch {
+          auditAppended = false;
+        }
+        return {
+          username,
+          profileId: profile.id,
+          changed: true,
+          version: updated.version,
+          auditAppended,
+        };
+      },
+    );
+
+    let effortSessionCleanup = 0;
+    if (profileResults.some((result) => result.changed)) {
+      for (const provider of enabled) {
+        effortSessionCleanup += db.deleteSessionsByProviderId(
+          provider.id,
+        ).deletedCount;
+      }
+    }
+
     const mismatches = runtime
       .getEnabledProviders()
       .filter((provider) => provider.anthropicModel !== TARGET_MODEL);
@@ -202,13 +278,31 @@ async function main(): Promise<void> {
           .join(', ')}`,
       );
     }
+    const profileMismatches = targetProfiles.filter(({ profile }) => {
+      const refreshed = db!.getAgentProfile(profile.id);
+      return (
+        !refreshed ||
+        refreshed.model_config_id !== null ||
+        refreshed.runtime_policy.reasoning.effort !== TARGET_EFFORT
+      );
+    });
+    if (profileMismatches.length > 0) {
+      throw new Error(
+        `Default Agent profile verification failed: ${profileMismatches
+          .map(({ username }) => username)
+          .join(', ')}`,
+      );
+    }
 
     console.log(
       JSON.stringify(
         {
           schemaVersion: db.CURRENT_SCHEMA_VERSION,
           targetModel: TARGET_MODEL,
-          enabledProviders: results,
+          targetEffort: TARGET_EFFORT,
+          enabledProviders: providerResults,
+          defaultAgentProfiles: profileResults,
+          effortSessionCleanup,
         },
         null,
         2,

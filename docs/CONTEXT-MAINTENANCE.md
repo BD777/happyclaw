@@ -36,7 +36,7 @@
 
 飞书的 `autoIsolateContext` 已对 windeng 和 aqiu 开启；QQ 私聊也已绑定独立 Session。不要为了“共享上下文”把私聊手工绑到 workspace 主会话，否则会破坏会话隔离；应使用 Profile、Memory 和 skill 共享长期上下文。
 
-系统当前唯一启用的官方 Claude provider 明确使用 `claude-opus-5`，windeng 和 aqiu 的默认 Agent Profile 都继承这一系统模型。以后修改 provider 的模型或端点时，HappyClaw 会重置对应的底层 SDK Session；聊天记录、Profile、Memory 和文件不会因此删除。
+系统当前唯一启用的官方 Claude provider 明确使用 `claude-opus-5`，windeng 和 aqiu 的默认 Agent Profile 都继承这一系统模型，并显式使用 `high` 推理档位。日常任务保持 `high`；只有高难度编程、长时间多工具 Agent 等任务才临时升到 `xhigh`，不要把 `max` 作为默认值。以后修改 provider 的模型、端点或 Agent 推理档位时，HappyClaw 会重置对应的底层 SDK Session；聊天记录、Profile、Memory 和文件不会因此删除。
 
 ### 要求记住
 

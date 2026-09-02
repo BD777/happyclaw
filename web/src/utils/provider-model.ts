@@ -52,7 +52,7 @@ export function buildDefaultProviderEnv(
       value: '1',
       source: 'default',
     },
-    { key: 'CLAUDE_CODE_EFFORT_LEVEL', value: 'max', source: 'default' },
+    { key: 'CLAUDE_CODE_EFFORT_LEVEL', value: 'high', source: 'default' },
     { key: 'CLAUDE_CODE_NO_FLICKER', value: '1', source: 'default' },
     { key: 'API_TIMEOUT_MS', value: '3000000', source: 'default' },
   ];

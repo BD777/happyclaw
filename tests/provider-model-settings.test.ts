@@ -42,7 +42,7 @@ describe('third-party provider model settings', () => {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.2[1m]',
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      CLAUDE_CODE_EFFORT_LEVEL: 'max',
+      CLAUDE_CODE_EFFORT_LEVEL: 'high',
       CLAUDE_CODE_NO_FLICKER: '1',
       API_TIMEOUT_MS: '3000000',
     });

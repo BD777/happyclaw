@@ -134,7 +134,7 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.2[1m]');
     expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
     expect(lines).toContain('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
-    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
+    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=high');
     expect(lines).toContain('CLAUDE_CODE_NO_FLICKER=1');
     expect(lines).toContain('API_TIMEOUT_MS=3000000');
   });
@@ -149,7 +149,7 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=999999');
     expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=low');
     expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
-    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
+    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=high');
     expect(lines).toContain('CUSTOM_FLAG=kept');
   });
 
@@ -160,7 +160,7 @@ describe('buildClaudeEnvLines', () => {
     );
 
     expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=low');
-    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
+    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=high');
     expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
   });
 
