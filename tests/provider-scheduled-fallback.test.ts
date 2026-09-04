@@ -276,7 +276,7 @@ describe('scheduled provider fallback', () => {
     }
   });
 
-  test('isolated task without turnId reuses one stable id and the same provider', async () => {
+  test('isolated task keeps one stable id while bounded retries move past a noisy provider', async () => {
     for (const provider of mocks.enabledProviders) {
       providerPool.resetHealth(provider.id);
     }
@@ -299,9 +299,11 @@ describe('scheduled provider fallback', () => {
         ) => void,
       ): Promise<ContainerOutput> => {
         turnIds.push(input.turnId);
+        const transientPin = transientRetryProfileForInput(input.turnId);
         const selectedProviderId =
-          transientRetryProfileForInput(input.turnId) ??
-          providerPool.selectProvider();
+          transientPin && !providerPool.isTransientQuarantined(transientPin)
+            ? transientPin
+            : providerPool.selectProvider();
         attemptedProviders.push(selectedProviderId);
         onProcess(
           {} as never,
@@ -330,13 +332,14 @@ describe('scheduled provider fallback', () => {
       onProcess,
     );
 
-    expect(turnIds).toEqual(['durable-task-run-id', 'durable-task-run-id']);
-    expect(attemptedProviders).toHaveLength(2);
+    expect(new Set(turnIds)).toEqual(new Set(['durable-task-run-id']));
+    expect(attemptedProviders.length).toBeGreaterThanOrEqual(2);
+    expect(attemptedProviders.length).toBeLessThanOrEqual(6);
     expect(attemptedProviders[1]).toBe(attemptedProviders[0]);
-    expect(onProcess.mock.calls.map((call) => call[2])).toEqual([
-      attemptedProviders[0],
-      attemptedProviders[0],
-    ]);
+    expect(onProcess.mock.calls.map((call) => call[2])).toEqual(
+      attemptedProviders,
+    );
+    expect(new Set(attemptedProviders).size).toBeGreaterThan(1);
     expect(output.providerFailureTerminal).toBe(true);
     for (const provider of mocks.enabledProviders) {
       expect(providerPool.getHealthStatus(provider.id).healthy).toBe(true);

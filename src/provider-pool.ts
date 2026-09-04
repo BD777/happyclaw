@@ -30,6 +30,18 @@ interface ModelQuarantine {
 }
 
 /**
+ * Short-lived endpoint breaker for repeated transport/liveness failures.
+ *
+ * This is deliberately separate from account health: a 529, 5xx or silent
+ * connection does not prove that credentials or quota are bad. It only says
+ * this endpoint should be taken out of automatic rotation briefly while a
+ * durable input waits for another attempt.
+ */
+interface TransientQuarantine {
+  since: number;
+}
+
+/**
  * A model tier to select within: one shared model name, or a per-account map
  * for the primary tier where each account has its own configured model. The
  * empty string selects without any tier constraint.
@@ -131,6 +143,7 @@ export class ProviderPool {
   private recoveryIntervalMs = DEFAULT_RECOVERY_INTERVAL_MS;
   private healthMap: Map<string, ProviderHealthStatus> = new Map();
   private modelQuarantine: Map<string, ModelQuarantine> = new Map();
+  private transientQuarantine: Map<string, TransientQuarantine> = new Map();
   private roundRobinIndex = 0;
 
   /** True when the strategy rotates on every request rather than on failure. */
@@ -164,6 +177,9 @@ export class ProviderPool {
       if (!memberIds.has(modelKeyOwner(key))) {
         this.modelQuarantine.delete(key);
       }
+    }
+    for (const profileId of this.transientQuarantine.keys()) {
+      if (!memberIds.has(profileId)) this.transientQuarantine.delete(profileId);
     }
   }
 
@@ -230,6 +246,7 @@ export class ProviderPool {
       if (!m.enabled) return false;
       const health = this.healthMap.get(m.profileId);
       if (health && !health.healthy) return false;
+      if (this.isTransientQuarantined(m.profileId, now)) return false;
       const model =
         typeof tier === 'string' ? tier : (tier.get(m.profileId) ?? '');
       return !model || !this.isModelQuarantined(m.profileId, model, now);
@@ -252,6 +269,29 @@ export class ProviderPool {
     }
   }
 
+  /** Temporarily remove one noisy endpoint from automatic selection. */
+  reportTransientFailure(profileId: string): void {
+    const now = Date.now();
+    this.transientQuarantine.set(profileId, { since: now });
+    logger.warn(
+      {
+        profileId,
+        retryAfter: new Date(now + this.recoveryIntervalMs).toISOString(),
+      },
+      'Provider endpoint circuit opened after repeated transient failures',
+    );
+  }
+
+  isTransientQuarantined(profileId: string, now = Date.now()): boolean {
+    const entry = this.transientQuarantine.get(profileId);
+    if (!entry) return false;
+    if (now >= entry.since + this.recoveryIntervalMs) {
+      this.transientQuarantine.delete(profileId);
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Candidate-affecting quarantine state, used by bounded replay loops to
    * prove that a non-terminal provider failure actually made progress.
@@ -267,6 +307,13 @@ export class ProviderPool {
       .map((member) => member.profileId)
       .sort();
     const modelWalls: string[] = [];
+    const transientWalls = this.members
+      .filter(
+        (member) =>
+          member.enabled && this.isTransientQuarantined(member.profileId, now),
+      )
+      .map((member) => member.profileId)
+      .sort();
     for (const [key, entry] of this.modelQuarantine) {
       const recoverAt = entry.until ?? entry.since + this.recoveryIntervalMs;
       if (now >= recoverAt) {
@@ -280,7 +327,7 @@ export class ProviderPool {
       }
     }
     modelWalls.sort();
-    return JSON.stringify({ accountWalls, modelWalls });
+    return JSON.stringify({ accountWalls, transientWalls, modelWalls });
   }
 
   /** How many enabled members are currently configured */
@@ -369,6 +416,7 @@ export class ProviderPool {
 
   reportSuccess(profileId: string, model?: string): void {
     const health = this.getOrCreateHealth(profileId);
+    this.transientQuarantine.delete(profileId);
     // A completed turn proves this exact tier works again.
     if (model?.trim()) {
       this.modelQuarantine.delete(modelKey(profileId, model.trim()));
@@ -443,6 +491,7 @@ export class ProviderPool {
   refreshRecoveryState(now = Date.now()): void {
     for (const member of this.members) {
       if (!member.enabled) continue;
+      this.isTransientQuarantined(member.profileId, now);
       const health = this.healthMap.get(member.profileId);
       if (!health || health.healthy || health.unhealthySince === null) continue;
       // An upstream-reported reset is authoritative over the local interval:
@@ -481,6 +530,7 @@ export class ProviderPool {
 
   resetHealth(profileId: string): void {
     this.healthMap.set(profileId, makeHealthStatus(profileId));
+    this.transientQuarantine.delete(profileId);
     this.resetModelQuarantine(profileId);
   }
 

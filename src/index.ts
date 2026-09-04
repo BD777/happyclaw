@@ -301,6 +301,7 @@ import {
 } from './channel-outbox-runtime-scope.js';
 import {
   cleanupChannelReliability,
+  failRetryableChannelTurnRunsByCorrelationIds,
   getDeliveredChannelOutboxForTurn,
   getFailedChannelOutboxForTurn,
   getChannelTurnRun,
@@ -6602,7 +6603,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (channelTurnRuntime) {
     channelTurnRuntimes.set(lastProcessed.id, channelTurnRuntime);
   }
-  const markMainOutputSettled = (result: ContainerOutput): void => {
+  const markMainOutputSettled = (
+    result: ContainerOutput,
+    executionSucceeded = true,
+  ): void => {
     const completedInputTurnIds = result.ipcReceipts?.length
       ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
       : [result.inputTurnId ?? lastProcessed.id];
@@ -6618,8 +6622,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       effectiveGroup.folder,
       completedInputs,
     );
-    for (const inputTurnId of completedInputTurnIds) {
-      healthyCompletedInputTurns.add(inputTurnId);
+    if (executionSucceeded) {
+      for (const inputTurnId of completedInputTurnIds) {
+        healthyCompletedInputTurns.add(inputTurnId);
+      }
     }
   };
   const completeChannelRuntimesForOutput = async (
@@ -6728,14 +6734,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         );
         continue;
       }
-      const completed =
-        runtime.markFinalizing() &&
-        runtime.complete({
-          cursorCommitted: true,
-          sentReply: utteranceDelivered,
-          silent: !utteranceDelivered,
-          inputTurnId: inputId,
-        });
+      const executionFailed =
+        result.providerFailure === true ||
+        result.status === 'error' ||
+        result.finalizationReason === 'error';
+      const settlementResult = {
+        cursorCommitted: true,
+        sentReply: utteranceDelivered,
+        silent: !utteranceDelivered,
+        inputTurnId: inputId,
+        executionStatus: executionFailed ? 'failed' : 'completed',
+        deliveryStatus: utteranceDelivered ? 'delivered' : 'silent',
+        finalizationReason:
+          result.finalizationReason ??
+          (executionFailed ? 'error' : 'completed'),
+      };
+      const completed = executionFailed
+        ? runtime.fail(
+            result.error ||
+              result.providerFailureNotice ||
+              'Agent execution failed before producing a successful result',
+            settlementResult,
+          )
+        : runtime.markFinalizing() && runtime.complete(settlementResult);
       if (completed) {
         // Keep the immutable scope projection until the whole warm runner
         // exits. A late duplicate SDK callback for this already-completed
@@ -6758,7 +6779,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         );
       }
     }
-    if (allCompleted) markMainOutputSettled(result);
+    if (allCompleted) {
+      markMainOutputSettled(
+        result,
+        !(
+          result.providerFailure === true ||
+          result.status === 'error' ||
+          result.finalizationReason === 'error'
+        ),
+      );
+    }
     return allCompleted;
   };
   const channelScopeForOutput = (
@@ -10048,6 +10078,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       turnId: lastProcessed.id,
       sessionId: activeSessionId,
     });
+  }
+  // A terminal provider/configuration notice can be physically delivered and
+  // commit the exact cursor while the Agent execution itself is correctly
+  // recorded as failed. Do not require a healthy model result to suppress a
+  // replay after that already-visible terminal boundary.
+  if (activeCursorCommitted) {
+    await clearProcessingIndicatorForInput(ipcReplyTurnTracker.inputTurnId);
+    return true;
   }
   if (healthyCompletedInputTurns.has(ipcReplyTurnTracker.inputTurnId)) {
     commitCursor();
@@ -15435,7 +15473,10 @@ async function processAgentConversation(
   if (agentChannelTurnRuntime) {
     agentChannelTurnRuntimes.set(lastProcessed.id, agentChannelTurnRuntime);
   }
-  const markAgentOutputSettled = (result: ContainerOutput): void => {
+  const markAgentOutputSettled = (
+    result: ContainerOutput,
+    executionSucceeded = true,
+  ): void => {
     const completedInputTurnIds = result.ipcReceipts?.length
       ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
       : [result.inputTurnId ?? lastProcessed.id];
@@ -15448,8 +15489,10 @@ async function processAgentConversation(
         )
       : [{ chatJid: virtualChatJid, messageId: lastProcessed.id }];
     activeAgentBuilderTurns.clearCompleted(agentBuilderScope, completedInputs);
-    for (const inputTurnId of completedInputTurnIds) {
-      healthyAgentCompletedInputTurns.add(inputTurnId);
+    if (executionSucceeded) {
+      for (const inputTurnId of completedInputTurnIds) {
+        healthyAgentCompletedInputTurns.add(inputTurnId);
+      }
     }
   };
   const completeAgentChannelRuntimesForOutput = async (
@@ -15560,14 +15603,29 @@ async function processAgentConversation(
         );
         continue;
       }
-      const completed =
-        runtime.markFinalizing() &&
-        runtime.complete({
-          cursorCommitted: true,
-          replyDelivered: utteranceDelivered,
-          silent: !utteranceDelivered,
-          inputTurnId: inputId,
-        });
+      const executionFailed =
+        result.providerFailure === true ||
+        result.status === 'error' ||
+        result.finalizationReason === 'error';
+      const settlementResult = {
+        cursorCommitted: true,
+        replyDelivered: utteranceDelivered,
+        silent: !utteranceDelivered,
+        inputTurnId: inputId,
+        executionStatus: executionFailed ? 'failed' : 'completed',
+        deliveryStatus: utteranceDelivered ? 'delivered' : 'silent',
+        finalizationReason:
+          result.finalizationReason ??
+          (executionFailed ? 'error' : 'completed'),
+      };
+      const completed = executionFailed
+        ? runtime.fail(
+            result.error ||
+              result.providerFailureNotice ||
+              'Agent execution failed before producing a successful result',
+            settlementResult,
+          )
+        : runtime.markFinalizing() && runtime.complete(settlementResult);
       if (completed) {
         // Retain exact scope until runner finally; see main-path comment.
         await clearAgentProcessingIndicatorForInput(inputId);
@@ -15588,7 +15646,16 @@ async function processAgentConversation(
         );
       }
     }
-    if (allCompleted) markAgentOutputSettled(result);
+    if (allCompleted) {
+      markAgentOutputSettled(
+        result,
+        !(
+          result.providerFailure === true ||
+          result.status === 'error' ||
+          result.finalizationReason === 'error'
+        ),
+      );
+    }
     return allCompleted;
   };
   const agentScopeForOutput = (
@@ -22202,6 +22269,7 @@ async function main(): Promise<void> {
           registeredGroups[groupJid] ?? getRegisteredGroup(groupJid);
         const name = group?.name || groupJid;
         const error = `${name} 处理失败，已达最大重试次数`;
+        let terminalNoticeProjected = false;
         if (group && snapshot?.coveredCursors.length) {
           // Use only the immutable batch read by the final failed attempt.
           // A prompt arriving while this callback runs belongs to a future
@@ -22222,23 +22290,77 @@ async function main(): Promise<void> {
               getAgentBuilderInputMessage(targetJid, messageId),
             getRun: getTaskRunById,
           });
-          const durable = await projectTerminalScheduledGroupRuns({
+          await projectTerminalScheduledGroupRuns({
             runs,
             chatJid: groupJid,
             workspaceFolder: resolveEffectiveGroup(group).effectiveGroup.folder,
             status: 'failed',
             error,
           });
-          if (durable) {
-            // Retry exhaustion terminates this immutable final-attempt batch,
-            // including any ordinary inputs coalesced before its upper bound.
-            // Commit the whole bounded snapshot so crash recovery cannot
-            // replay the old scheduler prompt; later messages sort after this
-            // cursor and remain pending.
-            advanceCursors(groupJid, snapshot.cursor);
+
+          const agentId = groupJid.includes('#agent:')
+            ? groupJid.slice(groupJid.indexOf('#agent:') + 7)
+            : null;
+          const sourceJid =
+            [...exactMessages].reverse().find((message) => message.source_jid)
+              ?.source_jid ?? snapshot.cursor.sourceJid;
+          const route = sourceJid
+            ? resolveDurableChannelRoute(sourceJid)
+            : null;
+          if (sourceJid && route) {
+            terminalNoticeProjected =
+              await deliverIndependentChannelSystemNotice({
+                logicalChatJid: groupJid,
+                scopeKey: channelTurnScope(
+                  resolveEffectiveGroup(group).effectiveGroup.folder,
+                  agentId,
+                ),
+                targetJid: sourceJid,
+                originalInputTurnId: snapshot.cursor.id,
+                originalRunId: `retry-exhausted:${snapshot.cursor.id}`,
+                noticeKey: 'agent-max-retries',
+                text: error,
+                sender: '__system__',
+                senderName: 'system',
+                agentId,
+                presentation: 'native',
+                messageMeta: {
+                  turnId: snapshot.cursor.id,
+                  finalizationReason: 'error',
+                },
+                route,
+              });
           }
+
+          const failedTurns = failRetryableChannelTurnRunsByCorrelationIds({
+            correlationIds: snapshot.coveredCursors.map((cursor) => cursor.id),
+            error,
+            result: {
+              executionStatus: 'failed',
+              deliveryStatus: terminalNoticeProjected ? 'recorded' : 'web_only',
+              finalizationReason: 'error',
+              retryExhausted: true,
+            },
+          });
+          logger.error(
+            {
+              groupJid,
+              failedTurns,
+              coveredInputs: snapshot.coveredCursors.length,
+              terminalNoticeProjected,
+            },
+            'Durably terminalized message batch after retry exhaustion',
+          );
+
+          // Retry exhaustion terminates this immutable final-attempt batch,
+          // including ordinary and scheduled inputs. Commit the bounded
+          // snapshot so crash recovery cannot replay it; later messages sort
+          // after this cursor and remain pending.
+          advanceCursors(groupJid, snapshot.cursor);
         }
-        sendSystemMessage(groupJid, 'agent_max_retries', error);
+        if (!terminalNoticeProjected) {
+          sendSystemMessage(groupJid, 'agent_max_retries', error);
+        }
       } finally {
         await clearTrackedProcessingIndicators(groupJid);
       }

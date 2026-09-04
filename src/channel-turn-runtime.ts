@@ -247,10 +247,10 @@ export class ChannelTurnRuntime {
     return this.finish('completed', result);
   }
 
-  fail(error: unknown): boolean {
+  fail(error: unknown, result?: unknown): boolean {
     return this.finish(
       'failed',
-      undefined,
+      result,
       error instanceof Error ? error.message : String(error),
     );
   }

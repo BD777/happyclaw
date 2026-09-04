@@ -24,11 +24,13 @@ describe('liveness retry ledger', () => {
     expect(ledger.consume('turn-b')).toBe(false);
   });
 
-  test('a spent turn stops occupying the ledger', () => {
+  test('a spent turn remains fenced until success or bounded eviction', () => {
     const ledger = new TransientRetryLedger();
     ledger.consume('turn-a');
     expect(ledger.trackedTurnCount).toBe(1);
     ledger.consume('turn-a');
+    expect(ledger.trackedTurnCount).toBe(1);
+    ledger.clear('turn-a');
     expect(ledger.trackedTurnCount).toBe(0);
   });
 
@@ -45,6 +47,15 @@ describe('liveness retry ledger', () => {
     expect(ledger.consume('turn-a')).toBe(true);
     expect(ledger.consume('turn-a')).toBe(true);
     expect(ledger.consume('turn-a')).toBe(false);
+  });
+
+  test('grants a separate bounded replay after automatic provider failover', () => {
+    const ledger = new TransientRetryLedger();
+    expect(ledger.consume('turn-a', 'provider-a')).toBe(true);
+    expect(ledger.consume('turn-a', 'provider-a')).toBe(false);
+    expect(ledger.consume('turn-a', 'provider-b')).toBe(true);
+    expect(ledger.consume('turn-a', 'provider-b')).toBe(false);
+    expect(ledger.consume('turn-a', 'provider-a')).toBe(false);
   });
 
   test('evicts in insertion order instead of growing without bound', () => {

@@ -396,6 +396,35 @@ describe('resolveTurnOutcome', () => {
     }
   });
 
+  test('a delivered provider error records failed execution instead of completed', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const mainCompletion = main.slice(
+      main.indexOf('const completeChannelRuntimesForOutput'),
+      main.indexOf('const channelScopeForOutput'),
+    );
+    const agentCompletion = main.slice(
+      main.indexOf('const completeAgentChannelRuntimesForOutput'),
+      main.indexOf('const agentScopeForOutput'),
+    );
+    for (const branch of [mainCompletion, agentCompletion]) {
+      expect(branch).toContain('result.providerFailure === true');
+      expect(branch).toContain("result.finalizationReason === 'error'");
+      expect(branch).toContain('executionStatus: executionFailed');
+      expect(branch).toContain('deliveryStatus: utteranceDelivered');
+      expect(branch).toContain('? runtime.fail(');
+      expect(branch).toContain(': runtime.markFinalizing()');
+    }
+    expect(main).toContain(
+      'A terminal provider/configuration notice can be physically delivered',
+    );
+    expect(main).toMatch(
+      /if \(activeCursorCommitted\) \{[\s\S]*?return true;[\s\S]*?if \(healthyCompletedInputTurns\.has/,
+    );
+  });
+
   test('returns a negative MCP image acknowledgement when physical delivery is unconfirmed', () => {
     const main = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),

@@ -597,10 +597,10 @@ export function applyProviderFailureDisposition(
   allowFailover = true,
 ): boolean {
   const failureClass = resolveProviderFailureClass(output);
-  // Transient failures never consult the pool: no account was judged, so the
-  // only question is whether this input still has a retry left. This is
-  // identical for single- and multi-account installs by design — a 529 is not a
-  // reason to move the conversation to a different account.
+  // The first transient failure gets one same-provider replay. Repetition is
+  // still not an account/quota verdict, but it does open a short-lived endpoint
+  // circuit so an automatic pool can fail over and a single-provider install
+  // can release the durable input to its queue backoff instead of dropping it.
   if (failureClass === 'transient') {
     if (
       transientRetries.consume(
@@ -611,18 +611,20 @@ export function applyProviderFailureDisposition(
       applyKnownProviderFailureDisposition(output, false);
       return false;
     }
-    // The bounded same-provider replay is spent. Repetition does not turn a
-    // 529/5xx or a silent transport stall into evidence about account health:
-    // end this input visibly, but leave every configured account selectable.
+    providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
+    if (selectedProfileId) {
+      providerPool.reportTransientFailure(selectedProfileId);
+    }
     logger.warn(
       {
         providerId: selectedProfileId,
         livenessTimeout: output.providerLivenessTimeout === true,
+        alternateAvailable: allowFailover && poolCanStillServe(),
       },
-      'Transient provider failure repeated after its replay; ending input without quarantining the account',
+      'Transient provider failure repeated after its replay; preserving durable input and opening endpoint circuit',
     );
-    applyKnownProviderFailureDisposition(output, true);
-    return true;
+    applyKnownProviderFailureDisposition(output, false);
+    return false;
   }
   // A pinned model configuration is authoritative, so model_not_found ends
   // there. In an automatic multi-provider pool, however, each member may use a
@@ -1155,6 +1157,7 @@ export function willClearSessionOnProviderSwitch(
   // predicts a switch that the actual selection no longer performs.
   providerPool.refreshRecoveryState();
   if (!providerPool.getHealthStatus(boundId).healthy) return true;
+  if (providerPool.isTransientQuarantined(boundId)) return true;
   // Same second dimension the sticky path checks: a walled model tier moves
   // the session off a still-healthy account, and that switch must inject
   // history like any other.
@@ -1262,6 +1265,9 @@ export function trySelectPoolProvider(
     const healthy = providerPool.getHealthStatus(
       transientRetryProfileId,
     ).healthy;
+    const endpointAvailable = !providerPool.isTransientQuarantined(
+      transientRetryProfileId,
+    );
     const tierAvailable =
       !!pinned &&
       stickyBindingCanServeTier(
@@ -1269,7 +1275,7 @@ export function trySelectPoolProvider(
         enabledProviders,
         tierModel,
       );
-    if (pinned && healthy && tierAvailable) {
+    if (pinned && healthy && endpointAvailable && tierAvailable) {
       try {
         const resolved = resolveProviderById(transientRetryProfileId);
         providerPool.acquireSession(transientRetryProfileId);
@@ -1305,6 +1311,7 @@ export function trySelectPoolProvider(
           providerId: transientRetryProfileId,
           enabled: !!pinned,
           healthy,
+          endpointAvailable,
           tierAvailable,
         },
         'Transient replay provider is no longer eligible; returning to pool selection',
@@ -1323,6 +1330,11 @@ export function trySelectPoolProvider(
         logger.info(
           { groupFolder, agentId: agentId || null, providerId: boundId },
           'Sticky provider is unhealthy, falling back to pool selection',
+        );
+      } else if (providerPool.isTransientQuarantined(boundId)) {
+        logger.info(
+          { groupFolder, agentId: agentId || null, providerId: boundId },
+          'Sticky provider endpoint circuit is open, falling back to pool selection',
         );
       } else if (
         !stickyBindingCanServeTier(boundId, enabledProviders, tierModel)
@@ -2687,6 +2699,9 @@ export async function runContainerAgent(
         !providerFailureReported &&
         (result.status === 'success' || result.status === 'closed')
       ) {
+        if (result.inputTurnCompleted) {
+          transientRetries.clear(resolveTransientRetryKey(result));
+        }
         providerPool.reportSuccess(
           selectedProfileId,
           result.providerRateLimitModel,
@@ -3925,6 +3940,9 @@ export async function runHostAgent(
         !hostProviderFailureReported &&
         (hostResult.status === 'success' || hostResult.status === 'closed')
       ) {
+        if (hostResult.inputTurnCompleted) {
+          transientRetries.clear(resolveTransientRetryKey(hostResult));
+        }
         providerPool.reportSuccess(
           hostSelectedProfileId,
           hostResult.providerRateLimitModel,

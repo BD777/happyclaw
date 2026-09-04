@@ -104,7 +104,7 @@ describe('transient provider failure isolation', () => {
     [false, PROVIDER_TRANSIENT_FAILURE_USER_NOTICE],
     [true, PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE],
   ])(
-    'repeated 529/5xx or stall ends the input but never quarantines (liveness=%s)',
+    'repeated 529/5xx or stall opens an endpoint circuit without ending the input (liveness=%s)',
     (livenessTimeout, expectedNotice) => {
       resetPool();
       const id = `msg-terminal-${livenessTimeout}`;
@@ -114,12 +114,17 @@ describe('transient provider failure isolation', () => {
       );
 
       const second = transient(id, livenessTimeout);
-      expect(applyProviderFailureDisposition(second, 'provider-a')).toBe(true);
+      expect(applyProviderFailureDisposition(second, 'provider-a')).toBe(false);
       expect(second.providerFailureClass).toBe('transient');
-      expect(second.inputTurnCompleted).toBe(true);
-      expect(second.providerFailureNotice).toBe(expectedNotice);
+      expect(second.inputTurnCompleted).toBe(false);
+      expect(second.providerFailureNotice).toBeUndefined();
       expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
       expect(providerPool.getHealthStatus('provider-b').healthy).toBe(true);
+      expect(providerPool.isTransientQuarantined('provider-a')).toBe(true);
+      expect(providerPool.isTransientQuarantined('provider-b')).toBe(false);
+      // The class-specific notice remains available for the queue's eventual
+      // terminal projection if every durable retry is exhausted.
+      expect(expectedNotice).not.toContain('额度已用尽');
     },
   );
 

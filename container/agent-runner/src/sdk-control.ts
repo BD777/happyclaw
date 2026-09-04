@@ -51,7 +51,8 @@ export type SdkFirstResponseWatchdogPhase =
  * API error to the transcript but never forward it through the SDK iterator.
  */
 export class SdkFirstResponseWatchdog {
-  private timer: ReturnType<typeof setTimeout> | undefined;
+  private inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+  private retryLimitTimer: ReturnType<typeof setTimeout> | undefined;
   private activePhase: SdkFirstResponseWatchdogPhase | undefined;
   private timedOut = false;
   private readonly firstResponseStartedAt = Date.now();
@@ -78,9 +79,11 @@ export class SdkFirstResponseWatchdog {
 
   /**
    * An SDK api_retry event proves the provider request is still making
-   * progress. Give the next attempt one fresh first-response window, while an
-   * absolute deadline prevents a noisy retry loop from keeping the runner
-   * alive forever.
+   * progress. Treat it as a heartbeat and give the next attempt one fresh
+   * inactivity window. A separate absolute deadline prevents a noisy retry
+   * loop from keeping the runner alive forever; it must not replace the
+   * rolling inactivity timer because the SDK's own bounded backoff can
+   * legitimately span several minutes.
    */
   private observeApiRetry(): void {
     if (
@@ -91,15 +94,16 @@ export class SdkFirstResponseWatchdog {
       return;
     }
 
-    const remainingMs =
-      this.firstResponseStartedAt + this.maxRetryWaitMs - Date.now();
-    if (remainingMs <= this.timeoutMs) {
-      this.arm(
-        Math.max(0, remainingMs),
-        'api_retry_limit',
-        this.maxRetryWaitMs,
+    if (!this.retryLimitTimer) {
+      const remainingMs = Math.max(
+        0,
+        this.firstResponseStartedAt + this.maxRetryWaitMs - Date.now(),
       );
-      return;
+      this.retryLimitTimer = setTimeout(
+        () => this.finishTimeout('api_retry_limit', this.maxRetryWaitMs),
+        remainingMs,
+      );
+      this.retryLimitTimer.unref?.();
     }
     this.arm(this.timeoutMs, 'api_retry');
   }
@@ -113,12 +117,16 @@ export class SdkFirstResponseWatchdog {
    */
   beginCompaction(timeoutMs: number): void {
     if (this.timedOut || this.activePhase === 'compaction') return;
+    if (this.retryLimitTimer) clearTimeout(this.retryLimitTimer);
+    this.retryLimitTimer = undefined;
     this.arm(timeoutMs, 'compaction');
   }
 
   clear(): void {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = undefined;
+    if (this.inactivityTimer) clearTimeout(this.inactivityTimer);
+    if (this.retryLimitTimer) clearTimeout(this.retryLimitTimer);
+    this.inactivityTimer = undefined;
+    this.retryLimitTimer = undefined;
     this.activePhase = undefined;
   }
 
@@ -127,13 +135,22 @@ export class SdkFirstResponseWatchdog {
     phase: SdkFirstResponseWatchdogPhase,
     reportedTimeoutMs = timeoutMs,
   ): void {
-    this.clear();
+    if (this.inactivityTimer) clearTimeout(this.inactivityTimer);
+    this.inactivityTimer = undefined;
     this.activePhase = phase;
-    this.timer = setTimeout(() => {
-      this.timer = undefined;
-      this.activePhase = undefined;
-      this.timedOut = true;
-      this.onTimeout(phase, reportedTimeoutMs);
+    this.inactivityTimer = setTimeout(() => {
+      this.finishTimeout(phase, reportedTimeoutMs);
     }, timeoutMs);
+    this.inactivityTimer.unref?.();
+  }
+
+  private finishTimeout(
+    phase: SdkFirstResponseWatchdogPhase,
+    reportedTimeoutMs: number,
+  ): void {
+    if (this.timedOut) return;
+    this.timedOut = true;
+    this.clear();
+    this.onTimeout(phase, reportedTimeoutMs);
   }
 }

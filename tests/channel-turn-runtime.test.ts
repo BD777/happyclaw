@@ -52,6 +52,31 @@ afterAll(() => {
 });
 
 describe('durable channel turn runtime', () => {
+  test('failed execution keeps delivery evidence separate from execution status', () => {
+    const runtime = ChannelTurnRuntime.start({
+      ...route,
+      externalMessageId: 'msg-provider-execution-failed',
+      agentId: 'agent-provider-execution-failed',
+    });
+    expect(
+      runtime.fail('provider remained unavailable', {
+        executionStatus: 'failed',
+        deliveryStatus: 'delivered',
+        finalizationReason: 'error',
+      }),
+    ).toBe(true);
+    expect(reliability.getChannelTurnRun(runtime.runId)).toMatchObject({
+      status: 'failed',
+      error: 'provider remained unavailable',
+      result: {
+        executionStatus: 'failed',
+        deliveryStatus: 'delivered',
+        finalizationReason: 'error',
+      },
+    });
+    runtime.dispose();
+  });
+
   test('retryable close keeps the deterministic run claimable instead of terminal-skipping it', () => {
     const input = {
       ...route,

@@ -104,28 +104,24 @@ describe('host disposition is keyed on the class, not on individual flags', () =
     );
   });
 
-  test('transient failures are replayed and never consult the pool', () => {
+  test('transient failures replay once before opening an endpoint circuit', () => {
     expect(hostRunner).toMatch(
       /if \(failureClass === 'transient'\) \{[\s\S]*?transientRetries\.consume\([\s\S]*?resolveTransientRetryKey\(output\),[\s\S]*?selectedProfileId/,
     );
-    // Ordering matters: refreshFromConfig/poolCanStillServe must stay below the
-    // transient branch, or a 529 would still be answered by a failover.
-    const transientBranch = hostRunner.indexOf(
-      "if (failureClass === 'transient')",
-    );
-    const poolRefresh = hostRunner.indexOf('providerPool.refreshFromConfig(');
-    expect(transientBranch).toBeGreaterThan(-1);
-    expect(poolRefresh).toBeGreaterThan(transientBranch);
+    expect(hostRunner).toContain('providerPool.reportTransientFailure(');
   });
 
-  test('a repeated transient terminates without rewriting or quarantining', () => {
+  test('a repeated transient stays retryable without becoming an account verdict', () => {
     expect(hostRunner).toContain(
-      'ending input without quarantining the account',
+      'preserving durable input and opening endpoint circuit',
     );
     expect(hostRunner).not.toContain(
       "output.providerFailureClass = 'account';",
     );
     expect(hostRunner).not.toContain('providerFailureEscalatedFrom');
+    expect(hostRunner).toMatch(
+      /providerPool\.reportTransientFailure\(selectedProfileId\)[\s\S]*?applyKnownProviderFailureDisposition\(output, false\)/,
+    );
   });
 
   test('the first transient failure still replays without touching the account', () => {

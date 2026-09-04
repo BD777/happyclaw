@@ -1538,6 +1538,43 @@ export function completeRecoveredChannelTurnRun(
 }
 
 /**
+ * Terminalize the exact durable inputs owned by a message-lane retry snapshot.
+ *
+ * This is intentionally lease-free and limited to queued/retry_wait rows: the
+ * queue invokes it only after its final runner released the live lease. System
+ * notice turns share the original correlation id, so exclude their distinct
+ * idempotency keys from the transition.
+ */
+export function failRetryableChannelTurnRunsByCorrelationIds(input: {
+  correlationIds: readonly string[];
+  error: string;
+  result?: unknown;
+  now?: Date | string;
+}): number {
+  const correlationIds = [
+    ...new Set(input.correlationIds.map((id) => id.trim()).filter(Boolean)),
+  ];
+  if (correlationIds.length === 0) return 0;
+  const error = input.error.trim();
+  if (!error) throw new Error('turn failure error is required');
+  const now = isoNow(input.now);
+  const placeholders = correlationIds.map(() => '?').join(', ');
+  return requireDatabase()
+    .prepare(
+      `UPDATE turn_runs
+       SET status = 'failed', result = ?, error = ?, completed_at = ?,
+           lease_owner = NULL, lease_expires_at = NULL,
+           lease_token = lease_token + 1, revision = revision + 1,
+           updated_at = ?
+       WHERE correlation_id IN (${placeholders})
+         AND status IN ('queued','retry_wait')
+         AND idempotency_key NOT LIKE '%:system-notice:%'`,
+    )
+    .run(stringifyPayload(input.result), error, now, now, ...correlationIds)
+    .changes;
+}
+
+/**
  * Explicitly fence one live conversation Turn (stop button, shutdown, or
  * unrecoverable card/run reconciliation). Terminal rows are immutable, so
  * repeating the same interrupt is a no-op.

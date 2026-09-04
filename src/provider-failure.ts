@@ -134,7 +134,10 @@ const DEFAULT_MAX_TRACKED_TRANSIENT_TURNS = 512;
 export class TransientRetryLedger {
   private readonly used = new Map<
     string,
-    { attempts: number; profileId: string | null }
+    {
+      attemptsByProfile: Map<string, number>;
+      profileId: string | null;
+    }
   >();
 
   constructor(
@@ -153,25 +156,29 @@ export class TransientRetryLedger {
     selectedProfileId: string | null = null,
   ): boolean {
     if (!inputTurnId) return false;
-    const entry = this.used.get(inputTurnId);
-    const spent = entry?.attempts ?? 0;
-    if (
-      spent >= this.maxRetries ||
-      (entry && entry.profileId !== selectedProfileId)
-    ) {
-      this.used.delete(inputTurnId);
-      return false;
-    }
+    let entry = this.used.get(inputTurnId);
+    const profileKey = selectedProfileId ?? '';
+    // Once an automatic pool moves the turn to another provider, that new
+    // endpoint receives its own bounded same-provider replay. A spent entry is
+    // retained until success/eviction so repeated queue attempts cannot reset
+    // the budget and loop forever on one endpoint.
+    const spent = entry?.attemptsByProfile.get(profileKey) ?? 0;
+    if (entry) entry.profileId = selectedProfileId;
+    if (spent >= this.maxRetries) return false;
     // Turns that later succeed never come back to clear their entry, so evict
     // in insertion order instead of leaking one entry per stall.
     if (!this.used.has(inputTurnId) && this.used.size >= this.maxTracked) {
       const oldest = this.used.keys().next().value;
       if (oldest !== undefined) this.used.delete(oldest);
     }
-    this.used.set(inputTurnId, {
-      attempts: spent + 1,
-      profileId: entry?.profileId ?? selectedProfileId,
-    });
+    if (!entry) {
+      entry = {
+        attemptsByProfile: new Map<string, number>(),
+        profileId: selectedProfileId,
+      };
+      this.used.set(inputTurnId, entry);
+    }
+    entry.attemptsByProfile.set(profileKey, spent + 1);
     return true;
   }
 

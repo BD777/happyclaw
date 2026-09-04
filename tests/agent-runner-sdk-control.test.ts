@@ -152,6 +152,30 @@ describe('agent-runner SDK control requests', () => {
     }
   });
 
+  test('keeps accepting API retry heartbeats beyond the former three-minute cap', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(
+        60_000,
+        onTimeout,
+        10 * 60_000,
+      );
+
+      for (let elapsed = 30_000; elapsed <= 5 * 60_000; elapsed += 30_000) {
+        await vi.advanceTimersByTimeAsync(30_000);
+        watchdog.observe('system', 'api_retry');
+      }
+      expect(onTimeout).not.toHaveBeenCalled();
+
+      watchdog.observe('assistant');
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(onTimeout).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('allows a long compaction and clears its deadline on the real response', async () => {
     vi.useFakeTimers();
     try {

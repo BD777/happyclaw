@@ -398,6 +398,70 @@ describe('durable channel inbox', () => {
 });
 
 describe('durable channel turn runs', () => {
+  test('retry exhaustion fails only exact original retry-wait turns', () => {
+    const correlationId = 'retry-exhausted-input-1';
+    const original = reliability.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'turn:retry-exhausted:original',
+      correlationId,
+      now: '2026-07-23T00:57:00.000Z',
+    }).run;
+    const originalClaim = reliability.claimChannelTurnRunById(
+      original.id,
+      'retry-exhausted-worker',
+      60_000,
+      '2026-07-23T00:57:00.100Z',
+    )!;
+    reliability.retryChannelTurnRun(originalClaim, {
+      availableAt: '2026-07-23T00:57:00.200Z',
+      error: 'temporary provider failure',
+      now: '2026-07-23T00:57:00.200Z',
+    });
+
+    const notice = reliability.createChannelTurnRun({
+      ...route,
+      idempotencyKey:
+        'channel-turn-v1:feishu:bot-primary:retry-exhausted-input-1:system-notice:test',
+      correlationId,
+      now: '2026-07-23T00:57:00.000Z',
+    }).run;
+    const noticeClaim = reliability.claimChannelTurnRunById(
+      notice.id,
+      'retry-exhausted-notice-worker',
+      60_000,
+      '2026-07-23T00:57:00.100Z',
+    )!;
+    reliability.retryChannelTurnRun(noticeClaim, {
+      availableAt: '2099-07-23T00:57:00.200Z',
+      error: 'notice transport retry',
+      now: '2026-07-23T00:57:00.200Z',
+    });
+
+    expect(
+      reliability.failRetryableChannelTurnRunsByCorrelationIds({
+        correlationIds: [correlationId, correlationId],
+        error: 'maximum retries reached',
+        result: {
+          executionStatus: 'failed',
+          deliveryStatus: 'delivered',
+          retryExhausted: true,
+        },
+        now: '2026-07-23T00:57:01.000Z',
+      }),
+    ).toBe(1);
+    expect(reliability.getChannelTurnRun(original.id)).toMatchObject({
+      status: 'failed',
+      error: 'maximum retries reached',
+      result: {
+        executionStatus: 'failed',
+        deliveryStatus: 'delivered',
+        retryExhausted: true,
+      },
+      completedAt: '2026-07-23T00:57:01.000Z',
+    });
+    expect(reliability.getChannelTurnRun(notice.id)?.status).toBe('retry_wait');
+  });
+
   test('explicit interrupt fences every live state and leaves terminal rows immutable', () => {
     const at = '2026-07-23T00:58:00.000Z';
     const make = (suffix: string) =>
