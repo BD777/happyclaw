@@ -12,7 +12,7 @@ agent_build_context="$(mktemp -d)"
 trap 'test -n "$agent_build_context" && find "$agent_build_context" -depth -delete' EXIT
 cp -R container/agent-runner/dist "$agent_build_context/dist"
 cp -R container/agent-runner/prompts "$agent_build_context/prompts"
-# Reuse only lock-matching runtime packages. The two upstream security updates
+# Reuse only lock-matching runtime packages. The upstream security updates
 # are pure-JS packages and may be replaced from the freshly npm-ci-installed
 # tree. Any broader dependency drift requires a full image build.
 node --input-type=module - "$agent_base_ref" "$agent_build_context" <<'JS'
@@ -27,7 +27,7 @@ for (const [name, pkg] of Object.entries(installed.packages)) {
   if (pkg.dev) continue;
   if (!expected[name]) throw new Error(`Unexpected base package: ${name}`);
   if (pkg.version !== expected[name].version || pkg.integrity !== expected[name].integrity) {
-    if (!['node_modules/fast-uri','node_modules/qs'].includes(name)) throw new Error(`Full image build required: ${name}`);
+    if (!['node_modules/fast-uri','node_modules/qs','node_modules/side-channel'].includes(name)) throw new Error(`Full image build required: ${name}`);
     if (local[name]?.integrity !== expected[name].integrity || local[name]?.version !== expected[name].version) throw new Error(`Run npm ci first: ${name}`);
     fs.cpSync(path.join('container/agent-runner',name),path.join(process.argv[3],name),{recursive:true});
     installed.packages[name] = local[name];
@@ -59,8 +59,8 @@ COPY prompts /opt/happyclaw-agent/prompts
 COPY entrypoint.sh session-generated-paths.mjs write-tool-audit.sh /app/
 RUN find /opt/happyclaw-agent/dist /opt/happyclaw-agent/prompts -type d -exec chmod 0555 {} + \
  && find /opt/happyclaw-agent/dist /opt/happyclaw-agent/prompts -type f -exec chmod 0444 {} + \
- && find /opt/happyclaw-agent/node_modules/fast-uri /opt/happyclaw-agent/node_modules/qs -type d -exec chmod 0555 {} + \
- && find /opt/happyclaw-agent/node_modules/fast-uri /opt/happyclaw-agent/node_modules/qs -type f -exec chmod 0444 {} + \
+ && find /opt/happyclaw-agent/node_modules/fast-uri /opt/happyclaw-agent/node_modules/qs /opt/happyclaw-agent/node_modules/side-channel -type d -exec chmod 0555 {} + \
+ && find /opt/happyclaw-agent/node_modules/fast-uri /opt/happyclaw-agent/node_modules/qs /opt/happyclaw-agent/node_modules/side-channel -type f -exec chmod 0444 {} + \
  && chmod 0555 /app/entrypoint.sh /app/write-tool-audit.sh \
  && chmod 0444 /app/session-generated-paths.mjs
 DOCKER

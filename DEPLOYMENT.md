@@ -99,7 +99,7 @@ chmod 600 .env
 无法调用 GitHub Actions 或没有镜像仓库发布凭据时，可以使用本机可复现构建。
 必须先将完整提交推送到远程；记录基镜像的 registry digest、Git SHA 和最终 image ID。
 只允许在基镜像运行依赖与当前 Runner lockfile 一致时更新 Runner；脚本可从 npm ci
-安装结果替换上游 fast-uri / qs 两个纯 JavaScript 安全更新，其他依赖差异必须完整重建。
+安装结果替换上游 fast-uri / qs / side-channel 这三个纯 JavaScript 依赖更新，其他依赖差异必须完整重建。
 
 ```bash
 node scripts/check-linux-deployment.mjs
