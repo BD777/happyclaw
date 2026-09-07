@@ -82,7 +82,7 @@ describe('Docker image distribution contract', () => {
     expect(latestIndex).toBeGreaterThan(smokeIndex);
   });
 
-  test('builds only in GitHub Actions and pulls published images at runtime', () => {
+  test('default runtime entrypoints pull images; only the audited Linux repair script builds', () => {
     expect(read('src/config.ts')).toContain(
       "'riba2534/happyclaw-agent:latest'",
     );
