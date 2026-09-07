@@ -4,12 +4,20 @@
  * provider configured in the settings page (ANTHROPIC_API_KEY / OAuth / Base URL).
  */
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import {
   buildClaudeEnvLines,
   clearInheritedClaudeProviderEnv,
   getClaudeProviderConfig,
+  getEnabledProviders,
+  providerToConfig,
+  writeCredentialsFile,
 } from './runtime-config.js';
+import { reconcileDockerOAuthCredentials } from './docker-oauth-credentials.js';
 import { logger } from './logger.js';
 
 /**
@@ -30,7 +38,8 @@ export async function sdkQuery(
   // 构造隔离的 env 副本传给 SDK（options.env 是子进程 env 的权威来源）。
   // 不再突变全局 process.env、也无需 mutex 串行化，因此多个 sdkQuery（/recall、
   // 自动标题、bug 上报、task 解析等）可并发执行、凭据互不串扰。
-  const config = getClaudeProviderConfig();
+  const provider = getEnabledProviders()[0];
+  const config = provider ? providerToConfig(provider) : getClaudeProviderConfig();
   const envLines = buildClaudeEnvLines(config);
   const env: Record<string, string | undefined> = { ...process.env };
   clearInheritedClaudeProviderEnv(env);
@@ -43,7 +52,13 @@ export async function sdkQuery(
   const abortController = new AbortController();
   const timer = setTimeout(() => abortController.abort(), timeout);
 
+  let sessionDir: string | undefined;
   try {
+    // Full OAuth is read from disk by the SDK, not from envLines. A fresh
+    // directory also prevents API-key queries from inheriting an old CLI login.
+    sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-sdk-'));
+    env.CLAUDE_CONFIG_DIR = sessionDir;
+    writeCredentialsFile(sessionDir, config);
     const model = opts?.model || config.anthropicModel || undefined;
 
     let result = '';
@@ -80,5 +95,18 @@ export async function sdkQuery(
     return null;
   } finally {
     clearTimeout(timer);
+    if (sessionDir) {
+      try {
+        if (provider && config.claudeOAuthCredentials) {
+          reconcileDockerOAuthCredentials({
+            providerId: provider.id,
+            credentialsFilePath: path.join(sessionDir, '.credentials.json'),
+            launchCredentials: config.claudeOAuthCredentials,
+          });
+        }
+      } finally {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      }
+    }
   }
 }
