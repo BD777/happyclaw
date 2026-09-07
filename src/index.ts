@@ -15628,8 +15628,13 @@ async function processAgentConversation(
     ActiveChannelOutboxScope
   >();
   const rejectedAgentInputTurns = new Set<string>();
+  // Match the main route: retries have no new durable card reservation.
+  // Creating an untracked card here hides the final reply from the Outbox.
+  // A retry publishes its final answer (or failure) through static delivery.
   let agentStreamingSession =
-    publishesFrameworkAnswer(interactionMode) && replySourceImJid
+    agentRetryAttempt === 0 &&
+    publishesFrameworkAnswer(interactionMode) &&
+    replySourceImJid
       ? await imManager.createStreamingSession(
           replySourceImJid,
           (messageId) =>

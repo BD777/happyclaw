@@ -115,7 +115,10 @@ describe('Docker image distribution contract', () => {
       ...['scripts', 'container'].flatMap((directory) =>
         fs
           .readdirSync(path.join(root, directory))
-          .filter((file) => file.endsWith('.sh'))
+          .filter(
+            (file) =>
+              file.endsWith('.sh') && file !== 'build-local-agent-image.sh',
+          )
           .map((file) => path.join(directory, file)),
       ),
     ];
@@ -124,6 +127,20 @@ describe('Docker image distribution contract', () => {
         /\b(?:docker\s+(?:buildx?\b|compose\s+build\b)|podman\s+build\b)/,
       );
     }
+  });
+
+  test('the explicit Linux fallback requires pinned and verified artifacts', () => {
+    const fallback = read('scripts/build-local-agent-image.sh');
+    expect(fallback).toContain('@sha256:');
+    expect(fallback).toContain('git status --porcelain');
+    expect(fallback).toContain('pkg.integrity !== expected[name].integrity');
+    expect(fallback).toContain('org.opencontainers.image.revision');
+    expect(fallback).toContain('chmod 0444');
+    expect(fallback).toContain('./scripts/smoke-agent-image.sh');
+    expect(fallback).not.toContain('docker push');
+    expect(read('DEPLOYMENT.md')).toContain(
+      '不要把本地构建报告为 GitHub Actions 发布',
+    );
   });
 
   test('smoke helper exercises the immutable runner and lazy browser endpoint', () => {
