@@ -83,7 +83,9 @@ async function connectAndDrain(fetchMock: ReturnType<typeof vi.fn>) {
         agentId: null,
       }),
     });
-    await vi.waitFor(() => expect(db.storeMessageDirect).toHaveBeenCalled());
+    await vi.waitFor(() => expect(db.storeMessageDirect).toHaveBeenCalled(), {
+      timeout: 3000,
+    });
   } finally {
     await connection.disconnect();
   }
@@ -152,6 +154,86 @@ describe('WeChat inbound video CDN persist', () => {
     await connectAndDrain(fetchMock);
     expect(crypto.downloadAndDecryptMedia).toHaveBeenCalled();
     expect(downloader.saveDownloadedFile).toHaveBeenCalled();
+  });
+
+  test('image timeout retries then persists an explicit failure and wakes the agent', async () => {
+    crypto.downloadAndDecryptMedia.mockRejectedValue(new Error('CDN timeout'));
+    await connectAndDrain(
+      fetchOnceThenHang({
+        get_updates_buf: 'image-failed',
+        msgs: [
+          inboundMsg(
+            {
+              type: 2,
+              image_item: {
+                media: {
+                  encrypt_query_param: 'q-img',
+                  aes_key: 'k-img',
+                },
+              },
+            },
+            'image-timeout',
+          ),
+        ],
+      }),
+    );
+    expect(crypto.downloadAndDecryptMedia).toHaveBeenCalledTimes(2);
+    expect(db.storeMessageDirect).toHaveBeenCalledTimes(1);
+    expect(db.storeMessageDirect.mock.calls[0][4]).toContain('图片接收失败');
+    expect(db.storeMessageDirect.mock.calls[0][4]).toContain(
+      '无法查看图片内容',
+    );
+    expect(notify.notifyNewImMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test('transient image failure recovers without a false failure label', async () => {
+    crypto.downloadAndDecryptMedia.mockRejectedValueOnce(
+      new Error('CDN timeout'),
+    );
+    await connectAndDrain(
+      fetchOnceThenHang({
+        get_updates_buf: 'image-recovered',
+        msgs: [
+          inboundMsg(
+            {
+              type: 2,
+              image_item: {
+                media: {
+                  encrypt_query_param: 'q-img',
+                  aes_key: 'k-img',
+                },
+              },
+            },
+            'image-recovered',
+          ),
+        ],
+      }),
+    );
+    expect(crypto.downloadAndDecryptMedia).toHaveBeenCalledTimes(2);
+    expect(db.storeMessageDirect.mock.calls[0][4]).not.toContain('失败');
+    expect(db.storeMessageDirect.mock.calls[0][7].attachments).toBeTruthy();
+  });
+
+  test('image missing CDN credentials remains a visible inbound message', async () => {
+    await connectAndDrain(
+      fetchOnceThenHang({
+        msgs: [inboundMsg({ type: 2, image_item: {} }, 'missing-media')],
+      }),
+    );
+    expect(crypto.downloadAndDecryptMedia).not.toHaveBeenCalled();
+    expect(db.storeMessageDirect.mock.calls[0][4]).toContain('图片接收失败');
+  });
+
+  test('a polling replay after reconnect retains the same input identity', async () => {
+    const msg = inboundMsg(
+      { type: 1, text_item: { text: 'replayed text' } },
+      'replay-id',
+    );
+    await connectAndDrain(fetchOnceThenHang({ msgs: [msg] }));
+    const firstId = db.storeMessageDirect.mock.calls[0][0];
+    db.storeMessageDirect.mockClear();
+    await connectAndDrain(fetchOnceThenHang({ msgs: [msg] }));
+    expect(db.storeMessageDirect.mock.calls[0][0]).toBe(firstId);
   });
 
   test('type 4 PDF still downloads', async () => {

@@ -177,3 +177,17 @@ describe('model fallback is visible to the user', () => {
     }
   });
 });
+
+describe('actionable authentication failure', () => {
+  test('expired authorization asks for reauthorization, not quota or blind retries', async () => {
+    const { providerAuthenticationNotice } =
+      await import('../container/agent-runner/src/provider-fallback.js');
+    expect(providerAuthenticationNotice('authentication_failed')).toContain(
+      '重新授权',
+    );
+    expect(providerAuthenticationNotice('oauth_org_not_allowed')).toContain(
+      '无访问权限',
+    );
+    expect(providerAuthenticationNotice('server_error')).toBeUndefined();
+  });
+});

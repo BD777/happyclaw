@@ -114,6 +114,7 @@ import {
 import { resolveAgentSdkEffort } from './agent-effort.js';
 import {
   classifyProviderAssistantError,
+  providerAuthenticationNotice,
   decideProviderLimitAction,
   ProviderFallbackModelState,
   ProviderFallbackTurnLedger,
@@ -3288,6 +3289,7 @@ async function runQueryAttempt(
           publishProviderFailure({
             error: assistantError,
             failureClass: assistantErrorClass,
+            failureNotice: providerAuthenticationNotice(assistantError),
           });
           processor.discardPendingTextOutput();
           processor.cleanup();

@@ -94,6 +94,25 @@ fi
 chmod 600 .env
 ```
 
+### 受限发布环境：固定摘要的本机 Runner 构建
+
+无法调用 GitHub Actions 或没有镜像仓库发布凭据时，可以使用本机可复现构建。
+必须先将完整提交推送到远程；记录基镜像的 registry digest、Git SHA 和最终 image ID。
+只允许在基镜像运行依赖与当前 Runner lockfile 一致时更新 Runner，不得复用不兼容依赖。
+
+```bash
+node scripts/check-linux-deployment.mjs
+# BASE_IMAGE 必须是已验证的 image@sha256:...，禁止使用可变 latest 作为构建输入。
+bash scripts/build-local-agent-image.sh "$BASE_IMAGE"
+export HAPPYCLAW_AGENT_IMAGE="happyclaw-agent:git-${HAPPYCLAW_EXPECTED_SHA}"
+node scripts/check-linux-deployment.mjs "$HAPPYCLAW_AGENT_IMAGE"
+```
+
+脚本会规范化镜像内文件权限，并执行实际身份下的 Runner / 浏览器冒烟检查。
+仍须按上节原地更新 CONTAINER_IMAGE，再完成全部 Linux 验证；不得只覆盖旧镜像里的 dist。
+此路径不推送或更改公共 latest。新部署前至少保留 2 GiB 可用空间；只清理可重建缓存，
+不得删除用户数据释放空间。不要把本地构建报告为 GitHub Actions 发布。
+
 ## 4. 需要停服的配置迁移
 
 只有变更说明明确要求时才执行离线迁移。先确认没有 HappyClaw Agent 容器正在运行，再短暂

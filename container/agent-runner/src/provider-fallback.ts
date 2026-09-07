@@ -164,6 +164,16 @@ export function isProviderLimitNotice(result: string | null): boolean {
  */
 export type ProviderFailureClass = 'account' | 'transient' | 'config';
 
+/** Actionable terminal notice for credentials which retries cannot repair. */
+export function providerAuthenticationNotice(
+  error: string,
+): string | undefined {
+  if (error === 'authentication_failed' || error === 'oauth_org_not_allowed') {
+    return '⚠️ 模型账号授权已失效或无访问权限，本次处理未完成。请管理员在「模型配置」中重新授权或切换可用账号后重试。';
+  }
+  return undefined;
+}
+
 /** A verdict on the profile: quarantine and fail over. */
 const ACCOUNT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
   'authentication_failed',

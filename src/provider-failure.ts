@@ -6,14 +6,14 @@ export const PROVIDER_FAILURE_USER_NOTICE =
  * wording. It is only surfaced after the bounded same-provider retry is spent.
  */
 export const PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE =
-  '⚠️ 模型服务本轮长时间没有任何响应，重试后仍未恢复，本次请求未被执行。这通常是上游暂时不可用或网络中断，与账号额度无关。请稍后重新发送。';
+  '⚠️ 模型服务本轮长时间没有任何响应，重试后仍未恢复，本次处理未完成。请稍后重试；若持续失败，请管理员检查模型服务、授权和网络。';
 
 /**
  * A reported upstream error (529/5xx). Same disposition as a stall, but the
  * upstream did answer, so the wording must not claim it went silent.
  */
 export const PROVIDER_TRANSIENT_FAILURE_USER_NOTICE =
-  '⚠️ 模型服务上游暂时不可用（过载或服务端错误），重试后仍未恢复，本次请求未被执行。这与账号额度无关。请稍后重新发送。';
+  '⚠️ 模型服务上游暂时不可用（过载或服务端错误），重试后仍未恢复，本次处理未完成。请稍后重试。';
 
 /**
  * A configuration verdict, not a capacity one. Retrying and failing over both

@@ -14,6 +14,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fetch as undiciFetch, type Dispatcher } from 'undici';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
@@ -1044,12 +1045,23 @@ export function createWeChatConnection(
       return null;
     }
 
-    const buffer = await downloadAndDecryptMedia(
-      media.encrypt_query_param,
-      media.aes_key,
-      cdnBaseUrl,
-      ensureDispatcher(),
-    );
+    // Retry a transient CDN failure once. On exhaustion callers persist an
+    // explicit unavailable-media label before committing the polling cursor.
+    let buffer: Buffer | undefined;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        buffer = await downloadAndDecryptMedia(
+          media.encrypt_query_param,
+          media.aes_key,
+          cdnBaseUrl,
+          ensureDispatcher(),
+        );
+        break;
+      } catch (error) {
+        if (attempt === 1) throw error;
+        await delay(500);
+      }
+    }
 
     if (!buffer || buffer.length === 0) {
       logger.warn(`WeChat ${label} download returned empty buffer`);
@@ -1103,7 +1115,11 @@ export function createWeChatConnection(
           return `wechat_img_${msgIdentifier}${extMap[mimeType] ?? '.jpg'}`;
         },
       );
-      if (!result) return {};
+      if (!result)
+        return {
+          textPrefix:
+            '[图片接收失败：附件不可用，请重新发送图片；当前无法查看图片内容。]',
+        };
 
       const textPrefix = result.savedPath
         ? `[图片: ${result.savedPath}]`
@@ -1121,10 +1137,23 @@ export function createWeChatConnection(
         };
       }
 
-      return { attachmentEntry, textPrefix };
+      return {
+        attachmentEntry,
+        textPrefix:
+          textPrefix ??
+          (attachmentEntry
+            ? undefined
+            : '[图片接收失败：图片无法保存且超过内联大小限制，请压缩后重新发送。]'),
+      };
     } catch (err) {
-      logger.warn({ err }, 'WeChat image download/decrypt failed, skipping');
-      return {};
+      logger.warn(
+        { err },
+        'WeChat image download/decrypt failed; preserving failure in inbound message',
+      );
+      return {
+        textPrefix:
+          '[图片接收失败：下载或解密失败，请重新发送图片；当前无法查看图片内容。]',
+      };
     }
   }
 
@@ -1136,8 +1165,11 @@ export function createWeChatConnection(
   ): Promise<string | null> {
     const media =
       kind === 'video' ? item.video_item?.media : item.voice_item?.media;
+    const fallback =
+      kind === 'video'
+        ? '[视频接收失败：附件不可用，请重新发送视频。]'
+        : '[语音附件不可用：如无转写文字，请重新发送语音或文字。]';
     if (!hasDownloadableCdnMedia(media)) return null;
-    const fallback = kind === 'video' ? '[视频消息]' : '[语音消息]';
     try {
       const result = await downloadCdnMediaItem(
         media,
@@ -1174,10 +1206,10 @@ export function createWeChatConnection(
       );
       if (result?.savedPath) return `[文件: ${result.savedPath}]`;
       // CDN media unavailable, fall back to name-only label
-      return `[文件: ${fileName}]`;
+      return `[文件接收失败: ${fileName}；附件不可用，请重新发送文件。]`;
     } catch (err) {
       logger.warn({ err, fileName }, 'WeChat file download/decrypt failed');
-      return `[文件: ${fileName}]`;
+      return `[文件接收失败: ${fileName}；附件不可用，请重新发送文件。]`;
     }
   }
 
@@ -1422,7 +1454,10 @@ export function createWeChatConnection(
       if (!content) return; // No usable content
 
       // Route was resolved before registration and media download.
-      const id = crypto.randomUUID();
+      const id = `wechat-inbound:${crypto
+        .createHash('sha256')
+        .update(JSON.stringify([config.ilinkBotId, fromUserId, dedupKey(msg)]))
+        .digest('hex')}`;
       const timestamp = msg.create_time_ms
         ? new Date(msg.create_time_ms).toISOString()
         : nowIso;
