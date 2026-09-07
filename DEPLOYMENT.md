@@ -75,7 +75,7 @@ chmod 600 .env
 
 ```bash
 make install
-NODE_OPTIONS=--max-old-space-size=1024 npm run build:all
+NODE_OPTIONS=--max-old-space-size=1024 npm run build:all -- --max-processes 1
 docker pull "$HAPPYCLAW_AGENT_IMAGE"
 ```
 
@@ -175,7 +175,7 @@ Nginx/Cloudflare 路由，不得把其他主机的健康状态当作本次 Linux
 ```bash
 git switch --detach "$HAPPYCLAW_PREVIOUS_SHA"
 make install
-NODE_OPTIONS=--max-old-space-size=1024 npm run build:all
+NODE_OPTIONS=--max-old-space-size=1024 npm run build:all -- --max-processes 1
 pm2 restart happyclaw
 curl -fsS http://127.0.0.1:3000/api/health
 curl -fsS "$HAPPYCLAW_PUBLIC_URL/api/health"
