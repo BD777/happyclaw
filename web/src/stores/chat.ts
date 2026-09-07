@@ -815,6 +815,11 @@ interface PendingDelta {
 }
 const pendingDeltas = new Map<string, PendingDelta>();
 
+// Match the runner's retry banner (including unknown SDK counters), not user
+// progress text that happens to mention a retry or a file named retry.ts.
+const API_RETRY_STATUS_RE =
+  /^API (?:重试中 \((?:\d+|\?)\/(?:\d+|\?)\)，\d+s 后重试|retry in progress \((?:\d+|\?)\/(?:\d+|\?)\))$/i;
+
 function cancelPendingDelta(key: string): void {
   const entry = pendingDeltas.get(key);
   if (!entry) return;
@@ -1299,7 +1304,12 @@ function updateTaskRuntime(
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed')
+    else if (
+      patch?.status === 'failed' ||
+      patch?.status === 'killed' ||
+      patch?.status === 'stopped' ||
+      patch?.status === 'aborted'
+    )
       task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
     else if (patch?.status === 'running' || patch?.status === 'pending')
@@ -2628,6 +2638,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    // Clear in receive order: an older rAF batch must not erase a newer retry.
+    // Child activity does not mean the parent request has recovered.
+    if (
+      !event.parentToolUseId &&
+      (event.eventType === 'tool_use_start' ||
+        ((event.eventType === 'text_delta' ||
+          event.eventType === 'thinking_delta') &&
+          !!event.text))
+    ) {
+      set((s) => {
+        const prev = agentId ? s.agentStreaming[agentId] : s.streaming[chatJid];
+        if (
+          !prev ||
+          prev.interrupted ||
+          !API_RETRY_STATUS_RE.test(prev.systemStatus || '')
+        ) {
+          return s;
+        }
+        const next = { ...prev, systemStatus: null };
+        if (agentId) {
+          return { agentStreaming: { ...s.agentStreaming, [agentId]: next } };
+        }
+        saveStreamingToSession(chatJid, next);
+        return { streaming: { ...s.streaming, [chatJid]: next } };
+      });
+    }
+
     // ⓪ text_delta / thinking_delta — rAF batch for both agent and main conversation
     if (
       (event.eventType === 'text_delta' ||
@@ -2912,7 +2949,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (
         patchStatus === 'completed' ||
         patchStatus === 'failed' ||
-        patchStatus === 'killed'
+        patchStatus === 'killed' ||
+        patchStatus === 'stopped' ||
+        patchStatus === 'aborted'
       ) {
         finalizeSdkTask(
           resolvedTaskId,

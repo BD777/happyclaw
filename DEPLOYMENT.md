@@ -45,7 +45,7 @@ test -z "$(git status --porcelain)" || {
 
 printf 'Rollback commit: %s\n' "$HAPPYCLAW_PREVIOUS_SHA"
 git fetch --prune "$HAPPYCLAW_DEPLOY_REMOTE" \
-  "refs/heads/$HAPPYCLAW_DEPLOY_REF:refs/remotes/$HAPPYCLAW_DEPLOY_REMOTE/$HAPPYCLAW_DEPLOY_REF"
+  "refs/heads/${HAPPYCLAW_DEPLOY_REF}:refs/remotes/${HAPPYCLAW_DEPLOY_REMOTE}/${HAPPYCLAW_DEPLOY_REF}"
 test "$(git rev-parse "$HAPPYCLAW_DEPLOY_REMOTE/$HAPPYCLAW_DEPLOY_REF")" = \
   "$HAPPYCLAW_EXPECTED_SHA"
 test "$(git rev-parse HEAD)" = "$HAPPYCLAW_EXPECTED_SHA"

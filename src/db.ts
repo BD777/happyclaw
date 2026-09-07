@@ -1,3 +1,4 @@
+import { selectChannelReplyBatch } from './channel-reply-source.js';
 import crypto from 'crypto';
 import Database from './sqlite-compat.js';
 import fs from 'fs';
@@ -3713,7 +3714,9 @@ export function claimNextQueuedFollowUpBatch(
   return db.transaction(() => {
     const rows = select.all(chatJid) as Array<Record<string, unknown>>;
     if (rows.length === 0) return [];
-    const claimed = rows.map(normalizeQueuedFollowUpRow);
+    const claimed = selectChannelReplyBatch(
+      rows.map(normalizeQueuedFollowUpRow),
+    );
     const updatedAt = new Date().toISOString();
     for (const item of claimed) {
       const result = update.run(runId, updatedAt, chatJid, item.id);
@@ -8505,6 +8508,28 @@ export function setSessionProviderId(
     ).run(groupFolder, effectiveAgentId, providerId);
     syncWorkspaceRuntimeSessionProjection(groupFolder, effectiveAgentId);
   })();
+}
+
+/** Persisted session namespaces currently bound to one Provider account. */
+export function listSessionNamespacesForProviderId(providerId: string): Array<{
+  groupFolder: string;
+  agentId: string | null;
+}> {
+  if (!isDatabaseInitialized()) return [];
+  const rows = db
+    .prepare(
+      `SELECT group_folder, agent_id
+       FROM sessions
+       WHERE provider_id = ?`,
+    )
+    .all(providerId) as Array<{
+    group_folder: string;
+    agent_id: string | null;
+  }>;
+  return rows.map((row) => ({
+    groupFolder: row.group_folder,
+    agentId: row.agent_id || null,
+  }));
 }
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
