@@ -7,27 +7,41 @@ agent_base_ref="${1:?Usage: build-local-agent-image.sh <base-image@sha256:digest
 test -z "$(git status --porcelain --untracked-files=no)" || { echo 'Commit tracked changes first' >&2; exit 1; }
 agent_build_sha="$(git rev-parse HEAD)"
 agent_build_tag="happyclaw-agent:git-${agent_build_sha}"
-# Inspect npm's installed lock metadata without exposing runtime configuration.
-node --input-type=module - "$agent_base_ref" <<'JS'
-import fs from 'node:fs';
-import {execFileSync} from 'node:child_process';
-const expected = JSON.parse(fs.readFileSync('container/agent-runner/package-lock.json','utf8')).packages;
-const installed = JSON.parse(execFileSync('docker',['run','--rm','--entrypoint','cat',process.argv[2],'/opt/happyclaw-agent/node_modules/.package-lock.json'],{encoding:'utf8'})).packages;
-for (const [name, pkg] of Object.entries(installed)) {
-  if (pkg.dev) continue;
-  if (!expected[name] || pkg.version !== expected[name].version || pkg.integrity !== expected[name].integrity) {
-    throw new Error(`Base runtime dependency differs from committed lock: ${name}`);
-  }
-}
-for (const name of Object.keys(JSON.parse(fs.readFileSync('container/agent-runner/package.json','utf8')).dependencies)) {
-  if (!installed[`node_modules/${name}`]) throw new Error(`Missing runtime dependency: ${name}`);
-}
-JS
 npm --prefix container/agent-runner run build
 agent_build_context="$(mktemp -d)"
 trap 'test -n "$agent_build_context" && find "$agent_build_context" -depth -delete' EXIT
 cp -R container/agent-runner/dist "$agent_build_context/dist"
 cp -R container/agent-runner/prompts "$agent_build_context/prompts"
+# Reuse only lock-matching runtime packages. The two upstream security updates
+# are pure-JS packages and may be replaced from the freshly npm-ci-installed
+# tree. Any broader dependency drift requires a full image build.
+node --input-type=module - "$agent_base_ref" "$agent_build_context" <<'JS'
+import fs from 'node:fs';
+import path from 'node:path';
+import {execFileSync} from 'node:child_process';
+const expected = JSON.parse(fs.readFileSync('container/agent-runner/package-lock.json','utf8')).packages;
+const installed = JSON.parse(execFileSync('docker',['run','--rm','--entrypoint','cat',process.argv[2],'/opt/happyclaw-agent/node_modules/.package-lock.json'],{encoding:'utf8'}));
+const local = JSON.parse(fs.readFileSync('container/agent-runner/node_modules/.package-lock.json','utf8')).packages;
+const patches = [];
+for (const [name, pkg] of Object.entries(installed.packages)) {
+  if (pkg.dev) continue;
+  if (!expected[name]) throw new Error(`Unexpected base package: ${name}`);
+  if (pkg.version !== expected[name].version || pkg.integrity !== expected[name].integrity) {
+    if (!['node_modules/fast-uri','node_modules/qs'].includes(name)) throw new Error(`Full image build required: ${name}`);
+    if (local[name]?.integrity !== expected[name].integrity || local[name]?.version !== expected[name].version) throw new Error(`Run npm ci first: ${name}`);
+    fs.cpSync(path.join('container/agent-runner',name),path.join(process.argv[3],name),{recursive:true});
+    installed.packages[name] = local[name];
+    patches.push(name);
+  }
+}
+for (const [name,pkg] of Object.entries(local)) {
+  if (!pkg.dev && !installed.packages[name]) throw new Error(`Full image build required for new dependency: ${name}`);
+}
+fs.mkdirSync(path.join(process.argv[3],'node_modules'),{recursive:true});
+fs.writeFileSync(path.join(process.argv[3],'node_modules/.package-lock.json'),JSON.stringify(installed));
+fs.writeFileSync(path.join(process.argv[3],'dependency-patches.json'),JSON.stringify(patches));
+console.log(JSON.stringify({dependencyPatches:patches}));
+JS
 cp container/entrypoint.sh container/session-generated-paths.mjs container/write-tool-audit.sh "$agent_build_context/"
 # Normalize modes inside the image; a restrictive host umask must not make the
 # non-root production runner unreadable (the September 4 incident).
@@ -37,11 +51,16 @@ FROM ${BASE}
 USER root
 ARG REVISION
 LABEL org.opencontainers.image.revision=${REVISION}
+COPY dependency-patches.json /tmp/happyclaw-dependency-patches.json
+RUN node -e 'const fs=require("fs");for(const p of JSON.parse(fs.readFileSync("/tmp/happyclaw-dependency-patches.json")))fs.rmSync("/opt/happyclaw-agent/"+p,{recursive:true,force:true})'
+COPY node_modules /opt/happyclaw-agent/node_modules
 COPY dist /opt/happyclaw-agent/dist
 COPY prompts /opt/happyclaw-agent/prompts
 COPY entrypoint.sh session-generated-paths.mjs write-tool-audit.sh /app/
 RUN find /opt/happyclaw-agent/dist /opt/happyclaw-agent/prompts -type d -exec chmod 0555 {} + \
  && find /opt/happyclaw-agent/dist /opt/happyclaw-agent/prompts -type f -exec chmod 0444 {} + \
+ && find /opt/happyclaw-agent/node_modules/fast-uri /opt/happyclaw-agent/node_modules/qs -type d -exec chmod 0555 {} + \
+ && find /opt/happyclaw-agent/node_modules/fast-uri /opt/happyclaw-agent/node_modules/qs -type f -exec chmod 0444 {} + \
  && chmod 0555 /app/entrypoint.sh /app/write-tool-audit.sh \
  && chmod 0444 /app/session-generated-paths.mjs
 DOCKER
