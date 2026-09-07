@@ -114,6 +114,11 @@ describe('liveness timeout user notice', () => {
       PROVIDER_FAILURE_USER_NOTICE,
     );
     expect(PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE).not.toContain('额度已用尽');
-    expect(PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE).toContain('与账号额度无关');
+    expect(PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE).not.toContain(
+      '与账号额度无关',
+    );
+    expect(PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE).toContain(
+      '检查模型服务、授权和网络',
+    );
   });
 });
