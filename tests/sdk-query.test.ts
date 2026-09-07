@@ -4,8 +4,15 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 const query = vi.hoisted(() => vi.fn());
 const reconcile = vi.hoisted(() => vi.fn());
-const oauth = { accessToken: 'configured-access', refreshToken: 'configured-refresh', expiresAt: 9999999999999, scopes: ['user:inference'] };
-vi.mock('../src/docker-oauth-credentials.js', () => ({ reconcileDockerOAuthCredentials: reconcile }));
+const oauth = {
+  accessToken: 'configured-access',
+  refreshToken: 'configured-refresh',
+  expiresAt: 9999999999999,
+  scopes: ['user:inference'],
+};
+vi.mock('../src/docker-oauth-credentials.js', () => ({
+  reconcileDockerOAuthCredentials: reconcile,
+}));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query }));
 vi.mock('../src/runtime-config.js', () => ({
@@ -13,9 +20,19 @@ vi.mock('../src/runtime-config.js', () => ({
   clearInheritedClaudeProviderEnv: () => {},
   getClaudeProviderConfig: () => ({ anthropicModel: 'test-model' }),
   getEnabledProviders: () => [{ id: 'configured-provider' }],
-  providerToConfig: () => ({ anthropicModel: 'test-model', claudeOAuthCredentials: oauth }),
-  writeCredentialsFile: (dir: string, config: { claudeOAuthCredentials: unknown }) => {
-    fs.writeFileSync(path.join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: config.claudeOAuthCredentials }), { mode: 0o600 });
+  providerToConfig: () => ({
+    anthropicModel: 'test-model',
+    claudeOAuthCredentials: oauth,
+  }),
+  writeCredentialsFile: (
+    dir: string,
+    config: { claudeOAuthCredentials: unknown },
+  ) => {
+    fs.writeFileSync(
+      path.join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: config.claudeOAuthCredentials }),
+      { mode: 0o600 },
+    );
   },
 }));
 vi.mock('../src/logger.js', () => ({
@@ -30,7 +47,10 @@ function successfulConversation(result: string) {
   })();
 }
 
-beforeEach(() => { query.mockReset(); reconcile.mockReset(); });
+beforeEach(() => {
+  query.mockReset();
+  reconcile.mockReset();
+});
 
 describe('sdkQuery', () => {
   test('runs one-turn text queries without exposing tools or filesystem settings', async () => {
@@ -59,7 +79,10 @@ test('passes the configured full OAuth in an isolated directory and reconciles b
   query.mockImplementation(({ options }) => {
     dir = options.env.CLAUDE_CONFIG_DIR;
     expect(dir).not.toBe(process.env.CLAUDE_CONFIG_DIR);
-    expect(JSON.parse(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth).toEqual(oauth);
+    expect(
+      JSON.parse(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8'))
+        .claudeAiOauth,
+    ).toEqual(oauth);
     expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
     return successfulConversation('ok');
   });
@@ -82,7 +105,9 @@ test('concurrent queries have separate credentials and cleanup on failure', asyn
       throw new Error('provider unavailable');
     })();
   });
-  await expect(Promise.all([sdkQuery('one'), sdkQuery('two')])).resolves.toEqual([null, null]);
+  await expect(
+    Promise.all([sdkQuery('one'), sdkQuery('two')]),
+  ).resolves.toEqual([null, null]);
   expect(new Set(dirs).size).toBe(2);
   expect(dirs.every((dir) => !fs.existsSync(dir))).toBe(true);
 });

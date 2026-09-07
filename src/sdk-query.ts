@@ -39,7 +39,9 @@ export async function sdkQuery(
   // 不再突变全局 process.env、也无需 mutex 串行化，因此多个 sdkQuery（/recall、
   // 自动标题、bug 上报、task 解析等）可并发执行、凭据互不串扰。
   const provider = getEnabledProviders()[0];
-  const config = provider ? providerToConfig(provider) : getClaudeProviderConfig();
+  const config = provider
+    ? providerToConfig(provider)
+    : getClaudeProviderConfig();
   const envLines = buildClaudeEnvLines(config);
   const env: Record<string, string | undefined> = { ...process.env };
   clearInheritedClaudeProviderEnv(env);
