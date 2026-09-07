@@ -35,6 +35,8 @@ for (const [name, pkg] of Object.entries(installed.packages)) {
   }
 }
 for (const [name,pkg] of Object.entries(local)) {
+  // npm may retain metadata for optional binaries excluded on this host.
+  if (pkg.optional && !fs.existsSync(path.join('container/agent-runner',name))) continue;
   if (!pkg.dev && !installed.packages[name]) throw new Error(`Full image build required for new dependency: ${name}`);
 }
 fs.mkdirSync(path.join(process.argv[3],'node_modules'),{recursive:true});
