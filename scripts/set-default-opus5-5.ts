@@ -1,9 +1,9 @@
 /**
- * Pin every enabled official Claude provider to the exact Opus 5 model ID and
+ * Pin every enabled official Claude provider to the exact Opus 5.5 model ID and
  * set windeng's and aqiu's default Agent profiles to explicit high effort.
  *
  * Usage (HappyClaw must be stopped):
- *   npx tsx scripts/set-default-opus5.ts --apply
+ *   npx tsx scripts/set-default-opus5-5.ts --apply
  *
  * This command intentionally creates no database, runtime, or .env backup.
  * Model and effort changes invalidate only provider-bound SDK resume sessions;
@@ -24,7 +24,7 @@ import {
   releaseDatabaseMaintenanceGuard,
 } from '../src/database-maintenance.js';
 
-const TARGET_MODEL = 'claude-opus-5';
+const TARGET_MODEL = 'claude-opus-5-5';
 const TARGET_EFFORT = 'high' as const;
 const TARGET_USERNAMES = ['windeng', 'aqiu'] as const;
 const DATABASE_PATH = path.join(process.cwd(), 'data', 'db', 'messages.db');
@@ -33,7 +33,7 @@ const execFileAsync = promisify(execFile);
 function parseArgs(): void {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: npx tsx scripts/set-default-opus5.ts --apply');
+    console.log('Usage: npx tsx scripts/set-default-opus5-5.ts --apply');
     process.exit(0);
   }
   if (args.length !== 1 || args[0] !== '--apply') {
@@ -153,7 +153,7 @@ async function main(): Promise<void> {
     );
     if (nonOfficial.length > 0) {
       throw new Error(
-        `Refusing to assign Anthropic's Opus 5 ID to non-official provider(s): ${nonOfficial
+        `Refusing to assign Anthropic's Opus 5.5 ID to non-official provider(s): ${nonOfficial
           .map((provider) => provider.id)
           .join(', ')}`,
       );

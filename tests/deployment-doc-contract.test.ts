@@ -24,7 +24,7 @@ describe('Linux production deployment contract', () => {
     expect(deployment).not.toContain('env-before-$HAPPYCLAW_EXPECTED_SHA');
     expect(deployment).toContain('npm run build:all');
     expect(deployment).toContain('pm2 stop happyclaw');
-    expect(deployment).toContain('scripts/set-default-opus5.ts --apply');
+    expect(deployment).toContain('scripts/set-default-opus5-5.ts --apply');
     expect(deployment).toContain('/api/health');
     expect(deployment).toContain('/api/config/appearance/public');
     expect(deployment).toContain('HAPPYCLAW_PREVIOUS_SHA');

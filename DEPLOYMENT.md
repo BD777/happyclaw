@@ -119,12 +119,12 @@ node scripts/check-linux-deployment.mjs "$HAPPYCLAW_AGENT_IMAGE"
 只有变更说明明确要求时才执行离线迁移。先确认没有 HappyClaw Agent 容器正在运行，再短暂
 停止 PM2；迁移脚本必须自行验证端口已关闭、SQLite 无 sidecar 且数据库未被占用。
 
-当前 Opus 5 + High 配置迁移命令为：
+当前 Opus 5.5 + High 配置迁移命令为：
 
 ```bash
 docker ps --format '{{.ID}} {{.Names}} {{.Status}}'
 pm2 stop happyclaw
-npx tsx scripts/set-default-opus5.ts --apply
+npx tsx scripts/set-default-opus5-5.ts --apply
 pm2 start happyclaw
 ```
 
