@@ -65,6 +65,7 @@ import {
   listChannelMountsByWorkspace,
   listImContextBindingsByWorkspace,
   getMessage,
+  getMessageAttachments,
   deleteMessage,
   getUserPinnedGroups,
   pinGroup,
@@ -112,6 +113,11 @@ import path from 'node:path';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
 import { getStreamingSession } from '../feishu-streaming-card.js';
 import { attachSessionWorkflowRuns } from '../session-workflows.js';
+import {
+  invalidateThumbnails,
+  presentMessagesForWeb,
+  readOriginalAttachment,
+} from '../attachment-thumbnails.js';
 import {
   buildPinnedGitEnvironment,
   startPinnedHttpsProxy,
@@ -1298,26 +1304,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     execution_mode !== undefined ||
     interaction_mode !== undefined
   ) {
-    // Spread `...existing` instead of rebuilding from an explicit field list.
-    // setRegisteredGroup is INSERT OR REPLACE (full-row overwrite), so every
-    // field omitted from the object gets silently nulled. The old explicit list
-    // dropped owner_im_id / sender_allowlist / conversation_source /
-    // conversation_nav_mode / binding_mode / feishu_chat_mode /
-    // feishu_group_message_type on EVERY rename — wiping the IM owner-gate's
-    // security anchor and corrupting feishu_thread workspaces. Only override
-    // what this PATCH actually changes.
-    const updated: RegisteredGroup = {
-      ...existing,
-      name: name || existing.name,
-      executionMode:
-        execution_mode !== undefined
-          ? (execution_mode as ExecutionMode)
-          : existing.executionMode,
-      activation_mode:
-        activation_mode !== undefined
-          ? activation_mode
-          : existing.activation_mode,
-    };
+    // setRegisteredGroup is a full-column UPSERT, so every field on the object
+    // it receives is written. The old explicit field list dropped owner_im_id /
+    // sender_allowlist / conversation_source / conversation_nav_mode /
+    // binding_mode / feishu_chat_mode / feishu_group_message_type on EVERY
+    // rename. Spreading the pre-await `existing` snapshot has the same shape
+    // of bug under concurrency: this handler reads the row before
+    // `await c.req.json()`, and execution/interaction changes yield again
+    // inside quiesceWorkspaceRunnersAroundCommit before commitUpdate runs.
+    // A name-only PATCH can therefore put back activation_mode / owner_im_id
+    // after a concurrent writer committed. Re-read inside the commit and
+    // overlay only the keys this request actually changes. Do not change
+    // setRegisteredGroup itself — other callers depend on the full upsert.
 
     const commitUpdate = () => {
       if (
@@ -1333,6 +1331,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         activation_mode !== undefined ||
         execution_mode !== undefined
       ) {
+        const fresh = getRegisteredGroup(jid);
+        if (!fresh) {
+          throw new Error(`Group ${jid} not found during update commit`);
+        }
+        const updated: RegisteredGroup = {
+          ...fresh,
+          ...(name ? { name } : {}),
+          ...(execution_mode !== undefined
+            ? { executionMode: execution_mode as ExecutionMode }
+            : {}),
+          ...(activation_mode !== undefined ? { activation_mode } : {}),
+        };
         setRegisteredGroup(jid, updated);
         if (name) updateChatName(jid, name);
         deps.getRegisteredGroups()[jid] = updated;
@@ -2374,17 +2384,21 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
 
     const virtualJid = `${jid}#agent:${agentIdParam}`;
     if (afterSequence !== undefined || after) {
-      const messages = attachSessionWorkflowRuns(
-        getMessagesAfter(virtualJid, after, limit, afterSequence),
-        { groupFolder: group.folder, agentId: agentIdParam },
+      const messages = await presentMessagesForWeb(
+        attachSessionWorkflowRuns(
+          getMessagesAfter(virtualJid, after, limit, afterSequence),
+          { groupFolder: group.folder, agentId: agentIdParam },
+        ),
       );
       return c.json({ messages });
     }
     const rows = getMessagesPage(virtualJid, before, limit + 1, beforeSequence);
     const hasMore = rows.length > limit;
-    const messages = attachSessionWorkflowRuns(
-      hasMore ? rows.slice(0, limit) : rows,
-      { groupFolder: group.folder, agentId: agentIdParam },
+    const messages = await presentMessagesForWeb(
+      attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
+        groupFolder: group.folder,
+        agentId: agentIdParam,
+      }),
     );
     return c.json({ messages, hasMore });
   }
@@ -2423,26 +2437,32 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   if (queryJids.length === 1) {
     // 单 JID 走原路径
     if (afterSequence !== undefined || after) {
-      const messages = attachSessionWorkflowRuns(
-        getMessagesAfter(jid, after, limit, afterSequence),
-        { groupFolder: group.folder, agentId: null },
+      const messages = await presentMessagesForWeb(
+        attachSessionWorkflowRuns(
+          getMessagesAfter(jid, after, limit, afterSequence),
+          { groupFolder: group.folder, agentId: null },
+        ),
       );
       return c.json({ messages });
     }
     const rows = getMessagesPage(jid, before, limit + 1, beforeSequence);
     const hasMore = rows.length > limit;
-    const messages = attachSessionWorkflowRuns(
-      hasMore ? rows.slice(0, limit) : rows,
-      { groupFolder: group.folder, agentId: null },
+    const messages = await presentMessagesForWeb(
+      attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
+        groupFolder: group.folder,
+        agentId: null,
+      }),
     );
     return c.json({ messages, hasMore });
   }
 
   // 多 JID 合并查询
   if (afterSequence !== undefined || after) {
-    const messages = attachSessionWorkflowRuns(
-      getMessagesAfterMulti(queryJids, after, limit, afterSequence),
-      { groupFolder: group.folder, agentId: null },
+    const messages = await presentMessagesForWeb(
+      attachSessionWorkflowRuns(
+        getMessagesAfterMulti(queryJids, after, limit, afterSequence),
+        { groupFolder: group.folder, agentId: null },
+      ),
     );
     return c.json({ messages });
   }
@@ -2453,9 +2473,11 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     beforeSequence,
   );
   const hasMore = rows.length > limit;
-  const messages = attachSessionWorkflowRuns(
-    hasMore ? rows.slice(0, limit) : rows,
-    { groupFolder: group.folder, agentId: null },
+  const messages = await presentMessagesForWeb(
+    attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
+      groupFolder: group.folder,
+      agentId: null,
+    }),
   );
   return c.json({ messages, hasMore });
 });
@@ -2529,9 +2551,88 @@ groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
   }
 
   projectWebMessageDeleted(chatJid, messageId);
+  // Thumbnails are keyed by message id alone, so a later message reusing that
+  // id would otherwise inherit a deleted message's cached image.
+  invalidateThumbnails(messageId);
 
   return c.json({ success: true });
 });
+
+// GET /api/groups/:jid/messages/:messageId/attachments/:index/original
+// The message list serves downscaled thumbnails so a page of image-heavy
+// history stays small; the viewer pulls full resolution from here on demand.
+groupRoutes.get(
+  '/:jid/messages/:messageId/attachments/:index/original',
+  authMiddleware,
+  (c) => {
+    // Same virtual-JID resolution as DELETE: runtime-session messages live
+    // under `{workspaceJid}#agent:{sessionId}`, which is not a registered group.
+    const chatJid = c.req.param('jid');
+    const messageId = c.req.param('messageId');
+    const indexRaw = c.req.param('index');
+    const agentSep = chatJid.indexOf('#agent:');
+    const groupJid = agentSep >= 0 ? chatJid.slice(0, agentSep) : chatJid;
+    const agentId =
+      agentSep >= 0 ? chatJid.slice(agentSep + '#agent:'.length) : null;
+
+    if (!/^\d+$/.test(indexRaw)) {
+      return c.json({ error: 'Attachment not found' }, 404);
+    }
+    const index = Number(indexRaw);
+
+    const physicalGroup = getRegisteredGroup(groupJid);
+    if (!physicalGroup) return c.json({ error: 'Group not found' }, 404);
+    const executionGroup = resolveMessageExecutionGroup(
+      groupJid,
+      physicalGroup,
+    );
+    if (!executionGroup) return c.json({ error: 'Group not found' }, 404);
+
+    const authUser = c.get('user') as AuthUser;
+    if (
+      !canAccessGroup(
+        { id: authUser.id, role: authUser.role },
+        physicalGroup,
+      ) ||
+      !canAccessGroup({ id: authUser.id, role: authUser.role }, executionGroup)
+    ) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (
+      isHostExecutionGroup(executionGroup) &&
+      !hasHostExecutionPermission(authUser)
+    ) {
+      return c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
+      );
+    }
+    if (agentId) {
+      const agent = getAgent(agentId);
+      if (!agent || agent.chat_jid !== groupJid) {
+        return c.json({ error: 'Message not found' }, 404);
+      }
+    }
+
+    const original = readOriginalAttachment(
+      getMessageAttachments(chatJid, messageId),
+      index,
+    );
+    if (!original) return c.json({ error: 'Attachment not found' }, 404);
+
+    // Same cache posture as the message list: originals are per-user content,
+    // so keep them out of shared caches while still allowing the viewer to
+    // reuse one within the session.
+    c.header('Cache-Control', 'private, max-age=300');
+    c.header('Content-Type', original.mimeType);
+    return c.body(
+      original.buffer.buffer.slice(
+        original.buffer.byteOffset,
+        original.buffer.byteOffset + original.buffer.byteLength,
+      ) as ArrayBuffer,
+    );
+  },
+);
 
 // GET /api/groups/:jid/env - 获取容器环境变量配置
 groupRoutes.get('/:jid/env', authMiddleware, (c) => {

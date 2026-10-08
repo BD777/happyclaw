@@ -146,6 +146,9 @@ HappyClaw 区分不同层级的能力来源：
 
 内置 MCP 工具覆盖消息发送、定时任务、渠道查询、Skill 管理和记忆读写；实际开放的工具会根据用户权限、智能体策略、工作区模式和渠道上下文动态裁剪。
 
+添加远端服务时，参见[远端 MCP 配置与排查](docs/REMOTE-MCP.md)，按步骤填写 HTTP/SSE
+URL 与 Headers、选择作用域，并在指定智能体的最终生效能力中确认来源。
+
 ## 渠道接入
 
 每个用户都可以为同一渠道创建多个 Bot 账号，并为渠道会话显式选择绑定目标。
@@ -177,7 +180,7 @@ Session，需要 @ 时也不会另建话题 Session。话题群按话题隔离�
 Bot 账号；Web 输入只在对应 Web Session 回复。多个渠道可以共享一个 Session，
 但不同来源的输入分批执行，旧渠道归属或后续输入不能改写当前回复目标。
 
-在已经绑定且支持斜杠命令的渠道中，可以使用 `/list`、`/status`、`/where`、`/bind`、`/unbind`、`/new` 和 `/clear` 管理当前上下文。飞书里，Agent 忙碌时的普通消息会静默自然排队；在群聊中真实 `@Bot /steer <消息>` 可立即引导当前任务，真实 `@Bot /break` 可停止当前任务并取消此前已经排队的消息。两条 Runtime 控制命令只接受精确小写形式。写操作受工作区 owner 和渠道发言者策略约束。
+在已经绑定且支持斜杠命令的渠道中，可以使用 `/list`、`/status`、`/where`、`/bind`、`/unbind`、`/new`、`/clear` 和 `/fresh` 管理当前上下文。`/fresh [备注]` 会开启新的 SDK 窗口并写入零摘要交接说明，旧历史仍留在库中。飞书里，Agent 忙碌时的普通消息会静默自然排队；在群聊中真实 `@Bot /steer <消息>` 可立即引导当前任务，真实 `@Bot /break` 可停止当前任务并取消此前已经排队的消息。两条 Runtime 控制命令只接受精确小写形式。写操作受工作区 owner 和渠道发言者策略约束。
 
 ## 模型与提供商
 
@@ -322,7 +325,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `MAX_FILE_SIZE_MB`                   | `50`                              | Web 和 IM 入站文件大小上限                                                         |
 | `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
 | `TRUST_PROXY`                        | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
-| `TZ`                                 | 系统时区                          | 日志与定时任务时区                                                                 |
+| `TZ`                                 | 系统时区                          | 日志与定时任务时区（建议 IANA 名称，如 `Asia/Shanghai`）；无效值回退并告警         |
 | `HTTPS_PROXY` / `HTTP_PROXY`         | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
 | `NO_PROXY`                           | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
 
@@ -484,6 +487,7 @@ happyclaw/
 | [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、智能体、用量等接口 |
 | [运行时架构](docs/RUNTIME-ARCHITECTURE.md)                            | 模块边界、依赖规则和性能预算                       |
 | [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求               |
+| [远端 MCP 配置与排查](docs/REMOTE-MCP.md)                             | HTTP/SSE、Header、作用域、智能体生效确认与凭据保护 |
 | [Workspace Memory v2](docs/workspace-memory-v2.md)                    | Workspace 知识边界、数据模型、并发和 UI 语义       |
 | [Context v2 使用与维护](docs/CONTEXT-MAINTENANCE.md)                  | Profile、Memory、Skill 与 Session 的分层维护方法   |
 | [智能体优先架构记录](docs/agent-first-architecture-plan.md)           | 智能体、工作区、运行会话与渠道挂载的迁移背景       |

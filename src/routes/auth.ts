@@ -5,8 +5,12 @@ import { readFile } from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import type { Variables } from '../web-context.js';
-import { authMiddleware } from '../middleware/auth.js';
+import {
+  authMiddleware,
+  getVerifiedSessionTokens,
+} from '../middleware/auth.js';
 import { getClientIp } from '../utils.js';
 import { DATA_DIR } from '../config.js';
 import {
@@ -27,6 +31,7 @@ import {
   deleteUserSession,
   deleteUserSessionsByUserId,
   updateUserFields,
+  getSessionWithUser,
   getUserSessions,
   getUserCount,
   registerUserWithInvite,
@@ -44,6 +49,8 @@ import {
   verifyPassword,
   hashPassword,
   generateSessionToken,
+  sessionCookieHeaders,
+  clearedSessionCookieHeaders,
   sessionExpiresAt,
   checkLoginRateLimit,
   recordLoginAttempt,
@@ -62,11 +69,16 @@ import { getSystemSettings } from '../runtime-config.js';
 
 const authRoutes = new Hono<{ Variables: Variables }>();
 
-// --- Helper Functions ---
+// The unauthenticated JSON endpoints (setup / login / register) buffer the
+// whole request body before any auth or login rate limit runs. Cap them per
+// route (64KB, same budget as /api/memory) rather than router-wide, so the
+// authenticated /avatar multipart upload keeps its own larger limit.
+const authJsonBodyLimit = bodyLimit({
+  maxSize: 64 * 1024,
+  onError: (c) => c.json({ error: 'Payload too large' }, 413),
+});
 
-// Cookie helpers live in auth.ts (single source of truth, also used by middleware).
-import { setSessionCookie, clearSessionCookie } from '../auth.js';
-export { setSessionCookie, clearSessionCookie };
+// --- Helper Functions ---
 
 export function isUsernameConflictError(err: unknown): boolean {
   return (
@@ -135,7 +147,7 @@ authRoutes.get('/status', (c) => {
 });
 
 // Public: initial admin setup (only when no users exist)
-authRoutes.post('/setup', async (c) => {
+authRoutes.post('/setup', authJsonBodyLimit, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const { username: rawUsername, password } = body as {
     username?: string;
@@ -220,15 +232,14 @@ authRoutes.post('/setup', async (c) => {
     }),
     {
       status: 201,
-      headers: {
+      headers: sessionCookieHeaders(c, token, {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(c, token),
-      },
+      }),
     },
   );
 });
 
-authRoutes.post('/login', async (c) => {
+authRoutes.post('/login', authJsonBodyLimit, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const validation = LoginSchema.safeParse(body);
   if (!validation.success) {
@@ -345,10 +356,9 @@ authRoutes.post('/login', async (c) => {
     }),
     {
       status: 200,
-      headers: {
+      headers: sessionCookieHeaders(c, token, {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(c, token),
-      },
+      }),
     },
   );
 });
@@ -369,7 +379,7 @@ authRoutes.get('/register/status', (c) => {
   });
 });
 
-authRoutes.post('/register', async (c) => {
+authRoutes.post('/register', authJsonBodyLimit, async (c) => {
   if (getUserCount(true) === 0) {
     return c.json({ error: '系统尚未初始化，请先完成管理员设置。' }, 403);
   }
@@ -514,19 +524,27 @@ authRoutes.post('/register', async (c) => {
     JSON.stringify({ success: true, user: toUserPublic(newUser) }),
     {
       status: 201,
-      headers: {
+      headers: sessionCookieHeaders(c, token, {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(c, token),
-      },
+      }),
     },
   );
 });
 
 authRoutes.post('/logout', authMiddleware, (c) => {
-  const sessionId = c.get('sessionId');
-  deleteUserSession(sessionId);
-  invalidateSessionCache(sessionId);
   const user = c.get('user') as AuthUser;
+  // A browser that moved between HTTP and HTTPS can still send a live session
+  // under the other cookie name. Expiring the cookies alone would leave that
+  // session valid server-side, so end every signed session this browser
+  // presents for the same user. Sessions on other devices are untouched.
+  const sessionIds = new Set<string>([c.get('sessionId')]);
+  for (const token of getVerifiedSessionTokens(c.req.header('cookie'))) {
+    if (getSessionWithUser(token)?.user_id === user.id) sessionIds.add(token);
+  }
+  for (const sessionId of sessionIds) {
+    deleteUserSession(sessionId);
+    invalidateSessionCache(sessionId);
+  }
   logAuthEvent({
     event_type: 'logout',
     username: user.username,
@@ -535,10 +553,9 @@ authRoutes.post('/logout', authMiddleware, (c) => {
 
   return new Response(JSON.stringify({ success: true }), {
     status: 200,
-    headers: {
+    headers: clearedSessionCookieHeaders({
       'Content-Type': 'application/json',
-      'Set-Cookie': clearSessionCookie(c),
-    },
+    }),
   });
 });
 
@@ -711,10 +728,9 @@ authRoutes.put('/password', authMiddleware, async (c) => {
     JSON.stringify({ success: true, user: toUserPublic(updated) }),
     {
       status: 200,
-      headers: {
+      headers: sessionCookieHeaders(c, newToken, {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(c, newToken),
-      },
+      }),
     },
   );
 });

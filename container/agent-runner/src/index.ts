@@ -67,6 +67,7 @@ import { trimSessionJsonl } from './session-trim.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import {
   acknowledgeHappyClawOwnerProfileFirstWake,
+  activateMcpChannelTurn,
   createMcpTools,
   fetchHappyClawOwnerProfileTurn,
   fetchWorkspaceMemorySnapshot,
@@ -113,8 +114,8 @@ import {
 } from './provider-runtime.js';
 import { resolveAgentSdkEffort } from './agent-effort.js';
 import {
-  classifyProviderAssistantError,
   providerAuthenticationNotice,
+  resolveAssistantErrorAttemptBoundary,
   decideProviderLimitAction,
   ProviderFallbackModelState,
   ProviderFallbackTurnLedger,
@@ -139,8 +140,16 @@ import {
   AssistantUsageCollector,
   type AssistantUsageBatch,
 } from './assistant-usage.js';
-import { buildHappyClawPromptPlan, type PromptPlan } from './prompt-plan.js';
-import { withHappyClawSubagentContract } from './sdk-compat.js';
+import { createTranscriptUsageLoader } from './transcript-usage.js';
+import {
+  buildHappyClawPromptPlan,
+  hasBackgroundTaskTools,
+  type PromptPlan,
+} from './prompt-plan.js';
+import {
+  buildHappyClawSystemPrompt,
+  withHappyClawSubagentContract,
+} from './sdk-compat.js';
 import {
   isCliNoVisibleOutputCompanion,
   isProactiveFinalDeliveredSentinel,
@@ -160,6 +169,7 @@ import { prepareMessageStreamText } from './message-stream-text.js';
 import {
   BackgroundProtocolDebtWatchdog,
   DurableInputTurnCompletion,
+  isMergedBackgroundCompletionPlaceholder,
   QuiescentResultGate,
   shouldFailIncompleteQueryExit,
 } from './background-task-drain.js';
@@ -212,7 +222,9 @@ const DEFAULT_ALLOWED_TOOLS = [
   'WebSearch',
   'WebFetch',
   'Task',
-  'TaskOutput',
+  // 'TaskOutput' removed: Claude Code 2.1.277 dropped the deprecated tool.
+  // Background results arrive as task notifications and Bash output files are
+  // read with Read, so the entry no longer pre-approved anything.
   'TaskStop',
   'TeamCreate',
   'TeamDelete',
@@ -838,9 +850,23 @@ const BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS = 15_000;
 const BACKGROUND_PROTOCOL_FAILURE_EXIT_GRACE_MS = 1_000;
 
 function writeOutput(output: ContainerOutput): void {
-  const correlatedOutput: ContainerOutput = activeOutputInputTurnId
+  let correlatedOutput: ContainerOutput = activeOutputInputTurnId
     ? { ...output, inputTurnId: output.inputTurnId ?? activeOutputInputTurnId }
     : output;
+  if (
+    correlatedOutput.streamEvent?.eventType === 'usage' &&
+    correlatedOutput.inputTurnId
+  ) {
+    // Copy the emitted frame's immutable owner, not the mutable presentation
+    // turn or whichever queued input happens to be active when it is written.
+    correlatedOutput = {
+      ...correlatedOutput,
+      streamEvent: {
+        ...correlatedOutput.streamEvent,
+        inputTurnId: correlatedOutput.inputTurnId,
+      },
+    };
+  }
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(correlatedOutput));
   console.log(OUTPUT_END_MARKER);
@@ -1725,6 +1751,10 @@ async function runQueryAttempt(
       );
       containerInput.messageTaskId = currentMessage.taskId ?? undefined;
     }
+    if (mcpToolsContext) {
+      mcpToolsContext.currentQueryRunId = containerInput.queryRunId;
+      activateMcpChannelTurn(mcpToolsContext);
+    }
   };
   activateCurrentInputTurn(coldInputTurnId);
   const [workspaceMemoryTurn, ownerProfileTurn] = mcpToolsContext
@@ -2037,8 +2067,19 @@ async function runQueryAttempt(
       resultUsageState,
     );
     const assistantBatches: AssistantUsageBatch[] = [];
+    // Zero-token stream snapshots (message_start placeholders from providers
+    // that only reveal usage at response completion) are backfilled from the
+    // session transcript, which carries the CLI-merged final usage.
+    const transcriptUsageLoader = createTranscriptUsageLoader(() => {
+      const activeSessionId = newSessionId || sessionId;
+      if (!activeSessionId) return undefined;
+      return path.join(resolveTranscriptDir(), `${activeSessionId}.jsonl`);
+    });
     for (;;) {
-      const batch = assistantUsageCollector.drain(newSessionId || sessionId);
+      const batch = assistantUsageCollector.drain(
+        newSessionId || sessionId,
+        transcriptUsageLoader,
+      );
       if (!batch) break;
       assistantBatches.push(batch);
     }
@@ -2142,10 +2183,16 @@ async function runQueryAttempt(
       ipcQueryWatcher.close();
       return;
     }
-    // _drain: finish current query then exit. Once a result has been received,
-    // the query is logically done but the MessageStream keeps the SDK alive.
-    // Treat drain as close at this point to release the container.
-    if (resultCount > 0 && shouldDrain()) {
+    // A held checkpoint is not completion. Drain only after every accepted
+    // input and its background notification/summary protocol have settled;
+    // otherwise switching a Bot/mode would kill the still-running Tasks.
+    if (
+      resultCount > 0 &&
+      durableInputCompletion.isCompleted &&
+      !ipcDeliveryTracker.hasPendingTurns &&
+      processor.getBlockingBackgroundProtocolCount() === 0 &&
+      shouldDrain()
+    ) {
       log('Drain sentinel detected after query result, ending stream');
       cancelBackgroundResultCompletion();
       clearBackgroundProtocolDebtWatchdog();
@@ -2411,8 +2458,7 @@ async function runQueryAttempt(
   const hasWebTools = allowedTools.some(
     (tool) => tool === 'WebSearch' || tool === 'WebFetch',
   );
-  const hasBackgroundTaskTools =
-    allowedTools.includes('Task') && allowedTools.includes('TaskOutput');
+  const backgroundTaskToolsAvailable = hasBackgroundTaskTools(allowedTools);
   const proactiveInteractiveContract =
     usesProactiveInteractiveContract(containerInput);
   const backgroundResultGate = new QuiescentResultGate(100);
@@ -2568,7 +2614,7 @@ async function runQueryAttempt(
           ? PROACTIVE_OUTPUT_GUIDELINES
           : ASSISTANT_OUTPUT_GUIDELINES,
     ...(hasWebTools ? { web: WEB_FETCH_GUIDELINES } : {}),
-    ...(hasBackgroundTaskTools
+    ...(backgroundTaskToolsAvailable
       ? { backgroundTasks: BACKGROUND_TASK_GUIDELINES }
       : {}),
     ...(channelGuidelines
@@ -2592,13 +2638,10 @@ async function runQueryAttempt(
     throw new Error(`prompt_plan_invalid: ${promptPlan.errors.join('; ')}`);
   }
   const systemPromptAppend = promptPlan.text;
-  const systemPrompt = includeClaudePreset
-    ? {
-        type: 'preset' as const,
-        preset: 'claude_code' as const,
-        append: systemPromptAppend,
-      }
-    : systemPromptAppend;
+  const systemPrompt = buildHappyClawSystemPrompt(
+    systemPromptAppend,
+    includeClaudePreset,
+  );
   const promptAudit = buildPromptAudit(promptPlan);
   if (agentTurnAnchor) promptAudit.turnAnchor = agentTurnAnchor.audit;
   const contextAuditBase = runtimeContextAuditBase(containerInput);
@@ -3136,6 +3179,20 @@ async function runQueryAttempt(
         );
         continue;
       }
+      // SDK 0.3.274 起排队的后台任务完成共用一次模型调用：每条通知仍各有一条
+      // success result，但除最后一条外都是空占位（num_turns === 0、origin 为
+      // task-notification），非恢复会话同样会收到。占位只结清它所代表通知的
+      // 完成债务，既不是回复也不是输入完成边界——否则共享调用开始前的延迟
+      // （如 UserPromptSubmit hook）一旦超过静默窗口，就会发布 result=null 的
+      // 完成帧，让主进程提前把输入/查询当作已结束。放在恢复会话指纹判别之前，
+      // 使恢复会话里的占位同样结清债务。
+      if (isMergedBackgroundCompletionPlaceholder(message)) {
+        if (emitOutput) processor.observeMergedCompletionPlaceholder();
+        log(
+          '[bg-placeholder] merged background-completion result (num_turns=0); waiting for the shared reply',
+        );
+        continue;
+      }
       if (
         isResumedQuery &&
         message.type === 'result' &&
@@ -3262,6 +3319,59 @@ async function runQueryAttempt(
         continue;
       }
 
+      // Checked before sub-agent routing: a sub-agent's account verdict (usage
+      // limit, billing, auth) must fail over like the parent's would, instead
+      // of being rendered as sub-agent text and silently ending that task.
+      const assistantError =
+        message.type === 'assistant' && 'uuid' in message
+          ? (message as { error?: SDKAssistantMessageError }).error
+          : undefined;
+      if (assistantError) {
+        // Assistant.error is itself a terminal SDK-attempt boundary for the
+        // main agent. The classifier only selects the host disposition; it
+        // must never decide whether we keep waiting for a Result which
+        // compatible endpoints may never emit.
+        const assistantErrorClass = resolveAssistantErrorAttemptBoundary({
+          error: assistantError,
+          parentToolUseId: msgParentToolUseId,
+        });
+        if (assistantErrorClass) {
+          log(
+            `Assistant provider error (${assistantError}${
+              msgParentToolUseId
+                ? `, sub-agent ${String(msgParentToolUseId).slice(0, 12)}`
+                : ''
+            }); classified as ${assistantErrorClass}`,
+          );
+          publishProviderFailure({
+            error: assistantError,
+            failureClass: assistantErrorClass,
+            failureNotice: providerAuthenticationNotice(assistantError),
+          });
+          processor.discardPendingTextOutput();
+          processor.cleanup();
+          assistantTextTracker.reset();
+          canonicalAssistantUuid = undefined;
+          stream.end();
+          if (msgParentToolUseId) {
+            // The parent loop is still mid-tool and would otherwise keep
+            // spending this attempt on an account the host is quarantining.
+            q.interrupt().catch((err: unknown) =>
+              log(`Sub-agent provider-error interrupt failed: ${err}`),
+            );
+          }
+          return {
+            newSessionId,
+            lastAssistantUuid,
+            closedDuringQuery,
+            interruptedDuringQuery,
+            cancelledIpcReceipts,
+            pipedMessagesDuringQuery,
+            providerAccountFailure: true,
+          };
+        }
+      }
+
       // ── 子 Agent 消息转 StreamEvent ──
       if (processor.processSubAgentMessage(message as any)) {
         continue;
@@ -3274,38 +3384,6 @@ async function runQueryAttempt(
       }
 
       if (message.type === 'assistant' && 'uuid' in message) {
-        const assistantError = (message as { error?: SDKAssistantMessageError })
-          .error;
-        if (assistantError) {
-          // Assistant.error is itself a terminal SDK-attempt boundary. The
-          // classifier only selects the host disposition; it must never decide
-          // whether we keep waiting for a Result which compatible endpoints may
-          // never emit.
-          const assistantErrorClass =
-            classifyProviderAssistantError(assistantError) ?? 'transient';
-          log(
-            `Assistant provider error (${assistantError}); classified as ${assistantErrorClass}`,
-          );
-          publishProviderFailure({
-            error: assistantError,
-            failureClass: assistantErrorClass,
-            failureNotice: providerAuthenticationNotice(assistantError),
-          });
-          processor.discardPendingTextOutput();
-          processor.cleanup();
-          assistantTextTracker.reset();
-          canonicalAssistantUuid = undefined;
-          stream.end();
-          return {
-            newSessionId,
-            lastAssistantUuid,
-            closedDuringQuery,
-            interruptedDuringQuery,
-            cancelledIpcReceipts,
-            pipedMessagesDuringQuery,
-            providerAccountFailure: true,
-          };
-        }
         lastAssistantUuid = (message as { uuid: string }).uuid;
         const assistantMsg = message as Record<string, unknown>;
         if ((assistantMsg.parent_tool_use_id ?? null) === null) {
@@ -4503,6 +4581,15 @@ async function main(): Promise<void> {
       // idle timer and cause a 30-min delay before the next _close).
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
+        // If a healthy Result already completed the input, do not overwrite it
+        // with status:closed. That used to block cursor commit and trigger
+        // retries of work that had already finished.
+        if (queryResult.durableInputTurnCompleted) {
+          log(
+            'Healthy result already published; exiting without closed override',
+          );
+          break;
+        }
         // Notify host that this exit was due to _close, not a normal completion.
         // Without this marker the host treats the exit as silent success and
         // commits the message cursor, causing the in-flight IM message to be

@@ -225,6 +225,48 @@ export function getQQMediaFileType(fileName: string): QQMediaFileType {
   return QQMediaFileType.FILE;
 }
 
+/** Inbound QQ attachment fields HappyClaw reads from gateway events. */
+export interface QQInboundAttachment {
+  url?: string;
+  filename?: string;
+  content_type?: string;
+  /** QQ platform-side speech recognition result for voice messages. */
+  asr_refer_text?: string;
+}
+
+const QQ_VOICE_EXTENSIONS = new Set(['.amr', '.silk', '.slk', '.wav', '.mp3']);
+
+export function isQQVoiceAttachment(attachment: QQInboundAttachment): boolean {
+  const contentType = attachment.content_type?.trim().toLowerCase() ?? '';
+  if (contentType === 'voice' || contentType.startsWith('audio/')) return true;
+  const name = attachment.filename || attachment.url?.split('?')[0] || '';
+  return QQ_VOICE_EXTENSIONS.has(path.extname(name).toLowerCase());
+}
+
+/**
+ * QQ ships its own ASR transcript on voice attachments (`asr_refer_text`).
+ * Returns the trimmed transcript, or undefined when absent / not a voice.
+ */
+export function getQQVoiceTranscript(
+  attachment: QQInboundAttachment,
+): string | undefined {
+  if (!isQQVoiceAttachment(attachment)) return undefined;
+  const text = attachment.asr_refer_text?.trim();
+  return text || undefined;
+}
+
+/**
+ * Prepend the platform transcript so the Agent reads the spoken content as
+ * text instead of an undecodable SILK file.
+ */
+export function withQQVoiceTranscript(
+  content: string,
+  transcript: string | undefined,
+): string {
+  if (!transcript) return content;
+  return `[语音转文字] ${transcript}\n${content}`.trim();
+}
+
 // ─── Chunked Upload Utilities ──────────────────────────────────
 
 async function computeFileHashes(
@@ -575,6 +617,27 @@ export function requireQQOfficialSendId(data: unknown): { id: string } {
     );
   }
   return { id: id.trim() };
+}
+
+/**
+ * QQ error bodies carry a numeric business `code` (newer endpoints mirror it
+ * as `err_code`) and a `message`/`msg`, the fields apiRequest reads for HTTP
+ * >= 400. A 2xx body in that shape with a non-zero code is an explicit
+ * provider rejection; a body that merely lacks fields is not.
+ */
+export function readQQBusinessError(
+  data: unknown,
+): { code: number; message: string } | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const body = data as Record<string, unknown>;
+  const code = [body.code, body.err_code].find(
+    (value): value is number => typeof value === 'number' && value !== 0,
+  );
+  if (code === undefined) return null;
+  const message = [body.message, body.msg].find(
+    (value): value is string => typeof value === 'string' && value !== '',
+  );
+  return { code, message: message ?? 'unknown error' };
 }
 
 // ─── Factory Function ───────────────────────────────────────────
@@ -1415,7 +1478,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
    * Returns updated content string and optional attachmentsJson for vision.
    */
   async function processQQAttachment(
-    attachment: { url?: string; filename?: string },
+    attachment: QQInboundAttachment,
     msgId: string,
     jid: string,
     content: string,
@@ -1423,6 +1486,9 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     logContext: string,
     lease: ChannelInboundLease,
   ): Promise<{ content: string; attachmentsJson?: string }> {
+    const isVoice = isQQVoiceAttachment(attachment);
+    // Platform ASR text survives even when the audio download fails.
+    content = withQQVoiceTranscript(content, getQQVoiceTranscript(attachment));
     if (!attachment.url) return { content };
 
     const attachUrl = attachment.url.startsWith('http')
@@ -1480,14 +1546,17 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           buffer,
         );
         inboundLifecycle.assertCurrent(lease);
-        if (relPath) content = `[文件: ${relPath}]\n${content}`.trim();
+        if (relPath) {
+          const label = isVoice ? '语音' : '文件';
+          content = `[${label}: ${relPath}]\n${content}`.trim();
+        }
       } catch (err) {
         inboundLifecycle.assertCurrent(lease);
         logger.warn({ err }, `Failed to save QQ ${logContext} file`);
       }
     }
 
-    if (!content) content = '[文件]';
+    if (!content) content = isVoice ? '[语音]' : '[文件]';
     return { content };
   }
 
@@ -1979,7 +2048,9 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           // arguments) are deliberately not commands: they fall through to the
           // Agent as ordinary input rather than becoming "unknown command".
           // `/clear` is the exception -- it is a real command here.
-          (runtimeControl?.kind === 'clear' || !isRuntimeControlLike(content))
+          (runtimeControl?.kind === 'clear' ||
+            runtimeControl?.kind === 'fresh' ||
+            !isRuntimeControlLike(content))
         ) {
           const cmdBody = (
             slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
@@ -2250,7 +2321,9 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           // arguments) are deliberately not commands: they fall through to the
           // Agent as ordinary input rather than becoming "unknown command".
           // `/clear` is the exception -- it is a real command here.
-          (runtimeControl?.kind === 'clear' || !isRuntimeControlLike(content))
+          (runtimeControl?.kind === 'clear' ||
+            runtimeControl?.kind === 'fresh' ||
+            !isRuntimeControlLike(content))
         ) {
           const cmdBody = (
             slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
@@ -2603,7 +2676,18 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       if (params.event_id) {
         body.event_id = params.event_id;
       }
-      return apiRequest<{ id?: string }>('POST', endpoint, body);
+      const resp = await apiRequest<{ id?: string }>('POST', endpoint, body);
+      // apiRequest only rejects HTTP >= 400. A 2xx business error means QQ
+      // refused this chunk, which callers must not confuse with an ACK that
+      // simply omits the id.
+      const businessError = readQQBusinessError(resp);
+      if (businessError) {
+        throw new QQApiError(
+          `QQ API POST ${endpoint} returned business error ${businessError.code}: ${businessError.message}`,
+          businessError.code,
+        );
+      }
+      return resp;
     },
 
     claimPassiveReply(

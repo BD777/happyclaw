@@ -171,6 +171,12 @@ export interface IMChannelConnectOpts {
     targetJid?: string;
     senderImId: string;
   }) => Promise<string>;
+  onSessionFresh?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+    notes: string;
+  }) => Promise<string>;
   onFollowUpCardAction?: (input: {
     sourceJid: string;
     targetJid: string;
@@ -333,6 +339,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onFollowUpMessage: opts.onFollowUpMessage,
         onSessionBreak: opts.onSessionBreak,
         onSessionClear: opts.onSessionClear,
+        onSessionFresh: opts.onSessionFresh,
         onFollowUpCardAction: opts.onFollowUpCardAction,
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
@@ -1487,13 +1494,17 @@ export function createDiscordChannel(
         typingExpiry.arm(chatId, leaseId);
         // Discord typing indicator lasts 10s, repeat every 9s
         if (!typingIntervals.has(chatId)) {
-          await inner.setTyping(chatId, true);
+          // Reserve the per-chat pulse synchronously, before the provider
+          // round trip: a concurrent acquire for another lease (or a release
+          // racing this await) must see and own this single interval, or the
+          // interval created after the await is orphaned forever.
           const interval = setInterval(async () => {
             try {
               if (inner) await inner.setTyping(chatId, true);
             } catch {}
           }, 9000);
           typingIntervals.set(chatId, interval);
+          await inner.setTyping(chatId, true);
         }
       } else {
         const leases = typingLeases.get(chatId);

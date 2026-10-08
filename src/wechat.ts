@@ -50,6 +50,11 @@ const DEFAULT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 
 const LONGPOLL_EXTRA_TIMEOUT_MS = 5000;
 const DEFAULT_LONGPOLL_TIMEOUT_MS = 35000;
+// Same class of bug as the Feishu `defaultHttpInstance` fix: callers of `apiPost`
+// that omitted `timeoutMs` (sendMessageApi, sendTypingApi, getTypingTicket, media
+// sends) relied entirely on the undici dispatcher's own defaults, which are not
+// configured with a bound here — a stalled connection would hang indefinitely.
+const DEFAULT_API_REQUEST_TIMEOUT_MS = 30000;
 
 const RECONNECT_MIN_DELAY_MS = 3000;
 const RECONNECT_MAX_DELAY_MS = 60000;
@@ -810,7 +815,7 @@ export function createWeChatConnection(
   async function apiPost<T = any>(
     endpoint: string,
     body: Record<string, unknown>,
-    timeoutMs?: number,
+    timeoutMs: number = DEFAULT_API_REQUEST_TIMEOUT_MS,
     trackAsPollRequest = false,
   ): Promise<T> {
     const bodyStr = JSON.stringify(body);
@@ -819,9 +824,7 @@ export function createWeChatConnection(
 
     const controller = new AbortController();
     if (trackAsPollRequest) activePollController = controller;
-    const timer = timeoutMs
-      ? setTimeout(() => controller.abort(), timeoutMs)
-      : undefined;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const res = await fetchImpl(url.toString(), {
@@ -1099,9 +1102,16 @@ export function createWeChatConnection(
     attachmentEntry?: { type: string; data: string; mimeType: string };
     textPrefix?: string;
   }> {
+    const media = item.image_item?.media;
+    // extractTextContent already emitted "(image)" for undownloadable media.
+    if (!hasDownloadableCdnMedia(media)) return {};
+    // Same "[X消息]" family as the voice/video fallbacks, but naming why no
+    // image is attached so the agent does not assume it can see one.
+    const downloadFailed =
+      '[图片接收失败：下载或解密失败，请重新发送图片；当前无法查看图片内容。]';
     try {
       const result = await downloadCdnMediaItem(
-        item.image_item?.media,
+        media,
         groupFolder,
         'image',
         (buffer) => {
@@ -1121,10 +1131,6 @@ export function createWeChatConnection(
             '[图片接收失败：附件不可用，请重新发送图片；当前无法查看图片内容。]',
         };
 
-      const textPrefix = result.savedPath
-        ? `[图片: ${result.savedPath}]`
-        : undefined;
-
       let attachmentEntry:
         | { type: string; data: string; mimeType: string }
         | undefined;
@@ -1137,23 +1143,22 @@ export function createWeChatConnection(
         };
       }
 
-      return {
-        attachmentEntry,
-        textPrefix:
-          textPrefix ??
-          (attachmentEntry
-            ? undefined
-            : '[图片接收失败：图片无法保存且超过内联大小限制，请压缩后重新发送。]'),
-      };
+      if (result.savedPath) {
+        return { attachmentEntry, textPrefix: `[图片: ${result.savedPath}]` };
+      }
+      if (!attachmentEntry) {
+        // Too large to inline and not on disk (no workspace, or the save
+        // failed): an image-only message would otherwise be dropped as empty.
+        logger.warn(
+          { size: result.buffer.length },
+          'WeChat image too large to inline and not saved to the workspace',
+        );
+        return { textPrefix: '[图片消息（图片过大）]' };
+      }
+      return { attachmentEntry };
     } catch (err) {
-      logger.warn(
-        { err },
-        'WeChat image download/decrypt failed; preserving failure in inbound message',
-      );
-      return {
-        textPrefix:
-          '[图片接收失败：下载或解密失败，请重新发送图片；当前无法查看图片内容。]',
-      };
+      logger.warn({ err }, 'WeChat image download/decrypt failed');
+      return { textPrefix: downloadFailed };
     }
   }
 

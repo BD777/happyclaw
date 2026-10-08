@@ -4,10 +4,14 @@ import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import * as replyDelivery from '../src/reply-delivery.js';
 import * as interactionRuntime from '../src/workspace-interaction-runtime.js';
+import * as channelInteraction from '../src/channel-interaction-mode.js';
+import { channelConversationJid } from '../src/channel-address.js';
 import * as replySource from '../src/channel-reply-source.js';
 import { resolveContainerOutputInputTurnId } from '../src/channel-output-correlation.js';
 import { stripRedundantCompletionPreamble } from '../src/reply-finalization.js';
 import { TurnOutputCoordinator } from '../src/turn-output-coordinator.js';
+import { InputUsageProjection } from '../src/input-usage-projection.js';
+import { hasUnfinishedProactiveOutput } from '../src/turn-outcome.js';
 import { getChannelType } from '../src/im-channel.js';
 import { channelTurnScope } from '../src/channel-turn-registry.js';
 import { createRuntimeSourceHarness } from './helpers/runtime-source.js';
@@ -54,7 +58,15 @@ function makeOutputRuntime(lane: 'main' | 'session') {
   const sendImWithRetry = vi.fn(async () => true);
   const broadcastNewMessage = vi.fn();
   const commitCursor = vi.fn();
+  const inputUsageProjection = new InputUsageProjection('initial-im-input');
+  inputUsageProjection.admit(inputId);
+  const agentInputUsageProjection = new InputUsageProjection(
+    'initial-im-input',
+  );
+  agentInputUsageProjection.admit(inputId);
   const globals: Record<string, any> = {
+    inputUsageProjection,
+    agentInputUsageProjection,
     ...replyDelivery,
     ...interactionRuntime,
     ...replySource,
@@ -96,10 +108,12 @@ function makeOutputRuntime(lane: 'main' | 'session') {
     sentReplyByInput: new Map(),
     genuineReplyDeliveredByInput: new Map(),
     channelPhysicalDeliveryAckByInput: new Map(),
+    channelNonTerminalDeliveryAckByInput: new Map(),
     agentReplySentByInput: new Map(),
     agentAnyReplyProjectedByInput: new Map(),
     agentGenuineReplyDeliveredByInput: new Map(),
     agentPhysicalDeliveryAckByInput: new Map(),
+    agentNonTerminalDeliveryAckByInput: new Map(),
     turnOutputCoordinators: coordinators,
     agentTurnOutputCoordinators: coordinators,
     scheduledGroupRunsByInput: new Map(),
@@ -139,6 +153,10 @@ function makeOutputRuntime(lane: 'main' | 'session') {
     rotateProviderAfterAgentTurn: false,
     rotatingAgentTurnCompleted: false,
     closeRunnerAfterRotatingProviderTurn: () => false,
+    currentAgentChannelContext: undefined,
+    getMessageChannelTurnContext: () => null,
+    bindActiveChannelTurn: vi.fn(),
+    getFailedChannelOutboxForTurn: () => undefined,
     getAgent: () => ({ title_source: 'manual' }),
     extractLocalImImagePaths: () => [],
     ensureChatExists: db.ensureChatExists,
@@ -182,6 +200,7 @@ function makeOutputRuntime(lane: 'main' | 'session') {
   ] as (output: Record<string, unknown>) => Promise<void>;
   return {
     globals,
+    harness,
     inputId,
     virtualChatJid,
     commitCursor,
@@ -271,6 +290,43 @@ describe('actual runtime callbacks preserve per-input reply destinations', () =>
   );
 
   test.each(['main', 'session'] as const)(
+    '%s still sends the final IM answer after a held background-task progress reply',
+    async (lane) => {
+      const fixture = makeOutputRuntime(lane);
+      const inputId = 'initial-im-input';
+      fixture.globals.replySourceImJid = null;
+      fixture.globals.channelOutboxScopesByInput.set(inputId, {
+        sourceJid: OLD_IM,
+        token: 'initial-scope',
+        turnRunId: 'initial-run',
+      });
+      fixture.globals.turnOutputCoordinators.set(
+        inputId,
+        new TurnOutputCoordinator(),
+      );
+      await fixture.emit({
+        status: 'success',
+        result: 'Started a background search.',
+        sourceKind: 'sdk_final',
+        finalizationReason: 'completed',
+        pendingBgTasks: 1,
+        inputTurnId: inputId,
+        sdkMessageUuid: 'sdk-held',
+      });
+      await fixture.emit(finalOutput(inputId, 'Found 16 remote roles.'));
+      expect(fixture.sendImWithRetry).toHaveBeenCalledTimes(2);
+      expect(fixture.sendImWithRetry).toHaveBeenLastCalledWith(
+        OLD_IM,
+        'Found 16 remote roles.',
+        [],
+        expect.objectContaining({ scopeToken: 'initial-scope' }),
+      );
+      expect(fixture.commitCursor).toHaveBeenCalledWith(inputId);
+      expect(fixture.globals.hadError).toBe(false);
+    },
+  );
+
+  test.each(['main', 'session'] as const)(
     '%s does not persist or acknowledge a Web input whose admission was rejected',
     async (lane) => {
       const fixture = makeOutputRuntime(lane);
@@ -349,6 +405,9 @@ describe('actual message loop dispatches the unconsumed channel suffix', () => {
     const globals: Record<string, any> = {
       ...replySource,
       ...interactionRuntime,
+      ...channelInteraction,
+      channelConversationJid,
+      resolveScheduledGroupPromptInteractionMode: () => null,
       ...db,
       getChannelType,
       EMPTY_CURSOR,
@@ -362,13 +421,6 @@ describe('actual message loop dispatches the unconsumed channel suffix', () => {
       logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       resolveEffectiveGroup: () => ({ effectiveGroup: group }),
       getWorkspaceInteractionMode: () => 'assistant',
-      selectInteractionModeCompatibleMessagePrefix: (
-        messages: NewMessage[],
-      ) => ({
-        messages,
-        interactionMode: 'assistant',
-        hasDeferredMessages: false,
-      }),
       resolveBatchChannelContext: () => null,
       queue,
       buildExpandContext: () => ({ executionMode: 'host' }),
@@ -394,6 +446,8 @@ describe('actual message loop dispatches the unconsumed channel suffix', () => {
     };
     const harness = createRuntimeSourceHarness(globals);
     for (const name of [
+      'resolveTrustedInteractionMode',
+      'selectRuntimeInteractionBatch',
       'isCursorAfter',
       'createIpcDeliveryTarget',
       'advanceNextPullCursorOnly',
@@ -442,3 +496,210 @@ describe('actual message loop dispatches the unconsumed channel suffix', () => {
     }
   });
 });
+
+describe('actual runtime mount-mode admission and resume safety', () => {
+  test('cold source batch freezes one mode and leaves a different Home source behind', () => {
+    const homeJid = 'web:mode-home';
+    const group = { folder: 'mode-home' };
+    const research = 'feishu:mode-research';
+    const globals: Record<string, any> = {
+      ...interactionRuntime,
+      ...channelInteraction,
+      channelConversationJid,
+      registeredGroups: { [homeJid]: group },
+      getRegisteredGroup: () => undefined,
+      getWorkspaceInteractionMode: () => 'proactive',
+      getChannelMount: (jid: string) =>
+        jid === research
+          ? { workspace_jid: homeJid, interaction_mode_override: 'assistant' }
+          : undefined,
+      getTaskRunById: () => undefined,
+      resolveScheduledGroupPromptInteractionMode: (message: NewMessage) =>
+        message.task_id ? 'proactive' : null,
+    };
+    const harness = createRuntimeSourceHarness(globals);
+    harness.install('resolveTrustedInteractionMode');
+    harness.install('selectRuntimeInteractionBatch');
+    const messages = [
+      { id: 'a', chat_jid: homeJid, source_jid: research },
+      { id: 'b', chat_jid: homeJid, source_jid: 'feishu:mode-other' },
+      { id: 'c', chat_jid: homeJid, source_jid: research },
+    ];
+    const selected = globals.selectRuntimeInteractionBatch(
+      messages,
+      group,
+      homeJid,
+    );
+    expect(selected.interactionMode).toBe('assistant');
+    expect(selected.messages.map((message: NewMessage) => message.id)).toEqual([
+      'a',
+    ]);
+    expect(selected.hasDeferredMessages).toBe(true);
+    const next = globals.selectRuntimeInteractionBatch(
+      messages.slice(1),
+      group,
+      homeJid,
+    );
+    expect(next.interactionMode).toBe('proactive');
+    expect(next.messages.map((message: NewMessage) => message.id)).toEqual([
+      'b',
+    ]);
+    const frozen = globals.selectRuntimeInteractionBatch(
+      [
+        {
+          ...messages[0],
+          task_id: 'frozen-task',
+          source_kind: 'scheduled_task_prompt',
+        },
+        messages[2],
+      ],
+      group,
+      homeJid,
+    );
+    expect(frozen.interactionMode).toBe('proactive');
+    expect(frozen.messages).toHaveLength(1);
+    const spawned = globals.selectRuntimeInteractionBatch(
+      messages,
+      group,
+      homeJid,
+      'spawn',
+    );
+    expect(spawned.interactionMode).toBe('assistant');
+    expect(spawned.messages).toHaveLength(3);
+  });
+
+  test('a source-mode switch resets only its SDK namespace and preserves stored conversation history', () => {
+    const folder = `resume-mode-${crypto.randomUUID()}`;
+    const jid = `web:${folder}`;
+    db.ensureChatExists(jid);
+    db.storeMessageDirect(
+      'history',
+      jid,
+      'owner',
+      'Owner',
+      '既有历史不变',
+      '2026-09-13T00:00:00Z',
+      false,
+    );
+    db.setSession(folder, 'sdk-main');
+    db.setSessionInteractionMode(folder, undefined, 'proactive');
+    db.setSession(folder, 'sdk-agent', 'agent-sibling');
+    db.setSessionInteractionMode(folder, 'agent-sibling', 'proactive');
+    const globals: Record<string, any> = {
+      ...db,
+      ...interactionRuntime,
+      ...channelInteraction,
+      sessions: { [folder]: 'sdk-main' },
+      getWorkspaceInteractionMode: () => 'proactive',
+      logger: { info: vi.fn() },
+    };
+    const harness = createRuntimeSourceHarness(globals);
+    harness.install('resetSessionForInteractionModeMismatch');
+    expect(
+      globals.resetSessionForInteractionModeMismatch({ folder }, 'assistant'),
+    ).toBe(true);
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(globals.sessions[folder]).toBeUndefined();
+    expect(db.getSession(folder, 'agent-sibling')).toBe('sdk-agent');
+    expect(db.getMessagesPage(jid)[0].content).toBe('既有历史不变');
+    db.setSession(folder, 'sdk-new');
+    db.setSessionInteractionMode(folder, undefined, 'assistant');
+    expect(
+      globals.resetSessionForInteractionModeMismatch({ folder }, 'assistant'),
+    ).toBe(false);
+    expect(db.getSession(folder)).toBe('sdk-new');
+    expect(
+      globals.resetSessionForInteractionModeMismatch({ folder }, 'proactive'),
+    ).toBe(true);
+    expect(db.getSession(folder, 'agent-sibling')).toBe('sdk-agent');
+  });
+});
+
+test.each(['main', 'session'] as const)(
+  '%s keeps a failed final retryable after a successful held checkpoint',
+  async (lane) => {
+    const fixture = makeOutputRuntime(lane);
+    const inputId = 'initial-im-input';
+    const scopes =
+      lane === 'main'
+        ? fixture.globals.channelOutboxScopesByInput
+        : fixture.globals.agentChannelOutboxScopesByInput;
+    const physical =
+      lane === 'main'
+        ? fixture.globals.channelPhysicalDeliveryAckByInput
+        : fixture.globals.agentPhysicalDeliveryAckByInput;
+    const progress =
+      lane === 'main'
+        ? fixture.globals.channelNonTerminalDeliveryAckByInput
+        : fixture.globals.agentNonTerminalDeliveryAckByInput;
+    const genuine =
+      lane === 'main'
+        ? fixture.globals.genuineReplyDeliveredByInput
+        : fixture.globals.agentGenuineReplyDeliveredByInput;
+    const replied =
+      lane === 'main'
+        ? fixture.globals.sentReplyByInput
+        : fixture.globals.agentReplySentByInput;
+    const coordinators =
+      lane === 'main'
+        ? fixture.globals.turnOutputCoordinators
+        : fixture.globals.agentTurnOutputCoordinators;
+    fixture.globals.replySourceImJid = null;
+    scopes.set(inputId, {
+      sourceJid: OLD_IM,
+      token: 'initial-scope',
+      turnRunId: 'initial-run',
+    });
+    coordinators.set(inputId, new TurnOutputCoordinator());
+    const runtime = {
+      runId: 'initial-run',
+      markFinalizing: () => true,
+      complete: vi.fn(() => true),
+      dispose: vi.fn(),
+    };
+    Object.assign(fixture.globals, {
+      channelTurnRuntimes: new Map([[inputId, runtime]]),
+      agentChannelTurnRuntimes: new Map([[inputId, runtime]]),
+      hasUnfinishedProactiveOutput,
+      getUncertainChannelOutboxForTurn: () => undefined,
+      getDeliveredChannelOutboxForTurn: () => undefined,
+      clearProcessingIndicatorForInput: vi.fn(),
+      clearAgentProcessingIndicatorForInput: vi.fn(),
+      markMainOutputSettled: vi.fn(),
+      markAgentOutputSettled: vi.fn(),
+    });
+    fixture.harness.install(
+      lane === 'main'
+        ? 'completeChannelRuntimesForOutput'
+        : 'completeAgentChannelRuntimesForOutput',
+      lane === 'main' ? 'processGroupMessages' : 'processAgentConversation',
+    );
+    fixture.sendImWithRetry
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    await fixture.emit({
+      status: 'success',
+      result: 'Search running.',
+      sourceKind: 'sdk_final',
+      finalizationReason: 'completed',
+      pendingBgTasks: 1,
+      inputTurnId: inputId,
+      sdkMessageUuid: 'sdk-held',
+    });
+    expect(progress.get(inputId)).toBe(true);
+    expect(physical.get(inputId)).not.toBe(true);
+    await expect(
+      fixture.emit(finalOutput(inputId, 'Final results.')),
+    ).rejects.toThrow(/host_turn_settlement_failed/);
+    expect(genuine.get(inputId)).not.toBe(true);
+    expect(replied.get(inputId)).not.toBe(true);
+    expect(fixture.commitCursor).not.toHaveBeenCalled();
+    expect(runtime.complete).not.toHaveBeenCalled();
+    await fixture.emit(finalOutput(inputId, 'Final results.'));
+    expect(physical.get(inputId)).toBe(true);
+    expect(genuine.get(inputId)).toBe(true);
+    expect(runtime.complete).toHaveBeenCalledOnce();
+    expect(fixture.commitCursor).toHaveBeenCalledWith(inputId);
+  },
+);

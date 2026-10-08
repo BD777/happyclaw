@@ -31,6 +31,9 @@ export HAPPYCLAW_AGENT_IMAGE='riba2534/happyclaw-agent:latest'
 - 若 `container/` 或 Agent Runner 发生变化：已合入 `main` 时等待 `latest` 发布；部署尚未
   合入的远程分支时，用 GitHub Actions 的 `workflow_dispatch` 在精确 ref 上构建，并使用
   `riba2534/happyclaw-agent:git-<完整提交 SHA>`。分支构建不得推进公共 `latest`。
+- 安全 IPC 结果发布依赖 `/usr/bin/python3` 的原生目录相对系统调用。
+  在切换前检查 `open`、`rename` 和 `unlink` 均支持 `dir_fd`；能力缺失时不得降级为
+  路径写入或继续部署。
 
 ## 2. 只读预检与目标校验
 
@@ -42,6 +45,8 @@ test -z "$(git status --porcelain)" || {
   echo 'Production worktree is not clean; deployment stopped.' >&2
   exit 1
 }
+
+/usr/bin/python3 -I -S -c 'import os; assert all(f in os.supports_dir_fd for f in (os.open, os.rename, os.unlink)), "Secure IPC dir_fd support unavailable"'
 
 printf 'Rollback commit: %s\n' "$HAPPYCLAW_PREVIOUS_SHA"
 git fetch --prune "$HAPPYCLAW_DEPLOY_REMOTE" \

@@ -60,6 +60,11 @@ Public：
 - `DELETE /api/auth/sessions/:id`
 - `POST /api/auth/avatar`
 
+会话 Cookie 在 HTTPS 下名为 `__Host-happyclaw_session`，HTTP 下名为
+`happyclaw_session`；每次下发会话都会同时让另一个名称过期。`POST /api/auth/logout`
+让两个名称都过期，并删除该请求在两个名称下携带、且属于同一用户的全部会话；
+其他设备的会话不受影响。
+
 ## 工作区、消息和运行控制
 
 - `GET|POST /api/groups`
@@ -75,14 +80,23 @@ Public：
 - `POST /api/groups/:jid/reset-owner`，admin break-glass
 - `GET /api/groups/:jid/messages`
 - `DELETE /api/groups/:jid/messages/:messageId`
+- `GET /api/groups/:jid/messages/:messageId/attachments/:index/original`
 - `GET|PUT /api/groups/:jid/env`
 - `GET|PUT /api/groups/:jid/mcp`，仅兼容旧客户端
 - `POST /api/messages`
 - `GET /api/follow-ups`
 - `POST /api/follow-ups/:messageId/action`
 
-`POST /api/messages` 可以携带 Web 附件和 Runtime Session 标识。`/clear` 会进入与
-`reset-session` 相同的 owner 级破坏性检查。
+`POST /api/messages` 可以携带 Web 附件和 Runtime Session 标识。`/clear` 与
+`/fresh` 会进入与 `reset-session` 相同的 owner 级破坏性检查。`/fresh` 会开启
+新的 SDK 窗口并写入零摘要交接说明，不删除库中的旧历史，也不关闭 auto-compact。
+
+`GET /api/groups/:jid/messages` 返回的图片附件是降采样缩略图，并带
+`hasOriginal` 标记；原图由
+`GET /api/groups/:jid/messages/:messageId/attachments/:index/original`
+按需返回，`:index` 是附件在存储数组中的下标。存储的附件本身不变，Agent 仍然
+接收原分辨率图片。两个路由共用同一套工作区访问与 Host 执行权限检查，Runtime
+Session 消息使用 `{workspaceJid}#agent:{sessionId}` 作为 `:jid`。
 
 `POST /api/groups` 和 `PATCH /api/groups/:jid` 接受 `interaction_mode`
 （`assistant` 或 `proactive`），两者的响应体都会回显当前值。该字段存放在
@@ -254,6 +268,9 @@ owner 明确拒绝首次设置时可提交
 
 读操作要求访问工作区，写操作要求工作区 owner。
 
+`workspace-config/skills/install` 的 `package` 规则与 `POST /api/skills/install`
+相同：URL 形式只接受 github.com 仓库或 tree 链接，其他主机返回 400。
+
 ## 渠道账号
 
 - `GET|POST /api/channel-accounts`
@@ -289,6 +306,21 @@ Provider：
 - `POST /api/config/claude/apply`
 - `POST /api/config/claude/oauth/start`
 - `POST /api/config/claude/oauth/callback`
+- `POST /api/config/codex/oauth/start`，启动 ChatGPT/Codex 订阅 OAuth
+  PKCE 流程，返回 `authorizeUrl` 与 `state`；可选 `targetProviderId`
+  用于对已有 Provider 重新授权
+- `POST /api/config/codex/oauth/callback`，用 `{ state, code }`（`code`
+  接受回调页完整 URL 或裸授权码）换取 token，创建或更新 ChatGPT
+  订阅型 Provider；其 `anthropicBaseUrl` 落盘为内嵌网关占位值
+- `GET /api/config/codex/model-catalog`，返回 Codex 模型目录
+  `{ models: [{ value, label, efforts, defaultEffort? }], defaultModel,
+defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游
+  per-model 默认推理档，可能缺省）；目录由
+  `src/codex-gateway/model-catalog-sync.ts`
+  从上游 openai/codex 仓库 `codex-rs/models-manager/models.json` 同步
+  （`source` 为 `upstream`/`disk-cache`/`builtin`），baked-in 目录
+  （`src/codex-gateway/model-catalog.ts`）作离线兜底，供设置页模型/
+  推理力度下拉使用
 - `PUT /api/config/claude/custom-env`
 
 系统：
@@ -350,6 +382,14 @@ Skills：
 - `DELETE /api/skills/user-all`
 - `POST /api/skills/install`
 - `POST /api/skills/:id/reinstall`
+
+`POST /api/skills/install` 的 `package` 接受 `owner/repo`、`owner/repo@skill`
+等包名，或 `https://github.com/<owner>/<repo>`、
+`https://github.com/<owner>/<repo>/tree/<ref>/<path>` 形式的 GitHub URL。URL
+按解析出的 owner、repo、ref 和路径重建后交给 `skills add`；其他主机、非默认端口、
+凭据、查询串、片段和 blob 链接在启动安装进程前返回 400。其他 Git 主机改用
+`POST /api/skills/import/git`。`skills add` 子进程继承服务进程的
+`HTTPS_PROXY`/`NO_PROXY`。Agent 的 `install_skill` 工具与 reinstall 使用同一规则。
 
 MCP：
 

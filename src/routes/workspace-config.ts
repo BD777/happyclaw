@@ -8,6 +8,7 @@
  */
 
 import { Hono, type Context } from 'hono';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -17,7 +18,6 @@ import type { Variables } from '../web-context.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { GROUPS_DIR } from '../config.js';
-import { validateSafeHttpsUrl } from '../url-safety.js';
 import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import { getRegisteredGroup } from '../db.js';
 import {
@@ -25,6 +25,11 @@ import {
   validateSkillPath,
   scanSkillDirectory,
 } from '../skill-utils.js';
+import {
+  buildSkillsCliEnvironment,
+  canonicalizeGitHubSkillUrl,
+  SkillUrlRefusedError,
+} from '../skill-import-service.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -99,7 +104,10 @@ function readWorkspaceMeta(
   try {
     const data = fs.readFileSync(getWorkspaceMcpMetaPath(group), 'utf-8');
     return JSON.parse(data);
-  } catch {
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
     return { mcpServers: {} };
   }
 }
@@ -109,8 +117,29 @@ function writeWorkspaceMeta(
   meta: WorkspaceMeta,
 ): void {
   const metaPath = getWorkspaceMcpMetaPath(group);
+  try {
+    const existing = fs.readFileSync(metaPath, 'utf-8');
+    JSON.parse(existing);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
+  }
   fs.mkdirSync(path.dirname(metaPath), { recursive: true });
-  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  const tmpPath = `${metaPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(meta, null, 2), {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, metaPath);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* already renamed or never created */
+    }
+  }
 }
 
 function readWorkspaceSettings(
@@ -119,7 +148,10 @@ function readWorkspaceSettings(
   try {
     const data = fs.readFileSync(getWorkspaceSettingsPath(group), 'utf-8');
     return JSON.parse(data);
-  } catch {
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
     return {};
   }
 }
@@ -129,8 +161,29 @@ function writeWorkspaceSettings(
   settings: Record<string, unknown>,
 ): void {
   const settingsPath = getWorkspaceSettingsPath(group);
+  try {
+    const existing = fs.readFileSync(settingsPath, 'utf-8');
+    JSON.parse(existing);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
+  }
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  const tmpPath = `${settingsPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2), {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, settingsPath);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* already renamed or never created */
+    }
+  }
 }
 
 /**
@@ -258,11 +311,17 @@ workspaceConfigRoutes.post(
     if (!isNpmName && !isUrl) {
       return c.json({ error: 'Invalid package name format' }, 400);
     }
+    // URL form is limited to github.com and rebuilt before reaching the CLI, so
+    // `skills add` can never fetch or clone an arbitrary host (SSRF).
+    let source = pkg;
     if (isUrl) {
-      // SSRF 防护：URL 形式必须 HTTPS + 非内网（拒 169.254.169.254 等）。
-      const reason = validateSafeHttpsUrl(pkg);
-      if (reason) {
-        return c.json({ error: `Refused skill URL: ${reason}` }, 400);
+      try {
+        source = canonicalizeGitHubSkillUrl(pkg);
+      } catch (error) {
+        if (error instanceof SkillUrlRefusedError) {
+          return c.json({ error: error.message }, 400);
+        }
+        throw error;
       }
     }
 
@@ -276,10 +335,19 @@ workspaceConfigRoutes.post(
     try {
       await execFileAsync(
         'npx',
-        ['-y', 'skills', 'add', pkg, '--global', '--yes', '-a', 'claude-code'],
+        [
+          '-y',
+          'skills',
+          'add',
+          source,
+          '--global',
+          '--yes',
+          '-a',
+          'claude-code',
+        ],
         {
           timeout: 60_000,
-          env: { ...process.env, HOME: tempHome },
+          env: buildSkillsCliEnvironment(tempHome),
         },
       );
 

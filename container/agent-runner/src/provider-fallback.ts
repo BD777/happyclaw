@@ -179,6 +179,15 @@ const ACCOUNT_PROVIDER_ASSISTANT_ERRORS = new Set<SDKAssistantMessageError>([
   'authentication_failed',
   'oauth_org_not_allowed',
   'account_on_hold',
+  // 403 permission_error with error_code=verification_required: the
+  // organization behind this profile must complete verification before any
+  // request is served. Claude Code stops on it, like account_on_hold.
+  'verification_required',
+  // The cloud credentials this profile's environment points at (AWS/GCP/Azure)
+  // could not be loaded. Credentials belong to the profile, so another profile
+  // may still serve; and the config notice is about model names, which would
+  // misdirect the user here.
+  'cloud_credential_error',
   'billing_error',
   // A bare `rate_limit` assistant error carries no rateLimitType, so its blast
   // radius is unknown. classifyProviderRateLimitType() already fails safe as
@@ -242,6 +251,35 @@ export function classifyProviderAssistantError(
   // Unknown failures say nothing about account health, so fail safe as a
   // bounded transient replay instead of parking the stream indefinitely.
   return 'transient';
+}
+
+/**
+ * Decide whether an AssistantMessage error ends the current SDK attempt, and
+ * with which failure class.
+ *
+ * Every top-level error does (see classifyProviderAssistantError). A sub-agent
+ * runs on its parent's provider profile, so an account verdict there — usage
+ * limit, billing, authentication — means the parent cannot be served either.
+ * Leaving it to the parent would hand it a "you've hit your limit" tool result
+ * to narrate, and a background sub-agent would simply stop with nobody
+ * retrying it. Ending the attempt lets the host quarantine the profile and
+ * replay the still-unacknowledged input on another account, exactly as for a
+ * top-level limit.
+ *
+ * Transient and config errors stay local to the sub-agent: the parent receives
+ * them as a failed tool result and can adapt, so they must not replay the
+ * whole input.
+ *
+ * @returns the failure class, or undefined when the attempt continues.
+ */
+export function resolveAssistantErrorAttemptBoundary(input: {
+  error: SDKAssistantMessageError | (string & {}) | undefined;
+  parentToolUseId: string | null | undefined;
+}): ProviderFailureClass | undefined {
+  const failureClass = classifyProviderAssistantError(input.error);
+  if (!failureClass) return undefined;
+  if ((input.parentToolUseId ?? null) === null) return failureClass;
+  return failureClass === 'account' ? 'account' : undefined;
 }
 
 /**

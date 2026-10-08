@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
+import { fenceFeishuWebSocketLifecycle } from './feishu-ws-lifecycle.js';
 import {
   cancelAwaitingForwardBundleRoot,
   findForwardBundleCommentTail,
@@ -24,7 +25,18 @@ import {
 import { notifyNewImMessage } from './message-notifier.js';
 import { detectImageMimeType } from './image-detector.js';
 import { resolveJidByMessageId } from './feishu-streaming-card.js';
-import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
+import { buildPostMdFallback } from './feishu-message-format.js';
+export {
+  buildPostMdFallback,
+  FEISHU_POST_MD_NODE_MAX_BYTES,
+  splitFeishuPostMarkdown,
+} from './feishu-message-format.js';
+import {
+  FEISHU_POST_MAX_BYTES,
+  FEISHU_TEXT_MAX_BYTES,
+  prepareFeishuPostTextPages,
+  prepareFeishuPlainTextPages,
+} from './feishu-message-capacity.js';
 import {
   buildAgentReplyCard,
   buildFollowUpActionResultCard,
@@ -168,6 +180,12 @@ export interface ConnectOptions {
     targetJid?: string;
     senderImId: string;
   }) => Promise<string>;
+  onSessionFresh?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+    notes: string;
+  }) => Promise<string>;
   /** Handle buttons from legacy queued-message cards sent by older versions. */
   onFollowUpCardAction?: (input: {
     sourceJid: string;
@@ -220,7 +238,7 @@ export interface FeishuConnection {
     chatId: string,
     text: string,
     localImagePaths?: string[],
-    options?: { presentation?: 'default' | 'native' },
+    options?: { presentation?: 'default' | 'native'; physicalOutput?: boolean },
   ): Promise<void>;
   sendImage(
     chatId: string,
@@ -278,6 +296,18 @@ const FEISHU_INBOX_GATE_RETRY_DELAY_MS = 250;
 const FEISHU_INBOX_RECOVERY_LIMIT = 500;
 const FEISHU_RESOURCE_REQUEST_TIMEOUT_MS = 15_000;
 const FEISHU_RESOURCE_STREAM_TIMEOUT_MS = 30_000;
+// `lark.Client` requests (token fetch + all OpenAPI calls, including
+// send_card/add_reaction/api_request mutations) run on the SDK's shared
+// `defaultHttpInstance`, an axios instance created with no timeout. A stalled
+// TCP/TLS handshake to Feishu therefore hangs the underlying promise forever;
+// the only thing that ever fires is the runner's own 120s IPC poll timeout,
+// which surfaces as an opaque "Timeout waiting for IPC result" with no
+// indication that the stall was network-level. Bounding it here lets
+// `deliverChannelOutboxItem` observe a real error and fence the mutation as
+// `uncertain`/`failed` well inside that 120s budget instead of leaving both
+// the promise and the outbox claim hanging past it.
+const FEISHU_CLIENT_HTTP_TIMEOUT_MS = 60_000;
+let feishuClientHttpTimeoutApplied = false;
 const FEISHU_ACK_REACTION_TIMEOUT_MS = 10_000;
 const FEISHU_CURSOR_SCOPE = 'chat_messages';
 // 启动期 bot info 拉取的最大重试次数（指数退避 1s/2s/4s）
@@ -1122,124 +1152,6 @@ function getFileType(
  * - Code block / table spacing with <br>
  * - Invalid image cleanup
  */
-// Feishu documents a generous total post limit, but large single `md` elements
-// have produced provider-side 2200 errors in real threads. Keep one physical
-// message/Outbox row while using smaller rich-text nodes inside that message.
-export const FEISHU_POST_MD_NODE_MAX_BYTES = 2_400;
-
-function takeUtf8Prefix(
-  value: string,
-  maxBytes: number,
-): { prefix: string; rest: string } {
-  let bytes = 0;
-  let consumedCodeUnits = 0;
-  for (const character of value) {
-    const nextBytes = Buffer.byteLength(character);
-    if (bytes + nextBytes > maxBytes) break;
-    bytes += nextBytes;
-    consumedCodeUnits += character.length;
-  }
-  return {
-    prefix: value.slice(0, consumedCodeUnits),
-    rest: value.slice(consumedCodeUnits),
-  };
-}
-
-interface MarkdownFence {
-  marker: string;
-  opener: string;
-}
-
-function nextMarkdownFence(
-  line: string,
-  current: MarkdownFence | null,
-): MarkdownFence | null {
-  const trimmed = line.trim();
-  if (!current) {
-    const opener = trimmed.match(/^(`{3,}|~{3,})(.*)$/);
-    if (!opener) return null;
-    return {
-      marker: opener[1],
-      // Language identifiers are short in valid Markdown. Bounding an
-      // adversarial opener keeps continuation overhead below the node budget.
-      opener: Buffer.byteLength(trimmed) <= 128 ? trimmed : opener[1],
-    };
-  }
-  const closingPattern = new RegExp(
-    `^${current.marker[0]}{${current.marker.length},}\\s*$`,
-  );
-  return closingPattern.test(trimmed) ? null : current;
-}
-
-/**
- * Split optimized Markdown into several `md` elements without creating
- * additional provider messages. UTF-8 byte accounting avoids breaking CJK or
- * emoji, and long fenced blocks are closed/reopened at node boundaries so each
- * element renders independently.
- */
-export function splitFeishuPostMarkdown(
-  markdown: string,
-  maxBytes = FEISHU_POST_MD_NODE_MAX_BYTES,
-): string[] {
-  if (!Number.isInteger(maxBytes) || maxBytes < 256) {
-    throw new Error(
-      'Feishu post Markdown node budget must be at least 256 bytes',
-    );
-  }
-  if (!markdown) return [''];
-
-  const chunks: string[] = [];
-  let current = '';
-  let fence: MarkdownFence | null = null;
-  const flush = (): void => {
-    if (!current) return;
-    const closing = fence ? `\n${fence.marker}` : '';
-    chunks.push(`${current}${closing}`);
-    current = fence ? `${fence.opener}\n` : '';
-  };
-
-  const lines = markdown.match(/[^\n]*\n|[^\n]+$/g) ?? [markdown];
-  for (const line of lines) {
-    let remaining = line;
-    while (remaining) {
-      const closingReserve = fence ? Buffer.byteLength(`\n${fence.marker}`) : 0;
-      const available = maxBytes - Buffer.byteLength(current) - closingReserve;
-      if (available <= 0) {
-        flush();
-        continue;
-      }
-      if (Buffer.byteLength(remaining) <= available) {
-        current += remaining;
-        remaining = '';
-        fence = nextMarkdownFence(line, fence);
-        continue;
-      }
-      const { prefix, rest } = takeUtf8Prefix(remaining, available);
-      if (!prefix) {
-        flush();
-        continue;
-      }
-      current += prefix;
-      remaining = rest;
-      flush();
-    }
-  }
-  flush();
-  return chunks.length > 0 ? chunks : [''];
-}
-
-/** Build a post+md fallback content string for when interactive card send fails. */
-export function buildPostMdFallback(text: string): string {
-  const optimized = optimizeMarkdownStyle(text, 1);
-  return JSON.stringify({
-    zh_cn: {
-      content: splitFeishuPostMarkdown(optimized).map((chunk) => [
-        { tag: 'md', text: chunk },
-      ]),
-    },
-  });
-}
-
 function buildInteractiveCard(text: string): object {
   return buildAgentReplyCard({ status: 'done', text });
 }
@@ -1270,6 +1182,32 @@ export function createFeishuConnection(
 
   let client: lark.Client | null = null;
   let wsClient: lark.WSClient | null = null;
+  let wsConnectionGeneration = 0;
+
+  // WSClient.start() resolves before the endpoint pull and WS handshake
+  // finish, and close() does not cancel that in-flight start attempt. A
+  // stop() or reconnect that retires the client inside the handshake window
+  // would otherwise leave a live, auto-reconnecting long connection that no
+  // stop()/disconnect path references any more. Close any client that
+  // reaches ready after it stopped being the current one.
+  function createWsClient(): lark.WSClient {
+    const created: lark.WSClient = new lark.WSClient({
+      appId: config.appId,
+      appSecret: config.appSecret,
+      loggerLevel: lark.LoggerLevel.info,
+      // Detect silently-dead long connections instead of hanging on a
+      // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+      wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
+      onReady: () => {
+        if (wsClient === created) return;
+        logger.warn(
+          'Closing Feishu WS client that finished connecting after it was retired',
+        );
+        created.close({ force: true });
+      },
+    });
+    return fenceFeishuWebSocketLifecycle(created);
+  }
   let eventDispatcher: lark.EventDispatcher | null = null;
   let connectOptions: ConnectOptions | null = null;
   let botOpenId: string = '';
@@ -1956,6 +1894,66 @@ export function createFeishuConnection(
     );
   }
 
+  /** Send each accepted page once; only explicit size rejections reflow it. */
+  async function sendOrdinaryPages(
+    chatId: string,
+    text: string,
+    kind: 'post' | 'text',
+    tracker: PhysicalDeliveryTracker,
+    physicalOutput = false,
+  ): Promise<void> {
+    const prepare =
+      kind === 'post'
+        ? prepareFeishuPostTextPages
+        : prepareFeishuPlainTextPages;
+    const initialBudget =
+      kind === 'post' ? FEISHU_POST_MAX_BYTES : FEISHU_TEXT_MAX_BYTES;
+    const pages = (physicalOutput ? [text] : prepare(text)).map((page) => ({
+      text: page,
+      budget: initialBudget,
+    }));
+    tracker.addOutputs(pages.length - 1);
+    while (pages.length) {
+      const page = pages[0];
+      const content =
+        kind === 'post'
+          ? buildPostMdFallback(page.text)
+          : JSON.stringify({ text: page.text });
+      try {
+        await tracker.send(() =>
+          withFeishuHardTimeout(
+            sendToFeishu(chatId, kind, content),
+            FEISHU_RESOURCE_REQUEST_TIMEOUT_MS,
+            'Feishu ordinary reply page',
+          ),
+        );
+      } catch (error) {
+        const rejection =
+          error instanceof PartialChannelDeliveryError ? error.cause : error;
+        // Scoped physical pages belong to the durable outbox planner. Let it
+        // assign separate stable identities before sending smaller pages.
+        if (
+          !physicalOutput &&
+          feishuApiErrorCode(rejection) === 230025 &&
+          definitiveFeishuChannelDeliveryError(rejection) &&
+          page.budget > 4096
+        ) {
+          const budget = Math.floor(page.budget * 0.8);
+          const smaller = prepare(page.text, { maxBytes: budget });
+          tracker.addOutputs(smaller.length - 1);
+          pages.splice(
+            0,
+            1,
+            ...smaller.map((part) => ({ text: part, budget })),
+          );
+          continue;
+        }
+        throw error;
+      }
+      pages.shift();
+    }
+  }
+
   async function sendTextToChat(chatId: string, text: string): Promise<void> {
     if (!client) {
       throw new FeishuTextDeliveryError(
@@ -1964,10 +1962,11 @@ export function createFeishuConnection(
       );
     }
     try {
-      await withFeishuHardTimeout(
-        sendToFeishu(chatId, 'text', JSON.stringify({ text })),
-        FEISHU_RESOURCE_REQUEST_TIMEOUT_MS,
-        'Feishu text reply',
+      await sendOrdinaryPages(
+        chatId,
+        text,
+        'text',
+        new PhysicalDeliveryTracker(1),
       );
     } catch (err) {
       logger.error({ chatId, err }, 'Failed to send Feishu text reply');
@@ -2072,6 +2071,7 @@ export function createFeishuConnection(
       onFollowUpMessage,
       onSessionBreak,
       onSessionClear,
+      onSessionFresh,
       shouldProcessGroupMessage,
       resolveFeishuConversationPlan,
       isGroupOwnerMessage,
@@ -2278,6 +2278,7 @@ export function createFeishuConnection(
         !requestedFollowUpMode &&
         (runtimeControl?.kind === 'break' ||
           runtimeControl?.kind === 'clear' ||
+          runtimeControl?.kind === 'fresh' ||
           (onCommand && !runtimeControlLike))
       ) {
         const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
@@ -2372,7 +2373,8 @@ export function createFeishuConnection(
             }
             if (
               runtimeControl?.kind === 'break' ||
-              runtimeControl?.kind === 'clear'
+              runtimeControl?.kind === 'clear' ||
+              runtimeControl?.kind === 'fresh'
             ) {
               let targetJid: string | undefined;
               // Group routes are already registered and may carry a native
@@ -2398,6 +2400,15 @@ export function createFeishuConnection(
                       senderImId: senderOpenId,
                     })
                   : '当前运行环境不支持 /break。';
+              } else if (runtimeControl?.kind === 'fresh') {
+                reply = onSessionFresh
+                  ? await onSessionFresh({
+                      sourceJid: chatJid,
+                      targetJid,
+                      senderImId: senderOpenId,
+                      notes: runtimeControl.notes,
+                    })
+                  : '当前运行环境不支持 /fresh。';
               } else {
                 reply = onSessionClear
                   ? await onSessionClear({
@@ -3737,6 +3748,8 @@ export function createFeishuConnection(
 
   async function reconnectWebSocket(reason: string): Promise<void> {
     if (reconnecting || !connectOptions) return;
+    const generation = wsConnectionGeneration;
+    const options = connectOptions;
     reconnecting = true;
     reconnectRequestedAt = Date.now();
     disconnectedChecks = 0;
@@ -3751,7 +3764,7 @@ export function createFeishuConnection(
       }
       if (wsClient) {
         try {
-          await wsClient.close();
+          await wsClient.close({ force: true });
         } catch (err) {
           logger.debug(
             { err },
@@ -3760,25 +3773,24 @@ export function createFeishuConnection(
         }
       }
 
-      wsClient = new lark.WSClient({
-        appId: config.appId,
-        appSecret: config.appSecret,
-        loggerLevel: lark.LoggerLevel.info,
-        // Detect silently-dead long connections instead of hanging on a
-        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
-        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
-      });
-      await wsClient.start({ eventDispatcher });
+      if (generation !== wsConnectionGeneration || !eventDispatcher) return;
+      const nextWsClient = createWsClient();
+      wsClient = nextWsClient;
+      await nextWsClient.start({ eventDispatcher });
+      if (generation !== wsConnectionGeneration || wsClient !== nextWsClient) {
+        nextWsClient.close({ force: true });
+        return;
+      }
 
       lastWsStateConnected = true;
       logger.info({ reason }, 'Feishu WebSocket reconnected');
       await recoverQueuedInbox('reconnect');
       await runBackfill('reconnect');
-      connectOptions.onReady();
+      if (generation === wsConnectionGeneration) options.onReady();
     } catch (err) {
       logger.error({ err, reason }, 'Feishu WebSocket reconnect failed');
     } finally {
-      reconnecting = false;
+      if (generation === wsConnectionGeneration) reconnecting = false;
     }
   }
 
@@ -3833,6 +3845,7 @@ export function createFeishuConnection(
         logger.warn('Feishu config is empty, running in Web-only mode');
         return false;
       }
+      const generation = ++wsConnectionGeneration;
       connectOptions = opts;
       disconnectedChecks = 0;
       reconnectRequestedAt = Date.now();
@@ -3841,6 +3854,14 @@ export function createFeishuConnection(
       restoreDurableChatProgress();
 
       // Initialize client
+      if (!feishuClientHttpTimeoutApplied) {
+        // Set once: `defaultHttpInstance` is a module-level singleton shared
+        // by every `lark.Client` in this process, so re-applying per connect
+        // would be redundant, not incorrect.
+        lark.defaultHttpInstance.defaults.timeout =
+          FEISHU_CLIENT_HTTP_TIMEOUT_MS;
+        feishuClientHttpTimeoutApplied = true;
+      }
       client = new lark.Client({
         appId: config.appId,
         appSecret: config.appSecret,
@@ -3975,6 +3996,17 @@ export function createFeishuConnection(
                 return;
               }
               result = connectOptions?.onCardInterrupt?.(chatJid, operatorImId);
+              // The active streaming session owns its terminal card update.
+              // Replacing this card with a follow-up receipt would erase the
+              // generated answer and race the session's CardKit finalization.
+              // Return promptly so Feishu can release the interaction lock.
+              if (!result) return;
+              return {
+                toast: {
+                  type: result.ok ? 'success' : 'warning',
+                  content: result.message,
+                },
+              };
             } else if (
               action === 'steer_queued' ||
               action === 'cancel_queued' ||
@@ -4028,23 +4060,26 @@ export function createFeishuConnection(
         },
       });
 
-      // Initialize WebSocket client
-      wsClient = new lark.WSClient({
-        appId: config.appId,
-        appSecret: config.appSecret,
-        loggerLevel: lark.LoggerLevel.info,
-        // Detect silently-dead long connections instead of hanging on a
-        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
-        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
-      });
+      // stop() can retire this connect while REST inventory is still loading.
+      if (generation !== wsConnectionGeneration) return false;
+      const nextWsClient = createWsClient();
+      wsClient = nextWsClient;
 
       try {
-        await wsClient.start({ eventDispatcher });
+        await nextWsClient.start({ eventDispatcher });
+        if (
+          generation !== wsConnectionGeneration ||
+          wsClient !== nextWsClient
+        ) {
+          nextWsClient.close({ force: true });
+          return false;
+        }
         logger.info('Feishu WebSocket client started');
         lastWsStateConnected = true;
         startHealthMonitor();
         await recoverQueuedInbox('startup');
         await runBackfill('startup');
+        if (generation !== wsConnectionGeneration) return false;
         onReady();
         return true;
       } catch (err) {
@@ -4052,6 +4087,8 @@ export function createFeishuConnection(
           { err },
           'Failed to start Feishu client, running in Web-only mode',
         );
+        nextWsClient.close({ force: true });
+        if (generation !== wsConnectionGeneration) return false;
         // Clean up partially initialized state
         stopHealthMonitor();
         connectOptions = null;
@@ -4063,6 +4100,17 @@ export function createFeishuConnection(
     },
 
     async stop(): Promise<void> {
+      wsConnectionGeneration += 1;
+      const retiredWsClient = wsClient;
+      wsClient = null;
+      // Retire the transport before any asynchronous indicator cleanup.
+      if (retiredWsClient) {
+        try {
+          retiredWsClient.close({ force: true });
+        } catch (err) {
+          logger.warn({ err }, 'Error stopping Feishu client');
+        }
+      }
       stopHealthMonitor();
       if (inboxRecoveryTimer) {
         clearTimeout(inboxRecoveryTimer);
@@ -4077,16 +4125,6 @@ export function createFeishuConnection(
       reconnecting = false;
       disconnectedChecks = 0;
       await ackReactions.clearAll();
-      if (wsClient) {
-        logger.info('Stopping Feishu client');
-        try {
-          await wsClient.close();
-          logger.info('Feishu client stopped successfully');
-        } catch (err) {
-          logger.warn({ err }, 'Error stopping Feishu client');
-        }
-        wsClient = null;
-      }
       client = null;
       lastWsStateConnected = false;
     },
@@ -4095,7 +4133,10 @@ export function createFeishuConnection(
       chatId: string,
       text: string,
       localImagePaths?: string[],
-      options?: { presentation?: 'default' | 'native' },
+      options?: {
+        presentation?: 'default' | 'native';
+        physicalOutput?: boolean;
+      },
     ): Promise<void> {
       if (!client) {
         throw preAcceptImDeliveryError('Feishu client is not initialized');
@@ -4110,59 +4151,56 @@ export function createFeishuConnection(
       const tracker = new PhysicalDeliveryTracker(1 + imagePaths.length);
 
       try {
-        await tracker.send(async () => {
-          // Proactive-mode workspace Agents speak as ordinary native rich-text
-          // messages. They never enter the interactive-card presentation lane.
-          if (options?.presentation === 'native') {
-            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-            return;
-          }
-
+        const sendPost = () =>
+          sendOrdinaryPages(
+            chatId,
+            text,
+            'post',
+            tracker,
+            options?.physicalOutput,
+          );
+        if (options?.presentation === 'native') {
+          await sendPost();
+        } else {
           let prebuiltCard: string | undefined;
           if (text.startsWith('{"type":"interactive"')) {
-            // Parse independently from delivery. A send rejection must never be
-            // swallowed as if the JSON itself were malformed.
             try {
               const parsed = JSON.parse(text);
-              if (parsed.type === 'interactive' && parsed.card) {
+              if (parsed.type === 'interactive' && parsed.card)
                 prebuiltCard = text;
-              }
             } catch {
-              // Not valid card JSON, fall through to normal handling.
+              // Ordinary text that happens to start with a JSON prefix.
             }
           }
-
           if (prebuiltCard) {
-            await sendToFeishu(chatId, 'interactive', prebuiltCard);
-            return;
-          }
-
-          // Count markdown tables to decide format upfront — Feishu cards have
-          // a table limit. Each table has exactly one separator row.
-          const tableCount = (text.match(/^\|[\s:-]+\|/gm) || []).length;
-          const usePostMd = tableCount > CARD_TABLE_LIMIT;
-
-          if (usePostMd) {
-            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-            return;
-          }
-
-          const card = buildInteractiveCard(text);
-          const content = JSON.stringify(card);
-          try {
-            await sendToFeishu(chatId, 'interactive', content);
-          } catch (err) {
-            // A format fallback is a second provider mutation. It is safe only
-            // when the first mutation was authoritatively rejected (including a
-            // transport failure proven to precede TLS/request acceptance).
-            if (!definitiveFeishuChannelDeliveryError(err)) throw err;
-            logger.warn(
-              { err, chatId },
-              'Feishu interactive send was rejected, fallback to post+md',
+            await tracker.send(() =>
+              sendToFeishu(chatId, 'interactive', prebuiltCard!),
             );
-            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
+          } else {
+            const tableCount = (text.match(/^\|[\s:-]+\|/gm) || []).length;
+            const content = JSON.stringify(buildInteractiveCard(text));
+            // Inline IM cards have their own 30KB limit, unlike CardKit entities.
+            if (
+              tableCount > CARD_TABLE_LIMIT ||
+              Buffer.byteLength(content) > 30_000
+            ) {
+              await sendPost();
+            } else {
+              try {
+                await tracker.send(() =>
+                  sendToFeishu(chatId, 'interactive', content),
+                );
+              } catch (error) {
+                if (!definitiveFeishuChannelDeliveryError(error)) throw error;
+                logger.warn(
+                  { err: error, chatId },
+                  'Feishu interactive send was rejected, fallback to post+md',
+                );
+                await sendPost();
+              }
+            }
           }
-        });
+        }
         logger.debug(
           { chatId, presentation: options?.presentation ?? 'default' },
           'Sent Feishu message',
@@ -4266,9 +4304,7 @@ export function createFeishuConnection(
 
         // Step 3: If caption provided, send it as a follow-up text message
         if (caption) {
-          await tracker.send(() =>
-            sendToFeishu(chatId, 'text', JSON.stringify({ text: caption })),
-          );
+          await sendOrdinaryPages(chatId, caption, 'text', tracker);
         }
         logger.info(
           { chatId, imageKey, mimeType, size: imageBuffer.length },

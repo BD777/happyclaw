@@ -62,6 +62,9 @@ import workspaceRoutes from './routes/workspaces.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
+import { codexGatewayApp } from './codex-gateway/gateway.js';
+import { initCodexCatalogSync } from './codex-gateway/model-catalog-sync.js';
+import { CODEX_GATEWAY_ROUTE } from './codex-gateway/types.js';
 import channelAccountRoutes, {
   injectChannelAccountDeps,
 } from './routes/channel-accounts.js';
@@ -93,6 +96,7 @@ import {
   resolveBoundWorkspaceJid,
 } from './workspace-attribution.js';
 import { markdownToPlainText } from './im-utils.js';
+import { stripVirtualJidSuffix } from './utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
   AgentStatus,
@@ -128,9 +132,16 @@ import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import { RunStreamFence } from './run-stream-fence.js';
 import {
   executeSessionReset,
+  executeFreshWindowReset,
   isClearCommand,
+  parseFreshCommand,
   SESSION_RESET_FAILURE_MESSAGE,
+  SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
 } from './commands.js';
+import {
+  captureWorkspaceSnapshot,
+  formatFreshWindowHandoff,
+} from './fresh-window.js';
 import {
   normalizeImageAttachments,
   toAgentImages,
@@ -283,6 +294,9 @@ app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/bug-report', bugReportRoutes);
 app.route('/api/channel-accounts', channelAccountRoutes);
+// 不挂在 /api/* 下：网关用 provider gateway token 鉴权（x-api-key），
+// 不是浏览器 Cookie 会话，不需要也不应该套用 /api/* 的 CORS/Cookie 中间件。
+app.route(CODEX_GATEWAY_ROUTE, codexGatewayApp);
 
 // --- POST /api/messages ---
 
@@ -370,6 +384,65 @@ app.post('/api/messages', authMiddleware, async (c) => {
         is_from_me: true,
       });
       return c.json({ error: '清除上下文失败' }, 500);
+    }
+  }
+
+  // /fresh [notes]: zero-summary window switch. Same owner gate as /clear.
+  const freshCommand = parseFreshCommand(content);
+  if (freshCommand) {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: chatJid },
+      )
+    ) {
+      return c.json({ error: 'Only the workspace owner can run /fresh' }, 403);
+    }
+    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+    try {
+      const snapshot = await captureWorkspaceSnapshot(
+        group.customCwd || path.join(GROUPS_DIR, group.folder),
+      );
+      const handoff = formatFreshWindowHandoff({
+        notes: freshCommand.notes,
+        snapshot,
+      });
+      await executeFreshWindowReset(
+        chatJid,
+        group.folder,
+        {
+          queue: deps.queue,
+          sessions: deps.getSessions(),
+          broadcast: broadcastNewMessage,
+          setLastAgentTimestamp: deps.setLastAgentTimestamp,
+        },
+        { agentId, handoff },
+      );
+      return c.json({ success: true, cleared: true, fresh: true });
+    } catch (err) {
+      logger.error({ chatJid, err }, '/fresh command failed');
+      const errId = crypto.randomUUID();
+      const errTs = new Date().toISOString();
+      ensureChatExists(chatJid);
+      storeMessageDirect(
+        errId,
+        chatJid,
+        '__system__',
+        'system',
+        SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
+        errTs,
+        true,
+      );
+      broadcastNewMessage(chatJid, {
+        id: errId,
+        chat_jid: chatJid,
+        sender: '__system__',
+        sender_name: 'system',
+        content: SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
+        timestamp: errTs,
+        is_from_me: true,
+      });
+      return c.json({ error: '零摘要换窗失败' }, 500);
     }
   }
 
@@ -1252,8 +1325,8 @@ async function handleAgentConversationMessage(
         'Race: eager-expanded agent conv but runner exited before sendMessage; cold-start will re-expand',
       );
     }
-    // No running process — force close any stale state and start fresh.
-    // Mirrors the reliable IM path in buildOnAgentMessage() (#240).
+    // No running process — force close any stale state and start fresh
+    // (#240). Only reached on 'no_active'; a warm runner is never closed.
     deps.queue.closeStdin(virtualChatJid);
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
@@ -1397,6 +1470,18 @@ app.use(
 // （前端只看到 onclose、后端默认静默 destroy socket），没有这行日志运维成本极高。
 const warnedRejectedOrigins = new Set<string>();
 
+export function evaluateWsSpawnCommandAccess(
+  user: { id: string; role: UserRole },
+  chatJid: string,
+): { dispatched: true } | { dispatched: false; reason: 'access' } {
+  const baseJid = stripVirtualJidSuffix(chatJid);
+  const row = getRegisteredGroup(baseJid);
+  if (!row || !canModifyGroup(user, { ...row, jid: baseJid })) {
+    return { dispatched: false, reason: 'access' };
+  }
+  return { dispatched: true };
+}
+
 function setupWebSocket(server: any): WebSocketServer {
   // 8 MiB 上限：覆盖单条消息含 10 张 5MB base64 image 的合法上限（~70MB 是
   // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
@@ -1432,7 +1517,14 @@ function setupWebSocket(server: any): WebSocketServer {
   });
 
   server.on('upgrade', (request: any, socket: any, head: any) => {
-    const { pathname } = new URL(request.url, `http://${request.headers.host}`);
+    let pathname: string;
+    try {
+      ({ pathname } = new URL(request.url, `http://${request.headers.host}`));
+    } catch {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     if (pathname !== '/ws') {
       socket.destroy();
@@ -1765,6 +1857,15 @@ function setupWebSocket(server: any): WebSocketServer {
           // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──
           const swMatch = content.trim().match(/^\/(sw|spawn)\s+([\s\S]+)$/i);
           if (swMatch && deps?.handleSpawnCommand) {
+            const spawnAccess = evaluateWsSpawnCommandAccess(
+              { id: session.user_id, role: session.role },
+              chatJid,
+            );
+            if (!spawnAccess.dispatched) {
+              sendWsError('Only the workspace owner can run /sw', chatJid);
+              return;
+            }
+
             const spawnMessage = swMatch[2].trim();
             if (spawnMessage) {
               try {
@@ -1867,6 +1968,75 @@ function setupWebSocket(server: any): WebSocketServer {
                 sender: '__system__',
                 sender_name: 'system',
                 content: SESSION_RESET_FAILURE_MESSAGE,
+                timestamp: errTs,
+                is_from_me: true,
+              });
+            }
+            return;
+          }
+
+          // ── /fresh [notes]: zero-summary window switch ──
+          const wsFreshCommand = parseFreshCommand(content);
+          if (wsFreshCommand && deps && targetGroup) {
+            if (
+              !canModifyGroup(
+                { id: session.user_id, role: session.role },
+                { ...targetGroup, jid: chatJid },
+              )
+            ) {
+              sendWsError('Only the workspace owner can run /fresh', chatJid);
+              return;
+            }
+            if (agentId) {
+              const agent = getAgent(agentId);
+              if (!agent || agent.chat_jid !== chatJid) {
+                sendWsError('Agent not found', chatJid);
+                return;
+              }
+            }
+            const errorTargetJid = agentId
+              ? `${chatJid}#agent:${agentId}`
+              : chatJid;
+            try {
+              const snapshot = await captureWorkspaceSnapshot(
+                targetGroup.customCwd ||
+                  path.join(GROUPS_DIR, targetGroup.folder),
+              );
+              const handoff = formatFreshWindowHandoff({
+                notes: wsFreshCommand.notes,
+                snapshot,
+              });
+              await executeFreshWindowReset(
+                chatJid,
+                targetGroup.folder,
+                {
+                  queue: deps.queue,
+                  sessions: deps.getSessions(),
+                  broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
+                },
+                { agentId, handoff },
+              );
+            } catch (err) {
+              logger.error({ chatJid, agentId, err }, '/fresh command failed');
+              const errId = crypto.randomUUID();
+              const errTs = new Date().toISOString();
+              ensureChatExists(errorTargetJid);
+              storeMessageDirect(
+                errId,
+                errorTargetJid,
+                '__system__',
+                'system',
+                SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
+                errTs,
+                true,
+              );
+              broadcastNewMessage(errorTargetJid, {
+                id: errId,
+                chat_jid: errorTargetJid,
+                sender: '__system__',
+                sender_name: 'system',
+                content: SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
                 timestamp: errTs,
                 is_from_me: true,
               });
@@ -3384,6 +3554,8 @@ export function startWebServer(webDeps: WebDeps): void {
     broadcastDockerPullLog,
     broadcastDockerPullComplete,
   });
+  // Codex 模型目录：读磁盘缓存后后台同步上游（永不阻塞启动）。
+  initCodexCatalogSync();
 
   httpServer = serve(
     {

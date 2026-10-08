@@ -294,6 +294,8 @@ export interface StreamEvent {
   queryRunId?: string;
   /** Correlates all stream events for a single user turn. */
   turnId?: string;
+  /** Immutable input identity for usage-to-answer correlation; IPC uses deliveryId. */
+  inputTurnId?: string;
   /** SDK session identifier if known. */
   sessionId?: string;
   /** SDK message uuid if known. */
@@ -366,6 +368,8 @@ export interface StreamEvent {
     content: string;
     status: 'pending' | 'in_progress' | 'completed';
   }>;
+  /** input_total is a complete per-input display snapshot, never a billable delta. */
+  usageProjection?: 'input_total';
   /** Token usage data emitted at query completion */
   usage?: {
     /** Stable logical run ID used to make analytics and billing idempotent. */

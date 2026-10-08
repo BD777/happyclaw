@@ -27,6 +27,10 @@ import {
 } from './config.js';
 import { logger } from './logger.js';
 import {
+  resolveCodexGatewayBaseUrl,
+  isCodexGatewayBaseUrl,
+} from './codex-gateway/resolve-gateway-url.js';
+import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
 } from './effective-mcp-manifest.js';
@@ -263,6 +267,7 @@ export function clearSessionClaudeOAuthFiles(
 ): void {
   const sessionClaudeJson = path.join(sessionDir, '.claude.json');
   let sourceExists = false;
+  let hasSyntaxError = false;
   let claudeJson: Record<string, unknown> = {};
   try {
     const sourcePath = claudeJsonTemplatePath ?? sessionClaudeJson;
@@ -274,26 +279,44 @@ export function clearSessionClaudeOAuthFiles(
       }
       claudeJson = parsed as Record<string, unknown>;
     }
-  } catch {
-    // Invalid session metadata must not survive as an opaque OAuth signal.
-    sourceExists = true;
-    claudeJson = {};
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      hasSyntaxError = true;
+    } else if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      sourceExists = false;
+      claudeJson = {};
+    } else {
+      // Invalid session metadata must not survive as an opaque OAuth signal.
+      sourceExists = true;
+      claudeJson = {};
+    }
   }
 
-  try {
-    const stat = fs.lstatSync(sessionClaudeJson);
-    if (stat.isSymbolicLink()) fs.unlinkSync(sessionClaudeJson);
-  } catch {
-    /* not found, ok */
-  }
-  const hadOauthAccount = 'oauthAccount' in claudeJson;
-  delete claudeJson.oauthAccount;
-  if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
-    fs.writeFileSync(
-      sessionClaudeJson,
-      JSON.stringify(claudeJson, null, 2) + '\n',
-      { mode: 0o600 },
-    );
+  if (!hasSyntaxError) {
+    try {
+      const stat = fs.lstatSync(sessionClaudeJson);
+      if (stat.isSymbolicLink()) fs.unlinkSync(sessionClaudeJson);
+    } catch {
+      /* not found, ok */
+    }
+    const hadOauthAccount = 'oauthAccount' in claudeJson;
+    delete claudeJson.oauthAccount;
+    if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
+      const tmpPath = `${sessionClaudeJson}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        fs.writeFileSync(tmpPath, JSON.stringify(claudeJson, null, 2) + '\n', {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        fs.renameSync(tmpPath, sessionClaudeJson);
+      } finally {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          /* already renamed or never created */
+        }
+      }
+    }
   }
 
   const credentialsPath = path.join(sessionDir, '.credentials.json');
@@ -365,11 +388,38 @@ function removePreviousSettingsProjection(
   return cleaned;
 }
 
-function readSettingsRecord(filePath: string): Record<string, unknown> {
+function writeAtomicFile(
+  filePath: string,
+  contents: string,
+  mode: number,
+): void {
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, contents, { flag: 'wx', mode });
+    fs.renameSync(tmpPath, filePath);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function readSettingsRecord(
+  filePath: string,
+  options?: { ignoreSyntaxError?: boolean },
+): Record<string, unknown> {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     return isSettingsRecord(parsed) ? parsed : {};
-  } catch {
+  } catch (error) {
+    if (
+      !options?.ignoreSyntaxError &&
+      (error instanceof SyntaxError || (error as Error)?.name === 'SyntaxError')
+    ) {
+      throw error;
+    }
     return {};
   }
 }
@@ -387,8 +437,26 @@ function ensureSettingsJson(
     path.dirname(settingsFile),
     '.happyclaw-native-settings.json',
   );
-  const current = readSettingsRecord(settingsFile);
-  const previousProjection = readSettingsRecord(projectionFile);
+  let current: Record<string, unknown>;
+  try {
+    current = readSettingsRecord(settingsFile);
+  } catch (error) {
+    if (
+      error instanceof SyntaxError ||
+      (error as Error)?.name === 'SyntaxError'
+    ) {
+      return;
+    }
+    throw error;
+  }
+  let previousProjection: Record<string, unknown>;
+  try {
+    previousProjection = readSettingsRecord(projectionFile, {
+      ignoreSyntaxError: true,
+    });
+  } catch {
+    previousProjection = {};
+  }
   const existing = mergeSettingsRecord(
     removePreviousSettingsProjection(current, previousProjection),
     options?.baseSettings ?? {},
@@ -420,7 +488,7 @@ function ensureSettingsJson(
     /* write anyway */
   }
   if (settingsChanged) {
-    fs.writeFileSync(settingsFile, newContent, { mode: 0o644 });
+    writeAtomicFile(settingsFile, newContent, 0o644);
   }
 
   const projectionContent = `${JSON.stringify(options?.baseSettings ?? {}, null, 2)}\n`;
@@ -434,7 +502,7 @@ function ensureSettingsJson(
   } catch {
     /* write anyway */
   }
-  fs.writeFileSync(projectionFile, projectionContent, { mode: 0o600 });
+  writeAtomicFile(projectionFile, projectionContent, 0o600);
 }
 
 export interface ContainerInput {
@@ -1091,14 +1159,21 @@ export function shouldRotatePoolProviderAfterTurn(
 export function closeRunnerAfterRotatingProviderTurn(
   rotationEnabled: boolean,
   rotationAlreadyScheduled: boolean,
-  output: Pick<ContainerOutput, 'providerFailure' | 'inputTurnCompleted'>,
+  output: Pick<
+    ContainerOutput,
+    'providerFailure' | 'inputTurnCompleted' | 'pendingBgTasks'
+  >,
   closeRunner: () => void,
 ): boolean {
   if (
     !rotationEnabled ||
     rotationAlreadyScheduled ||
     output.providerFailure ||
-    output.inputTurnCompleted !== true
+    output.inputTurnCompleted !== true ||
+    // A runner still holding background Tasks must stay alive: closing stdin
+    // would kill the sub-agents and drop their completion summary. Rotation
+    // is retried on the next healthy completion once they have settled.
+    (output.pendingBgTasks ?? 0) > 0
   ) {
     return false;
   }
@@ -1607,6 +1682,8 @@ interface PreparedVolumeMounts {
   runtimeMcpServers: Record<string, Record<string, unknown>>;
   hostPlugins: SdkPluginConfig[];
   dockerOauthLaunch: DockerOauthLaunchSnapshot | null;
+  /** Selected provider routes through the ChatGPT/Codex 订阅网关; docker run needs host.docker.internal. */
+  usesCodexGateway: boolean;
 }
 
 function prepareVolumeMounts(
@@ -1771,14 +1848,53 @@ function prepareVolumeMounts(
   // Every selected Skill gets an explicit read-only mount. entrypoint rebuilds
   // /home/node/.claude/skills exclusively from this directory, so a real
   // directory persisted by an earlier container can never survive a restart.
+  // Workspace skills dir sits inside the RW /workspace/group bind and
+  // scanSkillDirectory accepts symlinks intentionally for host/user layers, so
+  // confine workspace skills to the group's real .claude/skills root (not
+  // realpath(skillsDir), which would follow a planted symlink).
+  let groupReal: string | null = null;
+  try {
+    groupReal = fs.realpathSync(path.join(GROUPS_DIR, group.folder));
+  } catch {
+    groupReal = null;
+  }
+  const workspaceSkillsRoot = groupReal
+    ? path.join(groupReal, '.claude', 'skills')
+    : null;
   for (const skill of claudeContextPlan.effectiveSkills.selected) {
     if (skill.source === 'plugin') continue;
     let hostPath = skill.path;
+    let realpathOk = true;
     try {
       hostPath = fs.realpathSync(hostPath);
     } catch {
       // The resolver already validated SKILL.md. Keep the original path so
       // Docker reports a deterministic mount error if it vanished afterward.
+      realpathOk = false;
+    }
+    if (skill.source === 'workspace') {
+      const rel = workspaceSkillsRoot
+        ? path.relative(workspaceSkillsRoot, hostPath)
+        : '';
+      if (
+        !realpathOk ||
+        !workspaceSkillsRoot ||
+        rel === '' ||
+        rel === '..' ||
+        rel.startsWith('..' + path.sep) ||
+        path.isAbsolute(rel)
+      ) {
+        logger.warn(
+          {
+            group: group.folder,
+            skillId: skill.id,
+            skillPath: skill.path,
+            resolvedPath: hostPath,
+          },
+          'Skipping workspace skill outside workspace skills root',
+        );
+        continue;
+      }
     }
     mounts.push({
       hostPath,
@@ -1892,7 +2008,17 @@ function prepareVolumeMounts(
       : null,
   );
   fs.mkdirSync(envDir, { recursive: true });
-  const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
+  const rawGlobalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
+  const globalConfig = {
+    ...rawGlobalConfig,
+    anthropicBaseUrl: resolveCodexGatewayBaseUrl(
+      rawGlobalConfig.anthropicBaseUrl,
+      'container',
+    ),
+  };
+  const usesCodexGateway = isCodexGatewayBaseUrl(
+    rawGlobalConfig.anthropicBaseUrl,
+  );
   const containerOverride = getContainerEnvConfig(group.folder);
   const effectiveContainerOverride = resolvedProvider
     ? { customEnv: containerOverride.customEnv }
@@ -2066,6 +2192,7 @@ function prepareVolumeMounts(
     runtimeMcpServers,
     hostPlugins: pluginSkills,
     dockerOauthLaunch,
+    usesCodexGateway,
   };
 }
 
@@ -2507,7 +2634,10 @@ export async function runContainerAgent(
       containerName,
       TIMEZONE,
       detectContainerHostIdentity(),
-      { addHostGateway: containerProxy.addHostGateway },
+      {
+        addHostGateway:
+          containerProxy.addHostGateway || preparedLaunch.usesCodexGateway,
+      },
       containerImage,
     );
 
@@ -3544,8 +3674,15 @@ export async function runHostAgent(
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
   );
-  const globalConfig =
+  const rawGlobalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
+  const globalConfig = {
+    ...rawGlobalConfig,
+    anthropicBaseUrl: resolveCodexGatewayBaseUrl(
+      rawGlobalConfig.anthropicBaseUrl,
+      'host',
+    ),
+  };
   let hostProviderFailureReported = false;
   let hostProviderFailureTerminal: boolean | undefined;
   let hostProviderFailureMaintenance = false;

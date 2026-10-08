@@ -107,7 +107,10 @@ import {
   markIsolatedTaskRunIpcComplete,
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
-import { getScriptTaskHostExecutionError } from './script-task-policy.js';
+import {
+  getScriptTaskHostExecutionError,
+  resolveWorkspaceExecutionMode,
+} from './script-task-policy.js';
 import { resolveScheduledGroupDeliveryContract } from './reply-delivery.js';
 import { resolveRuntimeInteractionMode } from './workspace-interaction-runtime.js';
 import { explicitImDeliveryPhase } from './im-send-retry-policy.js';
@@ -165,16 +168,7 @@ function resolveTaskExecutionMode(
   // Legacy fallback: inherit from the original group
   const groups = deps.registeredGroups();
   const group = groups[task.chat_jid];
-  if (group) {
-    if (!group.is_home) {
-      const homeSibling = Object.values(groups).find(
-        (g) => g.folder === group.folder && g.is_home,
-      );
-      if (homeSibling) return homeSibling.executionMode || 'container';
-    }
-    return group.executionMode || 'container';
-  }
-  return 'container';
+  return group ? resolveWorkspaceExecutionMode(group, groups) : 'container';
 }
 
 function scriptTaskRuntimePolicyError(
@@ -1781,6 +1775,13 @@ async function runScriptTaskInner(
       error = '脚本执行已取消';
     } else if (scriptResult.timedOut) {
       error = `脚本执行超时 (${Math.round(scriptResult.durationMs / 1000)}s)`;
+    } else if (scriptResult.signal) {
+      // External SIGKILL/OOM (and other signals) must not be treated as success
+      // even when stdout captured a partial payload before death. Lead with
+      // the signal: stderr alone rarely says the process was killed.
+      const stderr = scriptResult.stderr.trim();
+      error = `脚本被信号终止: ${scriptResult.signal}${stderr ? `\n${stderr}` : ''}`;
+      result = scriptResult.stdout.trim() || null;
     } else if (scriptResult.exitCode !== 0) {
       error = scriptResult.stderr.trim() || `退出码: ${scriptResult.exitCode}`;
       result = scriptResult.stdout.trim() || null;
@@ -1824,6 +1825,7 @@ async function runScriptTaskInner(
         taskId: task.id,
         durationMs: Date.now() - startTime,
         exitCode: scriptResult.exitCode,
+        signal: scriptResult.signal,
       },
       'Script task completed',
     );
