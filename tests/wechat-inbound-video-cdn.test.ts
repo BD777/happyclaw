@@ -375,18 +375,22 @@ describe('WeChat inbound image CDN placeholders', () => {
       name: 'CDN download throws',
       arrange: () =>
         crypto.downloadAndDecryptMedia.mockRejectedValue(new Error('cdn fail')),
+      label:
+        '[图片接收失败：下载或解密失败，请重新发送图片；当前无法查看图片内容。]',
     },
     {
       name: 'CDN returns an empty buffer',
       arrange: () =>
         crypto.downloadAndDecryptMedia.mockResolvedValue(Buffer.alloc(0)),
+      label:
+        '[图片接收失败：附件不可用，请重新发送图片；当前无法查看图片内容。]',
     },
   ])(
     '$name: image-only message keeps a download-failed placeholder',
-    async ({ arrange }) => {
+    async ({ arrange, label }) => {
       arrange();
       const { content, attachments } = await persistImageOnly();
-      expect(content).toBe('[图片消息（下载失败）]');
+      expect(content).toBe(label);
       expect(attachments).toBeUndefined();
       expect(notify.notifyNewImMessage).toHaveBeenCalled();
     },
@@ -438,6 +442,8 @@ describe('WeChat inbound image CDN placeholders', () => {
       image_item: { media: { encrypt_query_param: 'missing-aes-key' } },
     });
     expect(crypto.downloadAndDecryptMedia).not.toHaveBeenCalled();
-    expect(content).toBe('(image)');
+    expect(content).toBe(
+      '[图片接收失败：附件不可用，请重新发送图片；当前无法查看图片内容。]',
+    );
   });
 });

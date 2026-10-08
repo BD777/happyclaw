@@ -219,7 +219,10 @@ describe('provider failure parsing through scheduled replay', () => {
         recoverOnSecondAttempt: false,
         livenessTimeout,
       });
-      expect(result.attemptedProviders).toHaveLength(2);
+      // A repeated transient failure is not terminal inside the attempt: it
+      // opens the endpoint circuit and releases the durable input, so the
+      // scheduled loop makes one more bounded attempt before giving up.
+      expect(result.attemptedProviders).toHaveLength(3);
       expect(result.attemptedProviders[1]).toBe(result.attemptedProviders[0]);
       const notice = livenessTimeout
         ? PROVIDER_LIVENESS_TIMEOUT_USER_NOTICE
@@ -232,11 +235,9 @@ describe('provider failure parsing through scheduled replay', () => {
         providerFailureNotice: notice,
       });
       expect(result.output.providerFailureNotice).not.toContain('额度已用尽');
-      expect(result.projected).toHaveLength(1);
-      expect(result.projected[0]).toMatchObject({
-        providerFailureTerminal: true,
-        providerFailureNotice: notice,
-      });
+      // Non-terminal attempts are never projected; the scheduler reports the
+      // terminal notice from the returned output once the bound is reached.
+      expect(result.projected).toHaveLength(0);
       for (const provider of mocks.enabledProviders)
         expect(providerPool.getHealthStatus(provider.id).healthy).toBe(true);
     },

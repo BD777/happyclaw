@@ -564,7 +564,9 @@ function extractTextContent(items: MessageItem[]): string {
       // Image placeholder — actual image is handled separately via CDN download
       // Only add placeholder if no CDN media to download
       if (!hasDownloadableCdnMedia(item.image_item?.media)) {
-        parts.push('(image)');
+        parts.push(
+          '[图片接收失败：附件不可用，请重新发送图片；当前无法查看图片内容。]',
+        );
       }
     } else if (item.type === MESSAGE_ITEM_TYPE_VOICE) {
       // Voice: prefer speech-to-text transcription
@@ -1103,7 +1105,7 @@ export function createWeChatConnection(
     textPrefix?: string;
   }> {
     const media = item.image_item?.media;
-    // extractTextContent already emitted "(image)" for undownloadable media.
+    // extractTextContent already labeled undownloadable media.
     if (!hasDownloadableCdnMedia(media)) return {};
     // Same "[X消息]" family as the voice/video fallbacks, but naming why no
     // image is attached so the agent does not assume it can see one.

@@ -82,6 +82,8 @@ function createNoticeRuntime(imSend: (...args: unknown[]) => Promise<void>) {
     CHANNEL_RELIABILITY_TERMINAL_STATUSES:
       reliability.CHANNEL_RELIABILITY_TERMINAL_STATUSES,
     getChannelTurnRun: reliability.getChannelTurnRun,
+    failRetryableChannelTurnRunsByCorrelationIds:
+      reliability.failRetryableChannelTurnRunsByCorrelationIds,
     getUncertainChannelOutboxForTurn:
       reliability.getUncertainChannelOutboxForTurn,
     deliverChannelOutboxItem,
